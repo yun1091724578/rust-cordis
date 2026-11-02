@@ -1,0 +1,15 @@
+[package]
+name = "plugin-harness-tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "harness spike 用的真动态库插件（M11：A4/A9/A11）"
+publish = false
+
+[lib]
+name = "harness_tool"
+crate-type = ["cdylib"]
+
+[dependencies]
+cordis-abi = { workspace = true }
+serde_json = { workspace = true }

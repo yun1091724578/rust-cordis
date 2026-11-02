@@ -1,0 +1,1502 @@
+//! 首发产物封存：构建 release 插件，记录源码树 / 工具链 / ABI / SHA256，
+//! 并用**同版本宿主**做一次 `inspect` 加载检查。
+//!
+//! 封存目录不可覆盖：已有非空目录直接拒绝。这样“首发产物”不会在第二次
+//! 运行时被悄悄替换。校验只读 `seal.json` 与 `SHA256SUMS`，不重新构建，
+//! 因此可以在后续宿主版本上独立验证。
+
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const SEAL_FORMAT: &str = "cordis-plugin-seal/1";
+const SEAL_FILE: &str = "seal.json";
+const SUMS_FILE: &str = "SHA256SUMS";
+const SMOKE_CONFIG: &str = "smoke/cordis.yml";
+const SMOKE_EVIDENCE: &str = "smoke/inspect.txt";
+const SMOKE_METHOD: &str =
+    "cordis inspect --plugin-dir plugins (LoadedPlugin::open + OP_PING / OP_VOLATILE_PATHS; no mount)";
+
+const PLUGINS: &[PluginSpec] = &[
+    PluginSpec {
+        package: "plugin-greeting",
+        krate: "greeting",
+        label: "greeting",
+        plugin: "greeting",
+    },
+    PluginSpec {
+        package: "plugin-hello",
+        krate: "hello",
+        label: "hello",
+        plugin: "hello",
+    },
+    PluginSpec {
+        package: "plugin-harness-tool",
+        krate: "harness_tool",
+        label: "harness",
+        plugin: "harness-tool",
+    },
+];
+
+struct PluginSpec {
+    package: &'static str,
+    krate: &'static str,
+    label: &'static str,
+    plugin: &'static str,
+}
+
+#[derive(Debug)]
+struct SealArtifact {
+    package: String,
+    krate: String,
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Debug)]
+struct SealManifest {
+    workspace_version: String,
+    abi_version: u32,
+    error_format: u32,
+    target: String,
+    profile: String,
+    created_unix: u64,
+    rustc: String,
+    cargo: String,
+    rustflags: String,
+    source_sha256: String,
+    source_files: u64,
+    artifacts: Vec<SealArtifact>,
+    smoke_config: String,
+    smoke_config_sha256: String,
+    smoke_config_bytes: u64,
+    smoke_evidence: String,
+    smoke_evidence_sha256: String,
+    smoke_evidence_bytes: u64,
+    smoke_checked: bool,
+}
+
+impl SealManifest {
+    fn to_json(&self) -> Value {
+        json!({
+            "format": SEAL_FORMAT,
+            "created_unix": self.created_unix,
+            "workspace_version": self.workspace_version,
+            "abi_version": self.abi_version,
+            "error_format": self.error_format,
+            "target": self.target,
+            "profile": self.profile,
+            "toolchain": {
+                "rustc": self.rustc,
+                "cargo": self.cargo,
+                "rustflags": self.rustflags,
+            },
+            "source": {
+                "kind": "workspace-tree",
+                "sha256": self.source_sha256,
+                "files": self.source_files,
+            },
+            "artifacts": self.artifacts.iter().map(|artifact| json!({
+                "package": artifact.package,
+                "crate": artifact.krate,
+                "path": artifact.path,
+                "sha256": artifact.sha256,
+                "bytes": artifact.bytes,
+            })).collect::<Vec<_>>(),
+            "smoke": {
+                "config": self.smoke_config,
+                "config_sha256": self.smoke_config_sha256,
+                "config_bytes": self.smoke_config_bytes,
+                "evidence": self.smoke_evidence,
+                "evidence_sha256": self.smoke_evidence_sha256,
+                "evidence_bytes": self.smoke_evidence_bytes,
+                "checked": self.smoke_checked,
+                "method": SMOKE_METHOD,
+            },
+        })
+    }
+
+    fn from_json(value: &Value) -> Result<Self, String> {
+        if value.get("format").and_then(Value::as_str) != Some(SEAL_FORMAT) {
+            return Err(format!("封存清单格式不是 {SEAL_FORMAT}"));
+        }
+        let artifacts = value
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .ok_or("封存清单缺少 artifacts 数组")?
+            .iter()
+            .map(|artifact| {
+                Ok(SealArtifact {
+                    package: field_str(artifact, "package")?,
+                    krate: field_str(artifact, "crate")?,
+                    path: field_str(artifact, "path")?,
+                    sha256: field_str(artifact, "sha256")?,
+                    bytes: field_u64(artifact, "bytes")?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let source = value.get("source").ok_or("封存清单缺少 source")?;
+        let toolchain = value.get("toolchain").ok_or("封存清单缺少 toolchain")?;
+        let smoke = value.get("smoke").ok_or("封存清单缺少 smoke")?;
+        Ok(Self {
+            workspace_version: field_str(value, "workspace_version")?,
+            abi_version: field_u32(value, "abi_version")?,
+            error_format: field_u32(value, "error_format")?,
+            target: field_str(value, "target")?,
+            profile: field_str(value, "profile")?,
+            created_unix: field_u64(value, "created_unix")?,
+            rustc: field_str(toolchain, "rustc")?,
+            cargo: field_str(toolchain, "cargo")?,
+            rustflags: toolchain
+                .get("rustflags")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            source_sha256: field_str(source, "sha256")?,
+            source_files: field_u64(source, "files")?,
+            artifacts,
+            smoke_config: field_str(smoke, "config")?,
+            smoke_config_sha256: field_str(smoke, "config_sha256")?,
+            smoke_config_bytes: field_u64(smoke, "config_bytes")?,
+            smoke_evidence: field_str(smoke, "evidence")?,
+            smoke_evidence_sha256: field_str(smoke, "evidence_sha256")?,
+            smoke_evidence_bytes: field_u64(smoke, "evidence_bytes")?,
+            smoke_checked: smoke
+                .get("checked")
+                .and_then(Value::as_bool)
+                .ok_or("封存清单缺少 smoke.checked")?,
+        })
+    }
+}
+
+fn field_str(value: &Value, key: &str) -> Result<String, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("封存清单缺少字符串字段 {key}"))
+}
+
+fn field_u64(value: &Value, key: &str) -> Result<u64, String> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("封存清单缺少无符号整数字段 {key}"))
+}
+
+fn field_u32(value: &Value, key: &str) -> Result<u32, String> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+        .ok_or_else(|| format!("封存清单缺少 u32 字段 {key}"))
+}
+
+pub fn command(args: Vec<String>) -> i32 {
+    let mut out: Option<PathBuf> = None;
+    let mut verify: Option<PathBuf> = None;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--out" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("seal --out 缺少目录\n\n{}", crate::USAGE);
+                    return 2;
+                };
+                if out.replace(PathBuf::from(value)).is_some() {
+                    eprintln!("seal --out 只能出现一次\n\n{}", crate::USAGE);
+                    return 2;
+                }
+            }
+            "--verify" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("seal --verify 缺少目录\n\n{}", crate::USAGE);
+                    return 2;
+                };
+                if verify.replace(PathBuf::from(value)).is_some() {
+                    eprintln!("seal --verify 只能出现一次\n\n{}", crate::USAGE);
+                    return 2;
+                }
+            }
+            "-h" | "--help" => {
+                print!("{}", crate::USAGE);
+                return 0;
+            }
+            other => {
+                eprintln!("seal 未知参数 \"{other}\"\n\n{}", crate::USAGE);
+                return 2;
+            }
+        }
+    }
+    if out.is_some() && verify.is_some() {
+        eprintln!("seal --out 与 --verify 只能选一个\n\n{}", crate::USAGE);
+        return 2;
+    }
+    if let Some(dir) = verify {
+        let dir = crate::resolve_repo_path(dir);
+        return match verify_dir(&dir) {
+            Ok(manifest) => {
+                println!("封存校验通过：{}", dir.display());
+                print_manifest(&manifest);
+                0
+            }
+            Err(errors) => {
+                eprintln!("封存校验失败（{} 条，{}）：", errors.len(), dir.display());
+                for error in errors {
+                    eprintln!("  - {error}");
+                }
+                1
+            }
+        };
+    }
+
+    let out = out
+        .map(crate::resolve_repo_path)
+        .unwrap_or_else(default_output_dir);
+    match seal_to(&out) {
+        Ok(manifest) => {
+            println!("封存完成：{}", out.display());
+            print_manifest(&manifest);
+            println!("同版本加载检查通过：{SMOKE_METHOD}");
+            0
+        }
+        Err(err) => {
+            eprintln!("封存失败：{err}");
+            1
+        }
+    }
+}
+
+fn print_manifest(manifest: &SealManifest) {
+    println!(
+        "  version = {}  abi = {}  error_format = {}",
+        manifest.workspace_version, manifest.abi_version, manifest.error_format
+    );
+    println!(
+        "  target = {}  profile = {}",
+        manifest.target, manifest.profile
+    );
+    println!(
+        "  source = {}  files = {}",
+        manifest.source_sha256, manifest.source_files
+    );
+    println!(
+        "  smoke = {}  evidence = {}",
+        manifest.smoke_config, manifest.smoke_evidence
+    );
+    for artifact in &manifest.artifacts {
+        println!(
+            "  {}  {}  {} bytes",
+            artifact.sha256, artifact.path, artifact.bytes
+        );
+    }
+}
+
+pub fn default_output_dir() -> PathBuf {
+    let target = host_target().unwrap_or_else(|_| "unknown-target".to_string());
+    crate::workspace_root().join("dist").join(format!(
+        "cordis-plugins-{}-{target}",
+        env!("CARGO_PKG_VERSION")
+    ))
+}
+
+fn seal_to(out: &Path) -> Result<SealManifest, String> {
+    let root = crate::workspace_root();
+    if out.exists() {
+        let mut entries =
+            fs::read_dir(out).map_err(|err| format!("读取 {} 失败：{err}", out.display()))?;
+        if entries.next().is_some() {
+            return Err(format!(
+                "输出目录已存在且非空：{}（封存产物不可覆盖，请换 --out）",
+                out.display()
+            ));
+        }
+    }
+
+    let target = host_target()?;
+    let rustc = tool_version(&std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string()))?;
+    let cargo_program = cargo_program();
+    let cargo = tool_version(&cargo_program)?;
+    let rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    let (source_sha256, source_files) = source_tree_digest(&root, out)?;
+
+    let built = build_release_plugins(&root, &target)?;
+    let (after_sha256, after_files) = source_tree_digest(&root, out)?;
+    if source_sha256 != after_sha256 || source_files != after_files {
+        return Err("构建期间源码树发生变化；请先停掉会改源码的进程，再重新封存".to_string());
+    }
+
+    let parent = out.parent().unwrap_or(&root);
+    fs::create_dir_all(parent).map_err(|err| format!("创建 {} 失败：{err}", parent.display()))?;
+    let file_name = out
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("cordis-plugins");
+    let temp = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        temp_nonce()
+    ));
+    let mut guard = TempOut {
+        path: temp.clone(),
+        keep: false,
+    };
+    fs::create_dir(&temp)
+        .map_err(|err| format!("创建临时封存目录 {} 失败：{err}", temp.display()))?;
+    fs::create_dir(temp.join("plugins")).map_err(|err| format!("创建临时封存目录失败：{err}"))?;
+
+    let mut artifacts = Vec::new();
+    for spec in PLUGINS {
+        let source = built
+            .get(spec.krate)
+            .ok_or_else(|| format!("构建结果缺少 {} 的 cdylib", spec.package))?;
+        let name = source
+            .file_name()
+            .ok_or_else(|| format!("构建产物没有文件名：{}", source.display()))?;
+        let destination = temp.join("plugins").join(name);
+        fs::copy(source, &destination).map_err(|err| {
+            format!(
+                "复制 {} 到 {} 失败：{err}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        let bytes = fs::read(&destination)
+            .map_err(|err| format!("读取 {} 失败：{err}", destination.display()))?;
+        artifacts.push(SealArtifact {
+            package: spec.package.to_string(),
+            krate: spec.krate.to_string(),
+            path: format!("plugins/{}", name.to_string_lossy()),
+            sha256: sha256_hex(&bytes),
+            bytes: bytes.len() as u64,
+        });
+    }
+
+    fs::create_dir_all(temp.join("smoke")).map_err(|err| format!("创建 smoke 目录失败：{err}"))?;
+    fs::write(temp.join(SMOKE_CONFIG), smoke_yaml())
+        .map_err(|err| format!("写 smoke 配置失败：{err}"))?;
+    let inspect_output = run_load_check(&temp, &cargo_program, &target)?;
+    fs::write(temp.join(SMOKE_EVIDENCE), &inspect_output)
+        .map_err(|err| format!("写 smoke 证据失败：{err}"))?;
+    let config_bytes =
+        fs::read(temp.join(SMOKE_CONFIG)).map_err(|err| format!("读取 smoke 配置失败：{err}"))?;
+    let evidence_bytes =
+        fs::read(temp.join(SMOKE_EVIDENCE)).map_err(|err| format!("读取 smoke 证据失败：{err}"))?;
+
+    let manifest = SealManifest {
+        workspace_version: env!("CARGO_PKG_VERSION").to_string(),
+        abi_version: cordis_abi::ABI_VERSION,
+        error_format: cordis_abi::ERROR_FORMAT_V1,
+        target,
+        profile: "release".to_string(),
+        created_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0),
+        rustc,
+        cargo,
+        rustflags,
+        source_sha256,
+        source_files,
+        artifacts,
+        smoke_config: SMOKE_CONFIG.to_string(),
+        smoke_config_sha256: sha256_hex(&config_bytes),
+        smoke_config_bytes: config_bytes.len() as u64,
+        smoke_evidence: SMOKE_EVIDENCE.to_string(),
+        smoke_evidence_sha256: sha256_hex(&evidence_bytes),
+        smoke_evidence_bytes: evidence_bytes.len() as u64,
+        smoke_checked: true,
+    };
+    write_manifest_files(&temp, &manifest)?;
+    // 先按只读路径自检一遍，避免把缺文件的目录当成“封存完成”。
+    if let Err(errors) = verify_dir(&temp) {
+        return Err(format!("封存自检失败：{}", errors.join("；")));
+    }
+    if out.exists() {
+        fs::remove_dir(out).map_err(|err| format!("移除空目录 {} 失败：{err}", out.display()))?;
+    }
+    fs::rename(&temp, out).map_err(|err| format!("提交封存目录 {} 失败：{err}", out.display()))?;
+    guard.keep = true;
+    Ok(manifest)
+}
+
+struct TempOut {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for TempOut {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn build_release_plugins(root: &Path, target: &str) -> Result<BTreeMap<String, PathBuf>, String> {
+    let cargo = cargo_program();
+    let mut command = Command::new(&cargo);
+    command.current_dir(root).args([
+        "build",
+        "--release",
+        "--locked",
+        "--target",
+        target,
+        "--message-format=json-render-diagnostics",
+    ]);
+    for spec in PLUGINS {
+        command.arg("-p").arg(spec.package);
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("启动 {cargo} build 失败：{err}"))?;
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "release 插件构建失败（退出码 {:?}）",
+            output.status.code()
+        ));
+    }
+    let stdout =
+        String::from_utf8(output.stdout).map_err(|err| format!("构建输出不是 UTF-8：{err}"))?;
+    parse_build_artifacts(&stdout)
+}
+
+fn parse_build_artifacts(stdout: &str) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut found = BTreeMap::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let value: Value = serde_json::from_str(line)
+            .map_err(|err| format!("解析 cargo 构建输出失败：{err}\n{line}"))?;
+        if value.get("reason").and_then(Value::as_str) != Some("compiler-artifact") {
+            continue;
+        }
+        let target = value.get("target").ok_or("构建输出缺少 target")?;
+        let crate_types = target
+            .get("crate_types")
+            .and_then(Value::as_array)
+            .ok_or("构建输出缺少 target.crate_types")?;
+        if !crate_types
+            .iter()
+            .any(|kind| kind.as_str() == Some("cdylib"))
+        {
+            continue;
+        }
+        let name = target
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("构建输出缺少 target.name")?;
+        let Some(spec) = PLUGINS.iter().find(|spec| spec.krate == name) else {
+            continue;
+        };
+        let candidates = value
+            .get("filenames")
+            .and_then(Value::as_array)
+            .ok_or("构建输出缺少 filenames")?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(PathBuf::from)
+            .filter(|path| is_plugin_file(path))
+            .collect::<Vec<_>>();
+        let source = match candidates.as_slice() {
+            [path] => path.clone(),
+            [] => {
+                return Err(format!(
+                    "{} 的构建输出没有当前平台的动态库文件",
+                    spec.package
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "{} 的构建输出有多个动态库候选：{:?}",
+                    spec.package, candidates
+                ));
+            }
+        };
+        if !source.is_file() {
+            return Err(format!("构建产物不存在：{}", source.display()));
+        }
+        if found.insert(spec.krate.to_string(), source).is_some() {
+            return Err(format!("{} 的构建产物出现了两次", spec.package));
+        }
+    }
+    for spec in PLUGINS {
+        if !found.contains_key(spec.krate) {
+            return Err(format!("构建结果缺少 {} 的 cdylib", spec.package));
+        }
+    }
+    Ok(found)
+}
+
+fn is_plugin_file(path: &Path) -> bool {
+    let extension = path.extension().and_then(OsStr::to_str).unwrap_or("");
+    if cfg!(windows) {
+        extension.eq_ignore_ascii_case("dll")
+    } else if cfg!(target_os = "macos") {
+        extension == "dylib"
+    } else {
+        extension == "so"
+    }
+}
+
+fn smoke_yaml() -> String {
+    let mut text =
+        String::from("# Generated by `cargo xtask seal`. Read-only probe: inspect never mounts.\n");
+    for spec in PLUGINS {
+        text.push_str(&format!("- id: {}\n  name: {}\n", spec.label, spec.krate));
+    }
+    text
+}
+
+fn run_load_check(seal_dir: &Path, cargo: &str, target: &str) -> Result<String, String> {
+    let config = seal_dir.join(SMOKE_CONFIG);
+    let plugin_dir = seal_dir.join("plugins");
+    let manifest_path = crate::workspace_root().join("Cargo.toml");
+    let output = Command::new(cargo)
+        // CWD 就是封存目录：插件解析先试裸文件名，这样不会命中 workspace 根目录里的同名文件。
+        .current_dir(&plugin_dir)
+        .args([
+            "run",
+            "--release",
+            "--locked",
+            "--target",
+            target,
+            "--manifest-path",
+        ])
+        .arg(&manifest_path)
+        .args(["--quiet", "-p", "cordis-cli", "--", "inspect"])
+        .arg(&config)
+        .arg("--plugin-dir")
+        .arg(&plugin_dir)
+        .output()
+        .map_err(|err| format!("启动同版本加载检查失败：{err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "同版本加载检查失败（退出码 {:?}）：\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    verify_inspect_output(&stdout)?;
+    Ok(stdout)
+}
+
+fn verify_inspect_output(stdout: &str) -> Result<(), String> {
+    if !stdout.lines().any(|line| line.trim() == "mounted = 0") {
+        return Err(format!(
+            "同版本加载检查没有报告 mounted = 0，inspect 输出：\n{stdout}"
+        ));
+    }
+    for spec in PLUGINS {
+        let expected = format!("- {} (plugin: {})", spec.label, spec.plugin);
+        if !stdout.lines().any(|line| line.trim() == expected) {
+            return Err(format!(
+                "同版本加载检查缺少行 \"{expected}\"（或加载到了别的插件），inspect 输出：\n{stdout}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_manifest_files(dir: &Path, manifest: &SealManifest) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(&manifest.to_json())
+        .map_err(|err| format!("序列化封存清单失败：{err}"))?;
+    fs::write(dir.join(SEAL_FILE), format!("{text}\n"))
+        .map_err(|err| format!("写 {SEAL_FILE} 失败：{err}"))?;
+    let mut sums = String::new();
+    for artifact in &manifest.artifacts {
+        sums.push_str(&format!("{}  {}\n", artifact.sha256, artifact.path));
+    }
+    sums.push_str(&format!(
+        "{}  {}\n",
+        manifest.smoke_config_sha256, manifest.smoke_config
+    ));
+    sums.push_str(&format!(
+        "{}  {}\n",
+        manifest.smoke_evidence_sha256, manifest.smoke_evidence
+    ));
+    fs::write(dir.join(SUMS_FILE), sums).map_err(|err| format!("写 {SUMS_FILE} 失败：{err}"))
+}
+
+fn verify_dir(dir: &Path) -> Result<SealManifest, Vec<String>> {
+    let mut errors = Vec::new();
+    let text = match fs::read_to_string(dir.join(SEAL_FILE)) {
+        Ok(text) => text,
+        Err(err) => return Err(vec![format!("读取 {SEAL_FILE} 失败：{err}")]),
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(err) => return Err(vec![format!("解析 {SEAL_FILE} 失败：{err}")]),
+    };
+    let manifest = match SealManifest::from_json(&value) {
+        Ok(manifest) => manifest,
+        Err(err) => return Err(vec![err]),
+    };
+
+    if value.pointer("/source/kind").and_then(Value::as_str) != Some("workspace-tree") {
+        errors.push("source.kind 必须是 workspace-tree".to_string());
+    }
+    if manifest.workspace_version.trim().is_empty() {
+        errors.push("workspace_version 为空".to_string());
+    }
+    if manifest.abi_version == 0 {
+        errors.push("abi_version 必须大于 0".to_string());
+    }
+    if manifest.error_format == 0 {
+        errors.push("error_format 必须大于 0".to_string());
+    }
+    if manifest.target.trim().is_empty() {
+        errors.push("target 不能为空".to_string());
+    }
+    if manifest.profile != "release" {
+        errors.push(format!("profile 必须是 release，实际 {}", manifest.profile));
+    }
+    if manifest.rustc.trim().is_empty() || manifest.cargo.trim().is_empty() {
+        errors.push("rustc / cargo 版本不能为空".to_string());
+    }
+    if !is_sha256(&manifest.source_sha256)
+        || manifest.source_sha256.bytes().all(|byte| byte == b'0')
+    {
+        errors.push("source.sha256 不是有效的非零 64 位十六进制".to_string());
+    }
+    if manifest.source_files == 0 {
+        errors.push("source.files 必须大于 0".to_string());
+    }
+    if !manifest.smoke_checked {
+        errors.push("smoke.checked 必须为 true".to_string());
+    }
+    verify_expected_artifacts(&manifest, &mut errors);
+    if !is_sha256(&manifest.smoke_config_sha256) || manifest.smoke_config_bytes == 0 {
+        errors.push("smoke.config 的 SHA256 / 大小非法".to_string());
+    }
+    if !is_sha256(&manifest.smoke_evidence_sha256) || manifest.smoke_evidence_bytes == 0 {
+        errors.push("smoke.evidence 的 SHA256 / 大小非法".to_string());
+    }
+    verify_sealed_file(
+        dir,
+        "smoke.config",
+        &manifest.smoke_config,
+        &manifest.smoke_config_sha256,
+        Some(manifest.smoke_config_bytes),
+        &mut errors,
+    );
+    verify_sealed_file(
+        dir,
+        "smoke.evidence",
+        &manifest.smoke_evidence,
+        &manifest.smoke_evidence_sha256,
+        Some(manifest.smoke_evidence_bytes),
+        &mut errors,
+    );
+
+    let mut seen = BTreeSet::new();
+    let mut expected_sums = BTreeMap::new();
+    for artifact in &manifest.artifacts {
+        if artifact.package.trim().is_empty() || artifact.krate.trim().is_empty() {
+            errors.push("artifact 的 package / crate 不能为空".to_string());
+        }
+        if !is_sha256(&artifact.sha256) {
+            errors.push(format!("{} 的 SHA256 不是 64 位十六进制", artifact.path));
+        }
+        if !safe_relative_path(&artifact.path) {
+            errors.push(format!("artifact 路径不安全：{}", artifact.path));
+            continue;
+        }
+        if !artifact.path.starts_with("plugins/") {
+            errors.push(format!("artifact 必须位于 plugins/ 下：{}", artifact.path));
+            continue;
+        }
+        if !seen.insert(artifact.path.clone()) {
+            errors.push(format!("artifact 路径重复：{}", artifact.path));
+            continue;
+        }
+        expected_sums.insert(artifact.path.clone(), artifact.sha256.clone());
+        let path = dir.join(&artifact.path);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                errors.push(format!("读取 artifact {} 失败：{err}", artifact.path));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            errors.push(format!("artifact 不能是符号链接：{}", artifact.path));
+            continue;
+        }
+        if !metadata.is_file() {
+            errors.push(format!("artifact 不是普通文件：{}", artifact.path));
+            continue;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                errors.push(format!("读取 artifact {} 失败：{err}", artifact.path));
+                continue;
+            }
+        };
+        if bytes.len() as u64 != artifact.bytes {
+            errors.push(format!(
+                "artifact {} 大小不匹配：清单 {}，实际 {}",
+                artifact.path,
+                artifact.bytes,
+                bytes.len()
+            ));
+        }
+        let actual = sha256_hex(&bytes);
+        if actual != artifact.sha256.to_ascii_lowercase() {
+            errors.push(format!(
+                "artifact {} 的 SHA256 不匹配：清单 {}，实际 {actual}",
+                artifact.path, artifact.sha256
+            ));
+        }
+    }
+    if safe_relative_path(&manifest.smoke_config) && manifest.smoke_config.starts_with("smoke/") {
+        expected_sums.insert(
+            manifest.smoke_config.clone(),
+            manifest.smoke_config_sha256.clone(),
+        );
+    }
+    if safe_relative_path(&manifest.smoke_evidence) && manifest.smoke_evidence.starts_with("smoke/")
+    {
+        expected_sums.insert(
+            manifest.smoke_evidence.clone(),
+            manifest.smoke_evidence_sha256.clone(),
+        );
+    }
+    verify_exact_files(dir, "plugins", &seen, &mut errors);
+    verify_exact_files(
+        dir,
+        "smoke",
+        &BTreeSet::from([
+            manifest.smoke_config.clone(),
+            manifest.smoke_evidence.clone(),
+        ]),
+        &mut errors,
+    );
+    verify_sums(dir, &expected_sums, &mut errors);
+
+    if errors.is_empty() {
+        Ok(manifest)
+    } else {
+        Err(errors)
+    }
+}
+
+fn verify_expected_artifacts(manifest: &SealManifest, errors: &mut Vec<String>) {
+    if manifest.artifacts.len() != PLUGINS.len() {
+        errors.push(format!(
+            "artifact 数量必须是 {}，实际 {}",
+            PLUGINS.len(),
+            manifest.artifacts.len()
+        ));
+    }
+    let mut by_crate = BTreeMap::new();
+    for artifact in &manifest.artifacts {
+        if by_crate.insert(artifact.krate.as_str(), artifact).is_some() {
+            errors.push(format!("artifact crate 重复：{}", artifact.krate));
+        }
+        if !PLUGINS
+            .iter()
+            .any(|spec| spec.krate == artifact.krate && spec.package == artifact.package)
+        {
+            errors.push(format!(
+                "artifact 未登记：package={} crate={}",
+                artifact.package, artifact.krate
+            ));
+        }
+    }
+    for spec in PLUGINS {
+        match by_crate.get(spec.krate) {
+            Some(artifact) if artifact.package == spec.package => {}
+            Some(artifact) => errors.push(format!(
+                "artifact {} 的 package 应为 {}，实际 {}",
+                spec.krate, spec.package, artifact.package
+            )),
+            None => errors.push(format!("缺少 artifact：{} / {}", spec.package, spec.krate)),
+        }
+    }
+}
+
+fn verify_sealed_file(
+    dir: &Path,
+    label: &str,
+    relative: &str,
+    sha256: &str,
+    bytes: Option<u64>,
+    errors: &mut Vec<String>,
+) {
+    if !safe_relative_path(relative) || !relative.starts_with("smoke/") {
+        errors.push(format!("{label} 路径不安全或不在 smoke/ 下：{relative}"));
+        return;
+    }
+    let path = dir.join(relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            errors.push(format!("读取 {label} {relative} 失败：{err}"));
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        errors.push(format!("{label} 不能是符号链接：{relative}"));
+        return;
+    }
+    if !metadata.is_file() {
+        errors.push(format!("{label} 不是普通文件：{relative}"));
+        return;
+    }
+    let content = match fs::read(&path) {
+        Ok(content) => content,
+        Err(err) => {
+            errors.push(format!("读取 {label} {relative} 失败：{err}"));
+            return;
+        }
+    };
+    if let Some(expected) = bytes {
+        if content.len() as u64 != expected {
+            errors.push(format!(
+                "{label} {relative} 大小不匹配：清单 {expected}，实际 {}",
+                content.len()
+            ));
+        }
+    }
+    let actual = sha256_hex(&content);
+    if actual != sha256.to_ascii_lowercase() {
+        errors.push(format!(
+            "{label} {relative} 的 SHA256 不匹配：清单 {sha256}，实际 {actual}"
+        ));
+    }
+}
+
+fn verify_exact_files(
+    seal_dir: &Path,
+    dir_name: &str,
+    expected: &BTreeSet<String>,
+    errors: &mut Vec<String>,
+) {
+    let root = seal_dir.join(dir_name);
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            errors.push(format!("读取 {dir_name}/ 失败：{err}"));
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        errors.push(format!("{dir_name}/ 不能是符号链接"));
+        return;
+    }
+    if !metadata.is_dir() {
+        errors.push(format!("{dir_name}/ 不是目录"));
+        return;
+    }
+    let mut actual = BTreeSet::new();
+    if let Err(err) = collect_relative_files(seal_dir, &root, &mut actual) {
+        errors.push(err);
+        return;
+    }
+    for extra in actual.difference(expected) {
+        errors.push(format!("{dir_name}/ 多出未登记文件：{extra}"));
+    }
+}
+
+fn collect_relative_files(
+    seal_dir: &Path,
+    dir: &Path,
+    out: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|err| format!("读取 {} 失败：{err}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("读取目录项失败：{err}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("读取 {} 类型失败：{err}", path.display()))?;
+        if file_type.is_dir() {
+            collect_relative_files(seal_dir, &path, out)?;
+        } else {
+            let relative = path
+                .strip_prefix(seal_dir)
+                .map_err(|err| format!("计算相对路径失败：{err}"))?;
+            out.insert(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_sums(dir: &Path, expected: &BTreeMap<String, String>, errors: &mut Vec<String>) {
+    let text = match fs::read_to_string(dir.join(SUMS_FILE)) {
+        Ok(text) => text,
+        Err(err) => {
+            errors.push(format!("读取 {SUMS_FILE} 失败：{err}"));
+            return;
+        }
+    };
+    let mut actual = BTreeMap::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((hash, path)) = line.split_once("  ") else {
+            errors.push(format!("{SUMS_FILE} 行格式错误：{line}"));
+            continue;
+        };
+        if !is_sha256(hash) {
+            errors.push(format!("{SUMS_FILE} 中的 SHA256 非法：{hash}"));
+        }
+        if !safe_relative_path(path) {
+            errors.push(format!("{SUMS_FILE} 中的路径不安全：{path}"));
+            continue;
+        }
+        if actual.insert(path.to_string(), hash.to_string()).is_some() {
+            errors.push(format!("{SUMS_FILE} 中的路径重复：{path}"));
+        }
+    }
+    for (path, hash) in expected {
+        match actual.get(path) {
+            Some(actual_hash) if actual_hash.eq_ignore_ascii_case(hash) => {}
+            Some(actual_hash) => errors.push(format!(
+                "{SUMS_FILE} 中 {path} 的 SHA256 不匹配：清单 {hash}，校验文件 {actual_hash}"
+            )),
+            None => errors.push(format!("{SUMS_FILE} 缺少 {path}")),
+        }
+    }
+    for path in actual.keys() {
+        if !expected.contains_key(path) {
+            errors.push(format!("{SUMS_FILE} 多出未登记的 {path}"));
+        }
+    }
+}
+
+fn safe_relative_path(text: &str) -> bool {
+    let path = Path::new(text);
+    !text.is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn is_sha256(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn host_target() -> Result<String, String> {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let output = Command::new(&rustc)
+        .arg("-vV")
+        .output()
+        .map_err(|err| format!("运行 {rustc} -vV 失败：{err}"))?;
+    if !output.status.success() {
+        return Err(format!("{rustc} -vV 退出码 {:?}", output.status.code()));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|host| host.trim().to_string())
+        .ok_or_else(|| format!("{rustc} -vV 没有 host 行"))
+}
+
+fn tool_version(program: &str) -> Result<String, String> {
+    let output = Command::new(program)
+        .arg("--version")
+        .output()
+        .map_err(|err| format!("运行 {program} --version 失败：{err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{program} --version 退出码 {:?}",
+            output.status.code()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn cargo_program() -> String {
+    std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
+}
+
+fn temp_nonce() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn source_tree_digest(root: &Path, excluded: &Path) -> Result<(String, u64), String> {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        })
+        .unwrap_or_else(|| root.join("target"));
+    let mut files = Vec::new();
+    collect_source_files(root, root, excluded, &target, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(b"cordis-source-tree-v1\0");
+    for (relative, path) in &files {
+        let bytes =
+            fs::read(path).map_err(|err| format!("读取源码 {} 失败：{err}", path.display()))?;
+        canonical.extend_from_slice(&(relative.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(relative.as_bytes());
+        canonical.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(&bytes);
+    }
+    Ok((sha256_hex(&canonical), files.len() as u64))
+}
+
+fn collect_source_files(
+    root: &Path,
+    dir: &Path,
+    excluded: &Path,
+    target: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|err| format!("读取目录 {} 失败：{err}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("读取目录项失败：{err}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("读取 {} 类型失败：{err}", path.display()))?;
+        if file_type.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if path == excluded
+                || path == target
+                || matches!(
+                    name.as_str(),
+                    ".git" | "target" | "dist" | ".cargo-home" | "node_modules"
+                )
+                || name.contains(".tmp-")
+            {
+                continue;
+            }
+            collect_source_files(root, &path, excluded, target, out)?;
+        } else if file_type.is_file() && path != excluded && path != target {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name == ".ds_store" || name.ends_with(".swp") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|err| format!("计算相对路径失败：{err}"))?;
+            out.push((
+                relative.to_string_lossy().replace('\\', "/"),
+                path.to_path_buf(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 无依赖 SHA-256：封存清单必须能在没有新增哈希依赖的机器上独立校验。
+fn sha256_hex(bytes: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut message = bytes.to_vec();
+    let bit_len = (bytes.len() as u64) * 8;
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in message.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (index, word) in w.iter_mut().take(16).enumerate() {
+            let start = index * 4;
+            *word = u32::from_be_bytes([
+                chunk[start],
+                chunk[start + 1],
+                chunk[start + 2],
+                chunk[start + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(w[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    h.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempTree {
+        path: PathBuf,
+    }
+
+    impl TempTree {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("cordis-seal-{}-{label}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn expected_inspect() -> String {
+        let mut text = String::from("mounted = 0\n");
+        for spec in PLUGINS {
+            text.push_str(&format!("- {} (plugin: {})\n", spec.label, spec.plugin));
+        }
+        text
+    }
+
+    fn fixture(dir: &Path) -> SealManifest {
+        let payload = b"sealed plugin bytes";
+        fs::create_dir_all(dir.join("plugins")).unwrap();
+        fs::create_dir_all(dir.join("smoke")).unwrap();
+        let mut artifacts = Vec::new();
+        for (spec, name) in PLUGINS.iter().zip([
+            "plugins/greeting.bin",
+            "plugins/hello.bin",
+            "plugins/harness_tool.bin",
+        ]) {
+            fs::write(dir.join(name), payload).unwrap();
+            artifacts.push(SealArtifact {
+                package: spec.package.to_string(),
+                krate: spec.krate.to_string(),
+                path: name.to_string(),
+                sha256: sha256_hex(payload),
+                bytes: payload.len() as u64,
+            });
+        }
+        let config = smoke_yaml();
+        let evidence = expected_inspect();
+        fs::write(dir.join(SMOKE_CONFIG), &config).unwrap();
+        fs::write(dir.join(SMOKE_EVIDENCE), &evidence).unwrap();
+        let manifest = SealManifest {
+            workspace_version: "0.1.0".to_string(),
+            abi_version: 1,
+            error_format: 1,
+            target: "test-target".to_string(),
+            profile: "release".to_string(),
+            created_unix: 0,
+            rustc: "rustc test".to_string(),
+            cargo: "cargo test".to_string(),
+            rustflags: String::new(),
+            source_sha256: sha256_hex(b"source"),
+            source_files: 3,
+            artifacts,
+            smoke_config: SMOKE_CONFIG.to_string(),
+            smoke_config_sha256: sha256_hex(config.as_bytes()),
+            smoke_config_bytes: config.len() as u64,
+            smoke_evidence: SMOKE_EVIDENCE.to_string(),
+            smoke_evidence_sha256: sha256_hex(evidence.as_bytes()),
+            smoke_evidence_bytes: evidence.len() as u64,
+            smoke_checked: true,
+        };
+        write_manifest_files(dir, &manifest).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn sha256_matches_known_vectors_including_multi_block_inputs() {
+        let block = [b'a'; 64];
+        let million = vec![b'a'; 1_000_000];
+        let vectors: &[(&[u8], &str)] = &[
+            (
+                b"",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+            (
+                b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+                "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1",
+            ),
+            (
+                block.as_slice(),
+                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+            ),
+            (
+                million.as_slice(),
+                "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+            ),
+        ];
+        for (input, expected) in vectors {
+            assert_eq!(&sha256_hex(input), expected);
+        }
+    }
+
+    #[test]
+    fn verify_accepts_a_matching_seal() {
+        let tree = TempTree::new("verify-ok");
+        fixture(&tree.path);
+        verify_dir(&tree.path).expect("完整封存应通过");
+    }
+
+    #[test]
+    fn verify_rejects_tampered_artifact_bytes() {
+        let tree = TempTree::new("verify-tamper");
+        fixture(&tree.path);
+        fs::write(tree.path.join("plugins/greeting.bin"), b"tampered").unwrap();
+        let errors = verify_dir(&tree.path).expect_err("篡改必须失败");
+        assert!(errors.iter().any(|error| error.contains("SHA256")));
+    }
+
+    #[test]
+    fn verify_rejects_same_length_artifact_tamper() {
+        let tree = TempTree::new("verify-tamper-same-length");
+        fixture(&tree.path);
+        let mut bytes = fs::read(tree.path.join("plugins/greeting.bin")).unwrap();
+        bytes[0] ^= 1;
+        fs::write(tree.path.join("plugins/greeting.bin"), bytes).unwrap();
+        let errors = verify_dir(&tree.path).expect_err("同长度篡改必须失败");
+        assert!(errors.iter().any(|error| error.contains("SHA256")));
+    }
+
+    #[test]
+    fn verify_rejects_path_traversal() {
+        let tree = TempTree::new("verify-traversal");
+        let mut manifest = fixture(&tree.path);
+        manifest.artifacts[0].path = "../outside.bin".to_string();
+        write_manifest_files(&tree.path, &manifest).unwrap();
+        let errors = verify_dir(&tree.path).expect_err("路径穿越必须失败");
+        assert!(errors.iter().any(|error| error.contains("路径不安全")));
+    }
+
+    #[test]
+    fn verify_rejects_a_missing_checksum_entry() {
+        let tree = TempTree::new("verify-sums");
+        fixture(&tree.path);
+        fs::write(tree.path.join(SUMS_FILE), "").unwrap();
+        let errors = verify_dir(&tree.path).expect_err("缺少校验行必须失败");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("缺少 plugins/greeting.bin")));
+    }
+
+    #[test]
+    fn verify_rejects_a_missing_expected_artifact() {
+        let tree = TempTree::new("verify-missing-artifact");
+        let mut manifest = fixture(&tree.path);
+        manifest.artifacts.pop();
+        write_manifest_files(&tree.path, &manifest).unwrap();
+        let errors = verify_dir(&tree.path).expect_err("缺一个产物必须失败");
+        assert!(errors.iter().any(|error| error.contains("artifact 数量")));
+    }
+
+    #[test]
+    fn verify_rejects_an_extra_plugin_file() {
+        let tree = TempTree::new("verify-extra-file");
+        fixture(&tree.path);
+        fs::write(tree.path.join("plugins/stray.bin"), b"stray").unwrap();
+        let errors = verify_dir(&tree.path).expect_err("多出文件必须失败");
+        assert!(errors.iter().any(|error| error.contains("多出未登记文件")));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_smoke_config() {
+        let tree = TempTree::new("verify-smoke-config");
+        fixture(&tree.path);
+        fs::write(tree.path.join(SMOKE_CONFIG), "tampered\n").unwrap();
+        let errors = verify_dir(&tree.path).expect_err("smoke 配置篡改必须失败");
+        assert!(errors.iter().any(|error| error.contains("smoke.config")));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_inspect_evidence() {
+        let tree = TempTree::new("verify-evidence");
+        fixture(&tree.path);
+        fs::write(tree.path.join(SMOKE_EVIDENCE), "tampered\n").unwrap();
+        let errors = verify_dir(&tree.path).expect_err("inspect 证据篡改必须失败");
+        assert!(errors.iter().any(|error| error.contains("smoke.evidence")));
+    }
+
+    #[test]
+    fn inspect_output_must_name_the_expected_plugin() {
+        let tree = TempTree::new("inspect-identity");
+        fixture(&tree.path);
+        let mut output = expected_inspect();
+        output = output.replace(
+            "- greeting (plugin: greeting)",
+            "- greeting (plugin: hello)",
+        );
+        let errors = verify_inspect_output(&output).expect_err("插件身份错误必须失败");
+        assert!(errors.contains("plugin: greeting"));
+    }
+
+    #[test]
+    fn inspect_output_requires_mounted_zero() {
+        let tree = TempTree::new("inspect-mounted");
+        fixture(&tree.path);
+        let output = expected_inspect().replace("mounted = 0", "mounted = 1");
+        let errors = verify_inspect_output(&output).expect_err("mounted 非零必须失败");
+        assert!(errors.contains("mounted = 0"));
+    }
+
+    #[test]
+    fn source_digest_ignores_generated_directories() {
+        let tree = TempTree::new("source-digest");
+        fs::create_dir_all(tree.path.join("src")).unwrap();
+        fs::create_dir_all(tree.path.join("target")).unwrap();
+        fs::create_dir_all(tree.path.join("dist")).unwrap();
+        fs::create_dir_all(tree.path.join("out")).unwrap();
+        fs::write(tree.path.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        fs::write(tree.path.join("target/junk"), "junk").unwrap();
+        fs::write(tree.path.join("dist/junk"), "junk").unwrap();
+        fs::write(tree.path.join("out/artifact.bin"), "junk").unwrap();
+        fs::write(tree.path.join("notes.swp"), "junk").unwrap();
+        let excluded = tree.path.join("out");
+        let (first, files) = source_tree_digest(&tree.path, &excluded).unwrap();
+        assert_eq!(files, 1);
+        fs::write(tree.path.join("target/junk"), "changed").unwrap();
+        fs::write(tree.path.join("dist/junk"), "changed").unwrap();
+        let (second, _) = source_tree_digest(&tree.path, &excluded).unwrap();
+        assert_eq!(first, second);
+        fs::write(tree.path.join("src/lib.rs"), "fn main() { println!(); }\n").unwrap();
+        let (third, _) = source_tree_digest(&tree.path, &excluded).unwrap();
+        assert_ne!(first, third);
+    }
+
+    fn plugin_file_name(crate_name: &str) -> String {
+        if cfg!(windows) {
+            format!("{crate_name}.dll")
+        } else if cfg!(target_os = "macos") {
+            format!("lib{crate_name}.dylib")
+        } else {
+            format!("lib{crate_name}.so")
+        }
+    }
+
+    #[test]
+    fn cargo_artifact_output_selects_exactly_the_three_cdylibs() {
+        let tree = TempTree::new("cargo-artifacts");
+        let plugins = tree.path.join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let mut output = String::new();
+        for spec in PLUGINS {
+            let path = plugins.join(plugin_file_name(spec.krate));
+            fs::write(&path, b"artifact").unwrap();
+            let line = serde_json::json!({
+                "reason": "compiler-artifact",
+                "target": {"name": spec.krate, "crate_types": ["cdylib"]},
+                "filenames": [path.to_string_lossy()],
+            });
+            output.push_str(&line.to_string());
+            output.push('\n');
+        }
+        output.push_str(
+            &serde_json::json!({
+                "reason": "compiler-artifact",
+                "target": {"name": "not-a-plugin", "crate_types": ["lib"]},
+                "filenames": ["ignored.rlib"],
+            })
+            .to_string(),
+        );
+        let found = parse_build_artifacts(&output).expect("三个 cdylib 应被识别");
+        assert_eq!(found.len(), PLUGINS.len());
+        for spec in PLUGINS {
+            assert!(found.contains_key(spec.krate));
+        }
+    }
+
+    #[test]
+    fn cargo_artifact_output_must_contain_all_three_cdylibs() {
+        let tree = TempTree::new("cargo-missing");
+        let path = tree.path.join(plugin_file_name("greeting"));
+        fs::write(&path, b"artifact").unwrap();
+        let output = format!(
+            "{}\n",
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "target": {"name": "greeting", "crate_types": ["cdylib"]},
+                "filenames": [path.to_string_lossy()],
+            })
+        );
+        let error = parse_build_artifacts(&output).expect_err("缺产物必须失败");
+        assert!(error.contains("缺少"));
+    }
+
+    #[test]
+    fn artifact_extension_matches_the_platform() {
+        if cfg!(windows) {
+            assert!(is_plugin_file(Path::new("greeting.dll")));
+            assert!(!is_plugin_file(Path::new("libgreeting.so")));
+        } else if cfg!(target_os = "macos") {
+            assert!(is_plugin_file(Path::new("libgreeting.dylib")));
+        } else {
+            assert!(is_plugin_file(Path::new("libgreeting.so")));
+        }
+    }
+}

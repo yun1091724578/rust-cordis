@@ -1,0 +1,10 @@
+# 可移植的仓库级 Cargo 配置。
+#
+# 这里只放别名；代理、绝对 target 目录、平台专用 rustflags 都属于
+# 本机环境，放在 cargo.cmd（本地便利包装）或用户级 ~/.cargo/config.toml。
+#
+# 本机（Windows GNU + 中文路径）请用 `cargo.cmd`，它会设置
+# CARGO_TARGET_DIR / CARGO_HTTP_PROXY；其他环境直接 `cargo` 即可。
+
+[alias]
+xtask = "run --package xtask --"

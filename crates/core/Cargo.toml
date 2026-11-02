@@ -1,0 +1,15 @@
+[package]
+name = "cordis-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cordis 内核的最小 Rust 实现：服务容器 + epoch 驱动的 fiber 生命周期 + 可逆 effect + 五种事件调度"
+
+[dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

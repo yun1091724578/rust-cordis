@@ -1,0 +1,15 @@
+[package]
+name = "plugin-hello"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "hello"
+crate-type = ["cdylib"]
+
+[dependencies]
+cordis-abi = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

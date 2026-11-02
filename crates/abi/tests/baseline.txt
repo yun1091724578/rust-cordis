@@ -1,0 +1,875 @@
+# cordis-abi 相关测试基线（M0 冻结）
+#
+# 规则：**断言只增不减**。本文件记录 M0 收口时 ABI 兼容面（A1/A3）已有的
+# 测试用例与计数——此后任何提交都不允许删除或弱化下列断言；新增能力时
+# 在此追加条目并更新计数。数量对不上 = 提交说明里必须解释原因。
+
+## cordis-abi（本 crate）
+
+单元测试（src/sdk.rs，2 个）：
+- tail_appended_apis_degrade_gracefully_on_older_hosts
+    ctx_require / ctx_set 在"旧宿主"“中间代宿主”“全量宿主”上的逐字段探测与降级。
+- plugin_panics_become_status_err_at_the_abi_boundary
+    apply / 回调 / 清理三条路径的 panic 在 extern "C" 边界内被截成 STATUS_ERR。
+
+tests/copy_on_attach.rs（1 个）：
+- truncated_host_api_reads_only_inside_its_own_copy
+    G15 copy-on-attach：真截断 HostApi + 金丝雀；毒化原表后插件读到的必须是
+    attach 快照；size 外字段是零初始化 None，不是越界读来的垃圾。
+
+tests/v1_shape.rs（3 个）：
+- plugin_desc_prefix_size_is_frozen
+    PLUGIN_DESC_PREFIX_SIZE == 手算 v1 布局 == offset_of!(call)+size_of::<CallFnShape>()
+    == offset_of!(provision)。
+- plugin_desc_field_order_is_frozen
+    8 个字段偏移严格递增（x64: 0,4,8,24,40,56,64,72），provision 是尾字段。
+- host_api_v1_function_fields_are_frozen
+    头部 2 字段 + 11 个函数字段 v1 冻结序，ctx_set 收在结构体末尾。
+
+## cordis-host 侧的 ABI 矩阵（tests/abi_matrix.rs，2 个）
+
+- desc_gate_rejects_a_prefix_only_desc_under_the_old_rule_and_accepts_it_under_the_new
+    G14 门禁：前缀尺寸的 desc 旧规则拒 / 新规则收；不足前缀拒；主版本不符拒。
+- a_handwritten_v1_shaped_plugin_loads_and_works_on_a_v2_host
+    A3：手写 v1 形态 desc（size=PLUGIN_DESC_PREFIX_SIZE）在 v2 宿主可加载
+    （field_at 读 provision ⇒ None）可工作（apply_via + 真宿主函数表提供 v1-svc）。
+
+## 计数汇总（M0 收口）
+
+- cordis-abi：单元 2 + copy_on_attach 1 + v1_shape 3 = 6
+- cordis-host（ABI 相关）：abi_matrix 2
+- 合计：8
+
+## 冻结常量（x64 实测）
+
+- PLUGIN_DESC_PREFIX_SIZE = 72（= offset_of!(PluginDesc, call) 64 + fn 指针 8）
+- size_of::<PluginDesc>() = 88（v2：尾追加 provision: Blob @ 72）
+- size_of::<HostApi>() 头部：abi_version @ 0，size @ 4，函数字段自 8 起
+
+## M1 追加（ABI v2 能力五项：isolate / intercept / use / dispose / dispose_self）
+
+宿主侧（crates/host/tests/abi_m1.rs，4 个）：
+- abi_isolate_derives_a_realm_and_returns_a_usable_handle
+    派生句柄可用且 bit63=1；隔离域内读根域服务必须 missing（realm 隔离的直接证据）。
+- derived_handle_is_revoked_when_the_root_instance_unregisters
+    根实例注销 ⇒ 排水 owner==root 的派生句柄；再解析是可读的「已失效」。
+- derived_handle_does_not_receive_op_dispose
+    排水 ≠ 通知：OP_DISPOSE 恰好一次、只发给实例句柄。
+- a_derived_handle_never_resolves_as_an_instance
+    位布局：bit63=1 的句柄对实例专属 op（provide/effect）必须真失败（服务不得借道落根域）。
+
+宿主侧（crates/host/tests/abi_m1_use.rs，4 个）：
+- abi_use_mounts_a_child_component_and_disposes_it_with_the_parent
+    ctx_use + 假 PluginSource；子组件随父 fiber 卸载（effect 链）。
+- abi_use_resolves_native_components_by_at_name
+    `@native:<name>` 走 NativeRegistry；未注册的名字是可读错误（含名字）。
+- abi_use_from_inside_a_callback_does_not_deadlock
+    OP_CALLBACK 内部再进宿主（with_instance → mount）不得死锁（multi_thread + 10s 超时）。
+- abi_dispose_self_marks_the_loader_row_disabled_and_persists
+    自卸载：loader 行 disabled 且**落盘**；插件真的收到 OP_DISPOSE。
+
+crates/abi（单元 1 个）：
+- abi_isolate_degrades_on_a_truncated_host_api
+    截断宿主（size 到 v1 边界）上五个新能力逐字段降级成「宿主不支持」可读错误。
+
+### M1 允许的既有测试修改（具名）
+
+- crates/abi/tests/v1_shape.rs 的 `host_api_v1_function_fields_are_frozen`：**扩展**——
+  原「头部 2 字段 + 11 个函数字段序」断言逐字保留，追加 v2 尾序（isolate→intercept
+  →use→dispose→dispose_self）+「ctx_isolate 紧跟 v1 前缀」+「dispose_self 收尾于
+  sizeof(HostApi)」三条断言。断言只增不减，符合本文件规则。
+
+### 计数汇总（M1 收口）
+
+- cordis-abi：单元 3 + copy_on_attach 1 + v1_shape 3 = 7
+- cordis-host（ABI 相关）：abi_matrix 2 + abi_m1 4 + abi_m1_use 4 = 10
+- ABI 相关合计：17（M0 为 8；+9）
+- 全仓：129 passed / 0 failed（M0 的 120 + M1 的 9）
+- demo：第 7.5 组（isolate → @native: 子组件 → dispose 两分支）已并入 A2 快照
+  （expected.txt 3796 字节；diff 核对 = 仅插入 5 行，既有行逐字未变）
+
+## M2 追加（入站异步：dispatch_id / STATUS_PENDING / ctx_fulfill）
+
+crates/host/tests/abi_m2.rs（9 个：7 红 + 2 守卫）：
+- pending_inbound_continuation_is_settled_exactly_once
+    一次挂起恰好结算一次；第二次 ctx_fulfill 是可读错误「不存在或已结算」。
+- two_concurrent_dispatches_of_the_same_handler_settle_independently（G17）
+    同一 handler 两条并发派发各自挂起、各拿自己的结算值（注册 id 当键会互相覆盖）。
+- ids_do_not_collide_across_two_plugin_libraries
+    跨库 dispatch_id 不碰撞（全局铸造）；跨实例结算被拒（表按实例隔离）。
+- unregistering_an_instance_fails_its_pending_continuations
+    注销排水：派发以「插件已卸载」结算、pending_len 归零（不挂死）。
+- fulfill_on_a_stale_handle_is_rejected
+    陈旧句柄 ⇒ 「已失效」。
+- fulfill_goes_through_with_instance_and_respects_generation（守卫）
+    旧代际「已失效」；新句柄进表后报「不存在或已结算」（代际校验真生效）。
+- status_pending_is_not_confused_with_a_json_return_value
+    挂起走状态码：`{"pending":true}` 作为合法返回值在**两个方向**都不会被误读。
+- pending_is_observed_before_the_dispatch_returns
+    确定性证明"先登记后调用"：回调内部看到恰好 1 条自己的挂起条目。
+- sync_handler_path_is_unchanged（守卫）
+    同步路径逐字不变：回调恰好一次、立即带回、无挂起残留。
+
+crates/host/tests/abi_m2_timeout.rs（1 个，**独占进程**：看门狗是进程级设置）：
+- dispatch_policy_timeout_settles_a_never_fulfilled_continuation_as_timeout
+    start_paused（虚拟时间）触发看门狗；超时结算为 TimedOut + Unknown、条目移出。
+
+### M2 允许的既有测试修改（具名）
+
+- crates/abi/tests/v1_shape.rs 的 `host_api_v1_function_fields_are_frozen`：v2 尾序断言
+  5 → 6 字段（+`ctx_fulfill`），v1 前缀部分逐字未动。
+- crates/abi/tests/copy_on_attach.rs：截断夹具字面量与"size 之外全为 None"断言补 `ctx_fulfill`。
+- crates/abi/src/sdk.rs 的 `abi_isolate_degrades_on_a_truncated_host_api`：补 `ctx_fulfill` 降级断言。
+
+### 计数汇总（M2 收口）
+
+- 全仓：139 passed / 0 failed / 0 warnings（M1 的 129 + M2 的 10）
+- demo：第 7.6 组（挂起 → ctx_fulfill → 挂起表归零）并入 A2 快照
+- 非空验证（mutation）：`HOST_API.ctx_fulfill` 临时置 None ⇒ abi_m2 的 3 条
+  「挂起/结算」测试全部以**可读超时失败**（不是挂死、也不是静默通过）。
+- A2 确定性修复（M2 期间发现的**既有**竞态）：`[rust-side]` 的激活打印原先发生在
+  装载器任务里，与「已挂载」日志无 happens-before（约 1/4 运行翻转两行顺序）。
+  修复＝插件不直接打印（消息入队）+ main 在两个可观测收敛点 flush
+  （① `report.reconcile.applied == 2` ② 消息入队）。连跑 8 次哈希全同。
+
+## M2b 追加（waterfall 跨 ABI：ctx_next + kind:"next"）
+
+crates/host/tests/abi_m2b.rs（8 个：7 红 + 1 守卫）：
+- abi_handler_can_return_a_final_value_and_stop_the_chain
+    直接返回 ⇒ 短路：tail 不跑；waterfall 派发必须下发 `mode:"waterfall"`。
+- abi_handler_can_delegate_to_next_verbatim
+    ctx_next → on_done 收下游值 → fulfill 原样转发；**完整时序**逐字断言
+    （同步快速路径：next/fulfill 在 ctx_next 返回前内联送达）。
+- abi_handler_can_wrap_the_next_result
+    调 next 后改写（包一层）⇒ 改写值是派发结果。
+- next_arguments_replace_the_downstream_arguments
+    `next(new_args)` **替换**下游实参（JS `await next(args)` 语义）。
+- chain_tail_runs_when_the_last_handler_delegates
+    链尾（最后一个 handler 就 delegate）仍运行，且恰好一次；外层以 PENDING 返回。
+- a_fully_synchronous_chain_still_requires_exactly_one_pending_round_trip
+    全同步链也必须"返回 PENDING + fulfill"；`kind:next` 的**内联**投递由调用序钉死。
+- unfinished_waterfall_frame_is_cleaned_on_unregister
+    悬置帧随实例注销被**真的丢掉**（DropSpy 观测剩余链 future 的释放，不是泄漏）。
+- plain_native_waterfall_is_unchanged（守卫）
+    原生 waterfall（两个原生 handler + tail）逐字不变。
+
+crates/core（既有测试的机械修改，具名）：
+- tests/kernel.rs / tests/update_semantics.rs / host/src/loader.rs：
+  `Next::call()` → `Next::call(args)`（**M2b 的 API 升级**：JS 语义是 `next(args)`，
+  旧签名无从做"替换下游实参"）。断言逐字未动，只是补了实参。
+
+## M2c 追加（取消：ctx_abort + 取消树 + 取消桥）
+
+crates/host/tests/abi_m2c.rs（6 个）：
+- aborting_a_dispatch_settles_its_pending_continuations_as_failure
+    ctx_abort ⇒ 挂起续延以「已取消」结算；pending/dispatches 计数归零。
+- fulfill_after_abort_is_rejected
+    取消后 fulfill 是可读错误（条目真的被移出）。
+- aborting_a_parent_dispatch_cancels_its_child_dispatches（G20）
+    父取消**级联**到子：子派发的入站挂起与出站续延都结算，且各恰好一次
+    （自然完成被抑制）；出站节点摘净。
+- aborting_an_unknown_dispatch_id_is_a_readable_error
+    未知 id「不存在」；陈旧句柄「已失效」。
+- abort_does_not_affect_other_dispatch_ids
+    取消只作用于目标 id；别的在飞派发照常结算。
+- cancelled_token_settles_its_pending_continuation（**取消桥**，D3）
+    令牌撤销 ⇒ 宿主 `select!` 到它，以错误结算并移出条目（光丢 future 不够）。
+
+crates/core/tests/cancel_token.rs（1 个）：
+- cancel_token_is_visible_to_native_handlers_via_call
+    令牌经 `Call.cancel` 到原生 handler（对照面：普通派发是 `None`）；
+    `cancel()` 幂等；`cancelled()` 已取消时立即返回。
+
+### 计数汇总（M2b/M2c 收口）
+
+- 全仓：154 passed / 0 failed / 0 warnings（M2 的 139 + M2b 8 + M2c 7）
+- demo：第 7.7/7.8 组（SDK 面：waterfall 拦截 + 自我取消 + 令牌撤销）并入 A2 快照
+  （expected.txt 4510 字节；diff 核对 = 仅插入 6 行，既有行逐字未变；连跑 8 次哈希全同）
+- 执行期发现并修复的两个**新代码缺陷**（第 1 次跑测试就暴露，见方案附录 E）：
+  ① `deliver_next`/`deliver_abort` 持 `instances` 锁回调插件 ⇒ 同线程死锁（插件
+     在回调里 fulfill 需要同一把锁）；
+  ② 测试夹具 `id_for` 在持锁期间 `expect` ⇒ 锁中毒 ⇒ 后续 `extern "C"` 里 unwrap
+     中毒锁 = abort 整个测试进程。均已修，且共享静态改为**每测试独立夹具**。
+
+## M3 追加（intercept 消费点：提供者读 `d(k) ⊕ ι(k)`，右偏）
+
+crates/core/tests/intercept_meta.rs（6 个）：
+- providers_see_the_merged_metadata_of_declaration_and_context
+    提供者侧拿到的实参 = `merge(调用者的 inject 声明 d, context 携带的 ι)`：两路都必须到达。
+- context_carried_metadata_overrides_the_component_declaration
+    **右偏**：同键冲突时 context 的 `ι` 覆盖声明 `d`；声明里独有的键保留。
+- nearest_intercept_layer_wins_over_an_ancestor
+    链条优先级 = 最近 intercept 层 > 祖先 intercept 层 > 组件声明。
+- changing_intercept_does_not_restart_the_fiber
+    合并在**调用时**发生：调用点上再叠一层 ⇒ 提供者看到新元数据，而消费者与提供者
+    fiber 的 uid、apply 次数都不变。
+- service_config_reaches_the_plugin_through_resolved_config
+    引擎便利通道 ②（**不是** Def 26 的 d(k)）：`ctx.resolved_config()` = 已解析的插件
+    配置 + 每个**已声明**依赖在调用点上的合并结果（未声明的名字不出现）。
+- intercept_metadata_survives_a_provider_replacement
+    提供者换代（先卸后挂）后新提供者看到同一份元数据；消费者走了"依赖消失 ⇒ 卸载、
+    回来 ⇒ 重装"一轮，恰好 apply 两次（元数据挂在调用点的链上，与提供者是谁无关）。
+
+crates/host/tests/abi_m3.rs（1 个）：
+- use_site_metadata_reaches_the_provider_at_call_time
+    跨 ABI 的 wire 面：use-site（`ctx_intercept` 派生句柄）上的层 + 调用者的 `inject`
+    声明，经载荷**可选字段** `meta` 到达提供者；完全没有元数据时该字段**不出现**
+    （旧插件忽略未知字段即可）。同时钉死：派生句柄能用于 `ctx_call_iface`。
+
+### M3 一次定稿的签名与具名修改
+
+- `ExternService::call` → `call(&self, caller_meta: Option<Config>, method: String, args: Config)`
+  （方案 §4 M3 点名的三处：host 的 `PluginIface`、`core/tests/kernel.rs` 的 `Greeter`、
+  `core/src/context.rs` 的调用点）。
+- `Context::call_iface` 在派发前算 `resolve_caller_meta(service)`（`declare` 链 ⊕ `intercept`
+  链、右偏）；`Context` 新增私有字段 `declare`，`Fiber::new` 把非 null 的 `inject` 配置
+  从 intercept 链改入**声明链**——`resolve_intercept` 的契约与既有测试逐字未动。
+- `crates/abi/src/sdk.rs`：`CallbackInput` 新增 `meta`；`IfaceFn` 收第二个参数
+  `meta: Option<Json>`；新增 `Ctx::intercept_ctx`（把派生句柄包成可用的 `Ctx`）。
+  **具名波及**：`examples/plugins/greeting/src/lib.rs` 的三个方法闭包 + sdk 模块文档示例
+  （greeting 另加 `audit` 方法，把提供者侧读到的 meta 原样回抛——demo 组的断言面）。
+- `crates/host/src/lib.rs` 的 `ctx_call_iface`：`with_instance` → `with_resolved`
+  （派生句柄上的 use-site 层必须参与合并；实例句柄行为逐字不变，续延仍发回**根实例句柄**）。
+
+### 计数汇总（M3 收口）
+
+- 全仓：161 passed / 0 failed / 0 warnings（M2c 的 154 + M3 的 7）
+- demo：第 6.7 组（M3：**真 DLL** 提供者经 SDK 读 meta）并入 A2 快照
+  （expected.txt 4782 字节；diff 核对 = 仅插入 3 行，既有行逐字未变；连跑 8 次哈希全同）。
+  位置在热重载（6）之后：多挂一个 fiber 会移动 fiber uid 序列，从而扰动既有行里那些
+  **确定性哈希**（epoch）——插在热重载之后，既有行才逐字不变。
+- 执行期发现并记录一条**与 M3 无关的既有缺陷**（方案附录 E 缺陷 5）：卸载一个
+  "依赖装载器插件服务的原生 fiber"之后，该插件的暂存副本不再被回收（G11）。
+
+## M4 追加（scope / Filter：注册期 scope + 父键关系，**新原语**）
+
+crates/core/tests/hook_scope.rs（6 个：5 红 + 1 守卫）：
+- filtered_context_can_register_events_and_carries_the_fiber（G18）
+    `filter` 派生的子 context **带调用者的 fiber**（`fiber()`/`fiber_opt()` 都看得见）
+    ⇒ 在它上面注册事件是合法操作；三条作用域注册各自的 scope 都进 `hook_scopes` 诊断面；
+    派发点没有 scope ⇒ 四条都跑（既有行为逐字不变）；派发点 = 自己的作用域 ⇒
+    只跑"自己这一支 + 无 scope 的注册"。
+- service_method_can_observe_the_callers_scope
+    原生服务的方法用**调用者的 ctx** 做派发点 ⇒ 只有调用者那一支的拦截器参与
+    （两个 agent 同名事件互不可见）——M11「每 agent 一个 scope」的机制。
+- scope_parent_chain_is_queryable_and_rebindable
+    父键关系可查询（`in_scope_of` 沿链）、**可重绑**（换父之后旧父不在链上）、
+    反向不成立（父不继承子的可见性）。
+- scope_parent_cycle_is_rejected
+    成环/自绑被拒（可读错误含"环"），且拒绝时关系原封不动。
+- realm_and_fiber_dispatch_filters_are_unaffected（守卫）
+    既有两轴逐字不变：派发点没有 scope 时 scope 轴不参与，连"注册在带 scope 的
+    ctx 上"的钩子也照旧由两轴裁决（Parallel 全跑、fiber 子树滤掉）。
+- scope_survives_the_anchor_fiber_going_away
+    作用域比 fiber 活得久：锚点只持 `Weak`（**派生不得增加 fiber 的强引用计数**，
+    用 `Arc::strong_count` 钉死）；fiber 卸载后钩子摘除、装载表清空，而锚点身份
+    与父键查询照旧。
+
+### M4 的具名修改（既有代码）
+
+- `crates/core/src/context.rs`：`Context.fiber` 由 `Arc<Fiber>` 改 **`Weak<Fiber>`**；
+  `attach_fiber` 收 `&Arc<Fiber>`；新增 `fiber_weak()`；派生 ctx（`extend`/`isolate`/
+  `filter`）只带弱引用 ⇒ **派生一个 ctx 不再增加 fiber 的强引用计数**
+  （M1 的注释"派生 ctx 无 fiber"随之更新：现在它带的是**同一个** fiber 的弱引用）。
+- `crates/core/src/store.rs`：新增 `root_fiber` 强持槽（`bind_root_fiber` / `root_fiber()`）
+  ——根 fiber 既无 runtime 也不在装载表里，没人强持就会被立刻回收；
+  `Fiber::root` 建完即挂上（`App` 的公开字段不变）。
+- `crates/core/src/event.rs`：`Hook.scope` 字段（唯一构造点 `event::owned` 落章）。
+- `crates/core/src/store.rs`：`handlers` 收**派发点**的 `ctx` 并接上 scope 轴；
+  新增 `hook_scopes(name)`（升序去重的作用域 uid）。
+
+### 计数汇总（M4 收口）
+
+- 全仓：167 passed / 0 failed / 0 warnings（M3 的 161 + M4 的 6）
+- demo：**不新增组**——M4 的消费面是内核 API 与派发语义，A2 快照逐字节未变（4782 字节）
+- 非空验证（mutation）：把 `hook_scope::allows` 短路成恒真 ⇒
+  `filtered_context_can_register_events_and_carries_the_fiber`
+  （left `["plain","mine","stranger","denied"]` vs right `["plain","mine"]`）与
+  `service_method_can_observe_the_callers_scope`（left `["a"]` vs right `["b"]`）两条红。
+
+## M5 追加（provision 声明 / 能力清单 / 预挂载探测 / 环诊断；A5/A6）
+
+crates/core/tests/provision.rs（3 个）：
+- declared_provision_is_reported_per_fiber
+    按 fiber 报出「声明 / 实际安装 / 两边对不上」；**声明为空 = 不透明 = 跳过检查**
+    （不透明插件装了两个 key 也不报警——规则 1 的关口）。
+- installing_a_key_outside_the_declaration_is_reported（Def 48）
+    装了声明之外的 key ⇒ 问题里点名那个 key。
+- finishing_activation_without_installing_a_declared_key_is_reported（Def 76）
+    已 ACTIVE 却少装了声明里的 key ⇒ 报；**PENDING 的 fiber 不报**（它还没跑 apply）。
+
+crates/host/tests/loader_cycles.rs（4 个）：
+- dependency_cycle_is_reported_with_its_path（A6）
+    `report.cycles == [["a","b","a"]]`（首尾同名）；默认**不拒挂**（两行都挂上、停在 PENDING）。
+- cycle_does_not_prevent_the_rest_of_the_tree_from_mounting
+    手动驱动 `reconcile_once(tree_snapshot())`：环之外的行照常 ACTIVE。
+- strict_mode_turns_a_cycle_into_a_load_failure
+    `strict` ⇒ 装载失败，错误里带环路径（**本仓扩展，默认关**）。
+- acyclic_precedence_is_never_reported（**守卫**）
+    提供者在前、消费者在后 ⇒ `cycles == []`、两行都挂上、消费者 ACTIVE。
+
+crates/host/tests/loader_capabilities.rs（2 个）：
+- capabilities_report_aggregates_inject_provision_and_volatile
+    `report.capabilities` 每行一条（按 label 升序），inject/provision/volatile 三项齐全。
+- abi_plugin_can_declare_provision_through_the_build_path
+    `build_plugin_with_provision` 把声明写进 `PluginDesc.provision` 尾字段；
+    `Capabilities::of_desc`（先 attach，再读三项）读回来，且**不注册实例**。
+
+crates/host/tests/probe_capabilities.rs（1 个，**独占进程**：`set_plugin_source` 是进程级）：
+- probe_capabilities_reads_provision_without_mounting（**A5 的机制**）
+    解析 → 暂存 → 打开 → 探活 → 读能力面 → 立刻放手；`loaded_instances() == 0`。
+
+crates/cli/tests/inspect.rs（1 个，**独占进程**，A5 的判定）：
+- inspect_lists_capabilities_before_any_mount
+    `cordis_cli::inspect`：`mounted == 0`；每行三项；行级 `inject` 与插件声明取并集；
+    **未声明 provision 的行**进 `undeclared`；`render()` 里 `mounted = 0` 与三项都可读。
+
+### M5 的具名修改（既有代码）
+
+- `crates/abi/src/sdk.rs`：`build_plugin_with_provision`（新；`build_plugin_with_volatile`
+  改为委托它，`build_plugin` 逐字不变）；`cordis_plugin!` 新增 `provision:` 分支 +
+  `__provision!` 助手宏；`PluginDesc.provision` 从此**总是**写上（空声明 = `[]` = 不透明）。
+- `crates/core/src/store.rs`：`Plugin::provision`（默认空）；`with_provision` 包装器 +
+  私有 `Provisioned`；`ProvisionReport` + `Store::check_provision` / `provision_report`。
+- `crates/host/src/lib.rs`：`LoadedPlugin` 覆盖 `Plugin::provision`（读 desc）；
+  `Capabilities::{of_plugin, of_desc}` + `probe_capabilities` / `probe_capabilities_in`。
+- `crates/host/src/loader.rs`：`cycle_paths()`（**迭代** Tarjan，自环也算环）、
+  `capabilities()`、`collect_inject_names` 助手；`report` 新增 `cycles` / `capabilities`；
+  `load_with_source` 在 strict 下把环升级成装载失败（默认只报告 + 一条 WARN 日志）。
+- `crates/cli`：`src/lib.rs`（新：`inspect` / `inspect_entries` / `InspectReport` / `render`）
+  + `main.rs` 改为子命令入口（`inspect <配置文件>`）；`Cargo.toml` 加 cordis-core/host 依赖。
+- **demo 快照的单行具名变更**：第 9 行「装载报告」JSON 多了计划指定的
+  `"cycles":[]` 与 `"capabilities":[...]` 两个字段，其余 61 行逐字未变
+  （expected.txt 4782 → 4982 字节；连跑 8 次 SHA256 全同）。断言集合未变。
+
+### 计数汇总（M5 收口）
+
+- 全仓：178 passed / 0 failed / 0 warnings（M4 的 167 + M5 的 11）
+- 非空验证（mutation）：把 `cycle_paths` 短路成空 ⇒ `loader_cycles` 3 条红
+  （`dependency_cycle_*` / `cycle_does_not_prevent_*` / `strict_mode_*`），
+  守卫 `acyclic_precedence_is_never_reported` 照旧绿。
+- CLI 冒烟：`cordis`（无参）打印用法；`cordis inspect 不存在.yml` 给出可读错误。
+
+---
+
+## M6：`cordis-macros`（typed 服务 / typed 事件 / 插件声明 / typed 配置）
+
+### M6 新增测试（11 条，全部在 `crates/sdk/tests/`）
+
+> 这 11 条**都不碰** `cordis_abi::sdk` 的进程级 `build_plugin`（`HOST`/`APPLY`/`VOLATILE_PATHS`
+> 是 `OnceLock`）——它们走的是内核 + SDK 门面，因此不需要像 ABI 测试那样串行排布（M6 方案注）。
+
+`crates/sdk/tests/service_macro.rs`（6 条）：
+- `service_macro_generates_key_and_typed_accessor`
+    `GreeterService::{NAME, MAJOR, KEY}` = `greeter` / `1` / **`greeter@1`**；
+    provider 走 `provide`、consumer 走 `of`，端到端 mount 成功。
+- `async_service_methods_are_dyn_compatible`（**编译即断言**）
+    `dyn Greeter: Send + Sync`；`Arc<dyn Greeter>` → `Dyn::new(Iface::<dyn Greeter>(…))` →
+    `downcast::<Iface<dyn Greeter>>()` 取回**同一份**（不是 `Arc<Arc<dyn _>>`）；
+    脱糖后的调用点是 `fn(&'a self, …) -> ServiceFuture<'a, _>`。
+- `service_impl_macro_lets_authors_write_async_fn`
+    作者写的 `async fn`（含 `.await` 与 `?`）照常：`"  MiXeD  "` → `"hello, mixed"`；
+    空名字 ⇒ `Err("空名字")`（`E: Display` 原样穿过）；计数器 = 2。
+- `typed_accessor_and_json_adapter_dispatch_to_the_same_impl`（D2 的 T1/T2 规则）
+    typed 面 `of(ctx).greet(…)` 与 JSON 面 `ctx.call_iface("greeter@1", 1, "greet", ["json"])`
+    打到**同一个实现**（计数器 = 2）；请求更高版本 ⇒ 错误里带键与「接口版本」。
+- `typed_accessor_reports_type_mismatch_not_noinject`（G6 的下半截）
+    在 `Iface<dyn Greeter>` 上问 `dyn Impostor` ⇒ `ResolveError::TypeMismatch { name, expected }`
+    （`expected` 里能读出 `Iface<dyn …>`），且**不含** `NoInject`；同 key 二次注册被拒。
+- `json_adapter_shape_checks_the_argument_envelope`（G8 的 SDK 侧一半）
+    `service()` / `version()` / `methods()` 三项；信封非数组、长度不符、参数解不出、返回值
+    往返各一条可读错误（带期望元数与实到长度、参数名）。
+
+`crates/sdk/tests/key_namespacing.rs`（1 条）：
+- `key_namespacing_prevents_collision_between_two_tools_at_v1`（§6.6 路线 1）
+    `tools@1` 与 `tools@2` 共存；声明 `tools@2` 的消费者命中 v2，未声明的 `tools@1`
+    ⇒ `without inject`；只声明 `tools@3` ⇒ **停在 Pending**；同 key 二次注册被拒。
+
+`crates/sdk/tests/plugin_macro.rs`（2 条）：
+- `plugin_macro_emits_inject_provision_and_volatile`
+    `name = "agent-loop"`；`inject("greeter@1", llm)` ⇒ `["greeter@1", "llm"]`（裸名当字符串）；
+    `provision("agentLoop@1")`、`volatile("cache.dir")` 逐字。
+- `plugin_macro_apply_hook_runs_and_config_is_validated`
+    非法配置 ⇒ **挂载期**失败（`invalid config` + 字段名），`apply` 不跑（计数器 = 0）；
+    合规配置 ⇒ ACTIVE、`apply` 跑一次、`agentLoop@1` 装上；`LoopConfig::parse` 往返 + 可读 issue。
+
+`crates/sdk/tests/events_macro.rs`（2 条）：
+- `events_macro_generates_verbatim_names_and_dispatch_modes`
+    四个常量**逐字**（`agent/pre-step` / `tools/before-invoke` / `tool/decide` / `tool/observe`）；
+    emit 无返回值、serial 两个监听器都跑、bail 第二个表态即短路（第三个不跑）；
+    卸载即摘除（typed 监听器与裸监听器走同一张 hook 表）。
+- `typed_waterfall_payload_is_shared_with_json_listeners`（A9 的机制）
+    typed 拦截器改写载荷 ⇒ 报文层监听器读到的 JSON 与之逐字相同 ⇒ typed 链尾的决定回流；
+    不调 `next` 即短路（下游含尾都不跑）。
+
+### M6 的具名修改（既有代码 8 处）
+
+- `crates/core/src/iface.rs`（**新增**）：`Iface<T: ?Sized + Send + Sync + 'static>(pub Arc<T>)`
+    —— `dyn Trait` 进 `Any` 的唯一通道（`Iface<dyn A>` 与 `Iface<dyn B>` 是不同的 `TypeId`）；
+    手写 `Clone` / `Debug`（`#[derive(Clone)]` 会给 `?Sized` 加上 `T: Clone`，那是错的）。
+- `crates/core/src/dyn_value.rs`：`Dyn` 加第二个字段（可选 JSON 面）+ `with_adapter` /
+    **`adapter`**（「能不能按方法名调用」的**唯一判据**：显式适配器，或值本身是 `IfaceRef`）；
+    新增 `ServiceFuture<'a, T>`（借用盒，M6 脱糖的目标类型）。
+- `crates/core/src/store.rs`：`ResolveError::TypeMismatch { name, expected }` + 一条 Display 分支。
+- `crates/core/src/context.rs`：`require_as` 的类型不匹配改报 **`TypeMismatch`**（原来伪装成
+    `NoInject`）；新增 `Ctx::iface::<T>(name)`；`Ctx::call_iface` 的判据换成 `Dyn::adapter()`
+    （错误消息重写但保留 "provide_iface" 字样，既有断言不动）。
+- `crates/core/src/lib.rs`：导出 `Iface` / `ServiceFuture`。
+- `crates/host/src/lib.rs`：`encode_service` 的判据同样换成 `Dyn::adapter()`
+    ⇒ typed 服务对 ABI **可见**（能力发现）且**可调**（`ctx_call_iface` 是同一条路）。
+- `crates/sdk/Cargo.toml` + `src/lib.rs`：库名改 `cordis`（宏展开写 `::cordis::…`）+ 门面
+    （`core` / `abi` / 五个宏 / `serde` / `serde_json` / `typed`）。
+- `crates/macros/*`（**新增**）：`service` / `service_impl` / `events` / `plugin` / `config`
+    + `crates/sdk/src/typed/{service,events}.rs`（宏的运行时胶水）。
+- **既有测试文件：0 处改动**；**demo：逐字节不变**（仍 4982 字节，8/8 SHA256 相同）。
+
+### 计数汇总（M6 收口）
+
+- 全仓：**189 passed / 0 failed / 0 warnings**（M5 的 178 + M6 的 11）
+- 非空验证（mutation）：
+  ① `Dyn::adapter()` 短路成 `None` ⇒ **8 条红**（M3/内核的 7 条 `call_iface` / intercept
+     测试 + M6 的 `typed_accessor_and_json_adapter_dispatch_to_the_same_impl`）；
+  ② events 宏给事件名加前缀 `p/…` ⇒ **2 条红**（events_macro 的两条——「逐字」是承重的）。
+- 执行期发现并处理的两条（已写进宏文档）：
+  ① `Plugin::apply` 的 future 是 `'static`、借不了 `&self` ⇒ 插件宏**必须**要求 `Clone`
+     （共享状态放 `Arc`）；这是 D2「一次 `Arc<Self>` 提升」在插件类型上的落点；
+  ② `serde_json::from_value` 的错误里**没有字段路径** ⇒ `#[cordis::config]` 的 `parse` 改为
+     「字段级体检优先、serde 原话兜底」（否则配置诊断只有 `invalid type: …`，看不出是哪个字段）。
+- **G8 记为部分完成**：SDK 侧的参数信封形状校验已落地；宿主侧对任意 JSON 服务值的形状校验
+  属于领域契约，不在骨架内。
+
+---
+
+## M7：`cordis-components::registry`（provider 原地替换，G7 最小版）
+
+### M7 新增测试（5 条 = 4 具名 + 1 附加，全在 `crates/components/tests/registry.rs`）
+
+- `consumer_epoch_is_unchanged_when_a_named_impl_is_replaced`（**A7**）
+    槽位 `llm@1` 由注册表提供；消费方声明 `inject("llm@1")` 并在**自己的提交视图**上读值。
+    原地换值之后：`running_epoch` 与 `desired_epoch` **都不动**、apply 次数仍是 1（不重挂），
+    而两次读到的值是 `"a"` → `"b"`（**冻结的是身份，不是值**）。
+- `replacing_is_a_single_synchronous_write`
+    `replace` 是同步函数（签名即证据）：同 tick 可读；连写 5 次之后注册表自己的
+    `running_epoch` 不动、`effect_count` **不增**（一次写 ≠ 一次注册）、表里仍只有一个名字、
+    原生句柄读到的也是最后一次写的值。
+- `disposer_removes_the_entry`
+    先挂消费方（PENDING）⇒ `put` 之后变 ACTIVE；`disposer.run()` 之后：
+    服务表里查不到、`get` 为 `None`、名字消失、消费方回到 PENDING。
+- `empty_registry_degrades_gracefully`
+    空表：`names()` 空、`get` 为 `None`、`replace` 给"先 put"的可读错误；
+    **卸载注册表后**（句柄还握在调用方手里）：`names()` 空、`put` 报"注册表已卸载"
+    ——句柄只持 `Weak<Context>`（M4 的 Weak 纪律）。
+- `typed_registry_face_shares_the_table_with_the_native_handle`（附加）
+    `registry@1` 的 JSON 面（`ctx.call_iface`）与原生句柄**共用一张表**：
+    JSON 读得到 T1 注册的槽位、JSON 换值 T1 立刻看到、JSON 注册 T1 立刻看到；
+    `get` 查不到 ⇒ `null`（不是错误）；方法不存在 ⇒ 报出可用方法（顺带验收 M6 的适配器合同）。
+
+### M7 的具名修改（既有代码 0 处）
+
+- `crates/components/*`：`src/registry.rs` + `src/lib.rs` + `Cargo.toml`（此前只有空骨架）。
+- **既有代码 0 处修改**；**demo 逐字节不变**（仍 4982 字节）。
+- 复核结论（备后续查）：`Fiber::refresh_desired` 只对 `inject` 里**声明过**的名字混 epoch，
+  而 `Store::notify` 只碰 `declare_inject(name)` 的 fiber ⇒ 注册表**动态** provide/摘除槽位
+  既不会重建自己、也不会牵连消费方（这正是 M7 能零内核改动的原因；`Store::set` 只写
+  `Impl.value`，身份与 effect 表都不动）。
+- **给 M11 的用法（今天就能写）**：typed 服务也能放进槽位——槽位值是任意 `Dyn`，
+  于是 `Dyn::new(Iface::<dyn Llm>(arc.clone())).with_adapter(LlmService::adapter(arc))`
+  既让 `LlmService::of(ctx)` 拿得到 typed 面，也让 T2 的 `call_iface("llm@1", …)` 调得到；
+  换适配器 = 对该槽位 `replace` ⇒ agent loop 的 epoch 不变（A7 的 spike 写法）。
+
+### 计数汇总（M7 收口）
+
+- 全仓：**194 passed / 0 failed / 0 warnings**（M6 的 189 + M7 的 5）
+- 非空验证（mutation）：
+  ① `replace` 改成"重新 provide" ⇒ **3 条红**（epoch / 单次同步写 / typed 面）；
+  ② `get` 改成空实现 ⇒ **3 条红**（单次同步写 / disposer / typed 面）。
+- 红档：编译红 E0432（`cordis_components::registry` 不存在）→ 首实现即绿；
+  首跑即绿按 M5 起的纪律用两条 mutation 交代"断言有牙"。
+
+---
+
+## M9：配置层 `!!js` 能力化（D5，P2）
+
+### M9 新增测试（4 条 = 3 + 1 守卫，全在 `crates/host/tests/interpolation.rs`）
+
+- `js_expression_capabilities_are_extracted_and_reported`
+    三行配置各带一处引用（`process.env.<名>` / `ctx.get('<名>')` / `process.platform`）：
+    `state.capabilities()` 与 `loader.report.capabilities` 每行都有
+    `js{env,host,services}`（**名字**、升序去重）；没有表达式的行是空快照（形状稳定）。
+    另直调 `js::capabilities_of`：`?.`/`env.X`/`process.version` 都认，非字面量参数不猜。
+- `interpolation_injected_mode_rejects_an_unevaluated_expression`
+    `interpolation:"injected"` + 无注入引擎 ⇒ **失败**（错误含 `injected`、路径
+    `at gate.disabled` 与原文 `process.platform`），那一行不挂；注入了引擎 ⇒ 走注入的引擎。
+- `interpolation_builtin_mode_is_unchanged`（**守卫**）
+    默认与显式 `"builtin"` 逐字保持 M4-4 行为（休眠行 / 装载成功 / 失败计数 0）；
+    `report.interpolation.mode == "builtin"`。
+- `credential_values_never_appear_in_the_capability_snapshot`
+    凭据经 `process.env.M9_API_KEY` 进配置（**值确实到了插件**），而整份报告里
+    只有名字 `M9_API_KEY`、绝无 `SECRET`（D5 的红线）。
+
+### M9 的具名修改（既有源码 3 处 + 既有测试 9 处）
+
+- `crates/host/src/js.rs`：+`JsCapabilities`（**只有引用没有值**）+
+  `capabilities_of`（**词法**抽取：`process.env.X` / `env.X` / `process.X` / `ctx.get('字面量')`，
+  `.` 与 `?.` 等价）+ `RejectInjected`（injected 模式的"没有引擎"求值器，**每个表达式 fail loud**）。
+- `crates/host/src/patch.rs`：+`collect_js_capabilities`；**走法统一**——`walk_config_exprs`
+  成为唯一遍历器，`collect_config_issues_into` 改成它的薄包装（问题清单与能力快照必须看见
+  同一批表达式，否则会出现"报告里看得见、快照里看不见"的偏差）。
+- `crates/host/src/loader.rs`：+`InterpolationMode{builtin(默认)|injected}` + `LoaderConfig.interpolation`
+  + `as_str()`；求值器选择改成"先看模式、再看注入"；`LoaderState` 增 `interpolation_mode`
+  字段（Debug 也打印）；`report.interpolation` 增 `mode`；`capabilities()` 每行增 `js`。
+- 既有测试 **9 处**：`loader_capabilities.rs` 的整行 `json!` 断言（能力清单多一项 `js`——
+  计划里的"改既有 1"就是它）+ **8 处 `LoaderConfig` 字面量**补 `interpolation` 字段
+  （`crates/host/src/loader.rs` 的 inline 夹具、`abi_m1_use.rs`、`interpolation.rs` 的 `config_for`、
+  `loader_capabilities.rs`、`loader_cycles.rs`、`loader_reconcile.rs`、`loader_scope.rs`、
+  `loader_volatile.rs`）。
+- 夹具一处（**纯加法**）：`interpolation.rs` 的 `FakeSource` 增 `quiet` 分支
+  （只挂上、不 provide）——一次装载要挂多行时 `seen` 会撞车；`provides` 行为逐字不变。
+
+### 计数汇总（M9 收口）
+
+- 全仓：**198 passed / 0 failed / 0 warnings**（M7 的 194 + M9 的 4）
+- demo：**单行具名变更**（4982 → **5079 字节**）：报告那一行多出 `capabilities[].js`（两行各一处）
+  与 `interpolation.mode`，其余 61 行逐字未变；**8/8 stdout SHA256 相同**（只比 stdout，与
+  `compare.ps1` 同口径——把 stderr 合进来会因两个流的合并顺序抖动，那是采样的噪声，不是 demo 的）。
+- 非空验证（mutation）：① `capabilities_of` 短路成空 ⇒ **2 条红**（抽取 + 凭据红线——
+  后者正是"名字必须在"的那一条）；② `injected` 回落到内置子集 ⇒ **1 条红**。
+- 执行期发现（写进测试注释）：内置子集的 `?.` **只支持成员访问、不支持调用**
+  （`ctx?.get('x')` 报"不支持调用 成员访问 上的 `?`"）⇒ 能力抽取是**词法**的（照样认 `?.`），
+  而"能不能求值"是另一回事；测试据此把"抽取"与"求值"的断言分开写。
+- 留白（明说）：CLI 的 `InspectRow` 仍是 M5 的形状（inject/provision/volatile），没有加 `js`——
+  加它会再动一个既有测试，而 A5 的判据不依赖它；**装载前**想要这份快照的调用方今天就能用
+  `patch::collect_js_capabilities(&parse_entries(text)?)`（纯函数、不挂载）。
+
+---
+
+## M10：文档 + Weak 审计 + 兼容矩阵（A3/A8 的收口）
+
+### M10b 新增测试（1 条）
+
+`crates/core/tests/weak_audit.rs`：
+- `ctx_is_not_leaked_after_fiber_dispose`
+    fiber **自己**的 ctx 与它派生出来的**作用域 ctx**（闭包里刻意持有它的 `Weak`）在
+    `dispose()` 之后都必须回收（`Weak::strong_count == 0`）；**同时**断言 root ctx 照旧活着
+    ——"什么都回收了"不算通过（那说明连根都没了），必须看到"子回收、根还在"。
+
+### M10c 新增测试（1 条，宿主侧；截断侧在 `crates/abi`）
+
+`crates/host/tests/abi_matrix.rs`（该文件原有 2 条，现在 3 条）：
+- `abi_compatibility_matrix`（**A3 的后半截**）
+    取样尺寸 = 每个字段的"恰好够"与"差一个字节" + 0 + 冻结前缀；**每一格都是真读一次**
+    `PluginDesc::field_at` 得来的，并与判界规则 `size >= offset + width` **逐格对照**；
+    同一张表还对照 `desc_gate` 的收/拒（只有 `size >= prefix` 才收）。
+    它同时渲染 `兼容矩阵.md`：默认**只断言与已提交文档逐字一致**（防漂移），
+    `CORDIS_WRITE_MATRIX=1` 时生成它。
+- **截断侧**（`crates/abi`）：`copy_on_attach::truncated_host_api_reads_only_inside_its_own_copy`
+    （HostApi 截断 + 金丝雀，M0 起就在）+ `v1_shape`（前缀与字段序冻结）+ 本矩阵
+    （它驱动的正是 `cordis-abi` 的 `field_at`，所以"截断"与"宿主读法"是同一条证据链）。
+
+### M10a 文档（纯文档，不计测试）
+
+- `原理.md`：页号整体 **−3**（全角括号内 64 处 + 括号外裸引用 15 处——后者在收口时补齐，
+  免得同一句引文出现两种口径）、五条定理重编号（59→64 / 61→68 / 63→70 / 66→73 / 73→80，
+  共 15 处，含长写的 `Theorem N`）、元理论节号 `§4.4→§4.3`（含 `§4.4.2/§4.4.5`，3 处）；
+  处理内部不一致（§8.7 的 FRP 行 `Thm 64` 保持终稿编号、页号按同一规则 −3）；文末新增
+  「附：引用编号对照（M10a）」。
+- `方案.md` / `补全方案.md`：各追加一节「取代清单（来自《SDK方案.md》§0.3，M10a 同步）」——
+  把 `SDK方案.md` §0.3 那张表**逐字镜像**过去（以 `SDK方案.md` 为准）。
+- **新增 `SDK指南.md`**：三档 tier 与信任模型、键/名字/声明规则、**两张同名不同物的
+  interception**、**T1/T2 typed 边界规则（含 T1 转发给 T2 的规则）**、语义陷阱清单（11 条，
+  每条指到测试）、MSRV/特性矩阵、TS 移植对照、迁移清单。
+- **新增 `兼容矩阵.md`**（**自动生成**，文件头写明生成命令）。
+
+### 计数汇总（M10 收口）
+
+- 全仓：**200 passed / 0 failed / 0 warnings**（M9 的 198 + M10 的 2）
+- demo：逐字节不变（5079 字节）
+- 非空验证（mutation）：
+  ① `PluginDesc::field_at` 的判界 `>=` 改成 `>`（"恰好够"也读不到）⇒ **3 条红**
+     （矩阵 / v1 形态插件可加载 / M5 的 ABI provision 生产路径）；
+  ② 在 apply 里故意把一个 ctx 存进进程级静态（"某处忘了用 Weak"）⇒ **1 条红**，
+     且消息精确指出被强持的是哪个 ctx（派生 ctx 的 `parent` 是强引用，所以泄漏会连带吊住父 ctx）。
+
+## M11：harness spike（**总验收**；A4/A9/A10/A11 的真 DLL 层）
+
+### M11a 新增测试（5 条 = **无 DLL 层**，全部在 `examples/harness-spike/tests/e2e.rs`）
+
+| # | 测试 | 钉住的事 |
+|---|---|---|
+| 1 | `scope_isolation_hides_same_named_tools_between_agents` | M4：两个 agent 的同名工具**各答各的**；跨作用域"没有人应答"；目录面（`Tools::names`）按作用域链过滤；子代理 `bind_scope_parent` **继承**父这一支；成环被拒 |
+| 2 | `typed_services_are_callable_in_process_and_over_json` | M6：四个键都是 `<name>@<major>`；typed 面与 JSON 面（参数信封 `[a1…aN]`）打到**同一份实现**；重名/未知方法/iface 未提供者/版本不符四类失败都可读；`names(owners)` 换个链就给不同答案 |
+| 3 | `typed_event_payloads_are_checked_and_named_verbatim` | M6：三个事件名**逐字**；坏载荷不打给 typed 监听器（只记一条点名事件与缺失字段的日志），派发照常完成；`decode_ret` 对坏返回值同样是可读错误 |
+| 4 | `replay_adapter_drives_the_loop_deterministically` | 领域接缝：replay 适配器读**录制的 chunk 序列**⇒同一份录制跑两次逐字段相同；`sessions` 的 `seq` 连续 1..N 且第二次接着第一次；坏 chunk **fail loud** |
+| 5 | `replacing_the_llm_adapter_keeps_the_consumer_epoch` | M7/**A7**：原地换 `llm@1` 槽位 ⇒ agent-loop 的 `running_epoch` 一动不动、`apply` 不重跑，但读到的是**当下**的值；原生句柄里就是那个 `Iface<dyn Llm>` |
+
+### M11b 领域层（`examples/harness-spike/src/lib.rs`，生产代码不计测试）
+
+- 四个 `#[cordis::service]`：`tools@1`（目录：`register`/`unregister`/`names`/`call`）、
+  `llm@1`（适配器）、`sessions@1`（append-only 日志）、`agent@1`（agent 循环）；
+- `#[cordis::events]` 三条（名字逐字）：`agent/pre-step`（emit）、
+  `tools/before-invoke`（**waterfall**）、`tools/invoke`（bail）；
+- `agent_scope`（`filter` + 锚点**祖先链**谓词：继承方向与 `filter_subtree` 相反）、
+  `owner_chain`（自己 → 祖先 + 全局 0，供目录查询）；
+- `tool_plugin`：从**带作用域的 ctx** 挂出去 ⇒ 它注册的钩子带着作用域身份（派发期由
+  `Hook.scope` 逐个裁决）；`mount_agent`：每个 agent 一个作用域 + 一个**私有域**
+  （`isolate("agent@1")`——多个 agent 各挂一个 agent-loop 而不撞"一个键一个实现"）；
+- 目录回退（**D2**）：`tools/invoke` 上没人应答 ⇒ 问 T1 目录要不要把 T2 的 iface 转发进来；
+- `MemorySessions`（内存版，与 DLL 的线上形状逐字同形）、`ScriptedLlm`、`ReplayLlm`、
+  `llm_slot`（typed 面 + JSON 面指同一份实现）、`boot_core_in`/`boot_agents`/`boot`。
+
+### M11c 真 DLL 层（`examples/plugins/harness-tool` + `examples/harness-spike/src/main.rs`）
+
+| 步 | 断言 | 验收 |
+|---|---|---|
+| 0 | `probe_capabilities` 在读 provision（`sessions@1`）**之前** `loaded_instances() == 0`；**另加** `cordis-cli` 的库面（`inspect_entries` + `render`）审阅同一份配置：`mounted == 0`、行级 provision 可见 | A5 的同一条 seam |
+| 2 | 真动态库装载成功、`loader.report.failed == []`、报告 capability 带 provision | — |
+| 3 | DLL 自报：`boot=1`、`seq=3`、`registered=="ok"`（D2）、`meta=={"tenant":"harness","trace":"spike"}`（**M3**：提供者侧读到 use-site 元数据） | A4 |
+| 4 | 隔离域里的 `@native:harness-child` 读得到、根域读不到 | A4 |
+| 5 | 原地换适配器：epoch 不变（脚本 → 录制 → 再换回） | **A7** |
+| 6 | 一场真会话：`["search","harness-echo","harness-ask"]`（钩子 / **T2 iface 经目录转发** / **T2 异步挂起后由宿主放行**）、拦截痕迹 `["harness-tool"]`、`seq=[3..7]`、日志里第一条工具记录的 `input` 带 `guard` | **A9** |
+| 7 | 挂起中取消：`pending_len 1 → 0`、结算为 `None`、日志写明「已取消」 | **A10** |
+| 8 | 触碰文件 + **手动** `loader::reload_one` ⇒ 新实例 `boot=2`、`seq` 从日志恢复（10）、日志 append-only（旧文件是新文件的前缀）、依赖者被**自动**重拉、之后两场会话 `seq` 接着走 | **A11** |
+| 9 | `harness/unload` ⇒ 装载表摘除 + 对账后 `disabled=["harness"]` + `sessions@1` 不再可解析 + 目录里也没了它的登记 + 日志一字节不少 | A4 |
+| 10 | 真删除：2 个 `.rN` 副本从磁盘消失、`loaded_instances()==0`、`stagedLeaked==0` | D9/M0b 的老规矩 |
+
+### M11 的具名修改（既有代码 / 清单 4 处）
+
+1. `crates/host/src/loader.rs`：`async fn reload_one` → **`pub async fn reload_one`**（+ 文档：
+   外部确定性驱动用它，于是重载不必等墙钟 HMR）；
+2. `Cargo.toml`（根）：`[workspace.dependencies]` 新增 `cordis-cli`（spike 要用它的库面）；
+3. `examples/harness-spike/Cargo.toml`：新增 `[lib]`（领域层两层共用）+ 8 条依赖；
+4. `examples/plugins/harness-tool/Cargo.toml`：`[dependencies]`（`cordis-abi` + `serde_json`）。
+
+### 计数汇总（M11 收口）
+
+- 全仓：**205 passed / 0 failed / 0 warnings**（M10 的 200 + M11 的 5）
+- demo：逐字节不变（5079 字节）
+- spike 二进制：**连跑 3 次 stdout SHA256 全同**（`CC9DB47D…9C87`，3221 字节）；
+  断言全绿并打印 11 步验收记录
+- 非空验证（mutation，三处都在 M11 新代码里）：
+  ① `agent_scope` 的谓词恒真（作用域轴失效）⇒ **1 条红**，现场正是
+     `beta 调 search 拿到了 alpha 的工具`（left `alpha` / right `beta`）；
+  ② DLL 的 `SessionLog::open` **不恢复** `seq`（"内存计数器还在"的假象）⇒ spike 在 A11 上红
+     （`seq` 报 3 而日志里已经有 7 行）；
+  ③ DLL 的拦截器**不改写**入参 ⇒ spike 在 A9 上红
+     （`input` 少了 `guard`）。
+
+## M8（ADR）：第二载体 —— 交付决策文档（不计测试）
+
+`docs/adr/0001-second-carrier.md`（新文件）：**不实现**第二载体，但把四件事写死——
+① `LoadedPlugin` 是唯一适配器 + `cordis-abi` 零平台依赖（`PluginSource` / `HostApi` op 协议 /
+`probe_capabilities_in` / `set_plugin_source` 四个 seam 逐条点名，以及两级版本门禁的复用方式）；
+② D1 的两条硬话（T3 不是信任边界、**模型自生成组件永远不得是 T2**）；
+③ **D7 的流式推广路径**（`ctx_next` 已经反转了控制流 ⇒ 流式 = N 次回调 + 背压窗口，
+复用现有挂起机制；含将来实现时的验收口径：窗口 4、推 100 块、中途 abort 后
+`pending_len == 0` 且 `waterfall_len == 0`）；
+④ T3 的接口契约必须异步（含**待补**的 `provide_iface` 异步形态 `AsyncIfaceFn`、
+以及"取消在远程载体上本地绝不等待远端确认"）。
+
+## 缺陷 5 闭环：卸载"依赖装载器行服务的原生 fiber"之后插件对象被回收（4 条新测试）
+
+`crates/host/tests/loader_release.rs`（新文件，4 条）：
+- `unloading_a_row_after_its_calling_dependent_was_disposed_releases_the_plugin`（矩阵变体 (h)：依赖 + **调用** + 卸载）
+- `unloading_a_row_after_an_intercept_derived_dependent_was_disposed_releases_the_plugin`（矩阵变体 (b)：依赖 + **派生 intercept ctx** + 卸载）
+- `unloading_a_row_with_a_live_dependent_also_releases_the_plugin`（矩阵变体 (e)：依赖者**留在线上** ⇒ 退回 PENDING，插件对象照样回收）
+- `the_probe_detects_a_deliberately_retained_plugin`（**反空转**：假源故意留一份 `Arc<dyn Plugin>` ⇒ 判据必须为假）
+
+判据：**插件对象是否被 drop**（`SpyPlugin` 的 `Drop` 打标）——它就是二进制层"暂存副本能否删除"
+的等价观测，且**不依赖动态库**；假源提供的服务值形态与 ABI 提供者同形
+（`Dyn::new(...).with_adapter(adapter)`，adapter **握着提供者的 ctx**，与 `PluginIface` 同构），
+所以它真的覆盖"被留下的 ctx 吊住提供者 fiber"那条入口。
+夹具纪律：装载器**挂成一个插件 fiber**（行 fiber 是它的孩子）——否则量到的是缺陷 6
+（"行 fiber 是 root fiber 的 effect ⇒ 永不回收"），不是缺陷 5。
+
+### 结论与机制
+`Arc<dyn Plugin>` 的长期持有面只有 `Store.runtimes[..].plugin` 与 `Fiber.runtime → Runtime.plugin`
+两条，**两条都以"fiber 活着"为前提** ⇒ 缺陷 5 等价于"插件卸载后谁还握着那条 fiber"。
+答案是 **`ctx → fiber` 曾经是强引用**：依赖者被卸载后，只要还有人留着它的 ctx
+（依赖者提交视图里的 `Impl`、宿主的 `Instance.ctx`、派生的 intercept ctx），提供者的 fiber
+就被一起吊住。**M4 的 G18 已把它改成 `Weak<Fiber>`**（根 fiber 由 `Store.root_fiber` 强持）
+⇒ 链断；原记录里"最可能是 `Mounted.plugin` / watcher 没放手"的猜测**不成立**。
+
+### 具名修改（既有代码 1 处 + 既有示例 1 处）
+1. `examples/demo/src/main.rs`：6.7 组的调用者恢复**真卸载**（当初正因本条而省略这一步），
+   并加一条静默断言（卸载后该 fiber 是 `PENDING`）；两处注释指回本条与本文件的回归。
+   **输出快照逐字节不变**（5079B）——卸载不打印任何东西，`compare.ps1` 通过。
+2. `examples/demo/src/main.rs`：去掉本轮临时加的 `[diag]` 诊断（曾用于定位）。
+
+### 计数汇总（本轮收口）
+- 全仓：**209 passed / 0 failed / 0 warnings**（M11 的 205 + 本轮 4）
+- demo：逐字节不变（5079 字节，且 6.7 组现在多卸载一个 fiber）
+- 非空验证（mutation）：把 `Context::attach_fiber` 改成"另存一份 `Arc<Fiber>`"
+  （模拟 G18 之前的强引用）⇒ **3 条红**，报错正是"装载器拆完之后 `Arc<dyn Plugin>`
+  必须被回收"；反空转那条对照仍绿（它本来就该绿）。
+
+## M8-后续①：可挂起的接口方法（`AsyncIfaceFn`，ADR §4 的第一块拼图）
+
+`crates/host/tests/sdk_async_iface.rs`（新文件，**1 条测试**）：
+- `suspendable_iface_methods_share_everything_with_the_event_path`
+  六条断言：① 方法答 `Pending` ⇒ 宿主等 `ctx.fulfill` ⇒ 值原路返回且 `pending_len` 归零；
+  ② 同一接口里的**同步**方法照旧立即返回（同表里有挂起方法也不受影响）；
+  ③ 同一条异步通道也能**立刻**答复（`AsyncReply::Reply`）；④ 未知方法**列出可用方法**；
+  ⑤ 版本协商照旧（v2 打到 v1 被拒）；⑥ **卸载排水**——还挂着接口调用的插件被拆掉时，
+  那次调用以"插件已卸载/已取消"结算（不是永远挂着），且 `pending_len` 归零。
+
+**为什么只有一个测试**：`sdk::build_plugin_*` 的 apply 槽是**进程级**的（真插件走
+`cordis_plugin!`，每个宏调用有独立入口）。三个测试各造一个 ⇒ 后两个的 apply 静默不生效
+（本轮的第一次红档就是这个：`handle == 0`）。这条已写进 `sdk.rs` 的文档与
+`SDK指南.md` §6 的陷阱清单。
+
+### 实现（生产代码 2 处）
+1. `crates/abi/src/sdk.rs`：新增 `pub type AsyncIfaceFn`（方法体拿到 `dispatch_id`）+
+   `Registry.async_ifaces`（按"方法名 → 方法体"分表，同样按 id 索引）+ `dispatch()` 里
+   在 `handlers` 之后、`async_handlers` 之前的分派分支 + `Ctx::provide_iface_async`
+   （与 `provide_iface` 逐条同构：同一个宿主 op、同一个线上形状）。
+2. `crates/abi/src/sdk.rs`（文档）：`build_plugin_with_provision` 上写明"一个进程只该有一个"。
+
+**宿主侧零改动**——`PluginIface::call` 早就在 `pending.settle("接口方法")` 上等了，
+这正是 ADR §4"异步入站是载体层的能力"的直接证据。
+
+### 计数汇总（本轮最终）
+- 全仓：**210 passed / 0 failed / 0 warnings**（M11 的 205 + 缺陷 5 的 4 + 本轮 1）
+- demo：逐字节不变（5079 字节）
+- 红档：`provide_iface_async` 不存在 ⇒ E0599 编译红；随后实现中间态红（apply 槽进程级
+  ⇒ `handle == 0`、`Fn` 闭包不能 move 出捕获的句柄）
+- 非空验证（mutation）：见上（`attach_fiber` 强引用 ⇒ 3 条红）
+
+## ADR 0002：broker 的消费者问题（决策 + 文档，**零代码改动**）
+
+- 全仓：**210 passed / 0 failed / 0 warnings**（不变）；demo：逐字节不变（5079 字节）。
+  本文的计数不变（**210**），无具名测试修改。
+- 交付：`docs/adr/0002-broker.md`（170 行）。把"没有消费者"这句从口号升级为**可引用的一手证据**：
+  真实下游制品 `E:\code\新架构\deepseek-harness`（TS，vendored cordis `vendor/loader 1.0.6-alpha.1`）
+  的源码与 `.agents/notes`。
+- 论文一手引文（会话内转换件 `cordis-paper-2608.25512.md`，本仓之外、只引用不改动）：
+  §6.2 "The service broker underlies three capabilities: load balancing, rolling updates, and
+  cross-process invocation."（pp.71-72）；§4.2.1 "…keeps two routes: realms, and the broker of
+  Section 6.2, **one fiber providing the key** and dispatching among implementations registered
+  with it."（p.33）⇒ **broker 是模式，不是机制**。
+- 外部证据（file:line，均在 `deepseek-harness` 内）：
+  `.agents/notes/implemented/architecture/2026-07-14-provider-routed-llm-adapters.md:25,77,93`、
+  `packages/llm/llm/src/index.ts:297-315,383,431`（`DUPLICATE_ADAPTER` / `AdapterRegistrationHandle.replace`）、
+  `packages/llm/llm-retry/README.md:12,54,132`、`docs/subsystems/credentials.md:5`、
+  `packages/mcp/mcp-client/README.md:75,78,110,127`、`packages/core/tools/src/index.ts:747-750`、
+  `.agents/notes/implemented/architecture/2026-07-30-credential-boundaries-and-atomic-registration.md:23`、
+  `.agents/notes/proposed/simplification/2026-09-19-config-only-hmr.md:9,15,23`、
+  `.agents/notes/proposed/feature/2026-10-03-pi-plugins-compatibility.md:98,106,108`。
+- 四条决策：**D-a** 不做 broker；**D-b** 三条表达路径（组合二选一 / 实现内部路由 /
+  `isolate` 各域一个）；**D-c** `components::registry`（M7）= broker 的 **N=1 退化形态**，
+  已覆盖 A7；**D-d** drain 不做（换值走 `Arc` 语义本就不需要排水）。
+- 落地路径（将来）：`components::router`（普通插件，**零内核改动**）+ 三条触发条件；
+  跨进程块并入 ADR 0001 的 T3。
+- 同步改动（4 个既有文件，均为**指向本文的一行/一句**）：`SDK方案.md`（取代清单行、§1 G7 行、
+  附录 E 新行）、`方案.md` 与 `补全方案.md`（镜像取代清单行）、`SDK指南.md`（新增 §8.1
+  "同键多实现与换实现"）、`crates/components/src/lib.rs`（模块注释指向本文）。
+
+## M8-后续②：流式 op（ADR 0001 §5 的落地，`call_iface_stream`）
+
+**新增 14 条测试**（210 → 224）：core 9（`crates/core/tests/stream.rs`）+
+host 5（`crates/host/tests/abi_stream.rs`）。
+
+### 契约（本里程碑定稿）
+- 调用方：`Context::call_iface_stream(service, version, method, args) -> Result<AsyncStream>`；
+- 提供者（跨 ABI）：`ctx_stream_push(dispatch_id, chunk, on_credit)`（#20）、
+  `ctx_stream_close(dispatch_id)`（#21）、`ctx_stream_fail(dispatch_id, reason)`（#22）；
+- 窗口 `STREAM_WINDOW = 4`；满窗口的推送返回 `STATUS_PENDING` 且**块没被接受**；
+  消费者每取走一块 ⇒ 宿主以 `kind:"stream-credit"` 回调**那条续延 id**
+  （载荷 `{"result":{"window":n,…}}`；`{"error":…}` = 流没了，停手）；
+- **插件的返回值 = 长度 1 的流**（不写流式代码的提供者也能按流调用；`ExternService::call_stream`
+  的默认实现就是它）；
+- 收尾恰好一次（close / fail / 消费者丢弃）：close **不丢缓冲**、fail **立刻给 Err**
+  （缓冲丢弃——与真实 LLM 流的处置一致）；
+- 卸载 / 取消 / 超时 / 消费者离场 ⇒ **先排水**：等待中的 credit 被驳回、流以**错误**结束、
+  记录连同帧一起摘掉（`pending_len` / `waterfall_len` / `streams_len` 全归零）。
+
+**与 ADR §5 的三处偏离（有意，ADR 里已注记）**：① 不设 `open-stream`——"流"就是那次派发本身
+（复用 `dispatch_id`），少一个 id 空间与一次往返；② ADR 的 "abort" 定名 `stream_fail`
+（与宿主→插件的 `ctx_abort` 区分开）；③ 额度由 `next()` 隐式归还（一名额一次回调），不引入
+额外 API（ADR 里的 `credit()` 因此不需要）。
+
+### 红档（先红后绿）
+- 首跑即**编译红**：core `E0432`（`StreamSink`/`AsyncStream`/`PushOutcome`/`StreamObserver`/
+  `StreamOutcome`/`STREAM_WINDOW` 未导出）+ `E0407`（`call_stream` 不是 trait 成员）；
+  host `E0432`（`KIND_STREAM_CREDIT`/`STATUS_STREAM_GONE`/`streams_len`）+ `E0609`（三个
+  `ctx_stream_*` 字段不存在）+ `E0599`（`call_iface_stream` 不存在）。
+- 实现中间态红：`Dyn::adapter` 返回 `Arc<dyn ExternService>`（不是 `IfaceRef`）⇒ `iface_target`
+  的返回类型与 `version`/`methods` 调用点都得跟着改；`match` 两臂类型不一致（E0308）；
+  `DispatchRecord` 缺 `stream` 字段（E0063）；sdk.rs 少导入 `STATUS_STREAM_GONE`
+  ⇒ 模式匹配把它当**变量**（E0408）；夹具 `MutexGuard` 未 `mut`（E0596）。
+- 夹具纠错 1 处：`loaded_instances()` 是**进程级**计数，并行跑的其他测试也在挂插件 ⇒
+  卸载用例不能断言它为 0（改成 `streams_len(handle) == 0` + `pending_len(handle) == 0`）。
+
+### 非空验证（mutation，三条，全部变红）
+| # | 变异 | 红 |
+|---|---|---|
+| 1 | `push_with` 满窗口时不登记 credit id | core 2 条 + host 3 条（含验收用例撞 10s 护栏：`100 块必须在 10s 内流完`） |
+| 2 | `AsyncStream::drop` 不通知任何一方 | core 1 条（"离场也恰好收尾一次"）+ host 1 条（"等待超时：插件观察到「流已经不在了」"） |
+| 3 | 卸载排水不把流以错误收场 | host 1 条（"提供者卸载 ⇒ 没读完的流必须以错误结束"） |
+
+### 验收（ADR §5 的口径）
+`abi_stream.rs::a_stream_flows_through_a_window_of_four_with_credit_callbacks`：100 块、窗口 4
+⇒ 逐块比对 `1..=100`；插件观测到的**未归还峰值 == 4**（既不超过窗口、也没有被浪费）；
+`blocked >= 1`（背压真的发生过）；结束计数全零。
+真 DLL 层：`harness-spike` 第 **8.5** 步（`harness.stream@1` 推 20 块 ⇒ 被挡 **16** 次、
+成功 20 块），stdout 连跑 3 次 SHA256 全同（**3221 → 3432 字节**）。
+
+### 执行期发现（两条）
+1. **构建失败被误判为通过**：`cargo build` 的日志路径写成 `"$env:TEMP%\x.log"`
+   （PowerShell **不展开** `%`）⇒ 读不到日志、只看退出码就放行；真实原因是漏了
+   `use std::sync::atomic::AtomicBool`（E0433）⇒ DLL 没重建，spike 加载的是**旧副本**，
+   表现为 `NoInject("harness.stream@1")`（键根本没被提供）。教训：**先读日志再下结论**，
+   并用"产物里有没有这个字符串"验证链路（本轮就是这样定案的）。
+2. **新键要同步加进 `provision:`**：`cordis_plugin!` 的 provision 是 M5 的"声明即能力"，
+   也是 A5 预挂载清单的来源；运行期提供但没声明的键会被 `ProvisionReport` 记为
+   "装了没声明"（Def 48）。新增的 `harness.stream@1` 已补上。
+
+### 计数汇总（本轮最终）
+- 全仓：**224 passed / 0 failed / 0 warnings**（212 → 224：core 9 + host 5）——
+  连跑 3 次同结果
+- demo：逐字节不变（5079 字节）；spike：3432 字节、3 次 SHA256 相同
+- 生产代码具名修改：`crates/core/src/stream.rs`（新）、`core/src/lib.rs`（模块与导出）、
+  `core/src/context.rs`（`call_iface_stream` + 抽出 `iface_target`/`check_iface_call`，
+  **既有 `call_iface` 的语义与错误文案逐字不变**）、`core/src/dyn_value.rs`
+  （`ExternService::call_stream` 默认实现）、`crates/abi/src/lib.rs`（#20–#22 + 两个常量）、
+  `crates/abi/src/sdk.rs`（三个能力 + `invoke_statused` + `Registry::forget` + `StreamPush`/
+  `StreamCredit`）、`crates/host/src/lib.rs`（`DispatchRecord.stream`、流观察者、三个宿主 op、
+  credit 投递、四条收口路径、`streams_len`）
+- 既有测试的**具名**修改：`crates/abi/tests/v1_shape.rs`（尾字段 8 → 11 + 末尾断言换到
+  `ctx_stream_fail`）、`crates/abi/tests/copy_on_attach.rs`（`HostApi` 字面量补三个 `None`）、
+  `crates/abi/src/sdk.rs` 的 `host_with`（同上）
+- 示例：`examples/plugins/harness-tool/src/lib.rs`（`harness.stream@1` + `Streamer` +
+  provision 补键 + `AtomicBool` 导入）、`examples/harness-spike/src/main.rs`（第 8.5 步）
+
+## 终验收（A1..A11 复跑）与缺陷 7 闭环
+
+缺陷 7 是**验收期**抓到的一条既有问题（不在原方案清单内）。
+
+- 全仓：**224 → 225 passed / 0 failed / 0 warnings**（+1 回归测试；连跑 3 次同结果）。
+- demo：逐字节 5079B；**20 次连跑 0 次抖动**（修前 20 次里 1 次）；8 次 stdout SHA256 全同。
+- spike：3432B、5 次 SHA256 全同（`5F8F38…`）。
+- 各 A 项的定向测试与现场输出见 `SDK方案.md` **附录 F**。
+
+### 缺陷 7：装载器收尾期"晚到的一轮对账"往已拆掉的 `loader.report` 写值
+
+- **现象**：demo 快照约 **1/20** 的概率多 107 字节 ——
+  `length mismatch: expected 5079 bytes, actual 5186 bytes`，多出来的正是
+  `[WARN ] cordis:include: 刷新 loader.report 失败: cannot set property "loader.report" without provide`。
+- **判定**：不是异常，是**正常时序**。`loader.report` 的提供者**就是装载器自己**
+  （`load_with_source` 在 `provide` 之后才 `mark_report_published`），装载器拆到一半
+  （`Unloading`/`Disposed`）或依赖没齐（`Pending`）时这一写必然失败。
+- **修复**：`crates/host/src/loader.rs::publish_report` 在**装载器自己不在
+  `FiberState::Active`** 时直接返回（与 `attach_self_dispose_observer` 的第 2 条判定同源）；
+  只有"还 ACTIVE 却写不进自己的报告"才继续报警。
+- **回归（新 1 条）**：`crates/host/tests/loader_reconcile.rs::
+  a_reconcile_after_the_loader_fiber_is_disposed_does_not_publish`
+  —— 装载器挂在一个**自己的**插件 fiber 下 ⇒ 拆掉 ⇒ 再来一轮 `sync()` ⇒
+  断言日志里没有那句话、且 `loader.report` 已随提供者消失。
+  具名修改：`loader_reconcile.rs` 的 import 行加 `FiberState`。
+- **非空验证（mutation）**：去掉守卫 ⇒ 该条红（`收尾期不许再发布报告`）。
+
+
+
+
+
+
+

@@ -1,0 +1,19 @@
+[package]
+name = "abi-v1-frozen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 独立 crate：不加入 workspace，也不继承 workspace 依赖。
+# `src/lib.rs` 是 `crates/abi/src/lib.rs` 的冻结副本（已去掉 sdk 模块），
+# 再加上一个最小插件入口。下一次 ABI 变更后，它就是真正的“旧版”。
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[features]
+# 只给宿主测试用：分别制造“版本不兼容”和“尺寸不足”的坏夹具。
+bad-version = []
+bad-size = []
+
+[workspace]

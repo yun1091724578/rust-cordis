@@ -1,0 +1,10 @@
+# 可选的本机配置示例：复制到 ~/.cargo/config.toml，或按需取消注释。
+#
+# 仓库级 .cargo/config.toml 故意不包含下面这些机器相关内容。
+
+# [http]
+# proxy = "http://127.0.0.1:7897"
+
+# [build]
+# target-dir = "C:/cordis-rs-target"
+# rustflags = ["-C", "prefer-dynamic=no"]

@@ -1,0 +1,27 @@
+[package]
+name = "harness-spike"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "装载器/ABI 真 DLL 冒烟 spike（M11：总验收的两层落地）"
+publish = false
+
+# 领域层放进 **lib**：`cargo test` 的无 DLL 层（`tests/e2e.rs`）与真 DLL 层
+# （`src/main.rs`）用同一份领域代码——否则"两层断言同一件事"就无从谈起。
+[lib]
+name = "harness_spike"
+path = "src/lib.rs"
+
+[[bin]]
+name = "harness-spike"
+path = "src/main.rs"
+
+[dependencies]
+cordis-abi = { workspace = true }
+cordis-cli = { workspace = true }
+cordis-components = { workspace = true }
+cordis-core = { workspace = true }
+cordis-host = { workspace = true }
+cordis-sdk = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

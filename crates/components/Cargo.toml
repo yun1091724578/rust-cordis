@@ -1,0 +1,15 @@
+[package]
+name = "cordis-components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Cordis 标准组件库：registry（具名槽位 / 原地替换，M7）"
+publish = false
+
+[dependencies]
+cordis-core = { workspace = true }
+cordis-sdk = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

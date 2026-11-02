@@ -1,0 +1,23 @@
+[package]
+name = "cordis-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Cordis 插件 SDK 门面：typed 服务/事件/配置的过程宏与运行时胶水（M6）"
+publish = false
+
+# 宏展开的代码一律写 `::cordis::…`，因此**库名必须是 cordis**（包名照旧是 cordis-sdk）。
+# 插件作者只需要这一条依赖；`cordis_core` / `cordis_abi::sdk` 都从这里再导出（M6）。
+[lib]
+name = "cordis"
+path = "src/lib.rs"
+
+[dependencies]
+cordis-core = { workspace = true }
+cordis-abi = { workspace = true }
+cordis-macros = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

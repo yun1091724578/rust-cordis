@@ -1,0 +1,19 @@
+[package]
+name = "abi-err-v1"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 独立 crate：不加入 workspace，也不继承 workspace 依赖。
+# 这是一个**旧 ABI 错误夹具**：布局停在 72B v1 前缀，不跟随当前 PluginDesc。
+# 它只返回纯文本 STATUS_ERR；新宿主必须保留文本，并把结构化字段按 unknown 处理。
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[features]
+# 保留与 abi-v1 相同的坏门禁特性，便于复用构建/加载测试的失败路径。
+bad-version = []
+bad-size = []
+
+[workspace]

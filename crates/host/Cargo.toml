@@ -1,0 +1,15 @@
+[package]
+name = "cordis-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cordis 宿主：动态库加载 + C ABI 适配 + cordis.yml/patch 兼容装载器"
+
+[dependencies]
+cordis-core = { workspace = true }
+cordis-abi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }

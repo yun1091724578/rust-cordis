@@ -1,0 +1,24 @@
+[package]
+name = "cordis-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Cordis 命令行工具：inspect（M5）/ validate / run"
+publish = false
+
+[[bin]]
+name = "cordis"
+path = "src/main.rs"
+
+[lib]
+name = "cordis_cli"
+path = "src/lib.rs"
+
+[dependencies]
+cordis-core = { workspace = true }
+cordis-host = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
