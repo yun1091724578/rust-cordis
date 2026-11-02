@@ -27,7 +27,7 @@
 
 | 阶段 | 当前判断 | 已落地证据 | 未闭合 / 下一出口 |
 |---|---|---|---|
-| 0：验证基线 | 交付物完成，出口未满足 | 支持契约 25 行 / 17 条保证；API 清单；冻结 ABI v1 夹具；资源基线；`.\cargo.cmd xtask ci` 在 Windows GNU 全量通过；首发封存入口与同版本 `inspect` 本地演练（r3）；`cargo xtask soak` 本地 1000 轮通过 | **A5 关闭**：三平台真实结果、正式首发产物归档、历史产物 × 后续宿主、夜间 soak、其余发布前项 |
+| 0：验证基线 | 交付物完成，出口未满足 | 支持契约 25 行 / 17 条保证；API 清单；冻结 ABI v1 夹具；资源基线；`.\cargo.cmd xtask ci` 在 Windows GNU 全量通过；**三平台 CI 首跑通过**（[run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)，17 条保证 × 4 平台矩阵已实填）；首发封存入口与同版本 `inspect` 本地演练（r3）；`cargo xtask soak` 本地 1000 轮通过 | **A5 关闭**：正式首发产物归档、历史产物 × 后续宿主、夜间 soak、其余发布前项 |
 | 1：结果语义 | 完成（含已知例外） | ADR 0003 已冻结；八个契约词汇；§7 失败路径证据列；超时措辞收窄 | 事件路径没有返回协议，是已知例外，不为此新增协议 |
 | 2：结构化错误 | 完成（A4 已收口，含已知边界） | ADR 0004 设计已接受；能力位 / 编解码 / 双向 `STATUS_ERR` / 详细入口 / 有界降级；异步 `on_done`、卸载 / 取消、provider 业务错误、超时和真实旧 ABI 错误均有测试；兼容矩阵是 **2 格真 e2e + 2 个降级分支桩 / 单测** | 分类 / 重试消费者留到阶段 4；事件路径无返回协议；详细入口的同步失败仍为 `String`，宿主预解析仍文本 |
 | 3：声明与诊断 | 完成 | 配置 schema 在 `Capabilities` / CLI 可见；`Fiber::pending_injects` + `report.pending` + `cordis status` 解释缺失键 / 版本 / 未就绪 / 跨域 / 环；能力来源标注为插件自述 | 不承诺按 schema 自动校验；方法 I/O schema / 副作用声明留待消费者 |
@@ -41,19 +41,19 @@
 
 | 顺序 | 工作 | 关闭条件 | 依赖 / 边界 |
 |---|---|---|---|
-| 1 | **A5-1 三平台 CI 首跑 + 平台矩阵实填** | Linux / Windows MSVC / macOS 实际编译、运行全量测试与真 DLL e2e；把每个平台的真实结果逐条填入 `docs/platform-matrix.md` | **下一步**；需要可运行的 GitHub Actions；Windows GNU 本地结果不能代替三平台结果 |
-| 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | 可与 A5-1 并行；它推进发布证据，但不关闭平台出口 |
-| 3 | A5-3 正式首发封存 | 在干净发布源码树上重跑 `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `plugins` / `smoke` 目录；同版本 `inspect` 证据随产物归档 | 等三平台结果和发布候选版本冻结后再做；r3 只是本地演练，不是正式发布 |
+| 1 | **A5-1 三平台 CI 首跑 + 平台矩阵实填** | Linux / Windows MSVC / macOS 实际编译、运行全量测试与真 DLL e2e；把每个平台的真实结果逐条填入 `docs/platform-matrix.md` | **已完成**：2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)（commit `ea0489e`）三平台 `test` job 全绿；17 条保证 × 4 平台已填 `通过` |
+| 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | **下一步**；A5-1 已完成；它推进发布证据，但不关闭平台出口 |
+| 3 | A5-3 正式首发封存 | 在干净发布源码树上重跑 `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `plugins` / `smoke` 目录；同版本 `inspect` 证据随产物归档 | 三平台结果已通过；等发布候选版本冻结后再做；r3 只是本地演练，不是正式发布 |
 | 4 | A5-4 历史产物 × 后续宿主 | 后续宿主版本加载已封存的首发产物，再把“历史发布版”从**待验证**转成**保证**或明确拒绝 | 被后续宿主版本阻塞；不能用同版本加载冒充跨版本兼容 |
-| 5 | A5-5 关闭其余发布前项 | 仓库 URL、Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测；`release.md` 的发布前项关闭或明确延期 | 需要发布仓库 / 管理员权限 |
+| 5 | A5-5 关闭其余发布前项 | `Cargo.toml` 的 `repository` / `homepage` 元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测；`release.md` 的发布前项关闭或明确延期 | 私有仓库已建立；公开发布地址 / 管理员权限仍待确认 |
 
-**下一步先做 A5-1。** 阶段 0 的出口问的是“哪些保证在哪些平台实际验证过”，而当前只有
-Windows GNU 的单机结果；Windows MSVC、Linux、macOS 仍未执行，Unix 仅做过 `cargo check`。
-在三平台首跑之前继续增加本地功能，不会提高这个出口的可信度。
+**A5-1 已完成，下一步做 A5-2 夜间 soak。** 阶段 0 的平台出口已经由真实三平台结果回答：
+Windows MSVC、Linux、macOS 的 `test` job 全绿，平台矩阵 17 条保证已逐条填 `通过`。
+剩下的是长跑证据、正式首发封存和历史产物验证，不再需要重复证明平台维度。
 
-当前工作区没有 git 仓库 / 远端，A5-1 需要先把代码放到能运行 GitHub Actions 的仓库；
-这是外部步骤，不是本地代码改动。暂时不能跑 Actions 时，唯一可并行的本地动作是
-**A5-2 夜间 soak**；它可以提前积累长跑证据，但不能替代平台矩阵。
+A5-2 应在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档；当前本地
+1000 轮只是入口演练，不能替代夜间 soak。A5-3 必须等发布候选版本冻结后再执行；A5-4
+必须等后续宿主版本，不能用同版本加载冒充跨版本兼容。
 
 **现在不要启动**：
 
@@ -68,7 +68,7 @@ Windows GNU 的单机结果；Windows MSVC、Linux、macOS 仍未执行，Unix �
 | 1 | 支持契约 | `docs/support-contract.md` | 完成 |
 | 2 | 结果与错误契约 ADR | `docs/adr/0003-result-and-error-contract.md` | 完成 |
 | 3 | ABI 错误演进 ADR | `docs/adr/0004-abi-error-evolution.md` | 设计已接受；阶段 2 已实施，边界见 ADR |
-| 4 | 保证索引检查器 | `cargo xtask docs` + `xtask/src/contract.rs` 单测 | 完成（54 bin + 17 CLI；文档 25 行 / 17 保证） |
+| 4 | 保证索引检查器 | `cargo xtask docs` + `xtask/src/contract.rs` 单测 | 完成（55 bin + 17 CLI；文档 25 行 / 17 保证） |
 | 5 | 失败路径清单 | ADR 0003 §7 | 完成 |
 | 6 | 资源增长基线测试 | `crates/host/tests/resource_baseline.rs` + `staged.rs` | 完成（8 轮 × 7 路径；64 轮暂存；A5 另有本地 1000 轮 soak） |
 | 7 | 真实旧插件夹具 | `tests/fixtures/abi-v1` + `frozen_plugin.rs` | 完成（冻结 ABI v1；历史发布版仍待验证） |
@@ -106,12 +106,13 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
 
 ### A5：平台与发布证据
 
-- [ ] **三平台 CI 首跑**：Linux / Windows MSVC / macOS 实际编译、运行测试与真 DLL e2e；
-      记录首次结果。
+- [x] **三平台 CI 首跑**：Linux / Windows MSVC / macOS 实际编译、运行测试与真 DLL e2e；
+      2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)
+      三平台 `test` job 全绿。
 - [x] 保证 × 平台矩阵结构：`docs/platform-matrix.md` 由 `cargo xtask matrix` 检查，
       17 条保证逐条有行、四个平台列与证据；Windows GNU 已填本地结果。
-- [ ] **平台矩阵真实结果**：Windows MSVC / Linux / macOS 首次 CI 后逐条填写，不能只写
-      “CI 通过”；不能把结构通过当成平台通过。
+- [x] **平台矩阵真实结果**：Windows MSVC / Linux / macOS 首次 CI 后逐条填 `通过`；
+      记录 run URL 与 commit，不能只写结构通过。
 - [x] **首发封存入口与同版本加载检查**：`cargo xtask seal` 构建宿主目标 release 插件，
       记录源码树 / 工具链 / ABI / SHA256，保存 `smoke/inspect.txt`，并强制三个预期
       artifact 集合；`cargo xtask seal --verify` 只读复验。2026-11-02 在 Windows GNU
@@ -134,9 +135,8 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
       `sc stop`；三平台结果与平台矩阵见上。
 
 **阶段 0 出口（未满足）**：`docs/release.md` 必须能回答“哪些保证在哪些平台实际验证过”，
-而不是只有一条 CI 通过结论。当前只有本地 Windows GNU 套件结果；Windows MSVC、
-Linux、macOS 尚未执行，Unix 仅做过 `cargo check`。保证 × 平台矩阵的真实结果和历史
-发布版 × 新宿主都未完成。该出口由 A5 关闭。
+而不是只有一条 CI 通过结论。平台矩阵已经用首次三平台 CI 实填；剩下的是正式首发产物
+封存、同版本产物证据归档、历史发布版 × 新宿主，以及夜间 soak。该出口仍由 A5 关闭。
 
 ## 阶段 1：冻结结果与错误语义
 
@@ -296,11 +296,11 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 
 | 验收层 | 核心问题 | 本仓落点 | 当前判断 |
 |---|---|---|---|
-| 契约测试 | 语义与降级规则是否保持 | `support-contract.md` + `cargo xtask docs` | 25 行 / 17 保证，本地绿；平台维度待 A5 |
+| 契约测试 | 语义与降级规则是否保持 | `support-contract.md` + `cargo xtask docs` | 25 行 / 17 保证；本地与首次三平台 CI 均绿 |
 | 确定性交错测试 | 取消、完成、关闭同时发生时谁先 | `lifecycle_races.rs`、`abi_m2c.rs` | 已有测试；新增交错随变更补 |
 | 资源回归 | 成功与失败路径是否都能回收 | `weak_audit.rs`、`resource_baseline.rs`、`staged.rs`、`soak.rs` | 8 轮 × 7 路径 + 64 轮暂存 + 本地 1000 轮 soak；夜间长跑未做 |
 | 兼容测试 | 旧 ABI 二进制（冻结快照）是否仍工作 | `abi_matrix.rs`、`tests/fixtures/abi-v1`、`frozen_plugin.rs`、`legacy_error.rs` | 冻结 v1 与真实 72B 旧插件错误已绿；历史发布版待 A5；旧宿主格是桩；旧 Rust 调用者 API 稳定性仍待单列 |
-| 多平台验证 | 装载、卸载、信号、文件替换 | CI + `release.md` | 本地只有 Windows GNU；Unix 仅 `cargo check`；三平台首次结果待 A5 |
+| 多平台验证 | 装载、卸载、信号、文件替换 | CI + `release.md` | Windows GNU 本地 + Windows MSVC / Linux / macOS 首次 CI 均通过；后续变更需重跑 |
 | 压力测试 | 长时间重复操作后是否稳定 | `resource_baseline.rs`（8 轮）/ `staged.rs`（64 轮）/ `soak.rs`（1000 轮） | 本地 1000 轮有；夜间长跑未做 |
 | 故障注入 | 明确故障点是否得到契约允许的结果 | 阶段 2 / 5 | 已覆盖错误边界；崩溃恢复随恢复协议建设 |
 
@@ -330,7 +330,7 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 - 绿档：8 个用例通过；`cargo xtask docs` 对 `docs/support-contract.md` 通过。
 - 第二轮 P0 / P1：新增 9 个 bin 用例失败（真测试判定、路径逃逸、表头、围栏、转义、
   重复节、非保证行路径、索引行数、panic 行状态）；修复后 17 bin + 3 CLI 通过。
-- 当前：54 bin + 17 CLI；文档 25 行 / 17 保证；`cargo xtask ci` 已包含
+- 当前：55 bin + 17 CLI；文档 25 行 / 17 保证；`cargo xtask ci` 已包含
   `inventory --check`、`docs` 与 `matrix`，首发 `seal` 与 `soak` 是发布时入口，不在 `ci` 内。
 
 ### 第一批 #6：资源增长基线
@@ -455,6 +455,23 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 - 门禁：`cargo xtask docs` 通过（25 行 / 17 保证）；`inventory` 23 / 4 / 41 / 56 / 32；
   demo 的装载报告已加入 `"pending":[]` 并重新通过字节级快照（4998 bytes）。
 
+### A5-1：首次三平台 CI
+
+- 2026-11-02 在私有仓库 `yun1091724578/rust-cordis` 首次运行 GitHub Actions；
+  最终 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)
+  （commit `ea0489e`）的 `test (windows-latest)`、`test (ubuntu-latest)`、
+  `test (macos-latest)`、`lint`、`msrv`、`package` 全部成功。
+- 前三次运行暴露并修复了四个真实的跨平台问题：
+  1. `tests/fixtures/abi-v1/Cargo.toml` 的冻结哈希依赖 CRLF 检出；新增
+     `.gitattributes` 固定 `tests/fixtures/**` 为 `eol=lf`，并更新 README 哈希。
+  2. demo 的配置目录与 Unix 二进制 `cordis-demo` 同名；改为 `cordis-demo-config`。
+  3. harness-spike 同理，配置目录改为 `harness-spike-config`。
+  4. inventory 读取源码时未归一化 CRLF，marker 在 Windows MSVC 上匹配失败；
+     `read` 现在先归一化为 LF，并新增 CRLF 回归用例。
+- 平台矩阵 17 条保证在 Windows GNU / Windows MSVC / Linux / macOS 四列均填 `通过`；
+  Windows GNU 来自本地 `.\cargo.cmd xtask ci`，其余来自上述 CI 的完整测试 + demo + e2e。
+- 记录边界：这是**一次**通过的 CI 结果，不是持续保证；后续变更仍需重新跑三平台。
+
 ### A5：首发封存入口与同版本加载检查
 
 - 命令：`cargo xtask seal [--out <dir>]` 构建三个宿主目标 release cdylib，写
@@ -475,7 +492,7 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
   **本地演练**，正式首发归档仍未完成；r3 的源码快照早于后续文档改动，正式首发
   必须在干净源码树上重跑。
 - 边界：`seal --verify` 只做完整性校验，不是真实性 / 签名验证。
-- 测试：xtask 54 bin + 17 CLI；`seal --verify` 成功路径、失败路径、拒绝覆盖与
+- 测试：xtask 55 bin + 17 CLI；`seal --verify` 成功路径、失败路径、拒绝覆盖与
   冲突参数均有 CLI 用例。SHA-256 使用空串、56 / 64 / 112 字节与 1,000,000
   字节已知向量；cargo artifact JSON 解析有独立用例。
 
@@ -499,7 +516,7 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 - 边界：暂存部分是 `stage_plugin` / `StagedFile` 的 primitive 记账，不覆盖
   loader 真 DLL 的 `LoadedPlugin::open_staged`；带在飞派发 dispose、
   `ctx_dispose_self` 与 `App::close` 仍由各自专项测试覆盖。
-- 测试计数：xtask 54 bin + 17 CLI；`soak 0` / 非数字 / 多余参数退出码 2，
+- 测试计数：xtask 55 bin + 17 CLI；`soak 0` / 非数字 / 多余参数退出码 2，
   `soak --help` 退出码 0，均有 CLI 用例。
 
 ### A5：harness step 9 的异步卸载等待
