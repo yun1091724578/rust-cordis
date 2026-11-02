@@ -710,7 +710,9 @@ fn unique_marker(source: &str, marker: &str) -> Result<(), String> {
 }
 
 fn read(root: &Path, source: &str) -> Result<String, String> {
-    std::fs::read_to_string(root.join(source)).map_err(|err| format!("读取 {source} 失败: {err}"))
+    std::fs::read_to_string(root.join(source))
+        .map(|text| text.replace("\r\n", "\n"))
+        .map_err(|err| format!("读取 {source} 失败: {err}"))
 }
 
 fn source_text<'a>(
@@ -914,6 +916,16 @@ impl X {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn read_normalizes_crlf_before_marker_matching() {
+        let dir = std::env::temp_dir().join(format!("cordis-inventory-crlf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("创建临时目录");
+        std::fs::write(dir.join("source.rs"), "first\r\nsecond\r\n").expect("写临时源码");
+        assert_eq!(read(&dir, "source.rs").expect("读取临时源码"), "first\nsecond\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

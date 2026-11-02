@@ -91,7 +91,8 @@ async fn main() -> Result<()> {
         .parent()
         .map(PathBuf::from)
         .expect("可执行文件必须有父目录");
-    let config_dir = exe_dir.join("cordis-demo");
+    // 二进制本身叫 `cordis-demo`；Unix 没有 `.exe` 后缀，配置目录不能同名。
+    let config_dir = exe_dir.join("cordis-demo-config");
     std::fs::create_dir_all(&config_dir)?;
 
     // 演示用的两份配置：主配置 + 用户 patch 层。
