@@ -46,7 +46,8 @@ async fn main() -> Result<()> {
         .parent()
         .map(PathBuf::from)
         .expect("可执行文件必须有父目录");
-    let config_dir = exe_dir.join("harness-spike");
+    // 二进制本身叫 `harness-spike`；Unix 没有 `.exe` 后缀，配置目录不能同名。
+    let config_dir = exe_dir.join("harness-spike-config");
     std::fs::create_dir_all(&config_dir)?;
     let dll = exe_dir.join(format!(
         "{}harness_tool{}",

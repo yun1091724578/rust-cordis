@@ -920,11 +920,15 @@ impl X {
 
     #[test]
     fn read_normalizes_crlf_before_marker_matching() {
-        let dir = std::env::temp_dir().join(format!("cordis-inventory-crlf-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cordis-inventory-crlf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("创建临时目录");
         std::fs::write(dir.join("source.rs"), "first\r\nsecond\r\n").expect("写临时源码");
-        assert_eq!(read(&dir, "source.rs").expect("读取临时源码"), "first\nsecond\n");
+        assert_eq!(
+            read(&dir, "source.rs").expect("读取临时源码"),
+            "first\nsecond\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
