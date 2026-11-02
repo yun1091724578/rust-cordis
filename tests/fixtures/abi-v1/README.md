@@ -36,9 +36,10 @@
 |---|---|
 | 来源 `crates/abi/src/lib.rs` | `EB7EA39C9499AABD585471E94105F10EC5E75A768D949F81A07DF595780BE1CB` |
 | 夹具 `src/lib.rs` | `7740D09228A1ED3F00FA77CBA98486634241CBAEDF704D771047CD90361E2B8E` |
-| 夹具 `Cargo.toml` | `CF099A3F00B778C094E3E6C937BF6DA7FB743909DA079C290FB6B71086F8C5FA` |
+| 夹具 `Cargo.toml` | `1C91F3296AADF96335401FEF192643C07E8872A96217EBE5A472D92D78842CEC` |
 
-来源哈希是快照时的出处；A3 之后 HEAD 已多次变化，夹具仍是 `EB7EA39C…`
+哈希按 **LF 字节**计算；根目录 `.gitattributes` 把 `tests/fixtures/` 固定为 `eol=lf`，
+避免 Windows CRLF 检出改变夹具字节。来源哈希是快照时的出处；A3 之后 HEAD 已多次变化，夹具仍是 `EB7EA39C…`
 时的冻结副本，不跟随当前 ABI。
 夹具 `Cargo.lock` 零依赖，`--locked` 用它保证构建不漂移。
 

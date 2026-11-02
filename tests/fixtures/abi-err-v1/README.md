@@ -18,7 +18,9 @@
 | 文件 | SHA256 |
 |---|---|
 | `src/lib.rs` | `5dc6b27fca154e178896eba017f6550b308cccd8a3315952897d8f9deb3e1f10` |
-| `Cargo.toml` | `33a41d49076bde3594010fe26e85a570ec5bc6c9e3ceac92e93f071ddb83cf12` |
+| `Cargo.toml` | `be4eea93b83abcd282ee90d2690c63b11d92ee5849eb00862edfbf64110ad50e` |
 
-来源：`tests/fixtures/abi-v1` 的 v1 布局快照，按错误场景裁剪为本夹具；修改源码或
-清单时必须有意更新本表，不能跟随 workspace HEAD 自动漂移。
+哈希按 **LF 字节**计算；根目录 `.gitattributes` 把 `tests/fixtures/` 固定为 `eol=lf`，
+避免 Windows CRLF 检出改变夹具字节。来源：`tests/fixtures/abi-v1` 的 v1 布局快照，
+按错误场景裁剪为本夹具；修改源码或清单时必须有意更新本表，不能跟随 workspace HEAD
+自动漂移。

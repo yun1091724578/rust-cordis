@@ -1,0 +1,2 @@
+# Fixture hashes are byte-level contracts; keep LF on every checkout.
+tests/fixtures/** text eol=lf
