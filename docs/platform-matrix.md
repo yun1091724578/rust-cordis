@@ -10,7 +10,9 @@
 
 当前基线：2026-11-02 完成首次三平台 CI（run
 [`41460414477`](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)，
-commit `ea0489e`）。Windows MSVC / Linux / macOS 的 `test` job 均通过完整
+commit `ea0489e`）；2026-11-03 评审修正后再次全绿（run
+[`41560497289`](https://github.com/yun1091724578/rust-cordis/actions/runs/41560497289)，
+commit `617f470`）。Windows MSVC / Linux / macOS 的 `test` job 均通过完整
 `cargo test --workspace --all-targets --locked`、`cargo xtask demo` 与
 `cargo xtask e2e`；Windows GNU 另有 2026-11-03 本地 `.\cargo.cmd xtask ci`
 （exit 0）全量通过。逐条保证的测试名见 `docs/support-contract.md`。

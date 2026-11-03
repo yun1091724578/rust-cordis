@@ -42,7 +42,7 @@
 
 ### A5-1 已关闭
 
-- [x] **首次 GitHub Actions 三平台结果**：2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)（commit `ea0489e`）已通过；Linux / Windows MSVC / macOS 的 `test` job 均完成全量测试、demo 与真 DLL e2e，`lint` / `msrv` / `package` 也通过。一次通过不是持续保证，后续变更需重跑。
+- [x] **首次 GitHub Actions 三平台结果**：2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)（commit `ea0489e`）已通过；2026-11-03 评审修正后 [run 41560497289](https://github.com/yun1091724578/rust-cordis/actions/runs/41560497289)（commit `617f470`）再次全绿。Linux / Windows MSVC / macOS 的 `test` job 均完成全量测试、demo 与真 DLL e2e，`lint` / `msrv` / `package` 也通过。通过结果不是持续保证，后续变更需重跑。
 - [x] **保证 × 平台矩阵**：`docs/platform-matrix.md` 的 17 条保证已在 Windows GNU / Windows MSVC / Linux / macOS 四列实填 `通过`，依据是上述三平台 CI 与本地 Windows GNU 全量门禁；表内注明这是快照，后续变更需重跑。
 - [x] **验证入口可重复**：本机 `cargo.cmd` 解决 Windows GNU 的 `dlltool/as` 与固定目录/代理；三平台 CI 已获得一次通过结果，但跨机可重复性仍需在后续变更上重跑验证。
 

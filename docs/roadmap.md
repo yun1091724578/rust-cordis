@@ -463,7 +463,9 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 - 2026-11-02 在私有仓库 `yun1091724578/rust-cordis` 首次运行 GitHub Actions；
   最终 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)
   （commit `ea0489e`）的 `test (windows-latest)`、`test (ubuntu-latest)`、
-  `test (macos-latest)`、`lint`、`msrv`、`package` 全部成功。
+  `test (macos-latest)`、`lint`、`msrv`、`package` 全部成功；2026-11-03 评审修正后
+  [run 41560497289](https://github.com/yun1091724578/rust-cordis/actions/runs/41560497289)
+  （commit `617f470`）再次全绿。
 - 前三次运行暴露并修复了四个真实的跨平台问题，另有一次 lint 格式失败：
   1. `tests/fixtures/abi-v1` 的 `Cargo.toml` / `src/lib.rs` 冻结哈希依赖检出换行；
      新增 `.gitattributes` 固定 `tests/fixtures/**` 为 `eol=lf`，更新 README 中
