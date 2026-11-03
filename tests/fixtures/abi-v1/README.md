@@ -30,6 +30,10 @@
 同时更新下面的哈希与测试；`frozen_plugin.rs` 会重算 `src/lib.rs` 与
 `Cargo.toml` 的 SHA256，和本表不一致就失败。否则“旧插件”会悄悄变成“当前插件”。
 
+- 2026-11-02（A5-1）：只把按 CRLF 检出算出的 `Cargo.toml` 哈希更正为 LF 字节哈希；
+  夹具源码字节未改。`.gitattributes` 从此把 `tests/fixtures/**` 固定为 `eol=lf`，
+  测试在算哈希前也会把 CRLF 归一化为 LF。
+
 ## Provenance
 
 | 文件 | SHA256 |

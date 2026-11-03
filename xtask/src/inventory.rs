@@ -710,6 +710,7 @@ fn unique_marker(source: &str, marker: &str) -> Result<(), String> {
 }
 
 fn read(root: &Path, source: &str) -> Result<String, String> {
+    // 多行 marker 含 `\n`；CRLF 检出必须先归一化，否则 Windows 上匹配不到。
     std::fs::read_to_string(root.join(source))
         .map(|text| text.replace("\r\n", "\n"))
         .map_err(|err| format!("读取 {source} 失败: {err}"))
@@ -925,9 +926,11 @@ impl X {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("创建临时目录");
         std::fs::write(dir.join("source.rs"), "first\r\nsecond\r\n").expect("写临时源码");
-        assert_eq!(
-            read(&dir, "source.rs").expect("读取临时源码"),
-            "first\nsecond\n"
+        let text = read(&dir, "source.rs").expect("读取临时源码");
+        assert_eq!(text, "first\nsecond\n");
+        assert!(
+            unique_marker(&text, "first\nsecond").is_ok(),
+            "CRLF 源码归一化后必须能匹配多行 marker"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -6,7 +6,8 @@
   `schema` / `attach` / `call`），没有 `provision` / `error_format` / `reserved`；
   源码内有 72B 编译期断言；
 - `OP_APPLY` 与 `OP_CALLBACK` 都返回**纯文本** `STATUS_ERR`；
-- 它不跟随 HEAD，也不被 `abi-v1` 的冻结哈希门禁覆盖；`abi-v1` 的哈希与字节保持不变；
+- 它不跟随 HEAD，也不被 `abi-v1` 的冻结哈希门禁覆盖；`abi-v1` 的源码字节保持不变，
+  其 README 的 `Cargo.toml` 哈希在 A5-1 按 LF 字节更正过一次；
 - 用途是验证新宿主收到旧插件错误时保留可读文本，并把缺失的结构字段按 `unknown`
   处理，而不是误判成“无错误”或“未执行”。
 
@@ -20,7 +21,8 @@
 | `src/lib.rs` | `5dc6b27fca154e178896eba017f6550b308cccd8a3315952897d8f9deb3e1f10` |
 | `Cargo.toml` | `be4eea93b83abcd282ee90d2690c63b11d92ee5849eb00862edfbf64110ad50e` |
 
-哈希按 **LF 字节**计算；根目录 `.gitattributes` 把 `tests/fixtures/` 固定为 `eol=lf`，
-避免 Windows CRLF 检出改变夹具字节。来源：`tests/fixtures/abi-v1` 的 v1 布局快照，
-按错误场景裁剪为本夹具；修改源码或清单时必须有意更新本表，不能跟随 workspace HEAD
-自动漂移。
+哈希按 **LF 字节**计算；根目录 `.gitattributes` 把 `tests/fixtures/**` 固定为 `eol=lf`，
+避免 Windows CRLF 检出改变夹具字节。本表目前是**文档记录**：`legacy_error.rs` 校验
+72B 布局与文本降级，但不重算这两行哈希；只有 `abi-v1` 的哈希由 `frozen_plugin.rs`
+自动门禁。来源：`tests/fixtures/abi-v1` 的 v1 布局快照，按错误场景裁剪为本夹具；
+修改源码或清单时必须有意更新本表，不能跟随 workspace HEAD 自动漂移。

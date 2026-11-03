@@ -222,6 +222,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
     h.iter().map(|word| format!("{word:08x}")).collect()
 }
 
+/// 冻结夹具记录的是 LF 归一化后的字节；旧 CRLF 检出不应改变 provenance。
+fn sha256_lf_hex(bytes: &[u8]) -> String {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+    }
+    sha256_hex(&normalized)
+}
+
 /// 从 README 的 provenance 表里取某个文件的 SHA256。
 fn readme_hash(readme: &str, file: &str) -> String {
     let needle = format!("`{file}`");
@@ -244,17 +260,23 @@ async fn a_frozen_abi_v1_cdylib_loads_and_calls() {
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         "SHA-256 自检失败"
     );
+    assert_eq!(
+        sha256_lf_hex(b"a\r\nb\r\n"),
+        sha256_hex(b"a\nb\n"),
+        "严格 CRLF 检出必须与 LF 字节得到同一冻结哈希"
+    );
 
     // 冻结纪律：夹具源码/清单必须与 README 记录一致。
     let fixture = repo_root().join("tests/fixtures/abi-v1");
     let readme = std::fs::read_to_string(fixture.join("README.md")).expect("读取夹具 README");
-    let lib_hash = sha256_hex(&std::fs::read(fixture.join("src/lib.rs")).expect("读取夹具源码"));
+    let lib_hash = sha256_lf_hex(&std::fs::read(fixture.join("src/lib.rs")).expect("读取夹具源码"));
     assert_eq!(
         lib_hash,
         readme_hash(&readme, "src/lib.rs"),
         "夹具源码变了：必须有意更新 README 的哈希（永不跟随 HEAD）"
     );
-    let toml_hash = sha256_hex(&std::fs::read(fixture.join("Cargo.toml")).expect("读取夹具清单"));
+    let toml_hash =
+        sha256_lf_hex(&std::fs::read(fixture.join("Cargo.toml")).expect("读取夹具清单"));
     assert_eq!(
         toml_hash,
         readme_hash(&readme, "Cargo.toml"),

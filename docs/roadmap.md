@@ -27,7 +27,7 @@
 
 | 阶段 | 当前判断 | 已落地证据 | 未闭合 / 下一出口 |
 |---|---|---|---|
-| 0：验证基线 | 交付物完成，出口未满足 | 支持契约 25 行 / 17 条保证；API 清单；冻结 ABI v1 夹具；资源基线；`.\cargo.cmd xtask ci` 在 Windows GNU 全量通过；**三平台 CI 首跑通过**（[run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)，17 条保证 × 4 平台矩阵已实填）；首发封存入口与同版本 `inspect` 本地演练（r3）；`cargo xtask soak` 本地 1000 轮通过 | **A5 关闭**：正式首发产物归档、历史产物 × 后续宿主、夜间 soak、其余发布前项 |
+| 0：验证基线 | 交付物完成，出口未满足 | 支持契约 25 行 / 17 条保证；API 清单；冻结 ABI v1 夹具；资源基线；`.\cargo.cmd xtask ci` 在 Windows GNU 全量通过；**三平台 CI 首跑通过**（[run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)，17 条保证 × 4 平台矩阵已实填）；首发封存入口与同版本 `inspect` 本地演练（r3）；`cargo xtask soak` 本地 1000 轮通过 | **A5 关闭条件**：正式首发产物归档、历史产物 × 后续宿主、夜间 soak、其余发布前项 |
 | 1：结果语义 | 完成（含已知例外） | ADR 0003 已冻结；八个契约词汇；§7 失败路径证据列；超时措辞收窄 | 事件路径没有返回协议，是已知例外，不为此新增协议 |
 | 2：结构化错误 | 完成（A4 已收口，含已知边界） | ADR 0004 设计已接受；能力位 / 编解码 / 双向 `STATUS_ERR` / 详细入口 / 有界降级；异步 `on_done`、卸载 / 取消、provider 业务错误、超时和真实旧 ABI 错误均有测试；兼容矩阵是 **2 格真 e2e + 2 个降级分支桩 / 单测** | 分类 / 重试消费者留到阶段 4；事件路径无返回协议；详细入口的同步失败仍为 `String`，宿主预解析仍文本 |
 | 3：声明与诊断 | 完成 | 配置 schema 在 `Capabilities` / CLI 可见；`Fiber::pending_injects` + `report.pending` + `cordis status` 解释缺失键 / 版本 / 未就绪 / 跨域 / 环；能力来源标注为插件自述 | 不承诺按 schema 自动校验；方法 I/O schema / 副作用声明留待消费者 |
@@ -42,14 +42,15 @@
 | 顺序 | 工作 | 关闭条件 | 依赖 / 边界 |
 |---|---|---|---|
 | 1 | **A5-1 三平台 CI 首跑 + 平台矩阵实填** | Linux / Windows MSVC / macOS 实际编译、运行全量测试与真 DLL e2e；把每个平台的真实结果逐条填入 `docs/platform-matrix.md` | **已完成**：2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)（commit `ea0489e`）三平台 `test` job 全绿；17 条保证 × 4 平台已填 `通过` |
-| 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | **下一步**；A5-1 已完成；它推进发布证据，但不关闭平台出口 |
+| 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | **下一步**；A5-1 已完成；它推进发布证据，但不关闭阶段 0 出口 |
 | 3 | A5-3 正式首发封存 | 在干净发布源码树上重跑 `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `plugins` / `smoke` 目录；同版本 `inspect` 证据随产物归档 | 三平台结果已通过；等发布候选版本冻结后再做；r3 只是本地演练，不是正式发布 |
 | 4 | A5-4 历史产物 × 后续宿主 | 后续宿主版本加载已封存的首发产物，再把“历史发布版”从**待验证**转成**保证**或明确拒绝 | 被后续宿主版本阻塞；不能用同版本加载冒充跨版本兼容 |
 | 5 | A5-5 关闭其余发布前项 | `Cargo.toml` 的 `repository` / `homepage` 元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测；`release.md` 的发布前项关闭或明确延期 | 私有仓库已建立；公开发布地址 / 管理员权限仍待确认 |
 
-**A5-1 已完成，下一步做 A5-2 夜间 soak。** 阶段 0 的平台出口已经由真实三平台结果回答：
+**A5-1 已完成，下一步做 A5-2 夜间 soak。** 阶段 0 的平台出口已有一次可引用的三平台基线：
 Windows MSVC、Linux、macOS 的 `test` job 全绿，平台矩阵 17 条保证已逐条填 `通过`。
-剩下的是长跑证据、正式首发封存和历史产物验证，不再需要重复证明平台维度。
+剩下的是长跑证据、正式首发封存和历史产物验证；后续任何变更仍需重跑三平台，不能把
+这一次绿当成常驻结论。
 
 A5-2 应在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档；当前本地
 1000 轮只是入口演练，不能替代夜间 soak。A5-3 必须等发布候选版本冻结后再执行；A5-4
@@ -131,8 +132,9 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
       **不是夜间 soak**。
 - [ ] 夜间 soak：在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账与失败日志；
       当前只有 1000 轮本地结果与 8 轮 / 64 轮基线。
-- [ ] 关闭 `release.md` 的其余发布前项：仓库 URL、Windows SCM 真实 `sc create` /
-      `sc stop`；三平台结果与平台矩阵见上。
+- [ ] 关闭 `release.md` 的其余发布前项：`Cargo.toml` 的 `repository` / `homepage`
+      元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc stop`；三平台结果与
+      平台矩阵见上。
 
 **阶段 0 出口（未满足）**：`docs/release.md` 必须能回答“哪些保证在哪些平台实际验证过”，
 而不是只有一条 CI 通过结论。平台矩阵已经用首次三平台 CI 实填；剩下的是正式首发产物
@@ -172,7 +174,8 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
 - [x] 超时清理 / 日志措辞（事件路径不证明调用者 `Unknown`）
 - [x] 真实旧 ABI 插件返回 `STATUS_ERR`：独立 `tests/fixtures/abi-err-v1` 返回纯文本，
       `legacy_error` 验证新宿主保留文本、结构字段为 `unknown`，明确不是 `not_executed`；
-      `tests/fixtures/abi-v1` 的冻结哈希未改。
+      `tests/fixtures/abi-v1` 的源码字节未改；A5-1 只把 README 中按 CRLF 检出算出的
+      `Cargo.toml` 哈希更正为 LF 字节哈希。
 - [x] `on_done` / `args[0].error` 结构化兄弟与详细通道：`call_iface_detailed` 等入口
       接收 `ErrorPayload`，旧字符串入口只取 `.error`；不重放有副作用的调用。
 - [x] 超时通道端到端：`abi_outbound_timeout` / `abi_outbound_dispatch_timeout` /
@@ -408,7 +411,7 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
   仍可能触发 `dlltool/as` 环境问题。
 - 旧 ABI 错误：新增 `tests/fixtures/abi-err-v1`（72B v1、纯文本 `STATUS_ERR`），
   `legacy_error` 验证文本保留、`code/category/certainty=unknown`，且明确不是
-  `not_executed`；冻结的 `abi-v1` 未修改。
+  `not_executed`；冻结的 `abi-v1` 源码未修改（A5-1 仅更正 README 的 LF 哈希）。
 - 异步详细通道：`call_iface_detailed` / `dispatch_detailed` / `next_detailed` 接收
   `ErrorPayload`；旧字符串入口只取 `.error`。宿主在能力位为 1 时把
   `code/category/certainty/retry/detail` 写入 `args[0]` 兄弟字段。
@@ -461,15 +464,18 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
   最终 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)
   （commit `ea0489e`）的 `test (windows-latest)`、`test (ubuntu-latest)`、
   `test (macos-latest)`、`lint`、`msrv`、`package` 全部成功。
-- 前三次运行暴露并修复了四个真实的跨平台问题：
-  1. `tests/fixtures/abi-v1/Cargo.toml` 的冻结哈希依赖 CRLF 检出；新增
-     `.gitattributes` 固定 `tests/fixtures/**` 为 `eol=lf`，并更新 README 哈希。
+- 前三次运行暴露并修复了四个真实的跨平台问题，另有一次 lint 格式失败：
+  1. `tests/fixtures/abi-v1` 的 `Cargo.toml` / `src/lib.rs` 冻结哈希依赖检出换行；
+     新增 `.gitattributes` 固定 `tests/fixtures/**` 为 `eol=lf`，更新 README 中
+     `Cargo.toml` 的 LF 哈希，并让 `frozen_plugin` 在算哈希前归一化 CRLF。
   2. demo 的配置目录与 Unix 二进制 `cordis-demo` 同名；改为 `cordis-demo-config`。
   3. harness-spike 同理，配置目录改为 `harness-spike-config`。
   4. inventory 读取源码时未归一化 CRLF，marker 在 Windows MSVC 上匹配失败；
      `read` 现在先归一化为 LF，并新增 CRLF 回归用例。
+  5. 新增的 CRLF 测试未过 rustfmt，`lint` job 失败；`ea0489e` 格式化后通过。
 - 平台矩阵 17 条保证在 Windows GNU / Windows MSVC / Linux / macOS 四列均填 `通过`；
-  Windows GNU 来自本地 `.\cargo.cmd xtask ci`，其余来自上述 CI 的完整测试 + demo + e2e。
+  Windows GNU 来自 2026-11-03 本地 `.\cargo.cmd xtask ci`（exit 0），其余来自上述 CI 的
+  完整测试 + demo + e2e。
 - 记录边界：这是**一次**通过的 CI 结果，不是持续保证；后续变更仍需重新跑三平台。
 
 ### A5：首发封存入口与同版本加载检查

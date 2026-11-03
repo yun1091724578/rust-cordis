@@ -33,7 +33,7 @@ cargo xtask soak [cycles]
 cargo xtask doctor
 ```
 
-`cargo xtask ci` 依次执行格式检查、inventory/docs/平台矩阵结构检查、clippy（`-D warnings`）、workspace 测试、demo 快照比较与真 DLL harness。`cargo xtask fmt` 可单独检查格式；格式基线已建立，是阻塞门禁。`cargo xtask matrix` 只检查结构，不验证真实平台结果。`cargo xtask seal` 是发布时入口：构建三个宿主目标示例插件，写 SHA256/源码树/工具链清单，用同版本 `inspect` 逐插件核对身份，并保存 `smoke/inspect.txt`；它不在 `ci` 内，边界见 [`docs/release-seal.md`](docs/release-seal.md)。`cargo xtask soak [cycles]` 运行默认被忽略的宿主资源 / 暂存 soak（默认 1000 轮），同样不进入 `ci`。
+`cargo xtask ci` 依次执行格式检查、inventory/docs/平台矩阵检查、clippy（`-D warnings`）、workspace 测试、demo 快照比较与真 DLL harness。`cargo xtask fmt` 可单独检查格式；格式基线已建立，是阻塞门禁。`cargo xtask matrix` 只检查矩阵结构，不验证真实平台结果；实际结果记录在 [`docs/platform-matrix.md`](docs/platform-matrix.md)，是一次三平台 CI 的快照。`cargo xtask seal` 是发布时入口：构建三个宿主目标示例插件，写 SHA256/源码树/工具链清单，用同版本 `inspect` 逐插件核对身份，并保存 `smoke/inspect.txt`；它不在 `ci` 内，边界见 [`docs/release-seal.md`](docs/release-seal.md)。`cargo xtask soak [cycles]` 运行默认被忽略的宿主资源 / 暂存 soak（默认 1000 轮），同样不进入 `ci`。
 
 ### Windows GNU / 非 ASCII 路径
 
@@ -78,7 +78,7 @@ sc.exe stop Cordis
 
 ## 发布状态
 
-`cordis-core`、`cordis-abi`、`cordis-host`、`cordis-macros` 已能通过 `cargo package` 打包；examples、CLI 与标准组件保持 `publish = false`。仓库 URL 元数据仍需在首次发布前确定。完整门禁见 [`docs/release.md`](docs/release.md)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
+`cordis-core`、`cordis-abi`、`cordis-host`、`cordis-macros` 已能通过 `cargo package` 打包；examples、CLI 与标准组件保持 `publish = false`。私有仓库与首次三平台 CI 已建立，`Cargo.toml` 的 `repository` / `homepage` 元数据仍需在首次发布前确定。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
 
 ## 许可证
 

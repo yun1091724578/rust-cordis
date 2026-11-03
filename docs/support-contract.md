@@ -79,7 +79,7 @@ T1 = 链进宿主的原生插件；T2 = 同进程动态库插件；T3 = 进程�
 | 插件 panic 被截在 ABI 边界内 | 保证 | `crates/abi/src/sdk.rs::plugin_panics_become_status_err_at_the_abi_boundary`、`crates/abi/src/sdk.rs::desc_slot_catches_builder_panics_instead_of_crossing_the_c_abi`、`crates/abi/tests/invalid_schema_entry.rs::invalid_schema_entry_returns_null_instead_of_aborting` | apply / 回调 / 清理三条路径都转成 `STATUS_ERR`；入口构造期（含非法 schema）的 panic 降级为空描述表，由宿主报装载错误 |
 | 重复成功/失败/丢弃 Future/卸载/waterfall/stream/重载后资源计数回到基线 | 保证 | `crates/host/tests/resource_baseline.rs::repeated_cycles_return_to_baseline` | 8 轮 × 七条路径；实例 / 派发 / 挂起 / 派发帧 / 流 / effect |
 | 多轮暂存后台账回到基线 | 保证 | `crates/host/tests/staged.rs::staged_ledger_returns_to_baseline_across_many_rounds` | 64 轮；暂存 +1 / 认领归零 / drop 删除 |
-| 冻结 ABI v1 真 cdylib × 新宿主 | 保证 | `crates/host/tests/frozen_plugin.rs::a_frozen_abi_v1_cdylib_loads_and_calls` | 真 72B v1 结构体（无 `provision`）；volatile、probe/load/mount/回调/dispose；版本与尺寸拒绝；哈希冻结 |
+| 冻结 ABI v1 真 cdylib × 新宿主 | 保证 | `crates/host/tests/frozen_plugin.rs::a_frozen_abi_v1_cdylib_loads_and_calls` | 真 72B v1 结构体（无 `provision`）；volatile、probe/load/mount/回调/dispose；版本与尺寸拒绝；哈希按 LF 字节冻结，`.gitattributes` 固定 `tests/fixtures/**` |
 | 历史发布版 × 新宿主 | 待验证 | — | 当前封存对象是三个 `publish = false` 示例插件，不是可发布 crate；仍需正式首发产物归档（二进制 / 源码版本 / 工具链 / SHA256）与后续宿主版本。同版本宿主加载只证明产物可用，不等于跨版本兼容 |
 | 崩溃后任务恢复 | 非目标 | — | 无持久化账本；见 ADR 0003 |
 | 自动重试安全 / exactly-once | 非目标 | — | 当前不提供任何重试判定输入；见 ADR 0003 §4 |
