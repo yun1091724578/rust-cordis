@@ -14,7 +14,7 @@
 | 平台矩阵（结构 + 结果） | `.\cargo.cmd xtask matrix`（Windows GNU 本地；CI 用裸 `cargo`）/ 已接入 `xtask ci` | 17 条保证逐条有行、四平台状态合法、证据引用 `.rs` 文件；结构检查本身不验证真实平台结果。2026-11-02 首次三平台 CI 通过后，17 条保证在四个平台列均已实填 `通过`；表内注明这是快照，后续变更需重跑 |
 | 首发封存入口 | `cargo xtask seal [--out <dir>]` / `cargo xtask seal --verify <dir>` | 构建三个宿主目标 release 插件，记录源码树 / 工具链 / ABI / SHA256，用同版本 `inspect` 逐插件核对身份，并把 stdout、smoke 配置与 artifact 一起写入校验和；2026-11-02 Windows GNU 本地演练通过。封存对象是 `publish = false` 的示例插件，不是可发布 crate。格式与边界见 `docs/release-seal.md`；**不是 CI 门禁**，正式首发时必须运行并把整个目录归档 |
 | 资源增长回归 | `cargo test -p cordis-host --test resource_baseline` / `--test staged`（三平台 CI 已包含；2026-11-02 首次通过） | 实例 / 派发 / 挂起 / 派发帧 / 流 / effect / 暂存台账回到基线；独立 soak 见 A5-2 |
-| 夜间 soak | `cargo xtask soak [cycles]` / `.github/workflows/nightly-soak.yml`（每日 02:17 CST 或手动 dispatch） | workflow 默认 1,000,000 轮（约 17 分钟，Linux 单测试；手动 dispatch 可覆盖）；2026-11-03 **手动 dispatch** 首次 20,000 轮 [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 通过，`soak.log` artifact 已上传；cron 首跑与 1M 新默认待补，不阻塞 PR；后续变更需重跑，artifact 保留 90 天 |
+| 夜间 soak | `cargo xtask soak [cycles]` / `.github/workflows/nightly-soak.yml`（每日 02:17 CST 或手动 dispatch） | workflow 默认 1,000,000 轮（约 38 分钟，Linux 单测试；手动 dispatch 可覆盖）；2026-11-03 首次手动 20,000 轮 [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 通过；1M 默认已由 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543) 验证（`elapsed_ms=2265533`，artifact `soak-log-41592298543-c1000000`）；cron 首跑待补，不阻塞 PR；后续变更需重跑，artifact 保留 90 天 |
 | 冻结 ABI v1 兼容 | `cargo test -p cordis-host --test frozen_plugin`（三平台 CI 已包含；2026-11-02 首次通过） | 真 72B v1 结构体（无 `provision`）；volatile / 回调 / dispose；版本与尺寸拒绝；哈希冻结；夹具按 LF 字节固定 |
 | 声明与诊断 | `cargo test -p cordis-abi --test schema --test macro_schema --test invalid_schema_entry`；`cargo test -p cordis-macros`；`cargo test -p cordis-core --test pending_diagnostics --test runtime_cycles`；`cargo test -p cordis-host --test loader_cycles`；`cargo test -p cordis-cli --test status --test inspect --test args` | schema 装载前可见，非法/超限 schema 在入口降级不 abort，未声明与非法可区分；原生宏在展开期校验；Pending 区分 missing / version_mismatch / provider_not_ready / realm_mismatch / cycle，并提供者未 apply 时明确为 missing；`status` 列出 failed/disabled、支持 `--json`、失败退出码非 0；来源标注为插件自述 |
 | 错误通道兼容 | `cargo test -p cordis-host --test legacy_error --test sdk_detailed_timeout --test abi_outbound_timeout --test abi_outbound_dispatch_timeout --test abi_next_timeout --test sdk_iface_unload_detailed --test sdk_provider_error_detailed --test abi_iface_unload_abort` | 旧 ABI 文本 / `unknown`；异步详细入口；iface / dispatch / next 超时 `HOST_TIMEOUT/timeout/unknown`；卸载/取消 `host_lifecycle|host_cancel`；provider 业务错误 `callback_failed/business`；旧宿主格为桩并在 ADR 标注 |
@@ -47,7 +47,7 @@
 - [x] **保证 × 平台矩阵**：`docs/platform-matrix.md` 的 17 条保证已在 Windows GNU / Windows MSVC / Linux / macOS 四列实填 `通过`，依据是上述三平台 CI 与本地 Windows GNU 全量门禁；表内注明这是快照，后续变更需重跑。
 - [x] **验证入口可重复**：本机 `cargo.cmd` 解决 Windows GNU 的 `dlltool/as` 与固定目录/代理；三平台 CI 已获得一次通过结果，但跨机可重复性仍需在后续变更上重跑验证。
 
-### A5-2 已启用（首次手动 20k 通过，持续运行未闭合）
+### A5-2 已启用（首次 20k / 默认 1M 通过，持续运行未闭合）
 
 - [x] `.github/workflows/nightly-soak.yml` 已配置每日 02:17 CST（18:17 UTC）运行默认 1,000,000 轮，支持 `workflow_dispatch` 覆盖轮次并上传 `soak.log` artifact。
 - [x] `cargo xtask soak` 先以 `--ignored --list` 确认目标测试仍存在且被忽略；
@@ -58,10 +58,15 @@
 - [x] 2026-11-03 Windows GNU 本地 `.\cargo.cmd xtask soak 20000` 通过（exit 0）。
 - [x] 2026-11-03 加强断言后 Windows GNU 本地再次 20,000 轮通过：
   `elapsed_ms=201893`，`calls=applies=cleanups=disposes=58334`；版本包含带在飞
-  派发的同 key 重载与精确总数断言。CI artifact 仍来自加强前版本，需后续 nightly 重跑。
-- [ ] 首次 cron 触发与连续 nightly 结果（当前唯一一次是手动 dispatch）。
+  派发的同 key 重载与精确总数断言。
+- [x] 2026-11-03 1,000,000 轮 CI [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543)
+  通过：`elapsed_ms=2265533`（约 37 分 46 秒），
+  `calls=applies=cleanups=disposes=2916668`；artifact
+  `soak-log-41592298543-c1000000`（15,674 字节，含 rustc 1.99.1 与
+  `Cargo.lock` SHA-256 `7419d157…`）。
+- [ ] 首次 cron 触发与连续 nightly 结果（当前两次都是手动 dispatch）。
 - [ ] 把首次与后续 nightly artifact 转存到发布存储（见“仍需确认”第 6 项）。
-- 边界：当前 nightly 只在 Linux runner 跑单个测试；默认 1,000,000 轮约 17 分钟，首次手动 20k 约 20 秒；这是短时高频迭代，**不是整夜长跑**。暂存部分仍是 `stage_plugin` / `StagedFile` primitive，不覆盖真 DLL `open_staged`；artifact 保留 90 天。
+- 边界：当前 nightly 只在 Linux runner 跑单个测试；默认 1,000,000 轮约 38 分钟，首次手动 20k 约 20 秒；这是短时高频迭代，**不是整夜长跑**。暂存部分仍是 `stage_plugin` / `StagedFile` primitive，不覆盖真 DLL `open_staged`；artifact 保留 90 天。
 
 ### 仍需确认
 

@@ -29,7 +29,7 @@
 
 | 阶段 | 当前判断 | 已落地证据 | 未闭合 / 下一出口 |
 |---|---|---|---|
-| 0：验证基线 | 交付物完成，出口未满足 | 支持契约 25 行 / 17 条保证；API 清单；冻结 ABI v1 夹具；资源基线；`.\cargo.cmd xtask ci` 在 Windows GNU 全量通过；**三平台 CI 首跑通过**（[run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)，17 条保证 × 4 平台矩阵已实填）；首发封存入口与同版本 `inspect` 本地演练（r3）；`cargo xtask soak` 本地 1000 轮通过；**nightly soak 首次手动 20k 通过**（[run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773)；cron 首跑待补） | **A5 关闭条件**：正式首发产物归档、历史产物 × 后续宿主、nightly 持续运行与 artifact 长期转存、其余发布前项 |
+| 0：验证基线 | 交付物完成，出口未满足 | 支持契约 25 行 / 17 条保证；API 清单；冻结 ABI v1 夹具；资源基线；`.\cargo.cmd xtask ci` 在 Windows GNU 全量通过；**三平台 CI 首跑通过**（[run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)，17 条保证 × 4 平台矩阵已实填）；首发封存入口与同版本 `inspect` 本地演练（r3）；`cargo xtask soak` 本地 1000 轮通过；**nightly soak 首次手动 20k 通过**（[run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773)）；**默认 1M 也已通过**（[run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543)，约 38 分钟）；cron 首跑待补 | **A5 关闭条件**：正式首发产物归档、历史产物 × 后续宿主、nightly 持续运行与 artifact 长期转存、其余发布前项 |
 | 1：结果语义 | 完成（含已知例外） | ADR 0003 已冻结；八个契约词汇；§7 失败路径证据列；超时措辞收窄 | 事件路径没有返回协议，是已知例外，不为此新增协议 |
 | 2：结构化错误 | 完成（A4 已收口，含已知边界） | ADR 0004 设计已接受；能力位 / 编解码 / 双向 `STATUS_ERR` / 详细入口 / 有界降级；异步 `on_done`、卸载 / 取消、provider 业务错误、超时和真实旧 ABI 错误均有测试；兼容矩阵是 **2 格真 e2e + 2 个降级分支桩 / 单测** | 分类 / 重试消费者留到阶段 4；事件路径无返回协议；详细入口的同步失败仍为 `String`，宿主预解析仍文本 |
 | 3：声明与诊断 | 完成 | 配置 schema 在 `Capabilities` / CLI 可见；`Fiber::pending_injects` + `report.pending` + `cordis status` 解释缺失键 / 版本 / 未就绪 / 跨域 / 环；能力来源标注为插件自述 | 不承诺按 schema 自动校验；方法 I/O schema / 副作用声明留待消费者 |
@@ -65,7 +65,7 @@ R1 的第一份记录必须区分“需求来源”“仓内集成”“独立�
 | 顺序 | 工作 | 关闭条件 | 依赖 / 边界 |
 |---|---|---|---|
 | 1 | **A5-1 三平台 CI 首跑 + 平台矩阵实填** | Linux / Windows MSVC / macOS 实际编译、运行全量测试与真 DLL e2e；把每个平台的真实结果逐条填入 `docs/platform-matrix.md` | **已完成**：2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)（commit `ea0489e`）三平台 `test` job 全绿；17 条保证 × 4 平台已填 `通过` |
-| 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | **进行中**：2026-11-03 手动 dispatch [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 首次 20k 通过；每日 02:17 CST 的 `nightly-soak` workflow 已配置，默认 1,000,000 轮；cron 首跑与 artifact 长期转存未闭合 |
+| 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | **进行中**：2026-11-03 手动 dispatch [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 首次 20k 通过，默认 1,000,000 轮也由 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543) 验证；每日 02:17 CST 的 `nightly-soak` workflow 已配置；cron 首跑与 artifact 长期转存未闭合 |
 | 3 | **A5-3 正式首发封存** | 在干净发布源码树上重跑 `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `plugins` / `smoke` 目录；同版本 `inspect` 证据随产物归档 | **下一步（可与 nightly 积累并行）**；三平台已通过；nightly 首次手动 20k 已通过，持续运行与归档由 A5-5 收口；等发布候选版本冻结后再做；r3 只是本地演练，不是正式发布 |
 | 4 | A5-4 历史产物 × 后续宿主 | 后续宿主版本加载已封存的首发产物，再把“历史发布版”从**待验证**转成**保证**或明确拒绝 | 被后续宿主版本阻塞；不能用同版本加载冒充跨版本兼容 |
 | 5 | A5-5 关闭其余发布前项 | `Cargo.toml` 的 `repository` / `homepage` 元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测；`release.md` 的发布前项关闭或明确延期 | 私有仓库已建立；公开发布地址 / 管理员权限仍待确认 |
@@ -73,8 +73,8 @@ R1 的第一份记录必须区分“需求来源”“仓内集成”“独立�
 **A5-1 已完成；A5-2 已启用并完成首次手动 20k；发布线下一步是 A5-3 正式首发封存；
 接入线同时推进 R1/R2。** 阶段 0 的平台出口已有可引用的三平台基线：Windows MSVC、
 Linux、macOS 的 `test` job 全绿，平台矩阵 17 条保证已逐条填 `通过`；nightly soak
-已有手动 dispatch 的 20,000 轮通过、`soak.log` artifact 和每日 02:17 CST 的
-schedule（默认 1,000,000 轮），cron 首跑与长期转存仍未闭合。运行时代码、依赖或工具链变更需重跑受影响的
+已有手动 dispatch 的 20,000 轮与默认 1,000,000 轮通过、`soak.log` artifact 和每日
+02:17 CST 的 schedule，cron 首跑与长期转存仍未闭合。运行时代码、依赖或工具链变更需重跑受影响的
 平台验证；资源生命周期变更补跑 soak，发布候选执行完整门禁。纯文档变更运行文档与
 结构检查，既有 CI 保持不变。旧 run/commit 的结果不能自动延续为新版本的验证结论。
 
@@ -96,7 +96,7 @@ A5-3 可以与 nightly 积累并行，但必须等发布候选版本冻结后再
 | 3 | ABI 错误演进 ADR | `docs/adr/0004-abi-error-evolution.md` | 设计已接受；阶段 2 已实施，边界见 ADR |
 | 4 | 保证索引检查器 | `cargo xtask docs` + `xtask/src/contract.rs` 单测 | 完成（55 bin + 17 CLI；文档 25 行 / 17 保证） |
 | 5 | 失败路径清单 | ADR 0003 §7 | 完成 |
-| 6 | 资源增长基线测试 | `crates/host/tests/resource_baseline.rs` + `staged.rs` | 完成（8 轮 × 7 路径；64 轮暂存；A5 另有本地 1000 轮与 nightly 20k soak） |
+| 6 | 资源增长基线测试 | `crates/host/tests/resource_baseline.rs` + `staged.rs` | 完成（8 轮 × 7 路径；64 轮暂存；A5 另有本地 1000 轮与 nightly 20k/1M soak） |
 | 7 | 真实旧插件夹具 | `tests/fixtures/abi-v1` + `frozen_plugin.rs` | 完成（冻结 ABI v1；历史发布版仍待验证） |
 
 A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
@@ -155,22 +155,24 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
       每 4 轮丢弃在飞 Future，每 3 轮重载）。2026-11-02 本地 1000 轮通过，
       资源、hook / runtime 与 `staged_leaked` 回基线。这是本地演练，
       **不是夜间 soak**。
-- [x] **夜间 soak 入口与首次手动 20k**：新增 `.github/workflows/nightly-soak.yml`，
+- [x] **夜间 soak 入口、首次 20k 与默认 1M**：新增 `.github/workflows/nightly-soak.yml`，
       每日 02:17 CST 运行默认 1,000,000 轮并上传 `soak.log` artifact；2026-11-03
       手动 dispatch [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773)
       的 20,000 轮首次通过（约 20 秒，Linux 单测试），`loaded_instances=0`、
       `staged_leaked=0`、`runtime=0`、`hooks=0`，日志 artifact 为
       `soak-log-41562347773`。2026-11-03 Windows GNU 本地 20,000 轮也通过（exit 0）。
-      后续 nightly 由 schedule 持续积累；cron 首跑尚未发生，artifact 保留 90 天，
-      正式发布前需转存长期存储。
+      默认 1,000,000 轮随后由 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543)
+      验证通过（约 38 分钟，`calls=applies=cleanups=disposes=2916668`，artifact
+      `soak-log-41592298543-c1000000`）。后续 nightly 由 schedule 持续积累；
+      cron 首跑尚未发生，artifact 保留 90 天，正式发布前需转存长期存储。
 - [ ] 关闭 `release.md` 的其余发布前项：`Cargo.toml` 的 `repository` / `homepage`
       元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc stop`；三平台结果与
       平台矩阵见上。
 
 **阶段 0 出口（未满足）**：`docs/release.md` 必须能回答“哪些保证在哪些平台实际验证过”，
 而不是只有一条 CI 通过结论。平台矩阵已经用三平台 CI 实填，夜间 soak 已有首次手动 20k
-与每日 workflow（默认 1,000,000 轮）；剩下的是 cron 首跑、正式首发产物封存、同版本产物
-证据归档、历史发布版 × 新宿主，以及 nightly 证据的长期转存。该出口仍由 A5 关闭。
+与默认 1,000,000 轮通过、每日 workflow；剩下的是 cron 首跑、正式首发产物封存、同版本
+产物证据归档、历史发布版 × 新宿主，以及 nightly 证据的长期转存。该出口仍由 A5 关闭。
 
 ## 阶段 1：冻结结果与错误语义
 
@@ -333,10 +335,10 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 |---|---|---|---|
 | 契约测试 | 语义与降级规则是否保持 | `support-contract.md` + `cargo xtask docs` | 25 行 / 17 保证；本地与首次三平台 CI 均绿 |
 | 确定性交错测试 | 取消、完成、关闭同时发生时谁先 | `lifecycle_races.rs`、`abi_m2c.rs` | 已有测试；新增交错随变更补 |
-| 资源回归 | 成功与失败路径是否都能回收 | `weak_audit.rs`、`resource_baseline.rs`、`staged.rs`、`soak.rs` | 8 轮 × 7 路径 + 64 轮暂存 + 本地 1000 轮 + CI nightly 手动 20k（旧断言）+ 本地加强断言 20k |
+| 资源回归 | 成功与失败路径是否都能回收 | `weak_audit.rs`、`resource_baseline.rs`、`staged.rs`、`soak.rs` | 8 轮 × 7 路径 + 64 轮暂存 + 本地 1000 轮 + CI nightly 20k/1M + 本地加强断言 20k |
 | 兼容测试 | 旧 ABI 二进制（冻结快照）是否仍工作 | `abi_matrix.rs`、`tests/fixtures/abi-v1`、`frozen_plugin.rs`、`legacy_error.rs` | 冻结 v1 与真实 72B 旧插件错误已绿；历史发布版待 A5；旧宿主格是桩；旧 Rust 调用者 API 稳定性仍待单列 |
 | 多平台验证 | 装载、卸载、信号、文件替换 | CI + `release.md` | Windows GNU 本地 + Windows MSVC / Linux / macOS 首次 CI 均通过；后续变更需重跑 |
-| 压力测试 | 重复操作后是否稳定 | `resource_baseline.rs`（8 轮）/ `staged.rs`（64 轮）/ `soak.rs`（nightly 20k） | 本地 1000 轮、CI nightly 手动 20k（旧断言）与本地加强断言 20k 有；这是短时高频迭代，不是整夜长跑；后续 nightly 持续积累 |
+| 压力测试 | 重复操作后是否稳定 | `resource_baseline.rs`（8 轮）/ `staged.rs`（64 轮）/ `soak.rs`（nightly 1M） | 本地 1000 轮、CI nightly 20k/1M 与本地加强断言 20k 有；1M 约 38 分钟，仍不是整夜；后续 nightly 持续积累 |
 | 故障注入 | 明确故障点是否得到契约允许的结果 | 阶段 2 / 5 | 已覆盖错误边界；崩溃恢复随恢复协议建设 |
 
 崩溃恢复测试必须随恢复协议与持久化实现一起建设；当前可做的是异常退出、
@@ -585,12 +587,16 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
   （exit 0，`elapsed_ms=133869`，同样的资源计数回零）。
 - 2026-11-03 加强断言后 Windows GNU 本地再次 20,000 轮通过：
   `elapsed_ms=201893`，`calls=applies=cleanups=disposes=58334`；该版本包含
-  带在飞派发的同 key 重载与精确总数断言。CI artifact 仍来自加强前版本，需后续
-  nightly 重跑。
+  带在飞派发的同 key 重载与精确总数断言。
+- 2026-11-03 默认 1,000,000 轮手动 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543)
+  通过：`elapsed_ms=2265533`（约 37 分 46 秒），
+  `calls=applies=cleanups=disposes=2916668`；artifact
+  `soak-log-41592298543-c1000000` 已下载抽查，日志含 `rustc 1.99.1`、
+  `Cargo.lock` SHA-256 `7419d157…` 和完整 `soak complete` 行。
 - `soak.rs` 每 1,000 轮输出一次 `soak progress:`（第 1 轮、第 1001… 轮与末轮），
   全部断言通过后才输出 `soak complete:`；失败时由 `FailureTrace` 打印当前
   cycle / stage 和 pending / dispatch / effect / staged 快照。
-- 边界：当前 nightly 只在 Linux runner 跑单个测试；默认 1,000,000 轮约 17 分钟，
+- 边界：当前 nightly 只在 Linux runner 跑单个测试；默认 1,000,000 轮实测约 38 分钟，
   首次手动 20k 约 20 秒，仍**不是整夜长跑**；暂存部分仍是 `stage_plugin` /
   `StagedFile` primitive，不覆盖真 DLL `open_staged`；soak 是重复型压力，不扩展
   waterfall / stream / 带在飞派发 dispose 的路径覆盖。artifact 保留 90 天，
