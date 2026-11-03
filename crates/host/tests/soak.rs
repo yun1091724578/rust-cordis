@@ -25,7 +25,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const OK: u8 = 0;
 const ERR: u8 = 1;
@@ -232,6 +232,7 @@ async fn repeated_soak_cycles_leave_no_residue() {
     assert_eq!(staged_before, 0, "soak 开始前暂存台账必须为零");
     let cleanups_before = CLEANUPS.load(Ordering::SeqCst);
     let disposes_before = DISPOSES.load(Ordering::SeqCst);
+    let started = Instant::now();
     let source = fixture_source();
 
     let app = App::new();
@@ -339,6 +340,22 @@ async fn repeated_soak_cycles_leave_no_residue() {
             drop(adopted);
             assert!(!staged.exists(), "drop 后暂存文件必须删除");
         }
+
+        if cycle % 1000 == 0 || cycle + 1 == cycles {
+            println!(
+                "soak progress: cycle={}/{} loaded_instances={} staged_leaked={} runtime={} hooks={} calls={} applies={} cleanups={} disposes={}",
+                cycle + 1,
+                cycles,
+                loaded_instances(),
+                staged_leaked().saturating_sub(staged_before),
+                app.store.runtime_count(),
+                app.store.hook_count("soak/event"),
+                CALLS.load(Ordering::SeqCst),
+                APPLIES.load(Ordering::SeqCst),
+                CLEANUPS.load(Ordering::SeqCst),
+                DISPOSES.load(Ordering::SeqCst),
+            );
+        }
     }
 
     assert_eq!(loaded_instances(), 0, "soak 结束不得留下实例");
@@ -355,6 +372,19 @@ async fn repeated_soak_cycles_leave_no_residue() {
     assert!(
         DISPOSES.load(Ordering::SeqCst) > disposes_before,
         "OP_DISPOSE 至少必须被投递一次"
+    );
+    println!(
+        "soak complete: cycles={} elapsed_ms={} loaded_instances={} staged_leaked={} runtime={} hooks={} calls={} applies={} cleanups={} disposes={}",
+        cycles,
+        started.elapsed().as_millis(),
+        loaded_instances(),
+        staged_leaked().saturating_sub(staged_before),
+        app.store.runtime_count(),
+        app.store.hook_count("soak/event"),
+        CALLS.load(Ordering::SeqCst),
+        APPLIES.load(Ordering::SeqCst),
+        CLEANUPS.load(Ordering::SeqCst),
+        DISPOSES.load(Ordering::SeqCst),
     );
     if let Some(dir) = source.parent() {
         let _ = std::fs::remove_dir_all(dir);

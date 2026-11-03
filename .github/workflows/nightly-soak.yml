@@ -1,0 +1,44 @@
+name: nightly-soak
+
+on:
+  schedule:
+    # 02:00 China Standard Time (UTC+8)
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      cycles:
+        description: Soak cycles
+        required: false
+        default: '20000'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-soak
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run soak
+        env:
+          CYCLES: ${{ github.event.inputs.cycles || '20000' }}
+        run: |
+          set -o pipefail
+          {
+            echo "nightly-soak run=$GITHUB_RUN_ID commit=$GITHUB_SHA cycles=$CYCLES started=$(date -u +%FT%TZ)"
+            cargo xtask soak "$CYCLES"
+          } 2>&1 | tee soak.log
+      - name: Upload soak log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-log-${{ github.run_id }}
+          path: soak.log
+          if-no-files-found: error
