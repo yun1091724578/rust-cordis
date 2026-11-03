@@ -7,4 +7,4 @@
 # CARGO_TARGET_DIR / CARGO_HTTP_PROXY；其他环境直接 `cargo` 即可。
 
 [alias]
-xtask = "run --package xtask --"
+xtask = "run --package xtask --locked --"

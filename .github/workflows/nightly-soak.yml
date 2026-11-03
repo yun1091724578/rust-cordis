@@ -2,14 +2,15 @@ name: nightly-soak
 
 on:
   schedule:
-    # 02:00 China Standard Time (UTC+8)
-    - cron: '0 18 * * *'
+    # 02:17 China Standard Time (UTC+8); avoid the top-of-hour scheduler spike.
+    - cron: '17 18 * * *'
   workflow_dispatch:
     inputs:
       cycles:
-        description: Soak cycles
+        description: Soak cycles (positive integer)
         required: false
-        default: '20000'
+        default: '1000000'
+        type: string
 
 permissions:
   contents: read
@@ -24,21 +25,40 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run soak
+        timeout-minutes: 170
+        shell: bash
         env:
-          CYCLES: ${{ github.event.inputs.cycles || '20000' }}
+          CYCLES: ${{ github.event.inputs.cycles || '1000000' }}
+          RUST_BACKTRACE: '1'
         run: |
-          set -o pipefail
+          set -euo pipefail
+          case "$CYCLES" in
+            ''|*[!0-9]*)
+              printf 'cycles must be a positive integer, got %q\n' "$CYCLES" >&2
+              exit 2
+              ;;
+          esac
+          if ((10#$CYCLES < 1)); then
+            printf 'cycles must be a positive integer, got %s\n' "$CYCLES" >&2
+            exit 2
+          fi
           {
-            echo "nightly-soak run=$GITHUB_RUN_ID commit=$GITHUB_SHA cycles=$CYCLES started=$(date -u +%FT%TZ)"
+            printf 'nightly-soak run=%s commit=%s cycles=%s started=%s\n' \
+              "$GITHUB_RUN_ID" "$GITHUB_SHA" "$CYCLES" "$(date -u +%FT%TZ)"
+            rustc -vV
+            printf 'cargo-lock-sha256=%s\n' "$(sha256sum Cargo.lock | cut -d' ' -f1)"
             cargo xtask soak "$CYCLES"
           } 2>&1 | tee soak.log
       - name: Upload soak log
-        if: always()
+        if: ${{ always() && hashFiles('soak.log') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: soak-log-${{ github.run_id }}
+          name: soak-log-${{ github.run_id }}-c${{ github.event.inputs.cycles || '1000000' }}
           path: soak.log
           if-no-files-found: error
+          retention-days: 90

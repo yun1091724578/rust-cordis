@@ -321,13 +321,58 @@ fn soak_command(args: Vec<String>) -> i32 {
                 return 2;
             }
         },
-        None => std::env::var("CORDIS_SOAK_CYCLES")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|cycles| *cycles > 0)
-            .unwrap_or(1000),
+        None => match std::env::var("CORDIS_SOAK_CYCLES") {
+            Ok(raw) => match raw.parse::<u64>() {
+                Ok(cycles) if cycles > 0 => cycles,
+                _ => {
+                    eprintln!("CORDIS_SOAK_CYCLES 必须是正整数，实际 \"{raw}\"\n\n{USAGE}");
+                    return 2;
+                }
+            },
+            Err(_) => 1000,
+        },
     };
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let test_name = "repeated_soak_cycles_leave_no_residue";
+    // `cargo test -- --ignored` 在 0 个 ignored 测试时也退出 0。先列出目标测试，
+    // 防止测试被删/改名/去掉 #[ignore] 后 nightly 变成假绿。
+    let listed = Command::new(&cargo)
+        .args([
+            "test",
+            "-p",
+            "cordis-host",
+            "--test",
+            "soak",
+            "--locked",
+            "--",
+            "--ignored",
+            "--list",
+        ])
+        .current_dir(workspace_root())
+        .output();
+    match listed {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !stdout.contains(&format!("{test_name}: test")) {
+                eprintln!(
+                    "soak 测试 {test_name} 未注册为 #[ignore] 测试；拒绝运行空 soak\n{}",
+                    stdout.trim_end()
+                );
+                return 1;
+            }
+        }
+        Ok(output) => {
+            eprintln!(
+                "列出 soak 测试失败（exit {:?}）",
+                output.status.code().unwrap_or(1)
+            );
+            return output.status.code().unwrap_or(1);
+        }
+        Err(err) => {
+            eprintln!("执行 {cargo} 失败: {err}");
+            return 1;
+        }
+    }
     println!(
         "+ {cargo} test -p cordis-host --test soak --locked -- --ignored --nocapture (cycles={cycles})"
     );

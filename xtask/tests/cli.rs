@@ -378,6 +378,8 @@ fn soak_rejects_invalid_or_extra_arguments() {
         vec!["soak", "0"],
         vec!["soak", "many"],
         vec!["soak", "1", "2"],
+        vec!["soak", "-1"],
+        vec!["soak", "--bogus"],
     ] {
         let output = Command::new(bin())
             .args(args)
@@ -385,6 +387,12 @@ fn soak_rejects_invalid_or_extra_arguments() {
             .expect("spawn xtask");
         assert_eq!(output.status.code(), Some(2));
     }
+    let output = Command::new(bin())
+        .env("CORDIS_SOAK_CYCLES", "many")
+        .arg("soak")
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(output.status.code(), Some(2));
     let output = Command::new(bin())
         .args(["soak", "--help"])
         .output()
