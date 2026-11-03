@@ -13,7 +13,8 @@
 | API 清单 | `cargo xtask inventory --check`（CI 由 xtask 的 inventory CLI 用例覆盖） | ABI 常量/字段与受控 marker 漂移即失败；新增宿主入口需人工加入清单 |
 | 平台矩阵（结构 + 结果） | `.\cargo.cmd xtask matrix`（Windows GNU 本地；CI 用裸 `cargo`）/ 已接入 `xtask ci` | 17 条保证逐条有行、四平台状态合法、证据引用 `.rs` 文件；结构检查本身不验证真实平台结果。2026-11-02 首次三平台 CI 通过后，17 条保证在四个平台列均已实填 `通过`；表内注明这是快照，后续变更需重跑 |
 | 首发封存入口 | `cargo xtask seal [--out <dir>]` / `cargo xtask seal --verify <dir>` | 构建三个宿主目标 release 插件，记录源码树 / 工具链 / ABI / SHA256，用同版本 `inspect` 逐插件核对身份，并把 stdout、smoke 配置与 artifact 一起写入校验和；2026-11-02 Windows GNU 本地演练通过。封存对象是 `publish = false` 的示例插件，不是可发布 crate。格式与边界见 `docs/release-seal.md`；**不是 CI 门禁**，正式首发时必须运行并把整个目录归档 |
-| 资源增长回归 | `cargo test -p cordis-host --test resource_baseline` / `--test staged`（三平台 CI 已包含；2026-11-02 首次通过） | 实例 / 派发 / 挂起 / 派发帧 / 流 / effect / 暂存台账回到基线；独立 soak 由 `cargo xtask soak` 运行，见发布前项 6 |
+| 资源增长回归 | `cargo test -p cordis-host --test resource_baseline` / `--test staged`（三平台 CI 已包含；2026-11-02 首次通过） | 实例 / 派发 / 挂起 / 派发帧 / 流 / effect / 暂存台账回到基线；独立 soak 见 A5-2 |
+| 夜间 soak | `.github/workflows/nightly-soak.yml`（每日 02:00 CST 或手动 dispatch） | 20,000 轮；首次 [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 通过，`soak.log` artifact 已上传；当前只在 Linux runner，artifact 保留期按 GitHub 默认 |
 | 冻结 ABI v1 兼容 | `cargo test -p cordis-host --test frozen_plugin`（三平台 CI 已包含；2026-11-02 首次通过） | 真 72B v1 结构体（无 `provision`）；volatile / 回调 / dispose；版本与尺寸拒绝；哈希冻结；夹具按 LF 字节固定 |
 | 声明与诊断 | `cargo test -p cordis-abi --test schema --test macro_schema --test invalid_schema_entry`；`cargo test -p cordis-macros`；`cargo test -p cordis-core --test pending_diagnostics --test runtime_cycles`；`cargo test -p cordis-host --test loader_cycles`；`cargo test -p cordis-cli --test status --test inspect --test args` | schema 装载前可见，非法/超限 schema 在入口降级不 abort，未声明与非法可区分；原生宏在展开期校验；Pending 区分 missing / version_mismatch / provider_not_ready / realm_mismatch / cycle，并提供者未 apply 时明确为 missing；`status` 列出 failed/disabled、支持 `--json`、失败退出码非 0；来源标注为插件自述 |
 | 错误通道兼容 | `cargo test -p cordis-host --test legacy_error --test sdk_detailed_timeout --test abi_outbound_timeout --test abi_outbound_dispatch_timeout --test abi_next_timeout --test sdk_iface_unload_detailed --test sdk_provider_error_detailed --test abi_iface_unload_abort` | 旧 ABI 文本 / `unknown`；异步详细入口；iface / dispatch / next 超时 `HOST_TIMEOUT/timeout/unknown`；卸载/取消 `host_lifecycle|host_cancel`；provider 业务错误 `callback_failed/business`；旧宿主格为桩并在 ADR 标注 |
@@ -46,6 +47,13 @@
 - [x] **保证 × 平台矩阵**：`docs/platform-matrix.md` 的 17 条保证已在 Windows GNU / Windows MSVC / Linux / macOS 四列实填 `通过`，依据是上述三平台 CI 与本地 Windows GNU 全量门禁；表内注明这是快照，后续变更需重跑。
 - [x] **验证入口可重复**：本机 `cargo.cmd` 解决 Windows GNU 的 `dlltool/as` 与固定目录/代理；三平台 CI 已获得一次通过结果，但跨机可重复性仍需在后续变更上重跑验证。
 
+### A5-2 已关闭（首次 nightly soak）
+
+- [x] `.github/workflows/nightly-soak.yml` 已配置每日 02:00 CST（18:00 UTC）运行 20,000 轮，支持 `workflow_dispatch` 覆盖轮次并上传 `soak.log` artifact。
+- [x] 2026-11-03 首次手动 [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 通过：`loaded_instances=0`、`staged_leaked=0`、`runtime=0`、`hooks=0`；artifact `soak-log-41562347773`。
+- [x] 2026-11-03 Windows GNU 本地 `.\cargo.cmd xtask soak 20000` 通过（exit 0）。
+- 边界：当前 nightly 只在 Linux runner；暂存部分仍是 `stage_plugin` / `StagedFile` primitive，不覆盖真 DLL `open_staged`；artifact 保留期按 GitHub 默认，正式发布前需转存长期存储。
+
 ### 仍需确认
 
 1. 仓库 URL：私有仓库已建立（`https://github.com/yun1091724578/rust-cordis`）；`Cargo.toml` 的 `repository` / `homepage` 元数据与公开发布地址仍待确认，当前 `cargo package` 只因此产生警告。
@@ -53,7 +61,7 @@
 3. **首发产物封存**：入口与本地演练已完成（`cargo xtask seal`，2026-11-02 Windows GNU），但正式首发仍需在 release 时重新运行并归档整个 `seal.json` / `SHA256SUMS` / `plugins` / `smoke` 目录；封存对象是三个 `publish = false` 示例插件，不是可发布 crate。这是历史兼容的基线。
 4. **首发产物 × 同版本宿主**：`seal` 已内置同版本 `inspect` 加载检查，并把完整 stdout 写入 `smoke/inspect.txt`、纳入 `SHA256SUMS`；正式首发时要把该证据连同产物一起归档。它只证明产物可用，**不证明跨版本兼容**。
 5. **历史产物 × 后续宿主版本**：等后续宿主版本加载已封存的首发产物，才把“历史发布版 × 新宿主”从待验证转成保证或明确拒绝。
-6. **夜间 soak**：`cargo xtask soak [cycles]` 入口已就绪，2026-11-02 本地 1000 轮通过（成功 / 失败 / 周期性的丢弃在飞 Future 与重载 + 暂存台账）；正式发布前至少跑一次更长轮次并记录结果。它不在 `ci` 内，不能用 1000 轮本地结果代替夜间运行。
+6. **nightly artifact 长期转存**：当前 `soak.log` 由 GitHub Actions artifact 保存，保留期按仓库设置；正式发布前需把首次与后续 nightly 结果转存到发布存储。nightly schedule 可能在仓库无活动时被 GitHub 自动暂停，发布前需确认最近一次结果。
 
 ## 已确定
 

@@ -78,7 +78,7 @@ sc.exe stop Cordis
 
 ## 发布状态
 
-`cordis-core`、`cordis-abi`、`cordis-host`、`cordis-macros` 已能通过 `cargo package` 打包；examples、CLI 与标准组件保持 `publish = false`。私有仓库与首次三平台 CI 已建立，`Cargo.toml` 的 `repository` / `homepage` 元数据仍需在首次发布前确定。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
+`cordis-core`、`cordis-abi`、`cordis-host`、`cordis-macros` 已能通过 `cargo package` 打包；examples、CLI 与标准组件保持 `publish = false`。私有仓库、首次三平台 CI 与 nightly soak workflow 已建立，`Cargo.toml` 的 `repository` / `homepage` 元数据仍需在首次发布前确定。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
 
 ## 许可证
 
