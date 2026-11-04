@@ -295,3 +295,109 @@ T2 插件拿到的 `sdk::Ctx` 只有提供侧的三个方法。
 6. 动态库插件：`provision` / `volatile` 声明写进 `cordis_plugin!`；`ctx.call_iface` 走 JSON 面；
 7. 卸载路径核一遍：注册都是 fiber 的 effect（`Disposable`），跑不跑都幂等；
 8. 最后跑 `.\cargo.cmd test --workspace --offline` 与 `examples/demo/compare.ps1`。
+
+---
+
+## 11. 仓外消费工程（R2：首发低层 ABI）
+
+首发支持路径已定为**低层 ABI + 固定 revision 的源码依赖**。标准 typed 门面
+`cordis-sdk` 仍是 `publish = false`，不在首发范围；下面是已经实际跑通的仓外宿主
+写法，证据见仓外工程 `../desolate/R1-REPORT.md`。
+
+### 11.1 独立 workspace，不继承本仓
+
+消费工程自己声明 workspace，并直接依赖固定 revision 的源码：
+
+```toml
+[workspace]
+resolver = "2"
+members = ["host", "plugins/note-v1"]
+
+# host/Cargo.toml
+[dependencies]
+cordis-core = { path = "../../rust-cordis/crates/core" }
+cordis-host = { path = "../../rust-cordis/crates/host" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# plugins/note-v1/Cargo.toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cordis-abi = { path = "../../../rust-cordis/crates/abi" }
+serde_json = "1"
+```
+
+不要把消费工程放进 `rust-cordis` 的 workspace，也不要用 `workspace = true`
+继承本仓依赖；那会掩盖“仓外工程是否能独立编译”的问题。用脚本固定 revision，
+例如 `git -C ../rust-cordis rev-parse HEAD` 与 `git status --porcelain -- crates/`
+一起检查。
+
+### 11.2 构建顺序与加载
+
+1. 先构建 cdylib 插件；`cargo run -p host` 不会自动构建插件：
+   `cargo build -p desolate-note-v1 -p desolate-note-v2`
+2. 宿主从自己的可执行文件目录定位插件：
+   `DLL_PREFIX + name + "." + DLL_EXTENSION`（Windows 是 `name.dll`，
+   Linux 是 `libname.so`）。
+3. 加载与调用：
+
+```rust
+let plugin = std::sync::Arc::new(cordis_host::LoadedPlugin::open(&plugin_path)?);
+let fiber = app.plugin(plugin, serde_json::json!({ "root": root })).await?;
+let value = app.root
+    .call_iface("desolate.index", 1, "scan", serde_json::json!({}))
+    .await?;
+fiber.update(serde_json::json!({ "root": root, "label": "reload" })).await?;
+fiber.dispose().await;
+app.close().await;
+```
+
+真实宿主的失败路径也要断言：空配置在挂载期失败、缺失 root 返回可读错误、
+卸载后 `call_iface` 找不到服务、`loaded_instances()` 回到 0。
+
+### 11.3 已验证范围与边界
+
+- 已验证：独立编译、低层 ABI 宏展开、真 DLL 装载、调用成功 / 失败、卸载、
+  `Fiber::update` 重载、v1→v2 顺序升级、`App::close`；31 篇自造样例完成索引、
+  搜索、重载、升级、标签过滤与报告写出；`detailed-probe` 覆盖
+  `call_iface_detailed` / `dispatch_detailed` / `next_detailed` 的正常结果、
+  同步启动错误、provider 回调错误、`HOST_TIMEOUT`、卸载/取消结算与卸载后不重复
+  投递；窄策略消费者按 `category` / `certainty` 选择
+  `accept` / `fail_fast` / `degrade_unknown` / `unavailable`，不解析文本、不自动重试。
+- 未验证：registry typed SDK、第三方真实数据与长期维护反馈、完整重试/补偿策略
+  （还需副作用类别、幂等是否生效、截止时间与预算）、原地 HMR、历史产物跨版本
+  兼容。第三方复现是额外证据，不是必选门禁。
+- 本机 Windows GNU 需要 `rust-cordis/cargo.cmd` 的 self-contained MinGW 与 ASCII
+  target 目录；普通环境可以直接用 `cargo`，但必须显式设置插件路径和构建顺序。
+
+### 11.4 真实 agent 首链路
+
+`../desolate` 的 `agent` 任务是一个可运行的最小消费链，不是新的框架层：
+
+```powershell
+.\scripts\agent.ps1 -Mode ok
+.\scripts\agent.ps1 -Mode stream_fail
+.\scripts\agent.ps1 -Mode tool_timeout
+.\scripts\agent.ps1 -Mode normal_timeout
+.\scripts\agent.ps1 -Mode tool_error
+.\scripts\agent.ps1 -Mode model_start_error
+```
+
+它覆盖“请求 → 模型 token 流 → 归档搜索工具 → 结果记录 → 关闭”。正常路径收到
+3 个 token 和 8 条归档命中；`stream_fail` 在部分输出后失败；`tool_timeout` 让
+工具先写出搜索结果、再不返回，宿主用自己的 100ms 截止时间记录
+`timeout_unknown` 和 `side_effect_observed=true`；`normal_timeout` 证明普通
+mode 下的真实超时仍按 `Err(elapsed)` 记为 `timed_out/unknown`，不是按 mode
+解释；`tool_error` / `model_start_error` 验证普通失败也会形成唯一终止并释放
+资源。每次运行还写
+`reports/*.events.jsonl`，终止事件带按消息保存的部分快照和独立的
+`status` / `certainty`。报告见 `../desolate/AGENT-REPORT.md`，事件协议见
+[`docs/agent-stream-protocol.md`](docs/agent-stream-protocol.md)。
+
+接入结论：失败流只带文本原因，已经消费的 token 可见，未读缓冲会被丢弃；需要
+保留全部部分输出时要单独改流错误协议。`DispatchPolicy` 不是宿主调用的通用截止
+时间，agent 宿主必须自己设 deadline，不能把看门狗当执行隔离。当前 JSONL sink
+仍是内存聚合后一次写入，不能证明在线增量交付；链路没有自动重试、账本、broker
+或进程外载体。

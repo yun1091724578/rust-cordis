@@ -199,8 +199,9 @@
   `next_detailed_delivers_a_structured_error_payload` 直接覆盖 `next_detailed` 的续延；
   `sdk_provider_error_detailed` 覆盖 provider 业务错误；
   `sdk_iface_unload_detailed` 覆盖卸载时的 `host_lifecycle/lifecycle/unknown`。
-  `dispatch_detailed` 与 `next_detailed` 仍是同一续延/解码路径，没有独立的真宿主
-  `dispatch_detailed` 回调用例；这是已知边界，不写成“全部端到端”。
+  `dispatch_detailed` 与 `next_detailed` 已在仓外消费工程 `../desolate` 的
+  `detailed-probe` 中用真实宿主覆盖正常结果、结构化超时和卸载后不重复投递；
+  它们不是仓内兼容矩阵的独立格，仍不写成“四格全部端到端”。
 - [x] 超时通道端到端：`abi_outbound_timeout` / `abi_outbound_dispatch_timeout` /
   `abi_next_timeout` 均断言可读原因与 `code=HOST_TIMEOUT`、`category=timeout`、
   `certainty=unknown`；事件日志路径仍是已知例外。

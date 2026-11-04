@@ -93,16 +93,34 @@ CI 使用 `cargo package --no-verify`，不替代解包构建和独立消费工�
 
 `cordis-sdk`、`cordis-components`、`cordis-cli` 与 examples 目前保持 `publish = false`。
 
-## 发布范围与仓外验收（R2，待完成）
+## 发布范围与仓外验收（R2：首发低层 ABI）
 
-- [ ] 冻结首发承诺的使用路径：低层 ABI、固定 revision 的源码 SDK，或 registry typed SDK。
-  宏生成代码依赖 `::cordis::typed`，目前由不发布的 `cordis-sdk` 提供；不能把四个 crate
-  可打包表述成标准 typed 插件已能仅靠 registry 依赖使用。
-- [ ] 按选定路径，在 workspace 外创建消费工程，显式声明全部依赖与版本，完成宏展开
-  （若包含 typed）、编译、插件装载和一次调用；保存构建命令、工具链与消费 revision。
-  若使用源码依赖，清楚标注这种交付方式，不冒充已发布 SDK。
-- [ ] 如果承诺 registry typed SDK，再处理门面发布、许可证/包元数据与打包后构建验证；
-  本轮不擅自修改 `publish`。若只发布低层 ABI，文档明确 typed 门面暂不在发布范围。
+**决策（2026-11-03）**：首发承诺的支持路径是**低层 ABI + 固定 revision 的源码依赖**。
+registry typed SDK **不在首发范围**；`cordis-sdk` 继续保持 `publish = false`，
+`cordis-macros` 虽可打包，但单独发布不构成 typed 门面，直到单独决定并验证
+registry 交付。
 
-执行状态以 `roadmap.md` R1/R2 为准。仓外验收不必等待 A5-4：后者只能在后续宿主
-版本出现后验证；首发时保持跨版本兼容待验证，并明确其范围。
+- [x] 冻结首发承诺的使用路径：低层 ABI + 固定 revision 源码依赖。
+  宏生成代码依赖 `::cordis::typed`，目前由不发布的 `cordis-sdk` 提供；不能把四个
+  crate 可打包表述成标准 typed 插件已能仅靠 registry 依赖使用。
+- [x] 按选定路径在 workspace 外创建消费工程：`../desolate`，直接 path 依赖
+  `crates/abi` / `crates/host`，固定 `rust-cordis` revision `9f5ddfb`，完成编译、
+  低层 ABI 宏展开、真实 DLL 装载、调用成功/失败、卸载、重载和 v1→v2 升级。
+  记录见 `../desolate/R1-REPORT.md`。这是低层 ABI 交付，不冒充已发布 SDK。
+- [x] 文档明确 typed 门面不在首发范围；只有未来决定承诺 registry typed SDK 时，才
+  处理门面发布、许可证 / 包元数据与打包后构建验证。
+- [x] 仓外技术接入与样例归档任务已完成：`../desolate` 的 manifest、构建、调用、
+  卸载、重载、升级路径已跑通；2026-11-04 又用 31 篇自造样例完成索引、搜索、
+  重载、v1→v2 升级、标签过滤与报告写出。`R1` 剩余项是真实数据与长期维护反馈，
+  不是等待第三方复现。第三方复现是额外证据，不是首发门禁。
+- [x] R3 调用通道使用契约已完成仓外验证：三个详细入口、正常/超时/取消路径、
+  卸载后不重复投递，以及按 `category` / `certainty` 选择动作的窄策略消费者；
+  记录见 `../desolate/R3-REPORT.md`。完整重试/补偿不在首发保证范围。
+- [x] 真实 agent 首链路已完成仓外验证：模型 token 流、真实归档工具、六条成功/
+  失败路径、按实际结果分类、统一终止与多消息部分快照、正常关闭；记录见
+  `../desolate/AGENT-REPORT.md`。它证明可开始真实 agent 集成，不证明在线增量
+  交付、网络模型、取消、通用预算或历史兼容。
+
+执行状态以 `roadmap.md` 的 R1/R2/R3 与真实 agent 链路为准。仓外验收不必等待
+A5-4：后者只能在后续宿主版本出现后验证；首发时保持跨版本兼容待验证，并明确其
+范围。
