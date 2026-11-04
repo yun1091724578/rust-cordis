@@ -23,11 +23,11 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-cordis-core = { version = "0.1.0", path = "crates/core" }
-cordis-abi = { version = "0.1.0", path = "crates/abi" }
-cordis-host = { version = "0.1.0", path = "crates/host" }
-cordis-sdk = { version = "0.1.0", path = "crates/sdk" }
-cordis-macros = { version = "0.1.0", path = "crates/macros" }
+cordis-core = { package = "rust-cordis-core", version = "0.1.0", path = "crates/core" }
+cordis-abi = { package = "rust-cordis-abi", version = "0.1.0", path = "crates/abi" }
+cordis-host = { package = "rust-cordis-host", version = "0.1.0", path = "crates/host" }
+cordis = { package = "rust-cordis-sdk", version = "0.1.0", path = "crates/sdk" }
+cordis-macros = { package = "rust-cordis-macros", version = "0.1.0", path = "crates/macros" }
 cordis-cli = { version = "0.1.0", path = "crates/cli" }
 cordis-components = { version = "0.1.0", path = "crates/components" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }

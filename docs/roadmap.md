@@ -49,7 +49,7 @@
 | 顺序 | 工作 / 状态 | 交付与验收出口 |
 |---|---|---|
 | 1 | **R1 仓外真实接入（技术接入 + 31 篇样例归档任务完成，待真实数据反馈）** | 2026-11-03 在 `../desolate` 建立独立 crate 图（直接 path 依赖，固定 revision `9f5ddfb`），真实 DLL 装载、配置失败、缺失 root、卸载、重载与 v1→v2 升级均通过。2026-11-04 用自造 31 篇样例（25 个 `.md` + 6 个 `.markdown`）完成索引、搜索、重载、升级、标签过滤与报告写出，报告见 `../desolate/reports/archive-report.json`，记录见 `../desolate/R1-REPORT.md`。这补上了任务形状，但还不是第三方生产数据或长期维护反馈；第三方复现是额外证据，不是必选门禁。 |
-| 1 | **R2 交付入口闭合（已决策：首发低层 ABI）** | 2026-11-03 决定首发支持低层 ABI + 固定 revision 源码依赖；`../desolate` 已验证仓外编译、宏展开、真实 DLL 装载、调用失败、卸载、重载与 v1→v2 升级。registry typed SDK 不在首发范围（`cordis-sdk` 仍 `publish = false`；`cordis-macros` 可打包但不能单独提供 typed 门面）；证据见 `../desolate/R1-REPORT.md` 与 `release.md`。 |
+| 1 | **R2 交付入口闭合（已决策：首发低层 ABI）** | 2026-11-03 决定首发支持低层 ABI + 固定 revision 源码依赖；`../desolate` 已验证仓外编译、宏展开、真实 DLL 装载、调用失败、卸载、重载与 v1→v2 升级。registry typed SDK 不在首发范围（`rust-cordis-sdk` 仍 `publish = false`；`rust-cordis-macros` 可打包但不能单独提供 typed 门面）；证据见 `../desolate/R1-REPORT.md` 与 `release.md`。 |
 | 2 | **R3 调用通道使用契约（完成：仓外三入口 + 窄策略消费者）** | `../desolate/plugins/detailed-probe` 已覆盖同步启动错误、provider 业务错误回调、`HOST_TIMEOUT`、卸载/取消结算与恰好一次；2026-11-04 又覆盖 `dispatch_ok` / `dispatch_timeout`、`next_ok` / `next_timeout`，并在卸载后检查续延未再次投递。探针的窄策略消费者按 `category` / `certainty` 选择 `accept` / `fail_fast` / `degrade_unknown` / `unavailable`，记录 `automatic_retry=false`，不解析文本、不自动重试；记录见 `../desolate/R3-REPORT.md`。完整重试/补偿决策仍属阶段 4。 |
 | 2 | **真实 agent 集成（首条链路完成，待真实模型）** | `../desolate` 的 `agent` 任务已跑通六模式：正常、模型流失败、工具超时未知、普通模式下真实超时、工具错误、模型启动失败。工具结果按 `Ok(Ok)` / `Ok(Err)` / `Err(elapsed)` 实际分支分类，测试模式不负责解释结果；`Ok(Err)` 无证据时保留 `unknown`。统一收尾路径先生成结果，再发最多一个 `run.finished`、释放插件并关闭 App；部分快照按消息保存。宿主自己持有 100ms 截止时间，不把 `DispatchPolicy` 当通用预算。记录见 `../desolate/AGENT-REPORT.md`；事件协议与设计见 [agent-stream-protocol](agent-stream-protocol.md)。下一步是有界增量交付，再接真实模型适配器、取消与预算。 |
 | 2 | **A5-3 / A5-5 发布收尾（待完成）** | 发布候选冻结后封存产物、转存日志、确认发布范围和 SCM 支持范围；仓外交付验收见 R2。A5-4 保留后续版本待验证，不冒充首发保证。 |
@@ -391,8 +391,8 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 
 - 范围：8 轮 × 成功 / 失败 / 丢弃 Future / 带在飞派发卸载 / waterfall / stream /
   同 key 重载；暂存台账 64 轮（`staged.rs`）。
-- 绿档：`cargo test -p cordis-host --test resource_baseline`（1 passed）与
-  `cargo test -p cordis-host --test staged`（4 passed）。
+- 绿档：`cargo test -p rust-cordis-host --test resource_baseline`（1 passed）与
+  `cargo test -p rust-cordis-host --test staged`（4 passed）。
 - 红档：把 `PendingDropGuard` 的 `if !stream_owned` 临时改成
   `if false && !stream_owned`，资源基线在“丢弃轮归零”处超时失败；还原后复绿。
   红档钉住的是**挂起记录撤销**；waterfall / stream / 重载 / effect 由正向对照钉住

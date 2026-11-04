@@ -20,8 +20,8 @@
 typed SDK 不在首发范围。`../desolate` 已按这条路径在 workspace 外完成编译、
 低层 ABI 宏展开、真实 DLL 装载、调用成功/失败、卸载、重载与 v1→v2 升级，
 记录见 `../desolate/R1-REPORT.md`。这关闭的是“交付路径选择”，不是
-“registry typed SDK 已可用”；`cordis-sdk` 继续保持 `publish = false`，
-`cordis-macros` 虽可打包，但单独发布不构成 typed 门面，只有未来明确承诺
+“registry typed SDK 已可用”；`rust-cordis-sdk` 继续保持 `publish = false`，
+`rust-cordis-macros` 虽可打包，但单独发布不构成 typed 门面，只有未来明确承诺
 registry 交付时再处理门面发布与元数据。
 
 ### R3：详细调用路径已仓外验证，完整重试留阶段 4

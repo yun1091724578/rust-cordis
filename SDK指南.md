@@ -9,11 +9,11 @@
 
 ## 1. 五分钟：一个插件、一个服务、一个事件
 
-依赖只有一条（`cordis-sdk` 的库名是 `cordis`，宏展开里的路径全是 `::cordis::…`）：
+依赖只有一条（包名是 `rust-cordis-sdk`，库名是 `cordis`，宏展开里的路径全是 `::cordis::…`）：
 
 ```toml
 [dependencies]
-cordis-sdk = { path = "…/crates/sdk" }
+cordis = { package = "rust-cordis-sdk", path = "…/crates/sdk" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 ```
 
@@ -96,7 +96,7 @@ let fiber = app.plugin(std::sync::Arc::new(AgentLoop), serde_json::json!({ "conc
 1. **模型自生成组件永远不得是 T2**——同地址空间里它可以直接拿到底层对象，任何"能力检查"都失效；
 2. **T3 是"载体可换"的证明，不是信任边界**。本仓能说清的是**接口透明性**与受限导入：
    ABI 的形状（单入口 + op 码 + 全部内存归宿主 + JSON）让换载体只需要重写适配器，
-   内核一行不改（`LoadedPlugin` 是唯一适配器；`cordis-abi` 零平台依赖）。
+   内核一行不改（`LoadedPlugin` 是唯一适配器；`rust-cordis-abi` 零平台依赖）。
 
 **T3 必须异步**：跨进程的调用点只能 await，所以 M2（入站挂起/结算）是 T3 的前置条件。
 
@@ -179,10 +179,10 @@ M3 的红测试钉住了第一条的全部语义（`crates/core/tests/intercept_
 |---|---|---|
 | MSRV | **1.85** | `Waker::noop()`（G19）比 `offset_of!`（1.77）更紧；每个成员 crate 都写 `rust-version.workspace = true` |
 | 内核 | **零 unsafe**（`#![forbid(unsafe_code)]`） | A8 的判据 |
-| `cordis-abi` | **零平台依赖**（只依赖 serde_json） | 载体可换的前提 |
-| `cordis-host` | `serde` / `serde_json` / `serde_yaml` / `tokio` / `libloading`（**已删**，见 M0） | |
+| `rust-cordis-abi` | **零平台依赖**（只依赖 serde_json） | 载体可换的前提 |
+| `rust-cordis-host` | `serde` / `serde_json` / `serde_yaml` / `tokio` / `libloading`（**已删**，见 M0） | |
 | tokio 特性 | `rt`、`rt-multi-thread`、`macros`、`sync`、`time`、`test-util` | `test-util` 供 `pause/advance` 类测试 |
-| 过程宏 | `syn = 3`（`full`）/ `quote` / `proc-macro2` | 仅 `cordis-macros` 依赖 |
+| 过程宏 | `syn = 3`（`full`）/ `quote` / `proc-macro2` | 仅 `rust-cordis-macros` 依赖 |
 | 构建 | **离线**：`.\cargo.cmd test --workspace --offline`（`CARGO_HOME` 指到工作区自带的缓存） | 见 `cargo.cmd` / `run-tests.cmd` |
 | ABI 面 | 单入口 + **7 个 op 码**（`OP_APPLY/DISPOSE/CALLBACK/CLEANUP/PING/VOLATILE_PATHS/VOLATILE_APPLY`）+ **6 个状态码**（`OK/ERR/TOO_SMALL/UNSUPPORTED/PENDING/STREAM_GONE`）+ **22 个宿主函数**（v1 的 11 个 + v2 追加 11 个） | 冻结值与矩阵见 [`兼容矩阵.md`](兼容矩阵.md) |
 
@@ -301,7 +301,7 @@ T2 插件拿到的 `sdk::Ctx` 只有提供侧的三个方法。
 ## 11. 仓外消费工程（R2：首发低层 ABI）
 
 首发支持路径已定为**低层 ABI + 固定 revision 的源码依赖**。标准 typed 门面
-`cordis-sdk` 仍是 `publish = false`，不在首发范围；下面是已经实际跑通的仓外宿主
+`rust-cordis-sdk` 仍是 `publish = false`，不在首发范围；下面是已经实际跑通的仓外宿主
 写法，证据见仓外工程 `../desolate/R1-REPORT.md`。
 
 ### 11.1 独立 workspace，不继承本仓
@@ -315,8 +315,8 @@ members = ["host", "plugins/note-v1"]
 
 # host/Cargo.toml
 [dependencies]
-cordis-core = { path = "../../rust-cordis/crates/core" }
-cordis-host = { path = "../../rust-cordis/crates/host" }
+cordis-core = { package = "rust-cordis-core", path = "../../rust-cordis/crates/core" }
+cordis-host = { package = "rust-cordis-host", path = "../../rust-cordis/crates/host" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
@@ -325,7 +325,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 crate-type = ["cdylib"]
 
 [dependencies]
-cordis-abi = { path = "../../../rust-cordis/crates/abi" }
+cordis-abi = { package = "rust-cordis-abi", path = "../../../rust-cordis/crates/abi" }
 serde_json = "1"
 ```
 

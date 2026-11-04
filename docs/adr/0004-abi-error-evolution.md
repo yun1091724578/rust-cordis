@@ -125,9 +125,9 @@
 
 ## 5. 公开 Rust API 的兼容检查
 
-`cordis-host` / `cordis-core` / `cordis-abi` / `cordis-macros` 都没有
-`publish = false`，本来就是 semver 约束；只有 `cordis-sdk`、`cordis-components`
-等才是。以下类型今天都是公开的、没有 `#[non_exhaustive]`：
+`rust-cordis-host` / `rust-cordis-core` / `rust-cordis-abi` / `rust-cordis-macros`
+都没有 `publish = false`，本来就是 semver 约束；只有 `rust-cordis-sdk`、
+`cordis-components` 等才是。以下类型今天都是公开的、没有 `#[non_exhaustive]`：
 
 | 类型 | 位置 | 加字段/变体的后果 |
 |---|---|---|

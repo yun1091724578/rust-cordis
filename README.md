@@ -82,11 +82,11 @@ sc.exe stop Cordis
 
 ## 发布状态
 
-`cordis-core`、`cordis-abi`、`cordis-host`、`cordis-macros` 已能通过 `cargo package` 打包；examples、CLI 与标准组件保持 `publish = false`。私有仓库、首次三平台 CI 与 nightly soak workflow 已建立，`Cargo.toml` 的 `repository` / `homepage` 元数据仍需在首次发布前确定。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
+`rust-cordis-core`、`rust-cordis-abi`、`rust-cordis-host`、`rust-cordis-macros` 已能通过 `cargo package` 打包；examples、CLI 与标准组件保持 `publish = false`。私有仓库、首次三平台 CI 与 nightly soak workflow 已建立，`Cargo.toml` 的 `repository` / `homepage` 元数据仍需在首次发布前确定。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
 
 首发支持路径已定为**低层 ABI + 固定 revision 的源码依赖**：仓外工程 `../desolate`
 已用真实 DLL 验证装载、调用、失败、卸载、重载和 v1→v2 升级。标准 typed 门面
-`cordis-sdk` 仍为 `publish = false`，过程宏依赖其 `cordis::typed` 运行时胶水；
+`rust-cordis-sdk` 仍为 `publish = false`，过程宏依赖其 `cordis::typed` 运行时胶水；
 registry typed SDK 不在首发范围。仓外技术接入、31 篇样例归档任务和一条真实
 agent 首链路（模型流 → 归档工具 → 超时未知 → 关闭）已完成；R1 还需真实数据与
 长期维护反馈，第三方复现是额外证据而非门禁，详见

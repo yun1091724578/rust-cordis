@@ -22,6 +22,6 @@ cordis-cli = { workspace = true }
 cordis-components = { workspace = true }
 cordis-core = { workspace = true }
 cordis-host = { workspace = true }
-cordis-sdk = { workspace = true }
+cordis = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

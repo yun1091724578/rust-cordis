@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 cordis-core = { workspace = true }
-cordis-sdk = { workspace = true }
+cordis = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

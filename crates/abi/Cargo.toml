@@ -1,10 +1,13 @@
 [package]
-name = "cordis-abi"
+name = "rust-cordis-abi"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Cordis 插件 ABI v1：单入口 op 协议 + 宿主函数表 + 插件侧 SDK"
+
+[lib]
+name = "cordis_abi"
 
 [dependencies]
 serde_json = { workspace = true }

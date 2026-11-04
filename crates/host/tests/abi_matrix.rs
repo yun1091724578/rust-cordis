@@ -328,7 +328,7 @@ fn sampled_sizes(prefix: usize) -> Vec<usize> {
 /// 3. **文档防漂移**：把矩阵渲染成 `兼容矩阵.md`（仓库根）。默认**只断言**（与已提交的
 ///    文档逐字一致），`CORDIS_WRITE_MATRIX=1` 时**生成**它——
 ///    这样"自动生成的文档"不会悄悄过期：
-///    `CORDIS_WRITE_MATRIX=1 cargo test -p cordis-host --test abi_matrix`。
+///    `CORDIS_WRITE_MATRIX=1 cargo test -p rust-cordis-host --test abi_matrix`。
 #[test]
 fn abi_compatibility_matrix() {
     let prefix = cordis_abi::PLUGIN_DESC_PREFIX_SIZE;
@@ -368,7 +368,7 @@ fn abi_compatibility_matrix() {
     }
     let text = std::fs::read_to_string(&doc).unwrap_or_else(|err| {
         panic!(
-            "读 {} 失败（用 `CORDIS_WRITE_MATRIX=1 cargo test -p cordis-host --test abi_matrix` 生成）: {err}",
+            "读 {} 失败（用 `CORDIS_WRITE_MATRIX=1 cargo test -p rust-cordis-host --test abi_matrix` 生成）: {err}",
             doc.display()
         )
     });
@@ -383,7 +383,9 @@ fn render_matrix(probes: &[Probe], rows: &[(usize, bool, Vec<bool>)], prefix: us
     let mut out = String::new();
     out.push_str("# ABI 兼容矩阵（自动生成，勿手改）\n\n");
     out.push_str("> 生成者：`crates/host/tests/abi_matrix.rs::abi_compatibility_matrix`\n");
-    out.push_str("> （`CORDIS_WRITE_MATRIX=1 cargo test -p cordis-host --test abi_matrix`）。\n");
+    out.push_str(
+        "> （`CORDIS_WRITE_MATRIX=1 cargo test -p rust-cordis-host --test abi_matrix`）。\n",
+    );
     out.push_str(
         "> 它同时是 A3 后半截的可执行证据：**宿主只读 `PluginDesc.size` 覆盖得到的字段**；\n",
     );

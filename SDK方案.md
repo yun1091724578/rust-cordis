@@ -222,7 +222,7 @@ unsafe { ptr::copy_nonoverlapping(host as *const u8, &mut local as *mut _ as *mu
 零初始化 = `None` ⇒ 缺席字段天然是「宿主不支持」；③ 一次性，无每次调用的分支。
 `field()` 仍保留 `size` 比较，用作**语义**区分（「有能力但本次不提供」的显式 `None`
 vs 「宿主没有」）。**测试 oracle**：夹具用**真截断**分配（`MaybeUninit` 按 `size` 字节），
-并在其后放**金丝雀**（断言未被改写）；`cargo +nightly miri test -p cordis-abi`
+并在其后放**金丝雀**（断言未被改写）；`cargo +nightly miri test -p rust-cordis-abi`
 作为**附加**门禁（进 `run-tests.cmd` 的 `miri` 子命令，**不是** A1 的必要条件，见 D10）。
 删掉 `sdk.rs:99-102` 的错误注释。
 `PluginDesc::field_at` 用**同一形状**（只在 size 足够的分支里 `ptr::read_unaligned`）。

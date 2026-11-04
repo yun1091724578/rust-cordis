@@ -1,5 +1,5 @@
 [package]
-name = "cordis-macros"
+name = "rust-cordis-macros"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,6 +7,7 @@ license.workspace = true
 description = "Cordis 插件声明过程宏：service / service_impl / events / plugin / config（M6）"
 
 [lib]
+name = "cordis_macros"
 proc-macro = true
 
 [dependencies]
