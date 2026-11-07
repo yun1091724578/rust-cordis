@@ -1,7 +1,8 @@
 param(
     [string]$Seal = "",
     [string]$Exe = "",
-    [string]$ServiceName = "CordisScmSmoke"
+    [string]$ServiceName = "CordisScmSmoke",
+    [string]$LogPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,6 +28,10 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "This script must run in an elevated PowerShell (administrator)."
+}
+
+if ($LogPath) {
+    Start-Transcript -Path $LogPath -Force | Out-Null
 }
 
 $config = Join-Path $env:TEMP "cordis-scm-$PID.yml"
@@ -80,4 +85,7 @@ finally {
         & sc.exe delete $ServiceName | Out-Null
     }
     Remove-Item -Force $config -ErrorAction SilentlyContinue
+    if ($LogPath) {
+        Stop-Transcript | Out-Null
+    }
 }

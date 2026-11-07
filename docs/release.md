@@ -20,19 +20,17 @@ core/abi。发布后用 `desolate/registry-consumer` 做了纯 crates.io 依赖�
 
 ### 两个未验证项的处理方式
 
-**Windows SCM**：真实 `sc create/start/stop` 需要管理员权限，当前本地 shell 是
-非提权会话，不能伪造通过。已提供 `scripts/scm-smoke.ps1`；在**管理员 PowerShell**
-中运行：
+**Windows SCM**：真实 `sc create/start/stop` 需要管理员权限。已提供
+`scripts/scm-smoke.ps1`；2026-11-07 在管理员 PowerShell（Windows 10.0.26300）
+实际跑通：
 
-```powershell
-.\scripts\scm-smoke.ps1 -Seal dist\cordis-0.1.0-rc2 `
-  -Exe C:\cordis-rs-target\debug\cordis.exe
+```text
+SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 ```
 
-脚本会执行 `sc create → sc start → sc query（RUNNING）→ sc stop → query（STOPPED）
-→ sc delete`，并在 finally 中清理服务。只有实际输出
-`SCM smoke passed` 后，才把该项从“待验证”改为有证据的保证；没有提权环境就保持
-待验证，不把单元测试的失败路径当成服务生命周期证据。
+脚本执行 `sc create → sc start → sc query（RUNNING）→ sc stop → query（STOPPED）
+→ sc delete`，日志 `dist/cordis-scm-smoke.log`；测试服务已删除（`sc query` 返回
+1060）。这是一次真实手工验证，持续 CI 重跑仍待补，不能夸大为跨机器持续保证。
 
 **历史产物 × 后续宿主**：已提供 `scripts/historical-compat.ps1`，用法：
 
@@ -126,7 +124,7 @@ core/abi。发布后用 `desolate/registry-consumer` 做了纯 crates.io 依赖�
 ### 仍需确认
 
 1. 仓库 URL：私有仓库已建立（`https://github.com/yun1091724578/rust-cordis`）；`Cargo.toml` 的 `repository` / `homepage` 元数据与公开发布地址仍待确认，当前 `cargo package` 只因此产生警告。
-2. Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测（需要管理员权限；已提供 `scripts/scm-smoke.ps1`，当前只验证了非 SCM 启动的失败路径，SCM 项仍待验证）。
+2. Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测：已提供 `scripts/scm-smoke.ps1`；2026-11-07 在管理员 PowerShell（Windows 10.0.26300）实际跑通 `create → RUNNING → stop → STOPPED → delete`，日志 `dist/cordis-scm-smoke.log`，服务已确认删除（`sc query` 返回 1060）。这是一次真实手工验证；持续 CI 重跑仍待补，因此不把它夸大为跨机器持续保证。
 3. **首发产物封存**：入口与本地演练已完成（`cargo xtask seal`，2026-11-02 Windows GNU），但正式首发仍需在 release 时重新运行并归档整个 `seal.json` / `SHA256SUMS` / `plugins` / `smoke` 目录；封存对象是三个 `publish = false` 示例插件，不是可发布 crate。这是历史兼容的基线。
 4. **首发产物 × 同版本宿主**：`seal` 已内置同版本 `inspect` 加载检查，并把完整 stdout 写入 `smoke/inspect.txt`、纳入 `SHA256SUMS`；正式首发时要把该证据连同产物一起归档。它只证明产物可用，**不证明跨版本兼容**。
 5. **历史产物 × 后续宿主版本**：等正式后续宿主版本加载已封存的首发产物，才把“历史发布版 × 新宿主”从待验证转成保证或明确拒绝。已提供 `scripts/historical-compat.ps1`；2026-11-07 的临时 0.1.1 forward drill 通过，但临时版本不作为正式保证。
