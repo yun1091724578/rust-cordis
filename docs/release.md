@@ -1,5 +1,23 @@
 # 发布检查清单
 
+## 0.1.0 发布记录（2026-11-07）
+
+低层 ABI 首发已发布到 crates.io，源码提交
+`24fde519825c5aa357ad8d2d41958110b58e70f9`，正式标签 `v0.1.0`：
+
+- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.0`
+- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.0`
+- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.0`
+- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.0`
+
+发布顺序为 core → abi → macros → host；host 的发布验证从 crates.io 下载了
+core/abi。发布后用 `desolate/registry-consumer` 做了纯 crates.io 依赖的
+编译、加载、调用与关闭验收。`rust-cordis-sdk`、`cordis-components`、
+`cordis-cli` 与 examples 均未发布。
+
+已知发布 warning：workspace 缺少 `documentation` / `homepage` / `repository`
+元数据，应在下一版本前补齐。SCM 与历史产物兼容仍是“不承诺 / 待验证”。
+
 ## 必须通过
 
 | 门禁 | 命令 / 位置 | 说明 |

@@ -82,7 +82,16 @@ sc.exe stop Cordis
 
 ## 发布状态
 
-`rust-cordis-core`、`rust-cordis-abi`、`rust-cordis-host`、`rust-cordis-macros` 已能通过 `cargo package` 打包；examples、CLI 与标准组件保持 `publish = false`。私有仓库、首次三平台 CI 与 nightly soak workflow 已建立，`Cargo.toml` 的 `repository` / `homepage` 元数据仍需在首次发布前确定。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
+**0.1.0 已发布到 crates.io（2026-11-07）**：
+
+- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.0`
+- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.0`
+- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.0`
+- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.0`
+
+`rust-cordis-sdk`、`cordis-components`、`cordis-cli` 与 examples 保持 `publish = false`。
+`Cargo.toml` 的 `repository` / `homepage` 元数据仍缺失（发布时产生 warning），应在
+下一版本前补齐。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
 
 首发支持路径已定为**低层 ABI + 固定 revision 的源码依赖**：仓外工程 `../desolate`
 已用真实 DLL 验证装载、调用、失败、卸载、重载和 v1→v2 升级。标准 typed 门面
