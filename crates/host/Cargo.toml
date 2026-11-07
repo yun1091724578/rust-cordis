@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Cordis 宿主：动态库加载 + C ABI 适配 + cordis.yml/patch 兼容装载器"
 
 [lib]

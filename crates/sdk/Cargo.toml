@@ -3,6 +3,9 @@ name = "rust-cordis-sdk"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Cordis 插件 SDK 门面：typed 服务/事件/配置的过程宏与运行时胶水（M6）"
 publish = false
 

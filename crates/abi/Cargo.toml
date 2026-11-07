@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Cordis 插件 ABI v1：单入口 op 协议 + 宿主函数表 + 插件侧 SDK"
 
 [lib]
