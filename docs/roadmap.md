@@ -6,6 +6,7 @@
 
 - 支持范围、非目标与保证索引：`docs/support-contract.md`
 - 结果与错误决策：`docs/adr/0003-result-and-error-contract.md`、`docs/adr/0004-abi-error-evolution.md`
+- 信任模型与插件来源：`docs/adr/0005-trust-model-and-plugin-source-boundary.md`
 - 发布门禁与未确认项：`docs/release.md`
 - 首发产物封存格式：`docs/release-seal.md`
 - 公开面与载荷清单：`docs/api-inventory.md`
@@ -25,26 +26,67 @@
 - “完成”只指**验收出口满足**。交付物存在、局部测试通过、或表格里写“部分完成”，
   都不等于阶段完成。
 
-## 总览（2026-11-07）
+## 总览（2026-11-07，ADR 0005 后）
 
-| 阶段 | 当前判断 | 已落地证据 | 未闭合 / 下一出口 |
+| 工作线 | 当前判断 | 已落地证据 | 未闭合 / 下一出口 |
 |---|---|---|---|
-| 0：验证基线 | 交付物完成，出口接近满足 | 支持契约 25 行 / 17 条保证；API 清单；冻结 ABI v1 夹具；资源基线；Windows GNU `xtask ci` 与 0.1.1 三平台 CI 通过（[run 42332542433](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542433)）；0.1.0/0.1.1 已发布 crates.io，封存与同版本 `inspect` 通过；0.1.1 宿主加载 0.1.0 封存插件通过；SCM 一次真实 elevated run 通过；默认 1M soak 已通过（[run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543)）；cron 首跑与 artifact 长期转存待补 | **A5 剩余条件**：历史兼容的可重复测试/正式保证、nightly 持续运行与 artifact 长期转存、SCM CI 重跑；不再阻塞低层 ABI 使用 |
-| 1：结果语义 | 完成（含已知例外） | ADR 0003 已冻结；八个契约词汇；§7 失败路径证据列；超时措辞收窄 | 事件路径没有返回协议，是已知例外，不为此新增协议 |
-| 2：结构化错误 | 完成（A4 已收口，含已知边界） | ADR 0004 设计已接受；能力位 / 编解码 / 双向 `STATUS_ERR` / 详细入口 / 有界降级；异步 `on_done`、卸载 / 取消、provider 业务错误、超时和真实旧 ABI 错误均有测试；兼容矩阵是 **2 格真 e2e + 2 个降级分支桩 / 单测** | 分类 / 重试消费者留到阶段 4；事件路径无返回协议；详细入口的同步失败仍为 `String`，宿主预解析仍文本 |
-| 3：声明与诊断 | 完成 | 配置 schema 在 `Capabilities` / CLI 可见；`Fiber::pending_injects` + `report.pending` + `cordis status` 解释缺失键 / 版本 / 未就绪 / 跨域 / 环；能力来源标注为插件自述 | 不承诺按 schema 自动校验；方法 I/O schema / 副作用声明留待消费者 |
-| 4：调用事实 | 条件性待启动 | — | 有真实消费者再设计；不引入 task-local |
-| 5：组件与宿主能力 | 条件性待启动 | — | 按门禁逐项 ADR；没有消费者只登记不实现 |
-| 6：产品化与进程外载体 | 条件性待启动 | — | 安装 / 激活 / 迁移是三条链路；载体不是安全边界 |
+| A. 低层 ABI 交付 | **完成** | 0.1.0/0.1.1 发布；封存、同版本加载、registry-only consumer、三平台 CI | 历史兼容的可重复测试 |
+| B. 信任模型 | **已接受（ADR 0005）** | README/支持契约已加入来源边界与不可抢占声明；产品口径已收口 | 来源 allow-list 实现与验证 |
+| C. 可信单租户底座 P0 | **待启动** | 现有生命周期/资源基线/错误通道 | 来源 allow-list、每 App dispatch policy、容量准入、锁纪律、不可抢占披露 |
+| D. 长期运行 P1 | **待启动** | 1M soak、resource baseline、staged primitive | semver/依赖求解、RSS/dhat、真实 open_staged、缓冲池、版本矩阵 |
+| E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型适配器、取消/预算 |
+| F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置；无实现 | 只有第三方/模型生成/多租户需求出现时另立 T3 ADR |
+| G. 维护治理 | **持续** | R4/R5/R6 已登记 | serde_yaml 迁移、宿主模块拆分、锁/panic 审查 |
 
-当前主线：**agent 有界增量交付 + R1 真实使用反馈 + A5 剩余验证**。0.1.1 已发布，
+阶段 0 的平台与发布基线：支持契约 **26 行 / 17 条保证**；0.1.1 三平台 CI
+[`42332542433`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542433)
+/ [`42332542329`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542329)
+通过；0.1.0/0.1.1 已发布并封存；正式 v0.1.1 宿主加载 0.1.0 封存插件通过一次；
+SCM 一次真实 elevated run 通过；默认 1M soak 已通过。历史兼容仍待可重复测试，
+nightly cron/长期转存仍待补。
+
+当前主线：**P0 可信单租户底座 + agent 有界增量交付 + R1 真实使用反馈**。
 历史兼容有一次正式版本通过但仍未形成可重复测试；阶段 2 / 3 的完成只覆盖既定范围，
 不等于 SDK 已经通过任意升级验证。
+
+### 信任模型约束（ADR 0005）
+
+1. T1/T2 与宿主共享地址空间、权限和生命周期；`realm/scope` 不是安全边界。
+2. T2 同步 `apply`/回调不可抢占；`DispatchPolicy` 只覆盖等待 `STATUS_PENDING`
+   结算，不覆盖正在执行的调用。
+3. T2 无法给单个插件设硬内存上限；cgroup/Job Object 限制整个宿主进程。
+4. Rust 不保证无逻辑泄漏；只证明已枚举路径回基线并做进程级观测。
+5. `abi_version` 是线格式门禁，不是插件 semver，也不证明行为兼容。
+6. 同一 dylib 的 static 由所有实例共享；插件作者新增全局状态必须按 handle 分片。
+7. 来源治理（review、revision、hash、allow-list）不是执行隔离；流水线/密钥
+   被攻破时，“可信”也会失效。
+
+ADR 0005 已接受；P0 整改完成前，本仓只能称为“可信组件运行时”，不能称为
+“agent / 微服务安全底座”。
 
 ## 当前执行优先级（架构现实审查后）
 
 以下是新增工作的优先级；后面的 A5 表保留发布批次状态，不再代表唯一开发队列。
 审查证据与已知边界见 [架构现实审查](architecture-review.md)。
+
+### 信任模型整改（ADR 0005，P0/P1）
+
+| 顺序 | 工作 | 交付 / 关闭条件 | 边界 |
+|---|---|---|---|
+| P0-1 | 来源与身份 | manifest 含 plugin id / semver / source revision / artifact hash；loader allow-list；inspect/status 展示来源 | 来源治理不是安全隔离 |
+| P0-2 | 每 App 的 dispatch policy | 不再只依赖进程级 `set_dispatch_policy`；按 App/插件/方法配置；只覆盖挂起结算；长调用显式 opt-out | 不覆盖同步 `apply`/回调 |
+| P0-3 | 容量与准入 | instances/dispatches/队列有上限；超限可读拒绝；按 App/实例配置 | 不能给 T2 插件内存硬上限 |
+| P0-4 | 锁纪律与故障注入 | 不持锁调插件；`call_inbound` 读锁路径审查；hang/panic/重入/卸载竞态有测试 | 锁中毒只在可达路径确认后定级 |
+| P0-5 | 失败模式对外披露 | README/支持契约/release 写明不可抢占、部署级 supervisor 兜底 | 不改写成“稳定保证” |
+| P1-1 | semver + 依赖求解 | `provides/requires` range；mount 前解析、歧义/缺失拒绝；`(id, version)` 身份 | ABI 仍精确匹配；不引入冲突的 abi range |
+| P1-2 | 版本矩阵 CI | 插件 vN 在宿主 vN/vN+1 各跑一遍 | 同版本加载不等于跨版本兼容 |
+| P1-3 | 内存观测 | nightly RSS / dhat；真实 `open_staged` soak；泄漏预算 | 进程级观测不是 per-plugin 硬上限 |
+| P1-4 | 性能与故障隔离 | 缓冲池化；若保留线程池，证明超时后不卸载、不释放插件；线程泄漏登记 | 真正的抢占仍属 T3 |
+
+P0 **不包含**“有界专用线程池 + 超时放弃等待”；线程池不能取消同步调用，
+超时放弃会留下仍在执行插件代码的线程，卸载时可能 use-after-unload。
+
+### 接入与维护线（原 R1–R6）
 
 | 顺序 | 工作 / 状态 | 交付与验收出口 |
 |---|---|---|
@@ -99,6 +141,8 @@ A5-3 已完成；A5-4 已有一次正式 v0.1.1 验证，但仍缺可重复测�
 - 阶段 4：没有真实调用事实消费者，不为了形式统一引入隐式上下文。
 - 阶段 5 / 6：没有消费者和独立 ADR 的能力只登记，不实现。
 - 事件接口：不新增返回协议；事件派发的调用者认知保持已知例外。
+- T3：第三方/模型生成/多租户/硬抢占需求未出现前，不实现 WASM 或子进程载体。
+- 线程池抢占：T2 同步调用不可取消；不要用“超时放弃等待”伪装成执行隔离。
 
 ## 第一批（交付物完成）
 
@@ -107,7 +151,7 @@ A5-3 已完成；A5-4 已有一次正式 v0.1.1 验证，但仍缺可重复测�
 | 1 | 支持契约 | `docs/support-contract.md` | 完成 |
 | 2 | 结果与错误契约 ADR | `docs/adr/0003-result-and-error-contract.md` | 完成 |
 | 3 | ABI 错误演进 ADR | `docs/adr/0004-abi-error-evolution.md` | 设计已接受；阶段 2 已实施，边界见 ADR |
-| 4 | 保证索引检查器 | `cargo xtask docs` + `xtask/src/contract.rs` 单测 | 完成（55 bin + 17 CLI；文档 25 行 / 17 保证） |
+| 4 | 保证索引检查器 | `cargo xtask docs` + `xtask/src/contract.rs` 单测 | 完成（55 bin + 17 CLI；文档 26 行 / 17 保证） |
 | 5 | 失败路径清单 | ADR 0003 §7 | 完成 |
 | 6 | 资源增长基线测试 | `crates/host/tests/resource_baseline.rs` + `staged.rs` | 完成（8 轮 × 7 路径；64 轮暂存；A5 另有本地 1000 轮与 nightly 20k/1M soak） |
 | 7 | 真实旧插件夹具 | `tests/fixtures/abi-v1` + `frozen_plugin.rs` | 完成（冻结 ABI v1；历史发布版仍待验证） |
@@ -350,7 +394,7 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 
 | 验收层 | 核心问题 | 本仓落点 | 当前判断 |
 |---|---|---|---|
-| 契约测试 | 语义与降级规则是否保持 | `support-contract.md` + `cargo xtask docs` | 25 行 / 17 保证；本地与首次三平台 CI 均绿 |
+| 契约测试 | 语义与降级规则是否保持 | `support-contract.md` + `cargo xtask docs` | 26 行 / 17 保证；本地与首次三平台 CI 均绿 |
 | 确定性交错测试 | 取消、完成、关闭同时发生时谁先 | `lifecycle_races.rs`、`abi_m2c.rs` | 已有测试；新增交错随变更补 |
 | 资源回归 | 成功与失败路径是否都能回收 | `weak_audit.rs`、`resource_baseline.rs`、`staged.rs`、`soak.rs` | 8 轮 × 7 路径 + 64 轮暂存 + 本地 1000 轮 + CI nightly 20k/1M + 本地加强断言 20k |
 | 兼容测试 | 旧 ABI 二进制（冻结快照）是否仍工作 | `abi_matrix.rs`、`tests/fixtures/abi-v1`、`frozen_plugin.rs`、`legacy_error.rs` | 冻结 v1 与真实 72B 旧插件错误已绿；历史发布版待 A5；旧宿主格是桩；旧 Rust 调用者 API 稳定性仍待单列 |
@@ -384,7 +428,7 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 - 绿档：8 个用例通过；`cargo xtask docs` 对 `docs/support-contract.md` 通过。
 - 第二轮 P0 / P1：新增 9 个 bin 用例失败（真测试判定、路径逃逸、表头、围栏、转义、
   重复节、非保证行路径、索引行数、panic 行状态）；修复后 17 bin + 3 CLI 通过。
-- 当前：55 bin + 17 CLI；文档 25 行 / 17 保证；`cargo xtask ci` 已包含
+- 当前：55 bin + 17 CLI；文档 26 行 / 17 保证；`cargo xtask ci` 已包含
   `inventory --check`、`docs` 与 `matrix`，首发 `seal` 与 `soak` 是发布时入口，不在 `ci` 内。
 
 ### 第一批 #6：资源增长基线
@@ -506,7 +550,7 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
   `plugin-self-description (not approval)`；支持契约新增“声明”行，明确不是审批。
 - 兼容性：`Capabilities` 增加私有 `schema` 字段 + accessor；外部 struct 字面量会失效，
   这是阶段 3 的已知 0.x 源级破坏（方法优先，但不加公开字段）。
-- 门禁：`cargo xtask docs` 通过（25 行 / 17 保证）；`inventory` 23 / 4 / 41 / 56 / 32；
+- 门禁：`cargo xtask docs` 通过（26 行 / 17 保证）；`inventory` 23 / 4 / 41 / 56 / 32；
   demo 的装载报告已加入 `"pending":[]` 并重新通过字节级快照（4998 bytes）。
 
 ### A5-1：首次三平台 CI

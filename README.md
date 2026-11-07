@@ -8,6 +8,12 @@ Cordis 的 Rust 实现：服务容器 + epoch 驱动的 fiber 生命周期 + 可
 它不是微服务底座，不提供安全沙箱，也不保证无感热插拔或自动重试安全。
 支持契约与证据索引见 [`docs/support-contract.md`](docs/support-contract.md)。
 
+插件来源按 [ADR 0005](docs/adr/0005-trust-model-and-plugin-source-boundary.md)：
+只承载第一方、可审查、固定 revision 构建的 T1/T2 插件；第三方、运行时下载或
+模型生成且未经人工审查的可执行插件不进入当前运行时。来源 allow-list 是准入，
+不是执行隔离。T2 同步 `apply`/回调不可抢占；`DispatchPolicy` 只覆盖等待挂起
+结算，不能中断正在执行的调用。
+
 当前执行入口见 [`docs/roadmap.md`](docs/roadmap.md)：仓外真实接入与发布收尾并行。
 已知交付缺口、调用通道边界和维护事项见 [`docs/architecture-review.md`](docs/architecture-review.md)。
 根目录设计长文保留历史背景，不作为当前进度或支持承诺。

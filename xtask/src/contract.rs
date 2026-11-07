@@ -537,7 +537,7 @@ async fn async_test() {}
     fn checks_the_real_support_contract() {
         let text = include_str!("../../docs/support-contract.md");
         let rows = parse_index(text).expect("支持契约必须包含保证索引");
-        assert_eq!(rows.len(), 25, "索引行数变化必须是一次有意的编辑");
+        assert_eq!(rows.len(), 26, "索引行数变化必须是一次有意的编辑");
         assert_eq!(
             rows.iter().filter(|row| row.status == "保证").count(),
             17,
