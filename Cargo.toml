@@ -17,19 +17,21 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/yun1091724578/rust-cordis"
+homepage = "https://github.com/yun1091724578/rust-cordis"
 
 [workspace.dependencies]
-cordis-core = { package = "rust-cordis-core", version = "0.1.0", path = "crates/core" }
-cordis-abi = { package = "rust-cordis-abi", version = "0.1.0", path = "crates/abi" }
-cordis-host = { package = "rust-cordis-host", version = "0.1.0", path = "crates/host" }
-cordis = { package = "rust-cordis-sdk", version = "0.1.0", path = "crates/sdk" }
-cordis-macros = { package = "rust-cordis-macros", version = "0.1.0", path = "crates/macros" }
-cordis-cli = { version = "0.1.0", path = "crates/cli" }
-cordis-components = { version = "0.1.0", path = "crates/components" }
+cordis-core = { package = "rust-cordis-core", version = "0.1.1", path = "crates/core" }
+cordis-abi = { package = "rust-cordis-abi", version = "0.1.1", path = "crates/abi" }
+cordis-host = { package = "rust-cordis-host", version = "0.1.1", path = "crates/host" }
+cordis = { package = "rust-cordis-sdk", version = "0.1.1", path = "crates/sdk" }
+cordis-macros = { package = "rust-cordis-macros", version = "0.1.1", path = "crates/macros" }
+cordis-cli = { version = "0.1.1", path = "crates/cli" }
+cordis-components = { version = "0.1.1", path = "crates/components" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
