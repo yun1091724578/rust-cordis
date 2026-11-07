@@ -82,16 +82,16 @@ sc.exe stop Cordis
 
 ## 发布状态
 
-**0.1.0 已发布到 crates.io（2026-11-07）**：
+**0.1.1 已发布到 crates.io（2026-11-07）**：
 
-- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.0`
-- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.0`
-- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.0`
-- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.0`
+- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.1`
+- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.1`
+- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.1`
+- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.1`
 
-`rust-cordis-sdk`、`cordis-components`、`cordis-cli` 与 examples 保持 `publish = false`。
-`Cargo.toml` 的 `repository` / `homepage` 元数据仍缺失（发布时产生 warning），应在
-下一版本前补齐。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
+0.1.1 是元数据补丁：`repository` / `homepage` 已补齐，发布时不再产生该 warning；
+ABI 和公开 API 未变。`rust-cordis-sdk`、`cordis-components`、`cordis-cli` 与 examples
+保持 `publish = false`。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
 
 首发支持路径已定为**低层 ABI + 固定 revision 的源码依赖**：仓外工程 `../desolate`
 已用真实 DLL 验证装载、调用、失败、卸载、重载和 v1→v2 升级。标准 typed 门面

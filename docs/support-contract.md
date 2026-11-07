@@ -85,7 +85,7 @@ T1 = 链进宿主的原生插件；T2 = 同进程动态库插件；T3 = 进程�
 | 重复成功/失败/丢弃 Future/卸载/waterfall/stream/重载后资源计数回到基线 | 保证 | `crates/host/tests/resource_baseline.rs::repeated_cycles_return_to_baseline` | 8 轮 × 七条路径；实例 / 派发 / 挂起 / 派发帧 / 流 / effect |
 | 多轮暂存后台账回到基线 | 保证 | `crates/host/tests/staged.rs::staged_ledger_returns_to_baseline_across_many_rounds` | 64 轮；暂存 +1 / 认领归零 / drop 删除 |
 | 冻结 ABI v1 真 cdylib × 新宿主 | 保证 | `crates/host/tests/frozen_plugin.rs::a_frozen_abi_v1_cdylib_loads_and_calls` | 真 72B v1 结构体（无 `provision`）；volatile、probe/load/mount/回调/dispose；版本与尺寸拒绝；哈希按 LF 字节冻结，`.gitattributes` 固定 `tests/fixtures/**` |
-| 历史发布版 × 新宿主 | 待验证 | — | 当前封存对象是三个 `publish = false` 示例插件，不是可发布 crate；仍需正式首发产物归档（二进制 / 源码版本 / 工具链 / SHA256）与后续宿主版本。同版本宿主加载只证明产物可用，不等于跨版本兼容。2026-11-07 已用临时 0.1.1 宿主做 forward drill（inspect + mount + cleanup，日志 `dist/cordis-0.1.0-forward-drill.log`），但临时版本不算正式后续宿主，状态仍保持待验证。 |
+| 历史发布版 × 新宿主 | 待验证 | — | 当前封存对象是三个 `publish = false` 示例插件，不是可发布 crate；仍需正式首发产物归档（二进制 / 源码版本 / 工具链 / SHA256）与后续宿主版本。同版本宿主加载只证明产物可用，不等于跨版本兼容。2026-11-07 已用正式 v0.1.1 宿主加载 0.1.0 封存插件，`inspect + mount + cleanup` 通过（`dist/cordis-0.1.1-historical.log`）；但这是一次发布级验证，仍是不可重复测试，状态保持待验证。 |
 | 崩溃后任务恢复 | 非目标 | — | 无持久化账本；见 ADR 0003 |
 | 自动重试安全 / exactly-once | 非目标 | — | 当前不提供任何重试判定输入；见 ADR 0003 §4 |
 | 不可信代码隔离 | 非目标 | — | 需要 OS / Wasm 执行边界，不是载体能提供的 |

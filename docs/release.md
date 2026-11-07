@@ -1,5 +1,23 @@
 # 发布检查清单
 
+## 0.1.1 发布记录（2026-11-07）
+
+0.1.1 是元数据补丁，源码提交 `8ab64f98001c19d3bca2b1cd2cd6dd4469645c8a`，
+正式标签 `v0.1.1`，ABI / 公开 API 未变：
+
+- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.1`
+- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.1`
+- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.1`
+- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.1`
+
+本版补齐 `repository` / `homepage` 元数据；`cargo publish` 不再产生缺失元数据
+warning。三平台 CI run 为 [42332542433](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542433)（main）
+与 [42332542329](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542329)（tag）。
+
+历史兼容：用正式 v0.1.1 宿主加载 0.1.0 封存插件，`inspect + mount + cleanup`
+通过，日志 `dist/cordis-0.1.1-historical.log`。这关闭了“有一次正式后续版本验证”的
+事实，但支持契约仍需要可重复测试才能升级为“保证”。
+
 ## 0.1.0 发布记录（2026-11-07）
 
 低层 ABI 首发已发布到 crates.io，源码提交
@@ -123,11 +141,11 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 
 ### 仍需确认
 
-1. 仓库 URL：私有仓库已建立（`https://github.com/yun1091724578/rust-cordis`）；`Cargo.toml` 的 `repository` / `homepage` 元数据与公开发布地址仍待确认，当前 `cargo package` 只因此产生警告。
+1. 仓库 URL：`Cargo.toml` 已在 0.1.1 补齐 `repository` / `homepage`（`https://github.com/yun1091724578/rust-cordis`），发布 warning 消失；仓库仍是私有的，公开发布地址/可见性另行决定。
 2. Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测：已提供 `scripts/scm-smoke.ps1`；2026-11-07 在管理员 PowerShell（Windows 10.0.26300）实际跑通 `create → RUNNING → stop → STOPPED → delete`，日志 `dist/cordis-scm-smoke.log`，服务已确认删除（`sc query` 返回 1060）。这是一次真实手工验证；持续 CI 重跑仍待补，因此不把它夸大为跨机器持续保证。
-3. **首发产物封存**：入口与本地演练已完成（`cargo xtask seal`，2026-11-02 Windows GNU），但正式首发仍需在 release 时重新运行并归档整个 `seal.json` / `SHA256SUMS` / `plugins` / `smoke` 目录；封存对象是三个 `publish = false` 示例插件，不是可发布 crate。这是历史兼容的基线。
-4. **首发产物 × 同版本宿主**：`seal` 已内置同版本 `inspect` 加载检查，并把完整 stdout 写入 `smoke/inspect.txt`、纳入 `SHA256SUMS`；正式首发时要把该证据连同产物一起归档。它只证明产物可用，**不证明跨版本兼容**。
-5. **历史产物 × 后续宿主版本**：等正式后续宿主版本加载已封存的首发产物，才把“历史发布版 × 新宿主”从待验证转成保证或明确拒绝。已提供 `scripts/historical-compat.ps1`；2026-11-07 的临时 0.1.1 forward drill 通过，但临时版本不作为正式保证。
+3. **首发产物封存**：已完成。0.1.0 rc2 与 0.1.1 均运行 `cargo xtask seal`/`--verify`，归档 `seal.json` / `SHA256SUMS` / `plugins` / `smoke`；封存对象是三个 `publish = false` 示例插件，不是可发布 crate。这是历史兼容的基线。
+4. **首发产物 × 同版本宿主**：已完成。`seal` 内置同版本 `inspect` 加载检查，stdout 写入 `smoke/inspect.txt` 并纳入 `SHA256SUMS`；0.1.0/0.1.1 证据已归档。它只证明产物可用，**不证明跨版本兼容**。
+5. **历史产物 × 后续宿主版本**：2026-11-07 已用正式 v0.1.1 宿主加载 0.1.0 封存插件，`inspect + mount + cleanup` 通过（`dist/cordis-0.1.1-historical.log`）。这是一次真实发布级验证；支持契约仍要求可重复测试，因此状态保持待验证，不把单次结果写成保证。
 6. **nightly artifact 长期转存**：当前 `soak.log` 由 GitHub Actions artifact 保存，保留期按仓库设置；正式发布前需把首次与后续 nightly 结果转存到发布存储。nightly schedule 可能在仓库无活动时被 GitHub 自动暂停，发布前需确认最近一次结果。
 
 ## 已确定
