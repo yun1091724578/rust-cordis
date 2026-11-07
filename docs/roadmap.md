@@ -32,7 +32,7 @@
 |---|---|---|---|
 | A. 低层 ABI 交付 | **完成** | 0.1.0/0.1.1 发布；封存、同版本加载、registry-only consumer、三平台 CI | 历史兼容的可重复测试 |
 | B. 信任模型 | **已接受（ADR 0005）** | README/支持契约已加入来源边界与不可抢占声明；产品口径已收口 | 来源 allow-list 实现与验证 |
-| C. 可信单租户底座 P0 | **待启动** | 现有生命周期/资源基线/错误通道 | 来源 allow-list、每 App dispatch policy、容量准入、锁纪律、不可抢占披露 |
+| C. 可信单租户底座 P0 | **进行中** | 来源策略模块与 `LoadedPlugin::open_verified` 已落地，7 个来源测试通过；现有生命周期/资源基线/错误通道 | 来源 allow-list 接入 loader/CLI、每 App dispatch policy、容量准入、锁纪律、不可抢占披露 |
 | D. 长期运行 P1 | **待启动** | 1M soak、resource baseline、staged primitive | semver/依赖求解、RSS/dhat、真实 open_staged、缓冲池、版本矩阵 |
 | E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型适配器、取消/预算 |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置；无实现 | 只有第三方/模型生成/多租户需求出现时另立 T3 ADR |
@@ -73,7 +73,7 @@ ADR 0005 已接受；P0 整改完成前，本仓只能称为“可信组件运�
 
 | 顺序 | 工作 | 交付 / 关闭条件 | 边界 |
 |---|---|---|---|
-| P0-1 | 来源与身份 | manifest 含 plugin id / semver / source revision / artifact hash；loader allow-list；inspect/status 展示来源 | 来源治理不是安全隔离 |
+| P0-1 | 来源与身份（进行中） | 已有 sidecar manifest + SHA256 allow-list 校验、`open_verified`/`open_staged_verified`、7 个来源测试；待接入 loader/CLI 与 inspect/status 展示 | 来源治理不是安全隔离 |
 | P0-2 | 每 App 的 dispatch policy | 不再只依赖进程级 `set_dispatch_policy`；按 App/插件/方法配置；只覆盖挂起结算；长调用显式 opt-out | 不覆盖同步 `apply`/回调 |
 | P0-3 | 容量与准入 | instances/dispatches/队列有上限；超限可读拒绝；按 App/实例配置 | 不能给 T2 插件内存硬上限 |
 | P0-4 | 锁纪律与故障注入 | 不持锁调插件；`call_inbound` 读锁路径审查；hang/panic/重入/卸载竞态有测试 | 锁中毒只在可达路径确认后定级 |
@@ -169,7 +169,7 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
 - [x] 公开 API、状态码、载荷格式清单
   - `docs/api-inventory.md` 由 `cargo xtask inventory --write` 生成；`--check` 已接进
     `cargo xtask ci` 与 xtask CLI 用例。
-  - 当前清单：23 个 ABI 常量、4 个结构 / 41 个字段、56 个宿主 / 核心 / SDK 公开入口、
+  - 当前清单：23 个 ABI 常量、4 个结构 / 41 个字段、63 个宿主 / 核心 / SDK 公开入口、
     32 条载荷；ABI 前缀 / 尺寸由 `兼容矩阵.md` 与 `abi_matrix.rs` 防漂移。
 - [x] 冻结 ABI v1 兼容夹具（`tests/fixtures/abi-v1` + `crates/host/tests/frozen_plugin.rs`）
   - 冻结副本（去掉 sdk）+ 最小入口，编译成真 cdylib；

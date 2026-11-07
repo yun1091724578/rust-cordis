@@ -241,6 +241,48 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub fn set_dispatch_policy",
     },
     PublicItem {
+        item: "open_verified",
+        kind: "fn",
+        source: "crates/host/src/lib.rs",
+        marker: "pub fn open_verified(",
+    },
+    PublicItem {
+        item: "open_staged_verified",
+        kind: "fn",
+        source: "crates/host/src/lib.rs",
+        marker: "pub fn open_staged_verified(",
+    },
+    PublicItem {
+        item: "PluginSourcePolicy",
+        kind: "struct",
+        source: "crates/host/src/source.rs",
+        marker: "pub struct PluginSourcePolicy",
+    },
+    PublicItem {
+        item: "PluginManifest",
+        kind: "struct",
+        source: "crates/host/src/source.rs",
+        marker: "pub struct PluginManifest",
+    },
+    PublicItem {
+        item: "AllowedPlugin",
+        kind: "struct",
+        source: "crates/host/src/source.rs",
+        marker: "pub struct AllowedPlugin",
+    },
+    PublicItem {
+        item: "VerifiedPluginSource",
+        kind: "struct",
+        source: "crates/host/src/source.rs",
+        marker: "pub struct VerifiedPluginSource",
+    },
+    PublicItem {
+        item: "PluginSourcePolicy::verify",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn verify(&self",
+    },
+    PublicItem {
         item: "DispatchPolicy",
         kind: "struct",
         source: "crates/host/src/lib.rs",
@@ -992,7 +1034,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 56, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 63, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 

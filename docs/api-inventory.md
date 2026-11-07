@@ -114,6 +114,13 @@
 | `apply_via_with_keepalive_and_error_format` | fn | `crates/host/src/lib.rs` |
 | `set_plugin_source` | fn | `crates/host/src/lib.rs` |
 | `set_dispatch_policy` | fn | `crates/host/src/lib.rs` |
+| `open_verified` | fn | `crates/host/src/lib.rs` |
+| `open_staged_verified` | fn | `crates/host/src/lib.rs` |
+| `PluginSourcePolicy` | struct | `crates/host/src/source.rs` |
+| `PluginManifest` | struct | `crates/host/src/source.rs` |
+| `AllowedPlugin` | struct | `crates/host/src/source.rs` |
+| `VerifiedPluginSource` | struct | `crates/host/src/source.rs` |
+| `PluginSourcePolicy::verify` | fn | `crates/host/src/source.rs` |
 | `DispatchPolicy` | struct | `crates/host/src/lib.rs` |
 | `streams_len` | fn | `crates/host/src/lib.rs` |
 | `pending_len` | fn | `crates/host/src/lib.rs` |

@@ -38,6 +38,9 @@ pub mod dylib;
 pub mod js;
 pub mod loader;
 pub mod patch;
+pub mod source;
+
+use crate::source::PluginSourcePolicy;
 
 use cordis_abi::{
     Blob, EntryFn, ErrorPayload, HostApi, Out, PluginDesc, ABI_VERSION, ENTRY_SYMBOL,
@@ -2997,6 +3000,39 @@ impl LoadedPlugin {
         let mut plugin = Self::open(path.as_ref())?;
         plugin.staged = Some(StagedFile::new(path.as_ref()));
         Ok(plugin)
+    }
+
+    /// 先校验 sidecar manifest 与来源 allow-list，再加载动态库。
+    pub fn open_verified(
+        path: impl AsRef<Path>,
+        policy: &PluginSourcePolicy,
+    ) -> Result<LoadedPlugin> {
+        let path = path.as_ref();
+        let verified = policy.verify(path)?;
+        let plugin = Self::open(path)?;
+        if plugin.name != verified.manifest.id {
+            return Err(format!(
+                "插件 id 与 manifest 不匹配: manifest={} plugin={}",
+                verified.manifest.id, plugin.name
+            )
+            .into());
+        }
+        Ok(plugin)
+    }
+
+    /// 先校验来源，再打开并认领暂存副本。
+    pub fn open_staged_verified(
+        path: impl AsRef<Path>,
+        policy: &PluginSourcePolicy,
+    ) -> Result<LoadedPlugin> {
+        let path = path.as_ref();
+        let mut plugin = Self::open_verified(path, policy)?;
+        plugin.staged = Some(StagedFile::new(path));
+        Ok(plugin)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.name
     }
 
     pub fn source(&self) -> &Path {
