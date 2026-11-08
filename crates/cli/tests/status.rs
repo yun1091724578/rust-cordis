@@ -98,6 +98,10 @@ async fn status_reports_the_precise_missing_inject_after_mounting() {
     assert!(text.contains("missing missing@1: missing"), "{text}");
     assert!(text.contains("failed = (none)"), "{text}");
     assert!(
+        text.contains("provenance source = missing/manifest"),
+        "没有 sidecar 的挂载行必须明确标注 missing/manifest：{text}"
+    );
+    assert!(
         text.contains("capability source = plugin-self-description (not approval)"),
         "{text}"
     );
@@ -110,6 +114,14 @@ async fn status_reports_the_precise_missing_inject_after_mounting() {
     assert_eq!(json["pending"][0]["missing"][0]["reason"], "missing");
     assert_eq!(json["disabled"], serde_json::json!([]));
     assert_eq!(json["failed"], serde_json::json!([]));
+    assert_eq!(
+        json["provenance"][0]["label"], "needs",
+        "provenance 必须带行标：{json}"
+    );
+    assert_eq!(
+        json["provenance"][0]["source"], "missing/manifest",
+        "没有 sidecar 的挂载行必须在 JSON 里显示 missing/manifest：{json}"
+    );
     assert_eq!(cordis_host::loaded_instances(), 0, "status 必须关闭装载树");
 }
 
@@ -197,7 +209,13 @@ fn cli_status_json_reports_failed_rows_and_exits_nonzero() {
     std::fs::write(&path, "- id: broken\n  name: no-such-plugin\n").expect("写配置");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cordis"))
-        .args(["status", path.to_str().unwrap(), "--no-strict", "--json"])
+        .args([
+            "status",
+            path.to_str().unwrap(),
+            "--no-strict",
+            "--json",
+            "--allow-unverified",
+        ])
         .output()
         .expect("启动 cordis status --json");
     assert_eq!(output.status.code(), Some(4));
@@ -231,6 +249,7 @@ fn cli_status_exits_nonzero_when_a_row_fails_under_no_strict() {
         .arg("status")
         .arg(&path)
         .arg("--no-strict")
+        .arg("--allow-unverified")
         .output()
         .expect("启动 cordis status");
     assert_eq!(

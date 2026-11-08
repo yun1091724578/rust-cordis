@@ -1546,6 +1546,7 @@ async fn self_dispose_of_a_patch_inserted_row_writes_the_patch_layer_not_main() 
 /// ② 暂存副本必须销账并删除，否则每个坏构建漏一个 `.rN`（`stagedLeaked` 只增不减）。
 #[tokio::test]
 async fn failed_reload_precheck_advances_fingerprint_and_cleans_the_staged_copy() {
+    cordis_host::source::set_allow_unverified(true);
     let app = App::new();
     let dir = TempDir::new("reload-bad-precheck");
     let plugin_path = dir.write("plug.dll", "not a real dll");

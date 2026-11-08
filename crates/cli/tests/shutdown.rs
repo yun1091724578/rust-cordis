@@ -33,6 +33,7 @@ fn stdin_eof_does_not_shutdown_the_run_command() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_cordis"))
         .arg("run")
         .arg(&config)
+        .arg("--allow-unverified")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

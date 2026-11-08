@@ -8,24 +8,30 @@
 //!
 //! `dev`/HMR 监听仍留给后续里程碑：生命周期与跨平台构建稳定后再做。
 
+use cordis_host::source::{set_active_policy, set_allow_unverified, PluginSourcePolicy};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 const USAGE: &str = "\
 cordis <子命令> [参数]
 
 子命令:
   inspect <config.yml> [--json] [--plugin-dir <dir>]
+      [--source-policy <allow-list.json>] [--allow-unverified]
                                                  打印装载前能力清单
   status <config.yml> [--patch <file>]...       短暂挂载后打印诊断并关闭
       [--plugin-dir <dir>] [--no-strict] [--json]
+      [--source-policy <allow-list.json>] [--allow-unverified]
                                                  （会执行插件 apply/cleanup）
   validate <config.yml> [--patch <file>]...     校验主配置 + patch 层（不挂载）
-      [--plugin-dir <dir>]
+      [--plugin-dir <dir>] [--source-policy <allow-list.json>] [--allow-unverified]
   run <config.yml> [--patch <file>]...          装载并运行，按 Enter / Ctrl-C 优雅关闭
       [--plugin-dir <dir>] [--no-strict]
+      [--source-policy <allow-list.json>] [--allow-unverified]
   service <config.yml> --name <service-name>    Windows SCM 服务入口
       [--patch <file>]... [--plugin-dir <dir>] [--no-strict]
+      [--source-policy <allow-list.json>] [--allow-unverified]
 
 退出码: 0 成功 / 2 用法错误 / 3 配置错误 / 4 运行时错误";
 
@@ -53,6 +59,10 @@ fn inspect(args: &[String]) -> ExitCode {
         Ok(parsed) => parsed,
         Err(message) => return usage_error("inspect", &message),
     };
+    if let Err(err) = activate_source_policy(&parsed.source_policy, parsed.allow_unverified) {
+        eprintln!("inspect 失败: {err}");
+        return ExitCode::from(3);
+    }
     let search = parsed.plugin_dir.map(|dir| vec![dir]).unwrap_or_else(|| {
         let dir = Path::new(&parsed.path)
             .parent()
@@ -81,6 +91,10 @@ fn validate(args: &[String]) -> ExitCode {
         Ok(parsed) => parsed,
         Err(message) => return usage_error("validate", &message),
     };
+    if let Err(err) = activate_source_policy(&parsed.source_policy, parsed.allow_unverified) {
+        eprintln!("validate 失败: {err}");
+        return ExitCode::from(3);
+    }
     let search = parsed.plugin_dir.map(|dir| vec![dir]).unwrap_or_else(|| {
         let dir = Path::new(&parsed.path)
             .parent()
@@ -109,6 +123,10 @@ fn status(args: &[String]) -> ExitCode {
         Ok(parsed) => parsed,
         Err(message) => return usage_error("status", &message),
     };
+    if let Err(err) = activate_source_policy(&parsed.source_policy, parsed.allow_unverified) {
+        eprintln!("status 失败: {err}");
+        return ExitCode::from(3);
+    }
     let options = cordis_cli::RunOptions {
         patches: parsed.patches,
         plugin_dir: parsed.plugin_dir,
@@ -151,6 +169,10 @@ fn run(args: &[String]) -> ExitCode {
         Ok(parsed) => parsed,
         Err(message) => return usage_error("run", &message),
     };
+    if let Err(err) = activate_source_policy(&parsed.source_policy, parsed.allow_unverified) {
+        eprintln!("run 失败: {err}");
+        return ExitCode::from(3);
+    }
     let options = cordis_cli::RunOptions {
         patches: parsed.patches,
         plugin_dir: parsed.plugin_dir,
@@ -186,6 +208,8 @@ fn service(args: &[String]) -> ExitCode {
     let mut name = None;
     let mut patches = Vec::new();
     let mut plugin_dir = None;
+    let mut source_policy = None;
+    let mut allow_unverified = false;
     let mut strict = true;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -202,6 +226,11 @@ fn service(args: &[String]) -> ExitCode {
                 Some(value) => plugin_dir = Some(PathBuf::from(value)),
                 None => return usage_error("service", "--plugin-dir 缺少目录"),
             },
+            "--source-policy" => match iter.next() {
+                Some(value) => source_policy = Some(PathBuf::from(value)),
+                None => return usage_error("service", "--source-policy 缺少文件"),
+            },
+            "--allow-unverified" => allow_unverified = true,
             "--no-strict" => strict = false,
             other if other.starts_with('-') => return usage_error("service", other),
             other => {
@@ -218,6 +247,10 @@ fn service(args: &[String]) -> ExitCode {
     let Some(name) = name else {
         return usage_error("service", "缺少 --name <service-name>");
     };
+    if let Err(err) = activate_source_policy(&source_policy, allow_unverified) {
+        eprintln!("service 失败: {err}");
+        return ExitCode::from(3);
+    }
 
     let options = cordis_cli::RunOptions {
         patches,
@@ -237,12 +270,15 @@ struct ConfigArgs {
     path: String,
     patches: Vec<PathBuf>,
     plugin_dir: Option<PathBuf>,
+    source_policy: Option<PathBuf>,
+    allow_unverified: bool,
     strict: bool,
     json: bool,
 }
 
 /// 解析 config 子命令的公共参数：位置参数、`--patch`、`--plugin-dir`、
-/// `--no-strict`、`--json`。缺值、重复位置参数和未知 flag 都是用法错误。
+/// `--source-policy`、`--no-strict`、`--json`。缺值、重复位置参数和未知 flag
+/// 都是用法错误。
 fn parse_config_args(
     args: &[String],
     allow_patch: bool,
@@ -253,6 +289,8 @@ fn parse_config_args(
     let mut path = None;
     let mut patches = Vec::new();
     let mut plugin_dir = None;
+    let mut source_policy = None;
+    let mut allow_unverified = false;
     let mut strict = true;
     let mut json = false;
     let mut iter = args.iter();
@@ -264,6 +302,10 @@ fn parse_config_args(
             "--plugin-dir" if allow_plugin_dir => {
                 plugin_dir = Some(PathBuf::from(next_value(&mut iter, "--plugin-dir")?));
             }
+            "--source-policy" => {
+                source_policy = Some(PathBuf::from(next_value(&mut iter, "--source-policy")?));
+            }
+            "--allow-unverified" => allow_unverified = true,
             "--no-strict" if allow_strict => strict = false,
             "--json" if allow_json => json = true,
             other if other.starts_with('-') => return Err(format!("未知参数 {other}")),
@@ -279,9 +321,32 @@ fn parse_config_args(
         path: path.ok_or_else(|| "缺少配置文件".to_string())?,
         patches,
         plugin_dir,
+        source_policy,
+        allow_unverified,
         strict,
         json,
     })
+}
+
+/// 读取 `--source-policy` 并设为进程级生效策略；缺省时明确复位为 `None`。
+///
+/// 文件缺失或 JSON 非法是配置错误（由调用方映射为退出码 3）。
+fn activate_source_policy(path: &Option<PathBuf>, allow_unverified: bool) -> Result<(), String> {
+    if let Some(path) = path {
+        let policy = PluginSourcePolicy::from_file(path)?;
+        set_allow_unverified(false);
+        set_active_policy(Some(Arc::new(policy)));
+        return Ok(());
+    }
+    if allow_unverified {
+        set_active_policy(None);
+        set_allow_unverified(true);
+        return Ok(());
+    }
+    Err(
+        "未配置插件来源策略；请传 --source-policy，或显式传 --allow-unverified 启用开发模式"
+            .to_string(),
+    )
 }
 
 fn next_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, String> {

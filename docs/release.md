@@ -83,18 +83,20 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 | 支持契约 | `cargo xtask docs`（CI 由 `cargo test --workspace` 覆盖索引检查） | 保证索引必须引用带 `#[test]` / `#[tokio::test]` 的测试；违规非零退出 |
 | API 清单 | `cargo xtask inventory --check`（CI 由 xtask 的 inventory CLI 用例覆盖） | ABI 常量/字段与受控 marker 漂移即失败；新增宿主入口需人工加入清单 |
 | 平台矩阵（结构 + 结果） | `.\cargo.cmd xtask matrix`（Windows GNU 本地；CI 用裸 `cargo`）/ 已接入 `xtask ci` | 17 条保证逐条有行、四平台状态合法、证据引用 `.rs` 文件；结构检查本身不验证真实平台结果。2026-11-02 首次三平台 CI 通过后，17 条保证在四个平台列均已实填 `通过`；表内注明这是快照，后续变更需重跑 |
-| 首发封存入口 | `cargo xtask seal [--out <dir>]` / `cargo xtask seal --verify <dir>` | 构建三个宿主目标 release 插件，记录源码树 / 工具链 / ABI / SHA256，用同版本 `inspect` 逐插件核对身份，并把 stdout、smoke 配置与 artifact 一起写入校验和；2026-11-02 Windows GNU 本地演练通过。封存对象是 `publish = false` 的示例插件，不是可发布 crate。格式与边界见 `docs/release-seal.md`；**不是 CI 门禁**，正式首发时必须运行并把整个目录归档 |
+| 首发封存入口 | `cargo xtask seal [--out <dir>]` / `cargo xtask seal --verify <dir>` | 构建三个宿主目标 release 插件，记录源码树 / 工具链 / ABI / SHA256，为每个 DLL 写 sidecar manifest 与根 `allow-list.json`，用同版本 `inspect --source-policy` 逐插件核对身份，并把 stdout、smoke 配置、artifact、manifest 与 allow-list 一起写入校验和；2026-11-02 Windows GNU 本地演练通过（旧 `/1` 格式）。封存对象是 `publish = false` 的示例插件，不是可发布 crate。格式与边界见 `docs/release-seal.md`；**不是 CI 门禁**，正式首发时必须运行并把整个目录归档 |
 | 资源增长回归 | `cargo test -p rust-cordis-host --test resource_baseline` / `--test staged`（三平台 CI 已包含；2026-11-02 首次通过） | 实例 / 派发 / 挂起 / 派发帧 / 流 / effect / 暂存台账回到基线；独立 soak 见 A5-2 |
 | 夜间 soak | `cargo xtask soak [cycles]` / `.github/workflows/nightly-soak.yml`（每日 02:17 CST 或手动 dispatch） | workflow 默认 1,000,000 轮（约 38 分钟，Linux 单测试；手动 dispatch 可覆盖）；2026-11-03 首次手动 20,000 轮 [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 通过；1M 默认已由 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543) 验证（`elapsed_ms=2265533`，artifact `soak-log-41592298543-c1000000`）；cron 首跑待补，不阻塞 PR；后续变更需重跑，artifact 保留 90 天 |
 | 冻结 ABI v1 兼容 | `cargo test -p rust-cordis-host --test frozen_plugin`（三平台 CI 已包含；2026-11-02 首次通过） | 真 72B v1 结构体（无 `provision`）；volatile / 回调 / dispose；版本与尺寸拒绝；哈希冻结；夹具按 LF 字节固定 |
-| 声明与诊断 | `cargo test -p rust-cordis-abi --test schema --test macro_schema --test invalid_schema_entry`；`cargo test -p rust-cordis-macros`；`cargo test -p rust-cordis-core --test pending_diagnostics --test runtime_cycles`；`cargo test -p rust-cordis-host --test loader_cycles`；`cargo test -p cordis-cli --test status --test inspect --test args` | schema 装载前可见，非法/超限 schema 在入口降级不 abort，未声明与非法可区分；原生宏在展开期校验；Pending 区分 missing / version_mismatch / provider_not_ready / realm_mismatch / cycle，并提供者未 apply 时明确为 missing；`status` 列出 failed/disabled、支持 `--json`、失败退出码非 0；来源标注为插件自述 |
+| 来源准入 | `cargo test -p rust-cordis-host --test source_policy`；`cargo test -p cordis-cli --test source_policy`；`cargo xtask seal --verify <dir>` | sidecar manifest + SHA256 allow-list 在 `dlopen` 前校验；无策略默认拒绝；`--allow-unverified` 仅显式开发模式；seal `/2` 产物包含 sidecar 与 allow-list |
+| 声明与诊断 | `cargo test -p rust-cordis-abi --test schema --test macro_schema --test invalid_schema_entry`；`cargo test -p rust-cordis-macros`；`cargo test -p rust-cordis-core --test pending_diagnostics --test runtime_cycles`；`cargo test -p rust-cordis-host --test loader_cycles --test source_policy`；`cargo test -p cordis-cli --test status --test inspect --test args --test source_policy` | schema 装载前可见，非法/超限 schema 在入口降级不 abort，未声明与非法可区分；原生宏在展开期校验；Pending 区分 missing / version_mismatch / provider_not_ready / realm_mismatch / cycle，并提供者未 apply 时明确为 missing；`status` 列出 failed/disabled、支持 `--json`、失败退出码非 0；来源标注为插件自述 |
 | 错误通道兼容 | `cargo test -p rust-cordis-host --test legacy_error --test sdk_detailed_timeout --test abi_outbound_timeout --test abi_outbound_dispatch_timeout --test abi_next_timeout --test sdk_iface_unload_detailed --test sdk_provider_error_detailed --test abi_iface_unload_abort` | 旧 ABI 文本 / `unknown`；异步详细入口；iface / dispatch / next 超时 `HOST_TIMEOUT/timeout/unknown`；卸载/取消 `host_lifecycle|host_cancel`；provider 业务错误 `callback_failed/business`；旧宿主格为桩并在 ADR 标注 |
 
 ## 首发封存流程
 
 1. 在发布用的干净源码树上运行 `cargo xtask seal`（或指定 `--out`）。
-2. 确认输出目录包含 `seal.json`、`SHA256SUMS`、`plugins/`、`smoke/cordis.yml`
-   与 `smoke/inspect.txt`，且命令末尾报告同版本加载检查通过。
+2. 确认输出目录包含 `seal.json`、`SHA256SUMS`、`allow-list.json`、`plugins/`
+   （每个 DLL 旁边有 `.manifest.json`）、`smoke/cordis.yml` 与
+   `smoke/inspect.txt`，且命令末尾报告同版本加载检查通过。
 3. 用 `cargo xtask seal --verify <dir>` 做一次只读的目录 / 校验和复验（不重跑
    加载检查）。
 4. 把**整个目录**归档到发布存储；不要用第二次运行覆盖首发表。格式、字段与

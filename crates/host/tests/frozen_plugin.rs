@@ -286,6 +286,7 @@ async fn a_frozen_abi_v1_cdylib_loads_and_calls() {
     let (valid_target, artifact) = build_fixture("valid", &[]);
 
     // 1. 能力面：真 v1 结构体没有 provision；volatile 走 {"ret":[...]}。
+    cordis_host::source::set_allow_unverified(true);
     let capabilities = probe_capabilities(&artifact).expect("新宿主必须能探测冻结夹具");
     assert_eq!(capabilities.plugin, "abi-v1-frozen");
     assert!(capabilities.inject.is_empty());

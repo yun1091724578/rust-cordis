@@ -25,6 +25,7 @@ fn sigterm_triggers_graceful_shutdown() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_cordis"))
         .arg("run")
         .arg(&config)
+        .arg("--allow-unverified")
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -80,7 +81,7 @@ fn service_mode_is_windows_only() {
     let output = Command::new(env!("CARGO_BIN_EXE_cordis"))
         .arg("service")
         .arg(&config)
-        .args(["--name", "CordisTestLifecycle"])
+        .args(["--name", "CordisTestLifecycle", "--allow-unverified"])
         .output()
         .expect("运行 cordis service");
 

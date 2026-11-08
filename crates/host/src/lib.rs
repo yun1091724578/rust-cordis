@@ -3009,7 +3009,7 @@ impl LoadedPlugin {
     ) -> Result<LoadedPlugin> {
         let path = path.as_ref();
         let verified = policy.verify(path)?;
-        let plugin = Self::open(path)?;
+        let plugin = Self::open(&verified.path)?;
         if plugin.name != verified.manifest.id {
             return Err(format!(
                 "插件 id 与 manifest 不匹配: manifest={} plugin={}",
@@ -3020,19 +3020,75 @@ impl LoadedPlugin {
         Ok(plugin)
     }
 
-    /// 先校验来源，再打开并认领暂存副本。
+    /// 校验原始 artifact，加载并认领一个**不同的**暂存副本。
+    ///
+    /// `original` 与 `staged` 必须是两个不同文件；相同路径会被拒绝，避免把
+    /// 部署目录里的原始插件当成暂存副本删除。
     pub fn open_staged_verified(
-        path: impl AsRef<Path>,
+        original: impl AsRef<Path>,
+        staged: impl AsRef<Path>,
         policy: &PluginSourcePolicy,
     ) -> Result<LoadedPlugin> {
-        let path = path.as_ref();
-        let mut plugin = Self::open_verified(path, policy)?;
-        plugin.staged = Some(StagedFile::new(path));
+        let original = original.as_ref();
+        let staged = staged.as_ref();
+        let original_abs = std::path::absolute(original)
+            .map_err(|err| format!("规范化插件 artifact {} 失败: {err}", original.display()))?;
+        let staged_abs = std::path::absolute(staged)
+            .map_err(|err| format!("规范化暂存副本 {} 失败: {err}", staged.display()))?;
+        let same = match (
+            std::fs::canonicalize(&original_abs),
+            std::fs::canonicalize(&staged_abs),
+        ) {
+            (Ok(original), Ok(staged)) => original == staged,
+            _ => original_abs == staged_abs,
+        };
+        if same {
+            return Err("open_staged_verified 拒绝把原始 artifact 当作暂存副本".into());
+        }
+        let discard_staged = || {
+            drop(StagedFile::new(staged));
+        };
+        let verified = match policy.verify(&original_abs) {
+            Ok(verified) => verified,
+            Err(error) => {
+                discard_staged();
+                return Err(error.into());
+            }
+        };
+        let staged_hash = match crate::source::sha256_file(&staged_abs) {
+            Ok(hash) => hash,
+            Err(error) => {
+                discard_staged();
+                return Err(error.into());
+            }
+        };
+        if staged_hash != verified.sha256 {
+            discard_staged();
+            return Err(format!(
+                "暂存副本 SHA256 与已校验 artifact 不匹配: staged={staged_hash} verified={}",
+                verified.sha256
+            )
+            .into());
+        }
+        let mut plugin = match Self::open(&staged_abs) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                discard_staged();
+                return Err(error);
+            }
+        };
+        if plugin.name != verified.manifest.id {
+            let plugin_id = plugin.name.clone();
+            drop(plugin);
+            discard_staged();
+            return Err(format!(
+                "插件 id 与 manifest 不匹配: manifest={} plugin={plugin_id}",
+                verified.manifest.id
+            )
+            .into());
+        }
+        plugin.staged = Some(StagedFile::new(staged));
         Ok(plugin)
-    }
-
-    pub fn id(&self) -> &str {
-        &self.name
     }
 
     pub fn source(&self) -> &Path {
@@ -3656,7 +3712,9 @@ fn is_json_object(text: &str) -> bool {
 ///
 /// 与装载共用 [`plugin_source`]（D8 的 seam）：真宿主走 `DiskPluginSource`，
 /// 测试可以塞假源（所以"读能力面"这条链本身不需要动态库就能验证，见
-/// `crates/host/tests/probe_capabilities.rs`）。
+/// `crates/host/tests/probe_capabilities.rs`）。配置了进程级
+/// [`crate::source::active_policy`] 时，`probe_capabilities_in` 会在打开动态库
+/// **之前**先验原始 artifact 的 sidecar manifest 与 allow-list。
 /// **不挂载**：不建 fiber、不注册实例、不派生 ctx。但它仍会加载动态库并调用
 /// `OP_PING` / `OP_VOLATILE_PATHS`，插件代码可能产生副作用；只对受信插件使用
 /// （CLI 的 `inspect` 就是这么用的）。
@@ -3674,6 +3732,13 @@ pub fn probe_capabilities_in(path: &std::path::Path, search: &[PathBuf]) -> Resu
         name: path.to_string_lossy().into_owned(),
         ..patch::Entry::default()
     };
+    // P0-1a：配置了来源策略时，inspect 也必须在打开动态库**之前**验证原始 artifact。
+    // 先解析到真实路径（`entry.name` 可能只是裸插件名）；没有策略时保持原有顺序，
+    // 这样测试注入的假 `PluginSource` 仍能在没有磁盘文件的情况下工作。
+    if let Some(policy) = crate::source::admission()? {
+        let resolved = resolve_plugin_path(&entry.name, search)?;
+        policy.verify(&resolved)?;
+    }
     let loaded = plugin_source().load(&entry, search, next_use_revision())?;
     // `loaded` 在这一句之后 drop：先 FreeLibrary、后删暂存副本（M0b 的字段序保证）。
     Ok(Capabilities::of_plugin(&*loaded.plugin))

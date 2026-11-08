@@ -15,7 +15,7 @@ fn service_mode_outside_scm_fails_with_runtime_code() {
     let output = Command::new(env!("CARGO_BIN_EXE_cordis"))
         .arg("service")
         .arg(&config)
-        .args(["--name", "CordisTestLifecycle"])
+        .args(["--name", "CordisTestLifecycle", "--allow-unverified"])
         .output()
         .expect("运行 cordis service");
 

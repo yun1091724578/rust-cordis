@@ -807,6 +807,22 @@ impl LoaderState {
         labels
     }
 
+    /// 当前挂载行的 `(行标, 用户提供的 artifact 路径)`（排序）。
+    ///
+    /// `status` 用它从**原始 artifact**（而不是暂存副本）读 sidecar manifest 与
+    /// SHA256；暂存副本的 `.rN` 名字旁边没有发布方写的 manifest。
+    pub fn mounted_sources(&self) -> Vec<(String, PathBuf)> {
+        let mut rows: Vec<(String, PathBuf)> = self
+            .mounted
+            .lock()
+            .unwrap()
+            .values()
+            .map(|record| (record.label.clone(), record.source.clone()))
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    }
+
     /// 诊断：装载表里每一行**是否指向活着的实例**。
     ///
     /// 这是对账路径的不变量：**记录先摘、后 dispose；先挂、后记录**——于是任何时刻
@@ -2031,7 +2047,8 @@ pub trait PluginSource: Send + Sync {
 }
 
 /// 真实实现：磁盘上的动态库。预检（ABI 版本、结构尺寸、入口可调用性）全在
-/// 动到正在跑的实例之前完成。
+/// 动到正在跑的实例之前完成。配置了进程级 [`crate::source::active_policy`] 时，
+/// artifact 还要先通过 sidecar manifest + allow-list 校验才会被暂存。
 pub struct DiskPluginSource;
 
 impl PluginSource for DiskPluginSource {
@@ -2042,9 +2059,21 @@ impl PluginSource for DiskPluginSource {
         revision: u64,
     ) -> std::result::Result<LoadedFile, String> {
         let path = resolve_plugin_path(&entry.name, search).map_err(|err| err.to_string())?;
+        // P0-1a：配置了进程级来源策略时，**暂存之前**先验 sidecar manifest 与
+        // allow-list。这样未登记 / 被篡改的 artifact 不会产生暂存副本，更不会
+        // 走到 `LoadLibrary`/`dlopen`。
+        let active_policy = crate::source::admission()?;
+        if let Some(policy) = &active_policy {
+            policy.verify(&path)?;
+        }
         let source_fingerprint = fingerprint(&path);
         let staged = stage_plugin(&path, revision).map_err(|err| err.to_string())?;
-        let plugin = LoadedPlugin::open_staged(&staged).map_err(|err| err.to_string())?;
+        let plugin = match &active_policy {
+            // 二次校验 + 暂存副本 hash：防的是 verify 与 stage 之间的替换窗口。
+            Some(policy) => LoadedPlugin::open_staged_verified(&path, &staged, policy)
+                .map_err(|err| err.to_string())?,
+            None => LoadedPlugin::open_staged(&staged).map_err(|err| err.to_string())?,
+        };
         // 预检：ABI 版本、结构尺寸、插件入口可调用性，全在动到正在跑的实例之前完成。
         // （探活失败时 `plugin` 在此 drop：先 FreeLibrary、后删暂存文件——不会泄漏。）
         if !plugin.ping() {
@@ -2776,6 +2805,21 @@ pub async fn reload_one(
 
     // ① 预检：新库先落到新文件名、打开、ABI 探活。**全部通过才动正在跑的实例**
     //    ——这是比"先卸后装"更好的地方：坏构建不会让你先失去能力再发现它坏了。
+    //    配置了来源策略时，和 `DiskPluginSource` 一样先验原始 artifact，再验
+    //    暂存副本的 hash；不通过就不产生/不保留暂存副本。
+    let active_policy = crate::source::admission()?;
+    if let Some(policy) = &active_policy {
+        if let Err(err) = policy.verify(&record.source) {
+            // 坏版本也要推进指纹，否则 HMR 会按 500ms 周期反复重试。
+            advance_fingerprint(state, label);
+            state.publish_report();
+            ctx.log(
+                Level::Error,
+                &format!("热重载 {label}: 来源策略拒绝新库（保留当前实例）: {err}"),
+            );
+            return Err(err);
+        }
+    }
     let staged = match stage_plugin(&record.source, state.next_revision()) {
         Ok(staged) => staged,
         Err(err) => {
@@ -2789,7 +2833,11 @@ pub async fn reload_one(
             return Err(err.to_string());
         }
     };
-    let plugin = match LoadedPlugin::open_staged(&staged) {
+    let plugin = match &active_policy {
+        Some(policy) => LoadedPlugin::open_staged_verified(&record.source, &staged, policy),
+        None => LoadedPlugin::open_staged(&staged),
+    };
+    let plugin = match plugin {
         Ok(plugin) => plugin,
         Err(err) => {
             // 打不开的副本永远不会被认领：立刻销账并删除，否则每个坏构建都会

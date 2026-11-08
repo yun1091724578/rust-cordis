@@ -13,13 +13,16 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SEAL_FORMAT: &str = "cordis-plugin-seal/1";
+const SEAL_FORMAT: &str = "cordis-plugin-seal/2";
+/// 历史格式：没有 sidecar manifest / `allow-list.json`，只校验 artifact 与 smoke。
+const SEAL_FORMAT_V1: &str = "cordis-plugin-seal/1";
 const SEAL_FILE: &str = "seal.json";
 const SUMS_FILE: &str = "SHA256SUMS";
+const ALLOW_LIST_FILE: &str = "allow-list.json";
 const SMOKE_CONFIG: &str = "smoke/cordis.yml";
 const SMOKE_EVIDENCE: &str = "smoke/inspect.txt";
-const SMOKE_METHOD: &str =
-    "cordis inspect --plugin-dir plugins (LoadedPlugin::open + OP_PING / OP_VOLATILE_PATHS; no mount)";
+const SMOKE_METHOD: &str = "cordis inspect --plugin-dir plugins --source-policy allow-list.json \
+     (PluginSourcePolicy::verify + LoadedPlugin::open + OP_PING / OP_VOLATILE_PATHS; no mount)";
 
 const PLUGINS: &[PluginSpec] = &[
     PluginSpec {
@@ -122,8 +125,11 @@ impl SealManifest {
     }
 
     fn from_json(value: &Value) -> Result<Self, String> {
-        if value.get("format").and_then(Value::as_str) != Some(SEAL_FORMAT) {
-            return Err(format!("封存清单格式不是 {SEAL_FORMAT}"));
+        let format = value.get("format").and_then(Value::as_str);
+        if format != Some(SEAL_FORMAT) && format != Some(SEAL_FORMAT_V1) {
+            return Err(format!(
+                "封存清单格式不是 {SEAL_FORMAT}（兼容 {SEAL_FORMAT_V1}）"
+            ));
         }
         let artifacts = value
             .get("artifacts")
@@ -377,6 +383,16 @@ fn seal_to(out: &Path) -> Result<SealManifest, String> {
         });
     }
 
+    // sidecar manifest + allow-list 必须在 smoke 之前落盘：同版本 inspect 会用
+    // `--source-policy allow-list.json` 走真实的准入路径。
+    write_plugin_provenance(
+        &temp,
+        env!("CARGO_PKG_VERSION"),
+        &source_sha256,
+        cordis_abi::ABI_VERSION,
+        &artifacts,
+    )?;
+
     fs::create_dir_all(temp.join("smoke")).map_err(|err| format!("创建 smoke 目录失败：{err}"))?;
     fs::write(temp.join(SMOKE_CONFIG), smoke_yaml())
         .map_err(|err| format!("写 smoke 配置失败：{err}"))?;
@@ -574,6 +590,8 @@ fn run_load_check(seal_dir: &Path, cargo: &str, target: &str) -> Result<String, 
         .arg(&config)
         .arg("--plugin-dir")
         .arg(&plugin_dir)
+        .arg("--source-policy")
+        .arg(seal_dir.join(ALLOW_LIST_FILE))
         .output()
         .map_err(|err| format!("启动同版本加载检查失败：{err}"))?;
     if !output.status.success() {
@@ -605,7 +623,118 @@ fn verify_inspect_output(stdout: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `source_revision` 的约定：`tree:<source.sha256>`。
+///
+/// seal 没有 git commit 字段，源码树聚合 SHA256 是唯一稳定、可重建的 revision
+/// 标识；它包含未跟踪文件，因此不等同于提交号。格式见 `docs/release-seal.md`。
+fn source_revision(source_sha256: &str) -> String {
+    format!("tree:{}", source_sha256.to_ascii_lowercase())
+}
+
+fn plugin_spec_for(artifact: &SealArtifact) -> Option<&'static PluginSpec> {
+    PLUGINS
+        .iter()
+        .find(|spec| spec.package == artifact.package && spec.krate == artifact.krate)
+}
+
+fn plugin_manifest_value(
+    artifact: &SealArtifact,
+    version: &str,
+    source_revision: &str,
+    abi_version: u32,
+) -> Result<Value, String> {
+    let spec = plugin_spec_for(artifact).ok_or_else(|| {
+        format!(
+            "artifact 未登记：package={} crate={}",
+            artifact.package, artifact.krate
+        )
+    })?;
+    Ok(json!({
+        "id": spec.plugin,
+        "version": version,
+        "source_revision": source_revision,
+        "abi_version": abi_version,
+        "sha256": artifact.sha256.to_ascii_lowercase(),
+    }))
+}
+
+fn allow_list_value(
+    version: &str,
+    source_revision: &str,
+    abi_version: u32,
+    artifacts: &[SealArtifact],
+) -> Result<Value, String> {
+    let mut allowed = Vec::new();
+    for spec in PLUGINS {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.package == spec.package && artifact.krate == spec.krate)
+            .ok_or_else(|| format!("缺少 artifact：{} / {}", spec.package, spec.krate))?;
+        allowed.push(plugin_manifest_value(
+            artifact,
+            version,
+            source_revision,
+            abi_version,
+        )?);
+    }
+    Ok(json!({ "allowed": allowed }))
+}
+
+fn json_file_bytes(value: &Value) -> Result<Vec<u8>, String> {
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|err| format!("序列化封存 provenance 失败：{err}"))?;
+    Ok(format!("{text}\n").into_bytes())
+}
+
+fn sidecar_path(artifact: &SealArtifact) -> String {
+    format!("{}.manifest.json", artifact.path)
+}
+
+/// 写每个 artifact 的 sidecar manifest 与封存根的 `allow-list.json`，返回
+/// `相对路径 -> SHA256`（供 `SHA256SUMS` 与 `--verify` 使用）。
+fn write_plugin_provenance(
+    dir: &Path,
+    version: &str,
+    source_sha256: &str,
+    abi_version: u32,
+    artifacts: &[SealArtifact],
+) -> Result<BTreeMap<String, String>, String> {
+    let revision = source_revision(source_sha256);
+    let mut written = BTreeMap::new();
+    for artifact in artifacts {
+        let relative = sidecar_path(artifact);
+        // 防御恶意/损坏的清单路径：宁可让 `--verify` 报「路径不安全」，也不往
+        // 封存目录外写文件（`verify_rejects_path_traversal` 覆盖这条）。
+        if !safe_relative_path(&relative) || !relative.starts_with("plugins/") {
+            continue;
+        }
+        // 不一致的清单（缺 artifact / 未登记 artifact）由 `verify_dir` 报告；
+        // 写侧只负责产出可生成的那部分，避免测试夹具在自检前就 panic。
+        let Ok(value) = plugin_manifest_value(artifact, version, &revision, abi_version) else {
+            continue;
+        };
+        let bytes = json_file_bytes(&value)?;
+        fs::write(dir.join(&relative), &bytes)
+            .map_err(|err| format!("写插件 manifest {relative} 失败：{err}"))?;
+        written.insert(relative, sha256_hex(&bytes));
+    }
+    if let Ok(value) = allow_list_value(version, &revision, abi_version, artifacts) {
+        let bytes = json_file_bytes(&value)?;
+        fs::write(dir.join(ALLOW_LIST_FILE), &bytes)
+            .map_err(|err| format!("写 {ALLOW_LIST_FILE} 失败：{err}"))?;
+        written.insert(ALLOW_LIST_FILE.to_string(), sha256_hex(&bytes));
+    }
+    Ok(written)
+}
+
 fn write_manifest_files(dir: &Path, manifest: &SealManifest) -> Result<(), String> {
+    let provenance_sums = write_plugin_provenance(
+        dir,
+        &manifest.workspace_version,
+        &manifest.source_sha256,
+        manifest.abi_version,
+        &manifest.artifacts,
+    )?;
     let text = serde_json::to_string_pretty(&manifest.to_json())
         .map_err(|err| format!("序列化封存清单失败：{err}"))?;
     fs::write(dir.join(SEAL_FILE), format!("{text}\n"))
@@ -613,6 +742,12 @@ fn write_manifest_files(dir: &Path, manifest: &SealManifest) -> Result<(), Strin
     let mut sums = String::new();
     for artifact in &manifest.artifacts {
         sums.push_str(&format!("{}  {}\n", artifact.sha256, artifact.path));
+        if let Some(hash) = provenance_sums.get(&sidecar_path(artifact)) {
+            sums.push_str(&format!("{hash}  {}\n", sidecar_path(artifact)));
+        }
+    }
+    if let Some(hash) = provenance_sums.get(ALLOW_LIST_FILE) {
+        sums.push_str(&format!("{hash}  {ALLOW_LIST_FILE}\n"));
     }
     sums.push_str(&format!(
         "{}  {}\n",
@@ -639,6 +774,9 @@ fn verify_dir(dir: &Path) -> Result<SealManifest, Vec<String>> {
         Ok(manifest) => manifest,
         Err(err) => return Err(vec![err]),
     };
+    // `/1` 是加入 provenance 文件之前的历史封存：保留只读复验能力，不要求
+    // sidecar / allow-list。新 `/2` 封存必须完整。
+    let legacy = value.get("format").and_then(Value::as_str) == Some(SEAL_FORMAT_V1);
 
     if value.pointer("/source/kind").and_then(Value::as_str) != Some("workspace-tree") {
         errors.push("source.kind 必须是 workspace-tree".to_string());
@@ -757,6 +895,9 @@ fn verify_dir(dir: &Path) -> Result<SealManifest, Vec<String>> {
             ));
         }
     }
+    if !legacy {
+        verify_plugin_provenance(dir, &manifest, &mut seen, &mut expected_sums, &mut errors);
+    }
     if safe_relative_path(&manifest.smoke_config) && manifest.smoke_config.starts_with("smoke/") {
         expected_sums.insert(
             manifest.smoke_config.clone(),
@@ -781,11 +922,166 @@ fn verify_dir(dir: &Path) -> Result<SealManifest, Vec<String>> {
         &mut errors,
     );
     verify_sums(dir, &expected_sums, &mut errors);
+    if !legacy {
+        verify_root_files(
+            dir,
+            &BTreeSet::from([
+                SEAL_FILE.to_string(),
+                SUMS_FILE.to_string(),
+                ALLOW_LIST_FILE.to_string(),
+            ]),
+            &mut errors,
+        );
+    }
 
     if errors.is_empty() {
         Ok(manifest)
     } else {
         Err(errors)
+    }
+}
+
+/// 校验每个 artifact 的 sidecar manifest 与封存根的 `allow-list.json`：
+/// 内容必须是本次 seal 生成器会写出的确定字节（id / version / revision /
+/// abi_version / sha256 全部匹配），同时把文件纳入 `SHA256SUMS` 的期望集合。
+fn verify_plugin_provenance(
+    dir: &Path,
+    manifest: &SealManifest,
+    seen: &mut BTreeSet<String>,
+    expected_sums: &mut BTreeMap<String, String>,
+    errors: &mut Vec<String>,
+) {
+    let revision = source_revision(&manifest.source_sha256);
+    for artifact in &manifest.artifacts {
+        let relative = sidecar_path(artifact);
+        if !safe_relative_path(&relative) || !relative.starts_with("plugins/") {
+            errors.push(format!(
+                "插件 manifest 路径不安全或不在 plugins/ 下：{relative}"
+            ));
+            continue;
+        }
+        if !seen.insert(relative.clone()) {
+            errors.push(format!("插件 manifest 路径重复：{relative}"));
+            continue;
+        }
+        let expected = match plugin_manifest_value(
+            artifact,
+            &manifest.workspace_version,
+            &revision,
+            manifest.abi_version,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                errors.push(err);
+                continue;
+            }
+        };
+        let bytes = match json_file_bytes(&expected) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                errors.push(err);
+                continue;
+            }
+        };
+        expected_sums.insert(relative.clone(), sha256_hex(&bytes));
+        verify_expected_file(dir, "插件 manifest", &relative, &bytes, errors);
+    }
+
+    let expected = match allow_list_value(
+        &manifest.workspace_version,
+        &revision,
+        manifest.abi_version,
+        &manifest.artifacts,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            errors.push(err);
+            return;
+        }
+    };
+    let bytes = match json_file_bytes(&expected) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            errors.push(err);
+            return;
+        }
+    };
+    expected_sums.insert(ALLOW_LIST_FILE.to_string(), sha256_hex(&bytes));
+    verify_expected_file(dir, "来源 allow-list", ALLOW_LIST_FILE, &bytes, errors);
+}
+
+fn verify_expected_file(
+    dir: &Path,
+    label: &str,
+    relative: &str,
+    expected: &[u8],
+    errors: &mut Vec<String>,
+) {
+    let path = dir.join(relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            errors.push(format!("读取 {label} {relative} 失败：{err}"));
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        errors.push(format!("{label} 不能是符号链接：{relative}"));
+        return;
+    }
+    if !metadata.is_file() {
+        errors.push(format!("{label} 不是普通文件：{relative}"));
+        return;
+    }
+    let content = match fs::read(&path) {
+        Ok(content) => content,
+        Err(err) => {
+            errors.push(format!("读取 {label} {relative} 失败：{err}"));
+            return;
+        }
+    };
+    if content != expected {
+        errors.push(format!(
+            "{label} {relative} 的内容与预期不一致：预期 {} 字节 / SHA256 {}，实际 {} 字节 / SHA256 {}",
+            expected.len(),
+            sha256_hex(expected),
+            content.len(),
+            sha256_hex(&content)
+        ));
+    }
+}
+
+fn verify_root_files(seal_dir: &Path, expected: &BTreeSet<String>, errors: &mut Vec<String>) {
+    let entries = match fs::read_dir(seal_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            errors.push(format!("读取封存根目录失败：{err}"));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                errors.push(format!("读取封存根目录项失败：{err}"));
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                errors.push(format!("读取封存根目录项 {name} 类型失败：{err}"));
+                continue;
+            }
+        };
+        if file_type.is_dir() {
+            if name != "plugins" && name != "smoke" {
+                errors.push(format!("封存根目录多出未登记目录：{name}"));
+            }
+        } else if !expected.contains(&name) {
+            errors.push(format!("封存根目录多出未登记文件：{name}"));
+        }
     }
 }
 
@@ -1306,6 +1602,107 @@ mod tests {
     }
 
     #[test]
+    fn verify_still_accepts_a_legacy_v1_seal_without_provenance_files() {
+        let tree = TempTree::new("verify-legacy-v1");
+        let manifest = fixture(&tree.path);
+        let mut value: Value =
+            serde_json::from_str(&fs::read_to_string(tree.path.join(SEAL_FILE)).unwrap()).unwrap();
+        value["format"] = SEAL_FORMAT_V1.into();
+        fs::write(
+            tree.path.join(SEAL_FILE),
+            format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+        )
+        .unwrap();
+        for artifact in &manifest.artifacts {
+            fs::remove_file(tree.path.join(sidecar_path(artifact))).unwrap();
+        }
+        fs::remove_file(tree.path.join(ALLOW_LIST_FILE)).unwrap();
+        let sums = fs::read_to_string(tree.path.join(SUMS_FILE))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains(".manifest.json") && !line.ends_with("allow-list.json"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(tree.path.join(SUMS_FILE), format!("{sums}\n")).unwrap();
+
+        verify_dir(&tree.path).expect("历史 /1 封存必须继续可复验");
+    }
+
+    #[test]
+    fn writes_sidecar_manifests_and_allow_list_that_match_the_artifacts() {
+        let tree = TempTree::new("provenance-files");
+        let manifest = fixture(&tree.path);
+
+        for artifact in &manifest.artifacts {
+            let spec = plugin_spec_for(artifact).expect("artifact 必须对应一个插件规格");
+            let text = fs::read_to_string(tree.path.join(sidecar_path(artifact)))
+                .expect("sidecar manifest 必须存在");
+            let value: Value = serde_json::from_str(&text).expect("sidecar 必须是 JSON");
+            assert_eq!(value["id"], spec.plugin);
+            assert_eq!(value["version"], manifest.workspace_version);
+            assert_eq!(
+                value["source_revision"],
+                source_revision(&manifest.source_sha256)
+            );
+            assert_eq!(value["abi_version"], manifest.abi_version);
+            assert_eq!(value["sha256"], artifact.sha256);
+        }
+
+        let allow: Value = serde_json::from_str(
+            &fs::read_to_string(tree.path.join(ALLOW_LIST_FILE)).expect("allow-list 必须存在"),
+        )
+        .expect("allow-list 必须是 JSON");
+        let allowed = allow["allowed"].as_array().expect("allowed 必须是数组");
+        assert_eq!(allowed.len(), PLUGINS.len());
+        for spec in PLUGINS {
+            assert!(allowed.iter().any(|entry| entry["id"] == spec.plugin));
+        }
+    }
+
+    #[test]
+    fn verify_rejects_a_tampered_sidecar_manifest() {
+        let tree = TempTree::new("verify-manifest");
+        let manifest = fixture(&tree.path);
+        let sidecar = tree.path.join(sidecar_path(&manifest.artifacts[0]));
+        let mut value: Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar).unwrap()).unwrap();
+        value["source_revision"] = "tree:tampered".into();
+        fs::write(&sidecar, value.to_string()).unwrap();
+
+        let errors = verify_dir(&tree.path).expect_err("篡改 sidecar 必须失败");
+        assert!(
+            errors.iter().any(|error| error.contains("manifest")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_missing_sidecar_manifest() {
+        let tree = TempTree::new("verify-missing-manifest");
+        let manifest = fixture(&tree.path);
+        fs::remove_file(tree.path.join(sidecar_path(&manifest.artifacts[0]))).unwrap();
+
+        let errors = verify_dir(&tree.path).expect_err("缺 sidecar 必须失败");
+        assert!(
+            errors.iter().any(|error| error.contains("manifest")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_tampered_allow_list() {
+        let tree = TempTree::new("verify-allow-list");
+        fixture(&tree.path);
+        fs::write(tree.path.join(ALLOW_LIST_FILE), "{\"allowed\":[]}\n").unwrap();
+
+        let errors = verify_dir(&tree.path).expect_err("篡改 allow-list 必须失败");
+        assert!(
+            errors.iter().any(|error| error.contains("allow-list")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn verify_rejects_tampered_artifact_bytes() {
         let tree = TempTree::new("verify-tamper");
         fixture(&tree.path);
@@ -1363,6 +1760,18 @@ mod tests {
         fs::write(tree.path.join("plugins/stray.bin"), b"stray").unwrap();
         let errors = verify_dir(&tree.path).expect_err("多出文件必须失败");
         assert!(errors.iter().any(|error| error.contains("多出未登记文件")));
+    }
+
+    #[test]
+    fn verify_rejects_an_extra_root_file() {
+        let tree = TempTree::new("verify-extra-root");
+        fixture(&tree.path);
+        fs::write(tree.path.join("stray.txt"), b"stray").unwrap();
+        let errors = verify_dir(&tree.path).expect_err("根目录多出文件必须失败");
+        assert!(
+            errors.iter().any(|error| error.contains("根目录多出")),
+            "{errors:?}"
+        );
     }
 
     #[test]

@@ -25,6 +25,130 @@ pub mod shutdown;
 
 const CAPABILITY_ORIGIN: &str = cordis_host::CAPABILITY_ORIGIN;
 const INJECT_SOURCE: &str = "plugin+config-entry";
+const PROVENANCE_MANIFEST: &str = "manifest";
+const PROVENANCE_MISSING: &str = "missing/manifest";
+
+/// artifact 的 provenance 状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvenanceSource {
+    /// sidecar `<artifact>.manifest.json` 存在且可解析。
+    Manifest,
+    /// sidecar 缺失或不可解析（`source = missing/manifest`）。
+    MissingManifest,
+}
+
+impl ProvenanceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProvenanceSource::Manifest => PROVENANCE_MANIFEST,
+            ProvenanceSource::MissingManifest => PROVENANCE_MISSING,
+        }
+    }
+}
+
+/// 一份 artifact 的来源摘要（审计面；不参与准入决策）。
+///
+/// `sha256` 是宿主对**实际文件**的计算值；manifest 的 id / version / revision /
+/// abi_version 是发布方自述。`source == missing/manifest` 表示 sidecar 缺失或
+/// 不可解析——此时 manifest 字段全部为 `None`，但 artifact 路径与（可读时）
+/// SHA256 仍会显示。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provenance {
+    pub artifact: String,
+    pub sha256: Option<String>,
+    pub source_revision: Option<String>,
+    pub id: Option<String>,
+    pub version: Option<String>,
+    pub abi_version: Option<u32>,
+    pub source: ProvenanceSource,
+}
+
+impl Provenance {
+    /// 只读审计：读取 artifact 的实际 SHA256 与其 sidecar manifest。永不 panic。
+    pub fn from_artifact(artifact: impl AsRef<Path>) -> Self {
+        let path = artifact.as_ref();
+        let sha256 = cordis_host::source::sha256_file(path).ok();
+        match cordis_host::source::read_manifest(path) {
+            Ok(manifest) => Self {
+                artifact: path.display().to_string(),
+                sha256,
+                source_revision: Some(manifest.source_revision),
+                id: Some(manifest.id),
+                version: Some(manifest.version),
+                abi_version: Some(manifest.abi_version),
+                source: ProvenanceSource::Manifest,
+            },
+            Err(_) => Self {
+                artifact: path.display().to_string(),
+                sha256,
+                source_revision: None,
+                id: None,
+                version: None,
+                abi_version: None,
+                source: ProvenanceSource::MissingManifest,
+            },
+        }
+    }
+
+    fn render_lines(&self, indent: &str, out: &mut String) {
+        out.push_str(&format!(
+            "{indent}provenance source = {}\n",
+            self.source.as_str()
+        ));
+        out.push_str(&format!(
+            "{indent}artifact: {}\n",
+            display_or_missing(Some(self.artifact.as_str()))
+        ));
+        out.push_str(&format!(
+            "{indent}sha256: {}\n",
+            display_or_missing(self.sha256.as_deref())
+        ));
+        out.push_str(&format!(
+            "{indent}source_revision: {}\n",
+            display_or_missing(self.source_revision.as_deref())
+        ));
+        if self.source == ProvenanceSource::Manifest {
+            out.push_str(&format!(
+                "{indent}manifest: id={} version={} abi_version={}\n",
+                display_or_missing(self.id.as_deref()),
+                display_or_missing(self.version.as_deref()),
+                self.abi_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "(missing)".to_string()),
+            ));
+        } else {
+            out.push_str(&format!("{indent}manifest: (missing)\n"));
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let manifest = self.source.eq(&ProvenanceSource::Manifest).then(|| {
+            serde_json::json!({
+                "id": self.id,
+                "version": self.version,
+                "abi_version": self.abi_version,
+            })
+        });
+        serde_json::json!({
+            "artifact": self.artifact,
+            "sha256": self.sha256,
+            "source": self.source.as_str(),
+            "source_revision": self.source_revision,
+            "manifest": manifest,
+        })
+    }
+}
+
+fn display_or_missing(value: Option<&str>) -> &str {
+    value.filter(|text| !text.is_empty()).unwrap_or("(missing)")
+}
+
+/// `status` 里每行挂载的 provenance。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowProvenance {
+    pub label: String,
+    pub provenance: Provenance,
+}
 
 /// 一行插件的能力面（装载**之前**读到的）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +171,8 @@ pub struct InspectRow {
     pub schema: Option<String>,
     /// 声明了 schema 但不可展示时的原因（未声明 ⇒ `None`）。
     pub schema_error: Option<String>,
+    /// artifact 路径、SHA256 与 sidecar manifest 的来源摘要。
+    pub provenance: Provenance,
 }
 
 /// `inspect` 的产物。
@@ -78,6 +204,7 @@ impl InspectReport {
         out.push_str(&format!("inject source = {INJECT_SOURCE}\n"));
         for row in &self.rows {
             out.push_str(&format!("- {} (plugin: {})\n", row.label, row.plugin));
+            row.provenance.render_lines("  ", &mut out);
             out.push_str(&format!(
                 "  inject required: {}\n",
                 list(&row.inject_required)
@@ -116,6 +243,7 @@ impl InspectReport {
                 "volatile": row.volatile,
                 "schema": row.schema,
                 "schema_error": row.schema_error,
+                "provenance": row.provenance.to_json(),
             })).collect::<Vec<_>>(),
         })
     }
@@ -191,6 +319,10 @@ pub fn inspect_entries(entries: &[Entry], search: &[PathBuf]) -> Result<InspectR
         inject.sort();
         inject.dedup();
 
+        // 审计面用**原始 artifact**：解析不到（例如测试注入的假源）时保留配置里的
+        // 名字，`Provenance` 会明确显示 `missing/manifest`，而不是拒绝整个 inspect。
+        let artifact = cordis_host::resolve_plugin_path(&entry.name, search)
+            .unwrap_or_else(|_| PathBuf::from(&entry.name));
         let row = InspectRow {
             label,
             plugin: caps.plugin,
@@ -201,6 +333,7 @@ pub fn inspect_entries(entries: &[Entry], search: &[PathBuf]) -> Result<InspectR
             volatile: caps.volatile,
             schema,
             schema_error,
+            provenance: Provenance::from_artifact(artifact),
         };
         if row.provision.is_empty() {
             undeclared.push(row.label.clone());
@@ -386,6 +519,8 @@ pub struct StatusReport {
     pub cycles: Vec<Vec<String>>,
     /// 最近一次对账的逐行失败消息（`--no-strict` 下仍会返回）。
     pub failed: Vec<String>,
+    /// 每个已挂载行的 artifact / SHA256 / sidecar manifest 来源摘要。
+    pub provenance: Vec<RowProvenance>,
 }
 
 impl StatusReport {
@@ -400,6 +535,15 @@ impl StatusReport {
             "capability source = {CAPABILITY_ORIGIN} (not approval)\n"
         ));
         out.push_str(&format!("inject source = {INJECT_SOURCE}\n"));
+        if self.provenance.is_empty() {
+            out.push_str("provenance = (none)\n");
+        } else {
+            out.push_str("provenance:\n");
+            for row in &self.provenance {
+                out.push_str(&format!("- {}\n", row.label));
+                row.provenance.render_lines("  ", &mut out);
+            }
+        }
         if self.disabled.is_empty() {
             out.push_str("disabled = (none)\n");
         } else {
@@ -451,6 +595,11 @@ impl StatusReport {
             "source": CAPABILITY_ORIGIN,
             "inject_source": INJECT_SOURCE,
             "cycles": self.cycles,
+            "provenance": self.provenance.iter().map(|row| {
+                let mut value = row.provenance.to_json();
+                value["label"] = serde_json::Value::String(row.label.clone());
+                value
+            }).collect::<Vec<_>>(),
             "pending": self.pending.iter().map(|row| serde_json::json!({
                 "label": row.label,
                 "plugin": row.plugin,
@@ -556,6 +705,17 @@ pub async fn status_with_source(
     let pending = session.pending_report();
     let cycles = session.cycles();
     let failed = string_list(&snapshot["failed"]);
+    // 用挂载记录的**原始 artifact** 路径读 sidecar：暂存副本的 `.rN` 文件名旁边
+    // 没有发布方写的 manifest。sidecar 缺失时保留 `missing/manifest` 状态。
+    let provenance = session
+        .state
+        .mounted_sources()
+        .into_iter()
+        .map(|(label, artifact)| RowProvenance {
+            label,
+            provenance: Provenance::from_artifact(artifact),
+        })
+        .collect();
     session.shutdown().await;
     Ok(StatusReport {
         mounted,
@@ -563,6 +723,7 @@ pub async fn status_with_source(
         pending,
         cycles,
         failed,
+        provenance,
     })
 }
 

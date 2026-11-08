@@ -5,6 +5,8 @@
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// 插件随产物一起发布的清单。文件名是 `<artifact>.manifest.json`。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -12,6 +14,7 @@ pub struct PluginManifest {
     pub id: String,
     pub version: String,
     pub source_revision: String,
+    pub abi_version: u32,
     pub sha256: String,
 }
 
@@ -21,12 +24,66 @@ pub struct AllowedPlugin {
     pub id: String,
     pub version: String,
     pub source_revision: String,
+    pub abi_version: u32,
     pub sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct AllowList {
     allowed: Vec<AllowedPlugin>,
+}
+
+static ACTIVE_POLICY: OnceLock<RwLock<Option<Arc<PluginSourcePolicy>>>> = OnceLock::new();
+static ALLOW_UNVERIFIED: AtomicBool = AtomicBool::new(false);
+
+fn active_policy_cell() -> &'static RwLock<Option<Arc<PluginSourcePolicy>>> {
+    ACTIVE_POLICY.get_or_init(|| RwLock::new(None))
+}
+
+/// 设置显式开发模式：没有来源策略时允许未校验插件。
+///
+/// 默认是 **拒绝**；只有 CLI 的 `--allow-unverified` 或嵌入方的显式调用才能关闭
+/// 默认拒绝。这个开关不是安全边界，只用于本地开发/旧测试。
+pub fn set_allow_unverified(allow: bool) {
+    ALLOW_UNVERIFIED.store(allow, Ordering::SeqCst);
+}
+
+pub fn allow_unverified() -> bool {
+    ALLOW_UNVERIFIED.load(Ordering::SeqCst)
+}
+
+/// 当前允许的准入模式：有策略 → 强制校验；无策略但显式开发模式 → 放行；
+/// 两者都没有 → 拒绝。
+pub fn admission() -> Result<Option<Arc<PluginSourcePolicy>>, String> {
+    if let Some(policy) = active_policy() {
+        return Ok(Some(policy));
+    }
+    if allow_unverified() {
+        return Ok(None);
+    }
+    Err("未配置插件来源策略；请传 --source-policy，或显式启用开发模式（set_allow_unverified/--allow-unverified）".to_string())
+}
+
+/// 设置进程级生效的来源策略。`None` = 没有策略；此时默认拒绝，除非显式
+/// [`set_allow_unverified(true)`]。
+///
+/// # 局限
+/// 这是**进程级**全局量，不是 per-App / per-[`crate::loader::LoaderConfig`] 配置：
+/// 后写覆盖先写。同一进程里并行运行多个宿主（或多个改动全局状态的测试）时，
+/// 调用方必须在使用完毕后显式 `set_active_policy(None)` + `set_allow_unverified(false)`
+/// 复位，否则会互相污染。
+pub fn set_active_policy(policy: Option<Arc<PluginSourcePolicy>>) {
+    *active_policy_cell()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+}
+
+/// 当前进程级生效的来源策略（[`set_active_policy`] 的读半边）。
+pub fn active_policy() -> Option<Arc<PluginSourcePolicy>> {
+    active_policy_cell()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 /// 通过校验的 artifact；`manifest` 是插件自述，`sha256` 是宿主实际计算值。
@@ -63,15 +120,14 @@ impl PluginSourcePolicy {
 
     /// 在加载动态库**之前**读取 artifact hash 与 sidecar manifest，并匹配 allow-list。
     pub fn verify(&self, artifact: impl AsRef<Path>) -> Result<VerifiedPluginSource, String> {
-        let artifact = artifact.as_ref();
-        let bytes = std::fs::read(artifact)
-            .map_err(|err| format!("读取插件 artifact {} 失败: {err}", artifact.display()))?;
-        let actual = sha256_hex(&bytes);
-        let manifest_path = manifest_path(artifact);
-        let text = std::fs::read_to_string(&manifest_path)
-            .map_err(|err| format!("读取插件 manifest {} 失败: {err}", manifest_path.display()))?;
-        let manifest: PluginManifest = serde_json::from_str(&text)
-            .map_err(|err| format!("解析插件 manifest {} 失败: {err}", manifest_path.display()))?;
+        let artifact = std::path::absolute(artifact.as_ref()).map_err(|err| {
+            format!(
+                "规范化插件 artifact {} 失败: {err}",
+                artifact.as_ref().display()
+            )
+        })?;
+        let actual = sha256_file(&artifact)?;
+        let manifest = read_manifest(&artifact)?;
         validate_manifest(&manifest)?;
         if manifest.sha256.to_ascii_lowercase() != actual {
             return Err(format!(
@@ -107,8 +163,14 @@ impl PluginSourcePolicy {
                 manifest.source_revision, allowed.source_revision
             ));
         }
+        if allowed.abi_version != manifest.abi_version {
+            return Err(format!(
+                "插件 abi_version 与 allow-list 不匹配: manifest={} allow-list={}",
+                manifest.abi_version, allowed.abi_version
+            ));
+        }
         Ok(VerifiedPluginSource {
-            path: artifact.to_path_buf(),
+            path: artifact,
             manifest,
             sha256: actual,
         })
@@ -124,6 +186,19 @@ pub fn manifest_path(artifact: impl AsRef<Path>) -> PathBuf {
     artifact.with_file_name(format!("{name}.manifest.json"))
 }
 
+/// 读取 artifact 旁边的 sidecar manifest（不校验身份与 hash）。
+///
+/// 供审计面（`inspect` / `status` 的 provenance）使用；加载路径必须用
+/// [`PluginSourcePolicy::verify`]。
+pub fn read_manifest(artifact: impl AsRef<Path>) -> Result<PluginManifest, String> {
+    let artifact = artifact.as_ref();
+    let path = manifest_path(artifact);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| format!("读取插件 manifest {} 失败: {err}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|err| format!("解析插件 manifest {} 失败: {err}", path.display()))
+}
+
 fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
     if manifest.id.trim().is_empty() {
         return Err("插件 manifest 缺少 id".to_string());
@@ -134,6 +209,13 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
     if manifest.source_revision.trim().is_empty() {
         return Err("插件 manifest 缺少 source_revision".to_string());
     }
+    if manifest.abi_version != cordis_abi::ABI_VERSION {
+        return Err(format!(
+            "插件 manifest 的 ABI 版本 {} 与宿主 {} 不匹配",
+            manifest.abi_version,
+            cordis_abi::ABI_VERSION
+        ));
+    }
     if manifest.sha256.len() != 64 || !manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(format!(
@@ -142,6 +224,13 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 计算一个文件的 SHA-256（审计/诊断面；加载路径用 [`PluginSourcePolicy::verify`]）。
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|err| format!("读取插件 artifact {} 失败: {err}", path.display()))?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// 无依赖 SHA-256，和 `xtask seal` 保持同一实现语义。

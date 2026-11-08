@@ -96,6 +96,7 @@ const CONFIG: &str = concat!(
 /// 未声明 provision 的行**被列出**。
 #[tokio::test]
 async fn inspect_lists_capabilities_before_any_mount() {
+    cordis_host::source::set_allow_unverified(true);
     cordis_host::set_plugin_source(Arc::new(FakeSource));
     let path = std::env::temp_dir().join(format!("cordis-inspect-{}.yml", std::process::id()));
     std::fs::write(&path, CONFIG).expect("写配置");
@@ -158,6 +159,11 @@ async fn inspect_lists_capabilities_before_any_mount() {
         "JSON 也要保留非法 schema 诊断：{}",
         json["rows"][2]
     );
+    assert_eq!(
+        json["rows"][0]["provenance"]["source"], "missing/manifest",
+        "假源没有 sidecar 时必须明确标注 missing/manifest：{}",
+        json["rows"][0]
+    );
 
     let legacy = &report.rows[1];
     assert_eq!(legacy.label, "legacy");
@@ -198,6 +204,10 @@ async fn inspect_lists_capabilities_before_any_mount() {
     );
     assert!(text.contains("schema: (invalid:"), "{text}");
     assert!(text.contains("legacy"), "{text}");
+    assert!(
+        text.contains("provenance source = missing/manifest"),
+        "文本输出必须给出 provenance 的缺失状态：{text}"
+    );
 
     // `mounted == 0` 是 A5 的语义字段（inspect 的返回值），但它是**恒真**的——
     // 单独断言它证明不了"没挂载"。真正的观测面是宿主全局实例表：inspect 不注册
@@ -212,6 +222,7 @@ async fn inspect_lists_capabilities_before_any_mount() {
 
 #[test]
 fn inspect_uses_the_loader_stable_labels_for_same_named_rows() {
+    cordis_host::source::set_allow_unverified(true);
     cordis_host::set_plugin_source(Arc::new(FakeSource));
     let entries =
         cordis_host::patch::parse_entries("- name: agent\n- name: agent\n").expect("parse");

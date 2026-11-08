@@ -11,8 +11,12 @@ Cordis 的 Rust 实现：服务容器 + epoch 驱动的 fiber 生命周期 + 可
 插件来源按 [ADR 0005](docs/adr/0005-trust-model-and-plugin-source-boundary.md)：
 只承载第一方、可审查、固定 revision 构建的 T1/T2 插件；第三方、运行时下载或
 模型生成且未经人工审查的可执行插件不进入当前运行时。来源 allow-list 是准入，
-不是执行隔离。T2 同步 `apply`/回调不可抢占；`DispatchPolicy` 只覆盖等待挂起
-结算，不能中断正在执行的调用。
+不是执行隔离：`cordis inspect/validate/status/run/service --source-policy
+<allow-list.json>` 会在 `dlopen` 之前检查 sidecar manifest 与 SHA256。**没有策略
+默认拒绝**；只有显式传 `--allow-unverified`（或嵌入方调用
+`set_allow_unverified(true)`）才进入本地开发模式。生产宿主必须传
+`--source-policy`。T2 同步 `apply`/回调不可抢占；`DispatchPolicy` 只覆盖等待
+挂起结算，不能中断正在执行的调用。
 
 当前执行入口见 [`docs/roadmap.md`](docs/roadmap.md)：仓外真实接入与发布收尾并行。
 已知交付缺口、调用通道边界和维护事项见 [`docs/architecture-review.md`](docs/architecture-review.md)。
@@ -43,7 +47,7 @@ cargo xtask soak [cycles]
 cargo xtask doctor
 ```
 
-`cargo xtask ci` 依次执行格式检查、inventory/docs/平台矩阵检查、clippy（`-D warnings`）、workspace 测试、demo 快照比较与真 DLL harness。`cargo xtask fmt` 可单独检查格式；格式基线已建立，是阻塞门禁。`cargo xtask matrix` 只检查矩阵结构，不验证真实平台结果；实际结果记录在 [`docs/platform-matrix.md`](docs/platform-matrix.md)，是一次三平台 CI 的快照。`cargo xtask seal` 是发布时入口：构建三个宿主目标示例插件，写 SHA256/源码树/工具链清单，用同版本 `inspect` 逐插件核对身份，并保存 `smoke/inspect.txt`；它不在 `ci` 内，边界见 [`docs/release-seal.md`](docs/release-seal.md)。`cargo xtask soak [cycles]` 运行默认被忽略的宿主资源 / 暂存 soak（默认 1000 轮），同样不进入 `ci`。
+`cargo xtask ci` 依次执行格式检查、inventory/docs/平台矩阵检查、clippy（`-D warnings`）、workspace 测试、demo 快照比较与真 DLL harness。`cargo xtask fmt` 可单独检查格式；格式基线已建立，是阻塞门禁。`cargo xtask matrix` 只检查矩阵结构，不验证真实平台结果；实际结果记录在 [`docs/platform-matrix.md`](docs/platform-matrix.md)，是一次三平台 CI 的快照。`cargo xtask seal` 是发布时入口：构建三个宿主目标示例插件，写 sidecar manifest、`allow-list.json`、SHA256/源码树/工具链清单，用同版本 `inspect --source-policy` 逐插件核对身份，并保存 `smoke/inspect.txt`；它不在 `ci` 内，边界见 [`docs/release-seal.md`](docs/release-seal.md)。`cargo xtask soak [cycles]` 运行默认被忽略的宿主资源 / 暂存 soak（默认 1000 轮），同样不进入 `ci`。
 
 ### Windows GNU / 非 ASCII 路径
 

@@ -68,6 +68,7 @@ impl PluginSource for ProbeSource {
 /// M5-10（**A5**）：挂载之前读到 inject / provision / volatile，且**没有**任何实例被注册。
 #[tokio::test]
 async fn probe_capabilities_reads_provision_without_mounting() {
+    cordis_host::source::set_allow_unverified(true);
     cordis_host::set_plugin_source(Arc::new(ProbeSource));
 
     let caps = cordis_host::probe_capabilities(Path::new("<probe:m5>")).expect("探测成功");

@@ -68,7 +68,10 @@ impl PluginSource for FakeSource {
 static INIT: Once = Once::new();
 
 fn source() -> Arc<dyn PluginSource> {
-    INIT.call_once(|| cordis_host::set_plugin_source(Arc::new(FakeSource)));
+    INIT.call_once(|| {
+        cordis_host::source::set_allow_unverified(true);
+        cordis_host::set_plugin_source(Arc::new(FakeSource));
+    });
     Arc::new(FakeSource)
 }
 

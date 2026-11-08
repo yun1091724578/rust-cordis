@@ -87,6 +87,8 @@ static M3_META: Mutex<Option<Value>> = Mutex::new(None);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 示例/测试产物没有发布 sidecar；显式开发模式，生产宿主必须用 --source-policy。
+    cordis_host::source::set_allow_unverified(true);
     let exe_dir = std::env::current_exe()?
         .parent()
         .map(PathBuf::from)
