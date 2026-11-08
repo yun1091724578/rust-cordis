@@ -241,6 +241,20 @@ fn output_text(output: &Output) -> String {
 }
 
 #[test]
+fn inspect_without_policy_or_dev_flag_denies_by_default() {
+    let config = std::env::temp_dir().join(format!(
+        "cordis-source-policy-default-deny-{}.yml",
+        std::process::id()
+    ));
+    std::fs::write(&config, "[]\n").unwrap();
+    let output = run(&[OsStr::new("inspect"), config.as_os_str()]);
+    let text = output_text(&output);
+    assert_eq!(output.status.code(), Some(3), "{text}");
+    assert!(text.contains("未配置插件来源策略"), "{text}");
+    let _ = std::fs::remove_file(config);
+}
+
+#[test]
 fn inspect_with_source_policy_shows_manifest_provenance() {
     let fixture = Fixture::new("inspect-ok");
     let output = inspect(&fixture, false);

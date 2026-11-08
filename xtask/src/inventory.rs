@@ -283,6 +283,60 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub fn verify(&self",
     },
     PublicItem {
+        item: "set_active_policy",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn set_active_policy",
+    },
+    PublicItem {
+        item: "active_policy",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn active_policy",
+    },
+    PublicItem {
+        item: "set_allow_unverified",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn set_allow_unverified",
+    },
+    PublicItem {
+        item: "allow_unverified",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn allow_unverified",
+    },
+    PublicItem {
+        item: "admission",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn admission(",
+    },
+    PublicItem {
+        item: "admission_mode",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn admission_mode",
+    },
+    PublicItem {
+        item: "read_manifest",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn read_manifest",
+    },
+    PublicItem {
+        item: "sha256_file",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn sha256_file",
+    },
+    PublicItem {
+        item: "mounted_sources",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub fn mounted_sources",
+    },
+    PublicItem {
         item: "DispatchPolicy",
         kind: "struct",
         source: "crates/host/src/lib.rs",
@@ -1034,7 +1088,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 63, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 72, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 

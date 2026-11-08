@@ -169,7 +169,7 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
 - [x] 公开 API、状态码、载荷格式清单
   - `docs/api-inventory.md` 由 `cargo xtask inventory --write` 生成；`--check` 已接进
     `cargo xtask ci` 与 xtask CLI 用例。
-  - 当前清单：23 个 ABI 常量、4 个结构 / 41 个字段、63 个宿主 / 核心 / SDK 公开入口、
+  - 当前清单：23 个 ABI 常量、4 个结构 / 41 个字段、72 个宿主 / 核心 / SDK 公开入口、
     32 条载荷；ABI 前缀 / 尺寸由 `兼容矩阵.md` 与 `abi_matrix.rs` 防漂移。
 - [x] 冻结 ABI v1 兼容夹具（`tests/fixtures/abi-v1` + `crates/host/tests/frozen_plugin.rs`）
   - 冻结副本（去掉 sdk）+ 最小入口，编译成真 cdylib；
@@ -471,7 +471,7 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 ### A2：API 清单生成器
 
 - 生成器 `xtask/src/inventory.rs`：自动扫描 23 个 ABI 常量、4 个结构 / 41 个字段；
-  63 个宿主 / 核心 / SDK 受控入口与 32 条载荷逐项校验源码 marker（必须恰好命中一次）。
+  72 个宿主 / 核心 / SDK 受控入口与 32 条载荷逐项校验源码 marker（必须恰好命中一次）。
 - `cargo xtask inventory --check` 通过；篡改清单 / 缺 payload 的用例红；
   `cargo xtask inventory --write` 生成 `docs/api-inventory.md`。
 - A2 当时 `cargo test -p xtask`：38 bin + 12 CLI；`cargo xtask ci` 包含

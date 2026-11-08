@@ -121,6 +121,15 @@
 | `AllowedPlugin` | struct | `crates/host/src/source.rs` |
 | `VerifiedPluginSource` | struct | `crates/host/src/source.rs` |
 | `PluginSourcePolicy::verify` | fn | `crates/host/src/source.rs` |
+| `set_active_policy` | fn | `crates/host/src/source.rs` |
+| `active_policy` | fn | `crates/host/src/source.rs` |
+| `set_allow_unverified` | fn | `crates/host/src/source.rs` |
+| `allow_unverified` | fn | `crates/host/src/source.rs` |
+| `admission` | fn | `crates/host/src/source.rs` |
+| `admission_mode` | fn | `crates/host/src/source.rs` |
+| `read_manifest` | fn | `crates/host/src/source.rs` |
+| `sha256_file` | fn | `crates/host/src/source.rs` |
+| `mounted_sources` | fn | `crates/host/src/loader.rs` |
 | `DispatchPolicy` | struct | `crates/host/src/lib.rs` |
 | `streams_len` | fn | `crates/host/src/lib.rs` |
 | `pending_len` | fn | `crates/host/src/lib.rs` |

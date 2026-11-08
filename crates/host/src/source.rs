@@ -52,6 +52,17 @@ pub fn allow_unverified() -> bool {
     ALLOW_UNVERIFIED.load(Ordering::SeqCst)
 }
 
+/// 诊断口径：当前进程的准入模式。
+pub fn admission_mode() -> &'static str {
+    if active_policy().is_some() {
+        "enforced"
+    } else if allow_unverified() {
+        "dev-unverified"
+    } else {
+        "denied"
+    }
+}
+
 /// 当前允许的准入模式：有策略 → 强制校验；无策略但显式开发模式 → 放行；
 /// 两者都没有 → 拒绝。
 pub fn admission() -> Result<Option<Arc<PluginSourcePolicy>>, String> {

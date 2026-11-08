@@ -64,10 +64,16 @@ cargo.cmd xtask demo
 
 ```text
 cordis inspect <config.yml> [--json] [--plugin-dir <dir>]
+    --source-policy <allow-list.json>        # 生产：加载前校验；无策略默认拒绝
+    --allow-unverified                       # 仅本地开发：显式关闭来源准入
 cordis status <config.yml> [--patch <file>]... [--plugin-dir <dir>] [--no-strict] [--json]
+    --source-policy <allow-list.json> | --allow-unverified
 cordis validate <config.yml> [--patch <file>]... [--plugin-dir <dir>]
+    --source-policy <allow-list.json> | --allow-unverified
 cordis run <config.yml> [--patch <file>]... [--plugin-dir <dir>] [--no-strict]
+    --source-policy <allow-list.json> | --allow-unverified
 cordis service <config.yml> --name <service-name>   # Windows SCM
+    --source-policy <allow-list.json> | --allow-unverified
 ```
 
 - `inspect` / `validate` 都不挂载插件；`validate` 会叠加 patch 层并报告警告，二者都支持 `--plugin-dir`。`inspect` 仍会加载动态库并调用 `OP_PING` / `OP_VOLATILE_PATHS`，不是“只读文件头”。
@@ -79,7 +85,7 @@ cordis service <config.yml> --name <service-name>   # Windows SCM
 Windows 服务示例（管理员 PowerShell）：
 
 ```text
-sc.exe create Cordis binPath= "\"C:\path\cordis.exe\" service \"C:\path\cordis.yml\" --name Cordis" start= auto
+sc.exe create Cordis binPath= "\"C:\path\cordis.exe\" service \"C:\path\cordis.yml\" --name Cordis --source-policy \"C:\path\allow-list.json\"" start= auto
 sc.exe start Cordis
 sc.exe stop Cordis
 ```

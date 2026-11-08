@@ -60,6 +60,12 @@ pub struct Provenance {
     pub id: Option<String>,
     pub version: Option<String>,
     pub abi_version: Option<u32>,
+    /// manifest 自述的 hash，便于与 `sha256` 对照。
+    pub manifest_sha256: Option<String>,
+    /// `sha256 == manifest_sha256`；sidecar 缺失时为 None。
+    pub manifest_hash_matches: Option<bool>,
+    /// 当前进程的准入模式：enforced / dev-unverified / denied。
+    pub admission: String,
     pub source: ProvenanceSource,
 }
 
@@ -68,16 +74,25 @@ impl Provenance {
     pub fn from_artifact(artifact: impl AsRef<Path>) -> Self {
         let path = artifact.as_ref();
         let sha256 = cordis_host::source::sha256_file(path).ok();
+        let admission = cordis_host::source::admission_mode().to_string();
         match cordis_host::source::read_manifest(path) {
-            Ok(manifest) => Self {
-                artifact: path.display().to_string(),
-                sha256,
-                source_revision: Some(manifest.source_revision),
-                id: Some(manifest.id),
-                version: Some(manifest.version),
-                abi_version: Some(manifest.abi_version),
-                source: ProvenanceSource::Manifest,
-            },
+            Ok(manifest) => {
+                let manifest_hash_matches = sha256
+                    .as_deref()
+                    .map(|actual| actual.eq_ignore_ascii_case(&manifest.sha256));
+                Self {
+                    artifact: path.display().to_string(),
+                    sha256,
+                    source_revision: Some(manifest.source_revision),
+                    id: Some(manifest.id),
+                    version: Some(manifest.version),
+                    abi_version: Some(manifest.abi_version),
+                    manifest_sha256: Some(manifest.sha256),
+                    manifest_hash_matches,
+                    admission,
+                    source: ProvenanceSource::Manifest,
+                }
+            }
             Err(_) => Self {
                 artifact: path.display().to_string(),
                 sha256,
@@ -85,6 +100,9 @@ impl Provenance {
                 id: None,
                 version: None,
                 abi_version: None,
+                manifest_sha256: None,
+                manifest_hash_matches: None,
+                admission,
                 source: ProvenanceSource::MissingManifest,
             },
         }
@@ -95,6 +113,7 @@ impl Provenance {
             "{indent}provenance source = {}\n",
             self.source.as_str()
         ));
+        out.push_str(&format!("{indent}admission: {}\n", self.admission));
         out.push_str(&format!(
             "{indent}artifact: {}\n",
             display_or_missing(Some(self.artifact.as_str()))
@@ -102,6 +121,16 @@ impl Provenance {
         out.push_str(&format!(
             "{indent}sha256: {}\n",
             display_or_missing(self.sha256.as_deref())
+        ));
+        out.push_str(&format!(
+            "{indent}manifest sha256: {}\n",
+            display_or_missing(self.manifest_sha256.as_deref())
+        ));
+        out.push_str(&format!(
+            "{indent}hash matches manifest: {}\n",
+            self.manifest_hash_matches
+                .map(|matches| matches.to_string())
+                .unwrap_or_else(|| "(missing)".to_string())
         ));
         out.push_str(&format!(
             "{indent}source_revision: {}\n",
@@ -133,6 +162,9 @@ impl Provenance {
             "artifact": self.artifact,
             "sha256": self.sha256,
             "source": self.source.as_str(),
+            "admission": self.admission,
+            "manifest_sha256": self.manifest_sha256,
+            "manifest_hash_matches": self.manifest_hash_matches,
             "source_revision": self.source_revision,
             "manifest": manifest,
         })
