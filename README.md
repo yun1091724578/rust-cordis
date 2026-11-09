@@ -86,10 +86,13 @@ Windows 服务示例（管理员 PowerShell）：
 
 ```powershell
 $binPath = '"C:\path\cordis.exe" service "C:\path\cordis.yml" --name Cordis --plugin-dir "C:\path\plugins" --source-policy "C:\path\allow-list.json"'
-sc.exe create Cordis binPath= $binPath start= auto
-sc.exe start Cordis
-sc.exe stop Cordis
+New-Service -Name Cordis -BinaryPathName $binPath -StartupType Automatic
+Start-Service Cordis
+Stop-Service Cordis
 ```
+
+`New-Service` 会把带空格的路径作为单个 `BinaryPathName` 写入，避免 PowerShell 5.1
+原生参数重拼时丢掉内层引号。
 
 ## 生命周期
 

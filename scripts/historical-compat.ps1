@@ -32,8 +32,11 @@ try {
     if ($BumpVersion) {
         $manifest = Join-Path $Worktree "Cargo.toml"
         $text = Get-Content -Raw $manifest
-        $text = $text -replace 'version = "0\.1\.0"', "version = `"$BumpVersion`""
-        Set-Content -NoNewline -Encoding UTF8 $manifest $text
+        $updated = $text -replace 'version = "0\.1\.0"', "version = `"$BumpVersion`""
+        if ($updated -eq $text) {
+            throw "BumpVersion=$BumpVersion did not match version 0.1.0 in $manifest"
+        }
+        Set-Content -NoNewline -Encoding UTF8 $manifest $updated
     }
 
     $env:CARGO_TARGET_DIR = $Target
@@ -51,7 +54,10 @@ try {
 
     # Old hosts do not know this flag; new hosts default-deny without it.
     $helpText = (& $exe --help 2>&1 | Out-String)
-    $admissionArgs = if ($helpText -match "--allow-unverified") {
+    $allowList = Join-Path $Seal "allow-list.json"
+    $admissionArgs = if ((Test-Path $allowList) -and ($helpText -match "--source-policy")) {
+        @("--source-policy", $allowList)
+    } elseif ($helpText -match "--allow-unverified") {
         @("--allow-unverified")
     } else {
         @()
