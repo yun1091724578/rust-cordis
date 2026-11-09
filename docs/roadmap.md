@@ -30,7 +30,7 @@
 
 | 工作线 | 当前判断 | 已落地证据 | 未闭合 / 下一出口 |
 |---|---|---|---|
-| A. 低层 ABI 交付 | **完成** | 0.1.0/0.1.1 发布；封存、同版本加载、registry-only consumer、三平台 CI | 历史兼容的可重复测试 |
+| A. 低层 ABI 交付 | **部分完成** | 0.1.0/0.1.1 发布；`/1` 候选封存、同版本加载、registry-only consumer、三平台 CI | 正式 `/2` 封存（需支持 tag 源的封存工具）、历史兼容的可重复测试 |
 | B. 信任模型 | **已接受（ADR 0005）** | README/支持契约已加入来源边界与不可抢占声明；产品口径已收口 | 来源 allow-list 实现与验证 |
 | C. 可信单租户底座 P0 | **进行中** | 来源策略模块、`LoadedPlugin::open_verified`、`--source-policy` 的 loader/CLI 强制与 inspect/status provenance 已落地；现有生命周期/资源基线/错误通道 | 每 App dispatch policy、容量准入、锁纪律、不可抢占披露 |
 | D. 长期运行 P1 | **待启动** | 1M soak、resource baseline、staged primitive | semver/依赖求解、RSS/dhat、真实 open_staged、缓冲池、版本矩阵 |
@@ -41,7 +41,7 @@
 阶段 0 的平台与发布基线：支持契约 **26 行 / 17 条保证**；0.1.1 三平台 CI
 [`42332542433`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542433)
 / [`42332542329`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542329)
-通过；0.1.0/0.1.1 已发布并封存；v0.1.1 宿主加载 0.1.0-rc2 封存插件通过一次；
+通过；0.1.0/0.1.1 已发布并有 `/1` 候选封存；v0.1.1 宿主加载 0.1.0-rc2 封存插件通过一次；
 SCM 一次真实 elevated run 通过；默认 1M soak 已通过。历史兼容仍待可重复测试，
 nightly cron/长期转存仍待补。
 
@@ -201,7 +201,7 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
       artifact 集合；`cargo xtask seal --verify` 只读复验。2026-11-02 在 Windows GNU
       本地演练通过（r3），格式见 `docs/release-seal.md`。这只证明入口可用，
       **不是正式发布**，也不证明产物真实性 / 签名。
-- [ ] **正式首发产物封存**：`dist/cordis-0.1.0-rc2` 是 `/1` 候选封存，不是正式 `/2` 归档；需从已发布 tag `v0.1.0` 与 `v0.1.1` 的干净 worktree 重跑 `/2` `cargo xtask seal`，并把 sidecar/allow-list 在内的整个目录归档到发布存储。
+- [ ] **正式首发产物封存**：`dist/cordis-0.1.0-rc2` 是 `/1` 候选封存，不是正式 `/2` 归档。当前 `xtask seal` 的 workspace root 在编译期固定，不能直接封存 tag worktree；需先提供 `seal --root <tag-worktree>` 或等价工具，再对 `v0.1.0`/`v0.1.1` 重跑 `/2` 并归档 sidecar/allow-list。
 - [ ] **正式首发产物 × 同版本宿主**：候选封存的同版本 `inspect` 结果已存在，但正式首发时仍需重新归档；它只证明发布产物可用，**不证明跨版本兼容**。
 - [ ] **历史产物 × 后续宿主版本**：等后续宿主版本加载已封存的首发产物，才把索引中的
       “历史发布版”从**待验证**转成**保证**或明确拒绝；不能停留在模糊状态。

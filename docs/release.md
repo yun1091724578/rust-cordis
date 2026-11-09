@@ -145,7 +145,7 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 
 1. 仓库 URL：`Cargo.toml` 已在 0.1.1 补齐 `repository` / `homepage`（`https://github.com/yun1091724578/rust-cordis`），发布 warning 消失；仓库仍是私有的，公开发布地址/可见性另行决定。
 2. Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测：已提供 `scripts/scm-smoke.ps1`；2026-11-07 在管理员 PowerShell（Windows 10.0.26300）实际跑通 `create → RUNNING → stop → STOPPED → delete`，日志 `dist/cordis-scm-smoke.log`，服务已确认删除（`sc query` 返回 1060）。这是一次真实手工验证；持续 CI 重跑仍待补，因此不把它夸大为跨机器持续保证。
-3. **首发产物封存**：**`/1` 候选封存已完成，正式 `/2` 封存未完成**。0.1.0-rc2 与 0.1.1 均运行过 `/1` `cargo xtask seal`/`--verify`，归档 `seal.json` / `SHA256SUMS` / `plugins` / `smoke`；但两者都缺 sidecar manifest 与 allow-list。需从已发布 tag 的干净 worktree 重跑 `/2` 并归档。
+3. **首发产物封存**：**`/1` 候选封存已完成，正式 `/2` 封存未完成且被工具能力阻塞**。0.1.0-rc2 与 0.1.1 均运行过 `/1` `cargo xtask seal`/`--verify`，归档 `seal.json` / `SHA256SUMS` / `plugins` / `smoke`；但两者都缺 sidecar manifest 与 allow-list。当前 `xtask seal` 的 workspace root 在编译期固定，不能直接封存历史 tag 的源码树；需先增加 `seal --root <tag-worktree>` 或等价能力，再重跑 `/2` 并归档。
 4. **首发产物 × 同版本宿主**：候选封存的同版本 `inspect` 加载检查已完成，stdout 写入 `smoke/inspect.txt` 并纳入 `SHA256SUMS`；正式首发仍需重新归档同版本证据。它只证明产物可用，**不证明跨版本兼容**。
 5. **历史产物 × 后续宿主版本**：2026-11-07 已用 v0.1.1 宿主加载 0.1.0-rc2 封存插件，`inspect + mount + cleanup` 通过（`dist/cordis-0.1.1-historical.log`）。这是候选封存物的一次验证，不是正式 0.1.0 产物的发布级验证；支持契约仍要求可重复测试和正式首发产物，因此状态保持待验证，不把单次结果写成保证。
 6. **nightly artifact 长期转存**：当前 `soak.log` 由 GitHub Actions artifact 保存，保留期按仓库设置；正式发布前需把首次与后续 nightly 结果转存到发布存储。nightly schedule 可能在仓库无活动时被 GitHub 自动暂停，发布前需确认最近一次结果。
