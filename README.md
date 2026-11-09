@@ -84,8 +84,9 @@ cordis service <config.yml> --name <service-name>   # Windows SCM
 
 Windows 服务示例（管理员 PowerShell）：
 
-```text
-sc.exe create Cordis binPath= "\"C:\path\cordis.exe\" service \"C:\path\cordis.yml\" --name Cordis --plugin-dir \"C:\path\plugins\" --source-policy \"C:\path\allow-list.json\"" start= auto
+```powershell
+$binPath = '"C:\path\cordis.exe" service "C:\path\cordis.yml" --name Cordis --plugin-dir "C:\path\plugins" --source-policy "C:\path\allow-list.json"'
+sc.exe create Cordis binPath= $binPath start= auto
 sc.exe start Cordis
 sc.exe stop Cordis
 ```

@@ -24,6 +24,9 @@ if (Test-Path $Worktree) {
     git -C $project worktree remove --force $Worktree | Out-Null
 }
 git -C $project worktree add --detach $Worktree $HostRef | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "git worktree add failed for HostRef=$HostRef"
+}
 
 try {
     if ($BumpVersion) {
@@ -34,8 +37,14 @@ try {
     }
 
     $env:CARGO_TARGET_DIR = $Target
-    & $cargo build -p cordis-cli
-    if ($LASTEXITCODE -ne 0) { throw "host build failed" }
+    Push-Location $Worktree
+    try {
+        & $cargo build -p cordis-cli
+        if ($LASTEXITCODE -ne 0) { throw "host build failed" }
+    }
+    finally {
+        Pop-Location
+    }
 
     $exe = Join-Path $Target "debug\cordis.exe"
     if (-not (Test-Path $exe)) { throw "missing host executable: $exe" }
