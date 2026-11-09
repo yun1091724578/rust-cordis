@@ -321,6 +321,20 @@ fn unique_revision() -> u64 {
     std::process::id() as u64 * 1_000_000 + NEXT.fetch_add(1, Ordering::SeqCst)
 }
 
+#[cfg(target_os = "linux")]
+fn rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(resident_pages.saturating_mul(4096))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rss_bytes() -> Option<u64> {
+    None
+}
+
+const RSS_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+
 #[tokio::test]
 #[ignore = "run via cargo xtask soak"]
 async fn repeated_soak_cycles_leave_no_residue() {
@@ -341,6 +355,8 @@ async fn repeated_soak_cycles_leave_no_residue() {
     // 失败轮是刻意制造的；soak 自己的 stdout 只需要最终结果，不刷错误日志。
     app.store.set_log_sink(Arc::new(|_, _, _| {}));
     assert_store_baseline(&app, "soak 开始前");
+    let rss_baseline = rss_bytes();
+    let mut rss_max = rss_baseline;
     for cycle in 0..cycles {
         let mut trace = FailureTrace::new(&app, cycle);
 
@@ -505,9 +521,12 @@ async fn repeated_soak_cycles_leave_no_residue() {
             );
         }
 
+        if let Some(rss) = rss_bytes() {
+            rss_max = Some(rss_max.map_or(rss, |prior| prior.max(rss)));
+        }
         if cycle % 1000 == 0 || cycle + 1 == cycles {
             println!(
-                "soak progress: cycle={}/{} loaded_instances={} staged_leaked={} runtime={} hooks={} calls={} applies={} cleanups={} disposes={}",
+                "soak progress: cycle={}/{} loaded_instances={} staged_leaked={} runtime={} hooks={} calls={} applies={} cleanups={} disposes={} rss_kb={}",
                 cycle + 1,
                 cycles,
                 loaded_instances(),
@@ -518,6 +537,7 @@ async fn repeated_soak_cycles_leave_no_residue() {
                 APPLIES.load(Ordering::SeqCst),
                 CLEANUPS.load(Ordering::SeqCst),
                 DISPOSES.load(Ordering::SeqCst),
+                rss_bytes().map(|bytes| bytes / 1024).unwrap_or(0),
             );
         }
     }
@@ -556,8 +576,15 @@ async fn repeated_soak_cycles_leave_no_residue() {
         "OP_DISPOSE 总数必须与 apply 总数一致"
     );
 
+    if let (Some(baseline), Some(max)) = (rss_baseline, rss_max) {
+        let growth = max.saturating_sub(baseline);
+        assert!(
+            growth <= RSS_BUDGET_BYTES,
+            "soak RSS 增长 {growth} bytes 超过预算 {RSS_BUDGET_BYTES} bytes（baseline={baseline}, max={max}）"
+        );
+    }
     println!(
-        "soak complete: cycles={} elapsed_ms={} loaded_instances={} staged_leaked={} runtime={} hooks={} calls={} applies={} cleanups={} disposes={}",
+        "soak complete: cycles={} elapsed_ms={} loaded_instances={} staged_leaked={} runtime={} hooks={} calls={} applies={} cleanups={} disposes={} rss_growth_bytes={}",
         cycles,
         started.elapsed().as_millis(),
         loaded_instances(),
@@ -568,5 +595,9 @@ async fn repeated_soak_cycles_leave_no_residue() {
         APPLIES.load(Ordering::SeqCst),
         CLEANUPS.load(Ordering::SeqCst),
         DISPOSES.load(Ordering::SeqCst),
+        rss_max
+            .zip(rss_baseline)
+            .map(|(max, baseline)| max.saturating_sub(baseline))
+            .unwrap_or(0),
     );
 }
