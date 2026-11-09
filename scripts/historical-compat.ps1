@@ -47,9 +47,13 @@ try {
     }
     $hostSourceVersion = [version]$Matches[1]
     if ($BumpVersion) {
-        $updated = $sourceText -replace 'version = "0\.1\.[0-9]+"', "version = `"$BumpVersion`""
+        if ($BumpVersion -eq $hostSourceVersion.ToString()) {
+            throw "BumpVersion must differ from the source version $hostSourceVersion"
+        }
+        $versionPattern = 'version = "' + [regex]::Escape($hostSourceVersion.ToString()) + '"'
+        $updated = $sourceText -replace $versionPattern, "version = `"$BumpVersion`""
         if ($updated -eq $sourceText) {
-            throw "BumpVersion=$BumpVersion did not match any 0.1.x workspace/dependency version in $manifest"
+            throw "BumpVersion=$BumpVersion did not match workspace version $hostSourceVersion in $manifest"
         }
         Set-Content -NoNewline -Encoding UTF8 $manifest $updated
     }
