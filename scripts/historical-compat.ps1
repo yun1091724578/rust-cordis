@@ -93,11 +93,14 @@ try {
         throw "could not read host workspace version from $manifest"
     }
     $hostVersion = [version]$Matches[1]
-    if ($hostSourceVersion -lt $sealVersion) {
-        throw "host source $hostSourceVersion is older than seal $sealVersion; this is not a forward-compat drill"
+    if ($hostSourceVersion -le $sealVersion) {
+        throw "host source $hostSourceVersion is not later than seal $sealVersion; choose a later HostRef"
+    }
+    if ($BumpVersion -and $hostVersion -le $hostSourceVersion) {
+        throw "BumpVersion=$BumpVersion must be greater than source version $hostSourceVersion"
     }
     if ($hostVersion -le $sealVersion) {
-        throw "host $hostVersion is not later than seal $sealVersion; pass -BumpVersion for a synthetic forward host"
+        throw "host $hostVersion is not later than seal $sealVersion"
     }
 
     $config = Join-Path $Worktree "forward-greeting.yml"

@@ -60,16 +60,16 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 脚本从指定宿主版本创建临时 worktree、构建 `cordis-cli`，对封存插件执行
 `inspect`（打开 + PING）和 `status`（挂载 + cleanup），最后清理 worktree。
 
-2026-11-07 已用 **临时 0.1.1 宿主**做了一次前向演练并通过：
+2026-11-07 已用 **正式 v0.1.1 宿主**加载 0.1.0 封存插件并通过
+`inspect + mount + cleanup`。支持契约仍保持“历史发布版 × 新宿主 = 待验证”，
+因为这是一次发布级验证，不是可重复测试。
 
 ```powershell
-.\scripts\historical-compat.ps1 -Seal dist\cordis-0.1.0-rc2 `
-  -HostRef v0.1.0 -BumpVersion 0.1.1
+.\scripts\historical-compat.ps1 -Seal dist\cordis-0.1.0-rc2 -HostRef v0.1.1
 ```
 
-但这是**演练**，不是正式 0.1.1 发布；支持契约仍保持“历史发布版 × 新宿主 =
-待验证”。只有后续正式版本存在并用它加载 0.1.0 封存产物、记录 run/日期后，才能
-升级为“保证”。`-BumpVersion` 只用于当前演练，不能替代真实后续版本。
+脚本现在要求宿主源码版本严格晚于封存版本；`-BumpVersion` 只能在该前提下生成
+更高版本的合成宿主，不能把同版本或旧源码伪装成前向宿主。
 
 ## 必须通过
 
