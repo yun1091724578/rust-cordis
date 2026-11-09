@@ -339,6 +339,13 @@ fn print_manifest(manifest: &SealManifest) {
         manifest.source_sha256, manifest.source_files
     );
     println!(
+        "  host = {}  source = {}  files = {}  same_source = {}",
+        manifest.host_workspace_version,
+        manifest.host_source_sha256,
+        manifest.host_source_files,
+        manifest.host_source_sha256 == manifest.source_sha256
+    );
+    println!(
         "  smoke = {}  evidence = {}",
         manifest.smoke_config, manifest.smoke_evidence
     );
@@ -482,7 +489,7 @@ fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
         source_files,
         host_source_sha256,
         host_source_files,
-        host_workspace_version: env!("CARGO_PKG_VERSION").to_string(),
+        host_workspace_version: workspace_version(&host_root)?,
         artifacts,
         smoke_config: SMOKE_CONFIG.to_string(),
         smoke_config_sha256: sha256_hex(&config_bytes),
@@ -852,6 +859,17 @@ fn verify_dir(dir: &Path) -> Result<SealManifest, Vec<String>> {
     }
     if manifest.workspace_version.trim().is_empty() {
         errors.push("workspace_version 为空".to_string());
+    }
+    if !legacy {
+        if manifest.host_workspace_version.trim().is_empty() {
+            errors.push("host.workspace_version 为空".to_string());
+        }
+        if manifest.host_source_sha256.len() != 64 {
+            errors.push("host.source_sha256 必须是 64 位十六进制".to_string());
+        }
+        if manifest.host_source_files == 0 {
+            errors.push("host.source_files 必须大于 0".to_string());
+        }
     }
     if manifest.abi_version == 0 {
         errors.push("abi_version 必须大于 0".to_string());

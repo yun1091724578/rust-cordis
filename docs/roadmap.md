@@ -112,7 +112,7 @@ R1 的记录必须区分“需求来源”“仓内集成”“独立工程实�
 |---|---|---|---|
 | 1 | **A5-1 三平台 CI 首跑 + 平台矩阵实填** | Linux / Windows MSVC / macOS 实际编译、运行全量测试与真 DLL e2e；把每个平台的真实结果逐条填入 `docs/platform-matrix.md` | **已完成**：2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)（commit `ea0489e`）三平台 `test` job 全绿；17 条保证 × 4 平台已填 `通过` |
 | 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | **进行中**：2026-11-03 手动 dispatch [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 首次 20k 通过，默认 1,000,000 轮也由 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543) 验证；每日 02:17 CST 的 `nightly-soak` workflow 已配置；cron 首跑与 artifact 长期转存未闭合 |
-| 3 | **A5-3 正式首发封存** | 在干净发布源码树上重跑 `/2` `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `allow-list.json` / `plugins` / `smoke` 目录；同版本 `inspect --source-policy` 证据随产物归档 | **已完成**：`xtask seal --root <tag-worktree>` 从 v0.1.0 / v0.1.1 生成 `/2`；本地 `dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal`，GitHub Release assets `cordis-0.1.0-formal.tar.gz` / `cordis-0.1.1-formal.tar.gz`；`seal --verify` 通过 |
+| 3 | **A5-3 正式首发封存** | 在干净发布源码树上重跑 `/2` `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `allow-list.json` / `plugins` / `smoke` 目录；同版本 `inspect --source-policy` 证据随产物归档 | **封存完成，严格同版本证据未满足**：`xtask seal --root <tag-worktree>` 已生成并归档 0.1.0/0.1.1 `/2`；但 smoke 的 host source 与 tag source 不同，只能算宿主加载检查 |
 | 4 | A5-4 历史产物 × 后续宿主 | 后续宿主版本加载已封存的首发产物，再把“历史发布版”从**待验证**转成**保证**或明确拒绝 | **已验证一次**：0.1.1 宿主加载 0.1.0 正式 `/2` 封存并通过 `inspect --source-policy`（`dist/cordis-0.1.0-formal/smoke/inspect.txt`）；仍缺可重复测试与严格同版本证据，因此支持契约保持待验证 |
 | 5 | A5-5 关闭其余发布前项 | `Cargo.toml` 的 `repository` / `homepage` 元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测；`release.md` 的发布前项关闭或明确延期 | 元数据已补；SCM 一次真实 elevated run 通过；剩余 nightly 长期转存与 SCM CI 重跑 |
 
@@ -202,7 +202,7 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
       本地演练通过（r3），格式见 `docs/release-seal.md`。这只证明入口可用，
       **不是正式发布**，也不证明产物真实性 / 签名。
 - [x] **正式首发产物封存**：`xtask seal --root <tag-worktree>` 已从 `v0.1.0`/`v0.1.1` 生成 `/2` 归档；`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal` 与 GitHub Release assets 均含 sidecar/allow-list，`seal --verify` 通过。
-- [x] **正式首发产物 × 同版本宿主**：0.1.1 正式封存的 `inspect --source-policy` 由 0.1.1 宿主通过；0.1.0 正式封存的同版本加载未单独重跑，而由 0.1.1 宿主 smoke 覆盖，跨版本结论仍留给 A5-4。
+- [ ] **正式首发产物 × 同版本宿主**：两个正式封存的 smoke 都由当前 0.1.1 工作区宿主执行，但 `host.source_sha256` 不等于封存 `source.sha256`；严格同版本证据仍缺，跨版本结论留给 A5-4。
 - [ ] **历史产物 × 后续宿主版本**：等后续宿主版本加载已封存的首发产物，才把索引中的
       “历史发布版”从**待验证**转成**保证**或明确拒绝；不能停留在模糊状态。
 - [x] **soak 入口与本地短时演练**：`cargo xtask soak [cycles]` 运行被忽略的

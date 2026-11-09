@@ -354,6 +354,7 @@ fn seal_verify_accepts_a_complete_seal() {
   "profile": "release",
   "toolchain": {"rustc": "rustc test", "cargo": "cargo test", "rustflags": ""},
   "source": {"kind": "workspace-tree", "sha256": "41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d", "files": 1},
+  "host": {"workspace_version": "0.1.0", "source_sha256": "41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d", "source_files": 1},
   "artifacts": [
     {"package": "plugin-greeting", "crate": "greeting", "path": "plugins/greeting.bin", "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "bytes": 3},
     {"package": "plugin-hello", "crate": "hello", "path": "plugins/hello.bin", "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "bytes": 3},
