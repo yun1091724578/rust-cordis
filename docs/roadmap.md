@@ -41,7 +41,7 @@
 阶段 0 的平台与发布基线：支持契约 **26 行 / 17 条保证**；0.1.1 三平台 CI
 [`42332542433`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542433)
 / [`42332542329`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542329)
-通过；0.1.0/0.1.1 已发布并封存；正式 v0.1.1 宿主加载 0.1.0 封存插件通过一次；
+通过；0.1.0/0.1.1 已发布并封存；v0.1.1 宿主加载 0.1.0-rc2 封存插件通过一次；
 SCM 一次真实 elevated run 通过；默认 1M soak 已通过。历史兼容仍待可重复测试，
 nightly cron/长期转存仍待补。
 
@@ -113,7 +113,7 @@ R1 的记录必须区分“需求来源”“仓内集成”“独立工程实�
 | 1 | **A5-1 三平台 CI 首跑 + 平台矩阵实填** | Linux / Windows MSVC / macOS 实际编译、运行全量测试与真 DLL e2e；把每个平台的真实结果逐条填入 `docs/platform-matrix.md` | **已完成**：2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)（commit `ea0489e`）三平台 `test` job 全绿；17 条保证 × 4 平台已填 `通过` |
 | 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | **进行中**：2026-11-03 手动 dispatch [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 首次 20k 通过，默认 1,000,000 轮也由 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543) 验证；每日 02:17 CST 的 `nightly-soak` workflow 已配置；cron 首跑与 artifact 长期转存未闭合 |
 | 3 | **A5-3 正式首发封存** | 在干净发布源码树上重跑 `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `plugins` / `smoke` 目录；同版本 `inspect` 证据随产物归档 | **已完成**：0.1.0 rc2 与 0.1.1 封存/复验通过；0.1.1 源码摘要 `a1eab4cb…` |
-| 4 | A5-4 历史产物 × 后续宿主 | 后续宿主版本加载已封存的首发产物，再把“历史发布版”从**待验证**转成**保证**或明确拒绝 | **已验证一次**：正式 v0.1.1 宿主加载 0.1.0 封存插件通过（`dist/cordis-0.1.1-historical.log`）；仍缺可重复测试，因此不支持契约仍为待验证 |
+| 4 | A5-4 历史产物 × 后续宿主 | 后续宿主版本加载已封存的首发产物，再把“历史发布版”从**待验证**转成**保证**或明确拒绝 | **已验证一次**：v0.1.1 宿主加载 0.1.0-rc2 封存插件通过（`dist/cordis-0.1.1-historical.log`）；仍缺可重复测试，因此不支持契约仍为待验证 |
 | 5 | A5-5 关闭其余发布前项 | `Cargo.toml` 的 `repository` / `homepage` 元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测；`release.md` 的发布前项关闭或明确延期 | 元数据已补；SCM 一次真实 elevated run 通过；剩余 nightly 长期转存与 SCM CI 重跑 |
 
 **A5-1/A5-3 已完成；A5-2 已启用并完成首次手动 20k；0.1.0/0.1.1 已发布并封存；

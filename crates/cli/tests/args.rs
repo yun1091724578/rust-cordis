@@ -8,6 +8,19 @@ fn run(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn version_flag_prints_the_package_version() {
+    for flag in ["version", "--version", "-V"] {
+        let output = run(&[flag]);
+        assert_eq!(output.status.code(), Some(0), "{flag}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("cordis {}\n", env!("CARGO_PKG_VERSION")),
+            "{flag}"
+        );
+    }
+}
+
+#[test]
 fn missing_plugin_dir_value_is_a_usage_error() {
     let output = run(&["inspect", "config.yml", "--plugin-dir"]);
     assert_eq!(output.status.code(), Some(2));
