@@ -44,6 +44,10 @@ dist/cordis-plugins-<workspace-version>-<target>/
   manifest 逐字段一致。它是 `cordis --source-policy` 的输入格式；
 - 记录 workspace 版本、ABI 主版本、结构化错误格式版本、目标三元组、rustc /
   cargo / RUSTFLAGS，以及封存时 workspace 工作树的聚合 SHA256；
+- 记录 smoke 宿主身份 `host.workspace_version` / `host.source_sha256` /
+  `host.source_files`。普通 `seal` 的 host 与 source 是同一棵树；`--root`
+  的 host 是当前工作区，若两者 `source_sha256` 不同，smoke 只是跨版本加载检查，
+  不能当作同版本证据；
 - 生成只读 smoke 配置，并用同版本 `cordis-cli inspect --source-policy
   allow-list.json` 加载三个插件（先验 sidecar / allow-list，再
   `LoadedPlugin::open` + `OP_PING` / `OP_VOLATILE_PATHS`；不挂载、不执行
@@ -52,7 +56,9 @@ dist/cordis-plugins-<workspace-version>-<target>/
 - 写 `seal.json` 与 `SHA256SUMS`（覆盖三个 artifact、三个 sidecar manifest、
   `allow-list.json`、smoke 配置与 inspect 证据），再做一次只读自检。
 
-`source.sha256` 是**封存时**工作树的快照，不是当前工作区的实时摘要；校验封存
+`source.sha256` 是**封存时**工作树的快照，不是当前工作区的实时摘要；linked
+worktree 根上的 `.git` 指针文件不会进入摘要。`host.source_sha256` 与
+`source.sha256` 相同才表示 smoke 由同版本树执行。校验封存
 不会重新计算它。它包含未跟踪文件，不读 `.gitignore`；排除 `.git/`、
 `target/`、`dist/`、`.cargo-home/`、`node_modules/`、`CARGO_TARGET_DIR`
 指向的目录、临时封存目录和编辑器交换文件。ABI / error_format 记录的是构建

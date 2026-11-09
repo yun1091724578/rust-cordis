@@ -22,7 +22,8 @@ const ALLOW_LIST_FILE: &str = "allow-list.json";
 const SMOKE_CONFIG: &str = "smoke/cordis.yml";
 const SMOKE_EVIDENCE: &str = "smoke/inspect.txt";
 const SMOKE_METHOD: &str = "cordis inspect --plugin-dir plugins --source-policy allow-list.json \
-     (PluginSourcePolicy::verify + LoadedPlugin::open + OP_PING / OP_VOLATILE_PATHS; no mount)";
+     (PluginSourcePolicy::verify + LoadedPlugin::open + OP_PING / OP_VOLATILE_PATHS; no mount; \
+     host identity is recorded under host.*)";
 
 const PLUGINS: &[PluginSpec] = &[
     PluginSpec {
@@ -74,6 +75,9 @@ struct SealManifest {
     rustflags: String,
     source_sha256: String,
     source_files: u64,
+    host_source_sha256: String,
+    host_source_files: u64,
+    host_workspace_version: String,
     artifacts: Vec<SealArtifact>,
     smoke_config: String,
     smoke_config_sha256: String,
@@ -103,6 +107,11 @@ impl SealManifest {
                 "kind": "workspace-tree",
                 "sha256": self.source_sha256,
                 "files": self.source_files,
+            },
+            "host": {
+                "workspace_version": self.host_workspace_version,
+                "source_sha256": self.host_source_sha256,
+                "source_files": self.host_source_files,
             },
             "artifacts": self.artifacts.iter().map(|artifact| json!({
                 "package": artifact.package,
@@ -165,6 +174,23 @@ impl SealManifest {
                 .to_string(),
             source_sha256: field_str(source, "sha256")?,
             source_files: field_u64(source, "files")?,
+            host_source_sha256: value
+                .get("host")
+                .and_then(|host| host.get("source_sha256"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            host_source_files: value
+                .get("host")
+                .and_then(|host| host.get("source_files"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            host_workspace_version: value
+                .get("host")
+                .and_then(|host| host.get("workspace_version"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             artifacts,
             smoke_config: field_str(smoke, "config")?,
             smoke_config_sha256: field_str(smoke, "config_sha256")?,
@@ -289,7 +315,7 @@ pub fn command(args: Vec<String>) -> i32 {
         Ok(manifest) => {
             println!("封存完成：{}", out.display());
             print_manifest(&manifest);
-            println!("同版本加载检查通过：{SMOKE_METHOD}");
+            println!("宿主加载检查通过：{SMOKE_METHOD}");
             0
         }
         Err(err) => {
@@ -418,9 +444,10 @@ fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
 
     // sidecar manifest + allow-list 必须在 smoke 之前落盘：同版本 inspect 会用
     // `--source-policy allow-list.json` 走真实的准入路径。
+    let source_version = workspace_version(root)?;
     write_plugin_provenance(
         &temp,
-        env!("CARGO_PKG_VERSION"),
+        &source_version,
         &source_sha256,
         cordis_abi::ABI_VERSION,
         &artifacts,
@@ -437,8 +464,9 @@ fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
     let evidence_bytes =
         fs::read(temp.join(SMOKE_EVIDENCE)).map_err(|err| format!("读取 smoke 证据失败：{err}"))?;
 
+    let (host_source_sha256, host_source_files) = source_tree_digest(&host_root, out)?;
     let manifest = SealManifest {
-        workspace_version: workspace_version(root)?,
+        workspace_version: source_version,
         abi_version: cordis_abi::ABI_VERSION,
         error_format: cordis_abi::ERROR_FORMAT_V1,
         target,
@@ -452,6 +480,9 @@ fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
         rustflags,
         source_sha256,
         source_files,
+        host_source_sha256,
+        host_source_files,
+        host_workspace_version: env!("CARGO_PKG_VERSION").to_string(),
         artifacts,
         smoke_config: SMOKE_CONFIG.to_string(),
         smoke_config_sha256: sha256_hex(&config_bytes),
@@ -1417,7 +1448,7 @@ fn collect_source_files(
             collect_source_files(root, &path, excluded, target, out)?;
         } else if file_type.is_file() && path != excluded && path != target {
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if name == ".ds_store" || name.ends_with(".swp") {
+            if name == ".git" || name == ".ds_store" || name.ends_with(".swp") {
                 continue;
             }
             let relative = path
@@ -1584,6 +1615,9 @@ mod tests {
             rustflags: String::new(),
             source_sha256: sha256_hex(b"source"),
             source_files: 3,
+            host_source_sha256: sha256_hex(b"host"),
+            host_source_files: 2,
+            host_workspace_version: "0.1.0".to_string(),
             artifacts,
             smoke_config: SMOKE_CONFIG.to_string(),
             smoke_config_sha256: sha256_hex(config.as_bytes()),
@@ -1864,6 +1898,7 @@ mod tests {
         fs::write(tree.path.join("dist/junk"), "junk").unwrap();
         fs::write(tree.path.join("out/artifact.bin"), "junk").unwrap();
         fs::write(tree.path.join("notes.swp"), "junk").unwrap();
+        fs::write(tree.path.join(".git"), "gitdir: /tmp/linked-worktree\n").unwrap();
         let excluded = tree.path.join("out");
         let (first, files) = source_tree_digest(&tree.path, &excluded).unwrap();
         assert_eq!(files, 1);
