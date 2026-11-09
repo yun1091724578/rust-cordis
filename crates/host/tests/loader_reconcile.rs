@@ -304,6 +304,7 @@ fn config_for(path: &Path, evaluator: Option<Arc<dyn JsEvaluator>>) -> LoaderCon
         hmr: None,
         js_evaluator: evaluator,
         interpolation: cordis_host::loader::InterpolationMode::Builtin,
+        dispatch_policy: None,
     }
 }
 

@@ -18,6 +18,13 @@ Cordis 的 Rust 实现：服务容器 + epoch 驱动的 fiber 生命周期 + 可
 `--source-policy`。T2 同步 `apply`/回调不可抢占；`DispatchPolicy` 只覆盖等待
 挂起结算，不能中断正在执行的调用。
 
+派发策略可按 **App / 装载器子树** 配置：`LoaderConfig.dispatchPolicy`
+（camelCase，如 `{ timeoutMs: 50, outboundTimeoutMs: 20 }`）在挂载前按
+`ctx.store` 身份登记，嵌入方也可调用 `set_dispatch_policy_for(&ctx, policy)`。
+同一进程的其他 App 不受影响；没有 per-App 条目的 App 才回落到进程级
+`set_dispatch_policy`。策略在实例注册时取快照，只影响之后注册的实例；
+目前的粒度是 App（以及装载器所在 App），还不是按插件/方法配置。
+
 当前执行入口见 [`docs/roadmap.md`](docs/roadmap.md)：仓外真实接入与发布收尾并行。
 已知交付缺口、调用通道边界和维护事项见 [`docs/architecture-review.md`](docs/architecture-review.md)。
 根目录设计长文保留历史背景，不作为当前进度或支持承诺。

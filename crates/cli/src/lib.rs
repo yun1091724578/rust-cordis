@@ -675,6 +675,7 @@ impl RunSession {
             hmr: None,
             js_evaluator: None,
             interpolation: InterpolationMode::Builtin,
+            dispatch_policy: None,
         };
         match load_with_source(app.root.clone(), config, source).await {
             Ok(state) => Ok(Self { app, state }),

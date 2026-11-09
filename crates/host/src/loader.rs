@@ -18,7 +18,10 @@
 //!    所以新库落到 `<name>.r<修订号>.<ext>`，旧句柄继续指向旧文件。
 
 use crate::patch::{apply_entry_patches_tracked, parse_entries, parse_patches, Entry, PatchOwners};
-use crate::{mount, resolve_plugin_path, stage_plugin, LoadedPlugin, StagedFile};
+use crate::{
+    mount, resolve_plugin_path, set_dispatch_policy_for, stage_plugin, DispatchPolicy,
+    LoadedPlugin, StagedFile,
+};
 use cordis_core::{
     equal_except_volatile, split_path, values_at, BoxFuture, Call, Config, Ctx, Disposable, Dyn,
     ExternValue, Fiber, FnPlugin, Inject, Level, Mode, Plugin, RealmId, Result, Ret, UpdateOutcome,
@@ -79,6 +82,14 @@ pub struct LoaderConfig {
     /// `!!js` 的求值模式（M9，D5）。缺省 `"builtin"`。
     #[serde(default)]
     pub interpolation: InterpolationMode,
+    /// 本装载器所在 **App** 的派发看门狗（P0-2）。缺省不覆盖。
+    ///
+    /// 装载开始时按 `ctx.store` 的同一性登记：本装载器挂载的插件（以及同一 App
+    /// 上之后注册的实例）使用它；其他 App 不受影响。只覆盖等待挂起结算，
+    /// 不中断正在执行的同步 `apply`/回调。没有配置时回落到进程级
+    /// [`crate::set_dispatch_policy`]。
+    #[serde(default)]
+    pub dispatch_policy: Option<DispatchPolicy>,
 }
 
 /// `!!js` 的求值模式（M9，D5，**P2**）。
@@ -122,6 +133,7 @@ impl std::fmt::Debug for LoaderConfig {
                 &self.js_evaluator.as_ref().map(|_| "已注入"),
             )
             .field("interpolation", &self.interpolation)
+            .field("dispatch_policy", &self.dispatch_policy)
             .finish()
     }
 }
@@ -687,6 +699,11 @@ pub struct LoaderState {
     interp_failures: Arc<AtomicU64>,
     /// **生效的** `!!js` 模式（M9，D5）：报告要如实说出"这份配置现在由谁在解释"。
     interpolation_mode: InterpolationMode,
+    /// 本装载器登记的派发策略（P0-2）：装载时已按 `ctx.store` 写进宿主注册表。
+    ///
+    /// 留一份在这里是为了让装载器的诊断/调试面能回答"这次装载声明了什么"；
+    /// 实际生效值在宿主侧按 App 保存，且只作用于之后注册的实例。
+    dispatch_policy: Option<DispatchPolicy>,
 }
 
 /// 对账驱动者的取消安全闸门。
@@ -731,6 +748,7 @@ impl std::fmt::Debug for LoaderState {
             .field("revision", &self.revision.load(Ordering::SeqCst))
             .field("config", &self.files.main)
             .field("interpolation_failed", &self.interpolation_failures())
+            .field("dispatch_policy", &self.dispatch_policy)
             .finish()
     }
 }
@@ -770,6 +788,7 @@ impl LoaderState {
         interpolation_mode: InterpolationMode,
         owners: PatchOwners,
         main_baseline: String,
+        dispatch_policy: Option<DispatchPolicy>,
     ) -> Self {
         let fingerprint = config_fingerprint(&files);
         Self {
@@ -797,6 +816,7 @@ impl LoaderState {
             evaluator,
             interp_failures,
             interpolation_mode,
+            dispatch_policy,
         }
     }
 
@@ -2103,6 +2123,12 @@ pub async fn load_with_source(
     config: LoaderConfig,
     source: Arc<dyn PluginSource>,
 ) -> Result<Arc<LoaderState>> {
+    // P0-2：先登记本装载器所在 App 的看门狗，再做任何挂载。实例在
+    // `register_instance_with_keepalive` 里取快照，所以这必须发生在 `sync()` 之前。
+    // 键是 `ctx.store` 的同一性：只覆盖这个 App，不影响同进程的其他 App。
+    if let Some(policy) = config.dispatch_policy {
+        set_dispatch_policy_for(&ctx, policy);
+    }
     let main_path = PathBuf::from(&config.path);
     let base_dir = main_path
         .parent()
@@ -2184,6 +2210,7 @@ pub async fn load_with_source(
         interpolation_mode,
         owners,
         text,
+        config.dispatch_policy,
     ));
 
     // 4) `!!js` 的插值挂上 `internal/config` 链（M4-4b）——**必须在第一次对账之前**：
@@ -3557,6 +3584,38 @@ mod tests {
         }
     }
 
+    /// P0-2：`dispatchPolicy` 是 `LoaderConfig` 的 camelCase 字段；缺省字段由
+    /// `DispatchPolicy` 的 `Default` 补齐，整个字段缺省时保持 `None`（回落全局）。
+    #[test]
+    fn loader_config_parses_dispatch_policy_from_yaml() {
+        let config: LoaderConfig = serde_yaml::from_str(
+            "path: cordis.yml\ndispatchPolicy: {timeoutMs: 50, outboundTimeoutMs: 20}\n",
+        )
+        .expect("camelCase dispatchPolicy 必须能解析");
+        assert_eq!(
+            config.dispatch_policy,
+            Some(DispatchPolicy {
+                timeout_ms: Some(50),
+                outbound_timeout_ms: Some(20),
+            })
+        );
+
+        let partial: LoaderConfig =
+            serde_yaml::from_str("path: cordis.yml\ndispatchPolicy:\n  timeoutMs: 5\n")
+                .expect("缺省字段由 DispatchPolicy::default 补齐");
+        assert_eq!(
+            partial.dispatch_policy,
+            Some(DispatchPolicy {
+                timeout_ms: Some(5),
+                outbound_timeout_ms: None,
+            })
+        );
+
+        let absent: LoaderConfig =
+            serde_yaml::from_str("path: cordis.yml\n").expect("缺省 dispatchPolicy 不报错");
+        assert_eq!(absent.dispatch_policy, None, "缺省时回落进程级策略");
+    }
+
     /// M1-4 → M4-4（改写）：装载点对 `!!js` 的处置。
     ///
     /// M1-4 的判据是"任何 `!!js` 都不许上线（报'暂不支持'）"——那时的前提是**没有求值器**。
@@ -3584,6 +3643,7 @@ mod tests {
             hmr: None,
             js_evaluator: None,
             interpolation: InterpolationMode::Builtin,
+            dispatch_policy: None,
         };
 
         // ① 算得出：休眠行 ⇒ 一行都不挂，但装载成功。
@@ -3701,6 +3761,7 @@ mod tests {
             InterpolationMode::Builtin,
             PatchOwners::default(),
             String::new(),
+            None,
         );
         state
             .mounted

@@ -238,7 +238,13 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         item: "set_dispatch_policy",
         kind: "fn",
         source: "crates/host/src/lib.rs",
-        marker: "pub fn set_dispatch_policy",
+        marker: "pub fn set_dispatch_policy(",
+    },
+    PublicItem {
+        item: "set_dispatch_policy_for",
+        kind: "fn",
+        source: "crates/host/src/lib.rs",
+        marker: "pub fn set_dispatch_policy_for",
     },
     PublicItem {
         item: "open_verified",
@@ -1088,7 +1094,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 72, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 73, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 

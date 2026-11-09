@@ -50,9 +50,10 @@ use cordis_abi::{
 };
 use cordis_core::{
     BoxFuture, CancelToken, Config, Ctx, Disposable, Dyn, Error, ExternService, ExternValue, Fiber,
-    Inject, Level, Next, Plugin, PluginKey, PushOutcome, Result, Ret, StreamObserver,
+    Inject, Level, Next, Plugin, PluginKey, PushOutcome, Result, Ret, Store, StreamObserver,
     StreamOutcome, StreamSink,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::any::Any;
 use std::collections::HashMap;
@@ -108,6 +109,12 @@ struct Instance {
     /// `done`，随后 `App::close` 就再也找不到这个任务。这里留到实例级，
     /// 关闭时统一等待；插入时顺手清掉已经完成的接收端。
     reclaiming: Arc<Mutex<Vec<tokio::sync::oneshot::Receiver<()>>>>,
+    /// 注册时从所属 App 的 per-App 策略（或进程级回落）取下的**快照**。
+    ///
+    /// 快照而不是每次读注册表：已注册实例的策略不因后来调用
+    /// [`set_dispatch_policy_for`] 而漂移；这也避免每次 settle / 出站派发都
+    /// 去锁全局注册表。`Instance` 会随派生句柄/续延克隆，策略跟着一起走。
+    dispatch_policy: DispatchPolicy,
 }
 
 /// 一条挂起续延的结算通道：`Ok(值)` 或带结构化原因的错误。
@@ -292,6 +299,7 @@ fn register_instance_with_keepalive(
     keepalive: Option<Arc<dyn Any + Send + Sync>>,
     error_format: u32,
 ) -> u64 {
+    let dispatch_policy = dispatch_policy_for_ctx(&ctx);
     instances().lock().unwrap().insert(Instance {
         ctx,
         call,
@@ -301,6 +309,7 @@ fn register_instance_with_keepalive(
         closed: Arc::new(AtomicBool::new(false)),
         lifecycle: Arc::new(RwLock::new(())),
         reclaiming: Arc::new(Mutex::new(Vec::new())),
+        dispatch_policy,
     })
 }
 
@@ -808,12 +817,15 @@ fn next_dispatch_id() -> u64 {
     DISPATCH_SEQ.fetch_add(1, Ordering::SeqCst)
 }
 
-/// 派发看门狗（M2，D3）：宿主等待 `ctx_fulfill` 的上限。
+/// 派发看门狗（M2，D3；P0-2 起按 App 配置）：宿主等待 `ctx_fulfill` 的上限。
 ///
-/// `None` = 不设上限（默认；与 M2 之前的行为逐字相同）。宿主级默认的接入口就是
-/// [`set_dispatch_policy`]（装载器配置将来把它接上去）。**不设上限时，行为不端的
-/// 插件可以占住一次派发**——这正是风险 1，缓解手段是卸载排水与 [`set_dispatch_policy`]。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// `None` = 不设上限（默认；与 M2 之前的行为逐字相同）。每个实例在注册时从
+/// **所属 App** 的策略注册表取一份快照（见 [`set_dispatch_policy_for`]）；
+/// 没有 per-App 条目时回落到进程级的 [`set_dispatch_policy`]。
+/// **不设上限时，行为不端的插件可以占住一次派发**——这正是风险 1，缓解手段是
+/// 卸载排水与看门狗。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct DispatchPolicy {
     /// 入站挂起续延与流式挂起的上限。
     pub timeout_ms: Option<u64>,
@@ -830,13 +842,64 @@ static DISPATCH_POLICY: RwLock<DispatchPolicy> = RwLock::new(DispatchPolicy {
     outbound_timeout_ms: None,
 });
 
-/// 设置派发看门狗（进程级；覆盖式，后设生效）。
+/// 设置**进程级**派发看门狗（覆盖式，后设生效）。
+///
+/// 这是**回落**而不是唯一入口：用 [`set_dispatch_policy_for`] 给单个 App 设置
+/// 策略后，该 App 的实例优先使用自己的策略；只有没有 per-App 条目（或条目随
+/// App 释放被清掉）时才读这里。已有实例保留注册时的快照。
 pub fn set_dispatch_policy(policy: DispatchPolicy) {
     *DISPATCH_POLICY.write().unwrap() = policy;
 }
 
 fn dispatch_policy() -> DispatchPolicy {
     *DISPATCH_POLICY.read().unwrap()
+}
+
+/// 一个 App 的看门狗条目：`store` 是**弱引用**，App 释放后条目可被顺手清掉，
+/// 注册表不会把 `Store` 吊住。
+struct AppDispatchPolicy {
+    store: Weak<Store>,
+    policy: DispatchPolicy,
+}
+
+/// 键是 `Arc::as_ptr(&ctx.store)`（App 的身份；派生 ctx 共享同一个 `Arc<Store>`）。
+fn app_dispatch_policies() -> &'static Mutex<HashMap<usize, AppDispatchPolicy>> {
+    static POLICIES: OnceLock<Mutex<HashMap<usize, AppDispatchPolicy>>> = OnceLock::new();
+    POLICIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 设置**单个 App** 的派发看门狗。
+///
+/// App 由 `ctx.store` 的同一性标识：同一个 `App` 上派生的所有 ctx（isolate /
+/// intercept / 装载器行）共享这条策略；不同 `App` 互不影响。装载器在
+/// `LoaderConfig.dispatch_policy` 有值时会在挂载前调用它。
+///
+/// 只影响**之后注册**的实例（实例在注册时取快照）；已注册实例不会被追溯修改。
+pub fn set_dispatch_policy_for(ctx: &Ctx, policy: DispatchPolicy) {
+    let key = Arc::as_ptr(&ctx.store) as usize;
+    let mut policies = app_dispatch_policies().lock().unwrap();
+    policies.retain(|_, entry| entry.store.strong_count() > 0);
+    policies.insert(
+        key,
+        AppDispatchPolicy {
+            store: Arc::downgrade(&ctx.store),
+            policy,
+        },
+    );
+}
+
+/// 内部读取：per-App 优先，缺失或 App 已释放时回落到进程级策略。
+fn dispatch_policy_for_ctx(ctx: &Ctx) -> DispatchPolicy {
+    let key = Arc::as_ptr(&ctx.store) as usize;
+    let mut policies = app_dispatch_policies().lock().unwrap();
+    match policies.get(&key) {
+        Some(entry) if entry.store.strong_count() > 0 => entry.policy,
+        Some(_) => {
+            policies.remove(&key);
+            dispatch_policy()
+        }
+        None => dispatch_policy(),
+    }
 }
 
 /// 一个实例的**在飞派发记录**总数（诊断口径）：含挂起续延、waterfall 帧与出站节点。
@@ -930,7 +993,7 @@ enum Inbound {
     /// 插件同步返回（M2 之前的行为，逐字不变）。
     Ready(Value),
     /// 插件返回 `STATUS_PENDING`：结果经 `ctx_fulfill` 到达。
-    Pending(PendingContinuation),
+    Pending(Box<PendingContinuation>),
 }
 
 /// 一个挂起的入站续延：宿主在等它被结算。
@@ -998,6 +1061,7 @@ impl PendingContinuation {
             cancel,
             _abandon,
         } = self;
+        let timeout_ms = instance.dispatch_policy.timeout_ms;
         let wait = async move {
             match cancel {
                 None => SettleOutcome::Settled(rx.await),
@@ -1007,7 +1071,7 @@ impl PendingContinuation {
                 },
             }
         };
-        let outcome = match dispatch_policy().timeout_ms {
+        let outcome = match timeout_ms {
             None => wait.await,
             Some(ms) => {
                 match tokio::time::timeout(std::time::Duration::from_millis(ms), wait).await {
@@ -1139,7 +1203,7 @@ unsafe fn call_inbound(
                 parsed.get("ret").cloned().unwrap_or(Value::Null),
             ))
         }
-        STATUS_PENDING => Ok(Inbound::Pending(PendingContinuation {
+        STATUS_PENDING => Ok(Inbound::Pending(Box::new(PendingContinuation {
             instance: instance.clone(),
             dispatch_id,
             rx,
@@ -1148,7 +1212,7 @@ unsafe fn call_inbound(
                 instance: instance.clone(),
                 dispatch_id,
             },
-        })),
+        }))),
         STATUS_ERR => {
             instance.dispatches.lock().unwrap().remove(&dispatch_id);
             Err(CallFailure::from_payload(decode_plugin_error(
@@ -1191,8 +1255,9 @@ fn with_iface_timeout(
     future: BoxFuture<Result<Config>>,
     service: String,
     method: String,
+    policy: DispatchPolicy,
 ) -> BoxFuture<Result<Config>> {
-    let Some(ms) = dispatch_policy().outbound_timeout_ms else {
+    let Some(ms) = policy.outbound_timeout_ms else {
         return future;
     };
     Box::pin(async move {
@@ -1216,8 +1281,9 @@ fn with_iface_timeout(
 fn with_dispatch_timeout(
     future: BoxFuture<Ret>,
     event: String,
+    policy: DispatchPolicy,
 ) -> BoxFuture<std::result::Result<Ret, ErrorPayload>> {
-    let Some(ms) = dispatch_policy().outbound_timeout_ms else {
+    let Some(ms) = policy.outbound_timeout_ms else {
         return Box::pin(async move { Ok(future.await) });
     };
     Box::pin(async move {
@@ -1237,8 +1303,9 @@ fn with_dispatch_timeout(
 fn with_next_timeout(
     future: BoxFuture<Ret>,
     dispatch_id: u64,
+    policy: DispatchPolicy,
 ) -> BoxFuture<std::result::Result<Ret, ErrorPayload>> {
-    let Some(ms) = dispatch_policy().outbound_timeout_ms else {
+    let Some(ms) = policy.outbound_timeout_ms else {
         return Box::pin(async move { Ok(future.await) });
     };
     Box::pin(async move {
@@ -2118,7 +2185,7 @@ impl ExternService for PluginIface {
             } {
                 Ok(Inbound::Ready(value)) => Ok(value),
                 Ok(Inbound::Pending(pending)) => {
-                    pending.settle("接口方法").await.map_err(Error::from)
+                    (*pending).settle("接口方法").await.map_err(Error::from)
                 }
                 Err(message) => Err(message.into()),
             }
@@ -2179,10 +2246,10 @@ impl ExternService for PluginIface {
                 // 流式挂起：记录归流观察者所有（流收尾时摘除）。若配了派发看门狗，
                 // 派生一个 settle 任务执行超时策略；超时会 revoke 记录并以错误收流。
                 Ok(Inbound::Pending(pending)) => {
-                    if dispatch_policy().timeout_ms.is_some() {
+                    if provider.dispatch_policy.timeout_ms.is_some() {
                         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                             runtime.spawn(async move {
-                                let _ = pending.settle("流式调用").await;
+                                let _ = (*pending).settle("流式调用").await;
                             });
                         }
                     }
@@ -2258,7 +2325,12 @@ unsafe extern "C" fn host_ctx_call_iface(
         let timeout_method = method.clone();
         let error_format = resolved.instance.error_format;
         let future = resolved.ctx.call_iface(&service, version, &method, parsed);
-        let future = with_iface_timeout(future, timeout_service, timeout_method);
+        let future = with_iface_timeout(
+            future,
+            timeout_service,
+            timeout_method,
+            resolved.instance.dispatch_policy,
+        );
         let consumer = resolved.owner;
         // 把这次 iface 调用登记成消费者实例的一条在飞记录：
         // 消费者卸载时 `apply_via` 的排水会把它撤掉，避免延迟 on_done 打进已释放的库。
@@ -2498,7 +2570,7 @@ unsafe extern "C" fn host_ctx_next(
             inner: future,
             scope: (handle, dispatch_id),
         });
-        let scoped = with_next_timeout(scoped, dispatch_id);
+        let scoped = with_next_timeout(scoped, dispatch_id, instance.dispatch_policy);
         let deliver: Arc<dyn Fn(std::result::Result<Ret, ErrorPayload>) + Send + Sync> =
             Arc::new(move |result| {
                 deliver_next(handle, dispatch_id, on_done, error_format, result);
@@ -2605,7 +2677,7 @@ unsafe extern "C" fn host_ctx_on(handle: u64, event: Blob, cb: u64, out: *mut Ou
             Box::pin(async move {
                 let settled = match result {
                     Ok(Inbound::Ready(value)) => Ok(value),
-                    Ok(Inbound::Pending(pending)) => pending.settle("事件监听器").await,
+                    Ok(Inbound::Pending(pending)) => (*pending).settle("事件监听器").await,
                     Err(message) => Err(message),
                 };
                 match settled {
@@ -2733,7 +2805,7 @@ unsafe fn dispatch_impl(
             inner: future,
             scope: (handle, dispatch_id),
         });
-        let future = with_dispatch_timeout(future, event);
+        let future = with_dispatch_timeout(future, event, instance.dispatch_policy);
         if continuation == 0 {
             // 纯 emit：派发后立即返回。这不是妥协——cordis 的 `emit` 本来就不取返回值。
             let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -4054,6 +4126,7 @@ mod tests {
             lifecycle: Arc::new(RwLock::new(())),
             reclaiming: Arc::new(Mutex::new(Vec::new())),
             error_format: 0,
+            dispatch_policy: DispatchPolicy::default(),
         }
     }
 

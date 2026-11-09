@@ -134,6 +134,7 @@ fn config_for(path: &Path, evaluator: Option<Arc<dyn JsEvaluator>>, strict: bool
         hmr: None,
         js_evaluator: evaluator,
         interpolation: InterpolationMode::Builtin,
+        dispatch_policy: None,
     }
 }
 

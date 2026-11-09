@@ -114,6 +114,7 @@
 | `apply_via_with_keepalive_and_error_format` | fn | `crates/host/src/lib.rs` |
 | `set_plugin_source` | fn | `crates/host/src/lib.rs` |
 | `set_dispatch_policy` | fn | `crates/host/src/lib.rs` |
+| `set_dispatch_policy_for` | fn | `crates/host/src/lib.rs` |
 | `open_verified` | fn | `crates/host/src/lib.rs` |
 | `open_staged_verified` | fn | `crates/host/src/lib.rs` |
 | `PluginSourcePolicy` | struct | `crates/host/src/source.rs` |

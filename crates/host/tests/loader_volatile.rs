@@ -208,6 +208,7 @@ fn config_for(path: &Path) -> LoaderConfig {
         hmr: None,
         js_evaluator: None,
         interpolation: cordis_host::loader::InterpolationMode::Builtin,
+        dispatch_policy: None,
     }
 }
 

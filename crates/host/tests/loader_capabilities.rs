@@ -110,6 +110,7 @@ async fn capabilities_report_aggregates_inject_provision_and_volatile() {
         hmr: None,
         js_evaluator: None,
         interpolation: cordis_host::loader::InterpolationMode::Builtin,
+        dispatch_policy: None,
     };
     load_with_source(app.root.clone(), config, Arc::new(CapabilitySource))
         .await
@@ -149,6 +150,7 @@ async fn loader_accepts_scoped_inject_and_optional_dependency_does_not_block() {
         hmr: None,
         js_evaluator: None,
         interpolation: cordis_host::loader::InterpolationMode::Builtin,
+        dispatch_policy: None,
     };
     let state = load_with_source(app.root.clone(), config, Arc::new(CapabilitySource))
         .await
