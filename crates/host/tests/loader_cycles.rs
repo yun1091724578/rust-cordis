@@ -125,6 +125,7 @@ fn config_for(path: &Path, strict: bool, strict_cycles: bool) -> LoaderConfig {
         js_evaluator: None,
         interpolation: cordis_host::loader::InterpolationMode::Builtin,
         dispatch_policy: None,
+        host_limits: None,
     }
 }
 

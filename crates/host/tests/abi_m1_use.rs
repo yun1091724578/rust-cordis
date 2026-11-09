@@ -475,6 +475,7 @@ async fn abi_dispose_self_marks_the_loader_row_disabled_and_persists() {
             js_evaluator: None,
             interpolation: cordis_host::loader::InterpolationMode::Builtin,
             dispatch_policy: None,
+            host_limits: None,
         },
         Arc::new(FixtureSource),
     )

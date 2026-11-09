@@ -19,8 +19,8 @@
 
 use crate::patch::{apply_entry_patches_tracked, parse_entries, parse_patches, Entry, PatchOwners};
 use crate::{
-    mount, resolve_plugin_path, set_dispatch_policy_for, stage_plugin, DispatchPolicy,
-    LoadedPlugin, StagedFile,
+    mount, resolve_plugin_path, set_dispatch_policy_for, set_host_limits_for, stage_plugin,
+    DispatchPolicy, HostLimits, LoadedPlugin, StagedFile,
 };
 use cordis_core::{
     equal_except_volatile, split_path, values_at, BoxFuture, Call, Config, Ctx, Disposable, Dyn,
@@ -90,6 +90,14 @@ pub struct LoaderConfig {
     /// [`crate::set_dispatch_policy`]。
     #[serde(default)]
     pub dispatch_policy: Option<DispatchPolicy>,
+    /// 本装载器所在 **App** 的容量准入上限（P0-3）。缺省不覆盖。
+    ///
+    /// 装载开始时按 `ctx.store` 的同一性登记，作用于本装载器挂载的插件以及同一
+    /// App 上之后注册的实例；其他 App 不受影响。这是宿主侧表项准入（实例数、
+    /// 派发记录、挂起续延、流），不是每插件的内存/CPU 硬上限。没有配置时回落到
+    /// 进程级 [`crate::set_default_host_limits`]；任何字段为 0 都会在挂载前报错。
+    #[serde(default)]
+    pub host_limits: Option<HostLimits>,
 }
 
 /// `!!js` 的求值模式（M9，D5，**P2**）。
@@ -134,6 +142,7 @@ impl std::fmt::Debug for LoaderConfig {
             )
             .field("interpolation", &self.interpolation)
             .field("dispatch_policy", &self.dispatch_policy)
+            .field("host_limits", &self.host_limits)
             .finish()
     }
 }
@@ -704,6 +713,8 @@ pub struct LoaderState {
     /// 留一份在这里是为了让装载器的诊断/调试面能回答"这次装载声明了什么"；
     /// 实际生效值在宿主侧按 App 保存，且只作用于之后注册的实例。
     dispatch_policy: Option<DispatchPolicy>,
+    /// 本装载器登记的容量准入上限（P0-3）：与 `dispatch_policy` 同一套快照语义。
+    host_limits: Option<HostLimits>,
 }
 
 /// 对账驱动者的取消安全闸门。
@@ -749,6 +760,7 @@ impl std::fmt::Debug for LoaderState {
             .field("config", &self.files.main)
             .field("interpolation_failed", &self.interpolation_failures())
             .field("dispatch_policy", &self.dispatch_policy)
+            .field("host_limits", &self.host_limits)
             .finish()
     }
 }
@@ -789,6 +801,7 @@ impl LoaderState {
         owners: PatchOwners,
         main_baseline: String,
         dispatch_policy: Option<DispatchPolicy>,
+        host_limits: Option<HostLimits>,
     ) -> Self {
         let fingerprint = config_fingerprint(&files);
         Self {
@@ -817,6 +830,7 @@ impl LoaderState {
             interp_failures,
             interpolation_mode,
             dispatch_policy,
+            host_limits,
         }
     }
 
@@ -2129,6 +2143,12 @@ pub async fn load_with_source(
     if let Some(policy) = config.dispatch_policy {
         set_dispatch_policy_for(&ctx, policy);
     }
+    // P0-3：容量上限同样必须在任何挂载之前登记——实例在注册时取快照。
+    // 0 是非法配置：这里直接让装载失败，绝不把“忘记填”解释成“永不接纳”。
+    if let Some(limits) = config.host_limits {
+        set_host_limits_for(&ctx, limits)
+            .map_err(|err| format!("LoaderConfig.hostLimits 无效: {err}"))?;
+    }
     let main_path = PathBuf::from(&config.path);
     let base_dir = main_path
         .parent()
@@ -2211,6 +2231,7 @@ pub async fn load_with_source(
         owners,
         text,
         config.dispatch_policy,
+        config.host_limits,
     ));
 
     // 4) `!!js` 的插值挂上 `internal/config` 链（M4-4b）——**必须在第一次对账之前**：
@@ -3616,6 +3637,33 @@ mod tests {
         assert_eq!(absent.dispatch_policy, None, "缺省时回落进程级策略");
     }
 
+    /// P0-3：`hostLimits` 是 `LoaderConfig` 的 camelCase 字段；缺省字段由
+    /// `HostLimits::default` 补齐，整个字段缺省时保持 `None`（回落进程级默认）。
+    #[test]
+    fn loader_config_parses_host_limits_from_yaml() {
+        let config: LoaderConfig = serde_yaml::from_str(
+            "path: cordis.yml\nhostLimits: {maxInstancesPerApp: 3, maxDispatchesPerInstance: 7}\n",
+        )
+        .expect("camelCase hostLimits 必须能解析");
+        assert_eq!(
+            config.host_limits,
+            Some(HostLimits {
+                max_instances_per_app: 3,
+                max_dispatches_per_instance: 7,
+                ..HostLimits::default()
+            })
+        );
+
+        let absent: LoaderConfig =
+            serde_yaml::from_str("path: cordis.yml\n").expect("缺省 hostLimits 不报错");
+        assert_eq!(absent.host_limits, None, "缺省时回落进程级默认");
+
+        let zero = serde_yaml::from_str::<LoaderConfig>(
+            "path: cordis.yml\nhostLimits: {maxInstancesPerApp: 0}\n",
+        );
+        assert!(zero.is_err(), "0 不是“无限”，必须作为非法配置拒绝");
+    }
+
     /// M1-4 → M4-4（改写）：装载点对 `!!js` 的处置。
     ///
     /// M1-4 的判据是"任何 `!!js` 都不许上线（报'暂不支持'）"——那时的前提是**没有求值器**。
@@ -3644,6 +3692,7 @@ mod tests {
             js_evaluator: None,
             interpolation: InterpolationMode::Builtin,
             dispatch_policy: None,
+            host_limits: None,
         };
 
         // ① 算得出：休眠行 ⇒ 一行都不挂，但装载成功。
@@ -3761,6 +3810,7 @@ mod tests {
             InterpolationMode::Builtin,
             PatchOwners::default(),
             String::new(),
+            None,
             None,
         );
         state

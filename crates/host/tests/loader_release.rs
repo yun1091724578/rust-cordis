@@ -215,6 +215,7 @@ fn config_for(path: &Path) -> LoaderConfig {
         js_evaluator: None,
         interpolation: InterpolationMode::Builtin,
         dispatch_policy: None,
+        host_limits: None,
     }
 }
 

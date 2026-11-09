@@ -115,6 +115,10 @@ struct Instance {
     /// [`set_dispatch_policy_for`] 而漂移；这也避免每次 settle / 出站派发都
     /// 去锁全局注册表。`Instance` 会随派生句柄/续延克隆，策略跟着一起走。
     dispatch_policy: DispatchPolicy,
+    /// 注册时从所属 App 的容量准入表（或进程级回落）取下的**快照**（P0-3）。
+    ///
+    /// 与 [`DispatchPolicy`] 同一套纪律：运行期改表不追溯已注册实例。
+    host_limits: HostLimits,
 }
 
 /// 一条挂起续延的结算通道：`Ok(值)` 或带结构化原因的错误。
@@ -293,14 +297,32 @@ fn instances() -> &'static Mutex<Slab> {
     INSTANCES.get_or_init(|| Mutex::new(Slab::default()))
 }
 
+/// 注册一个 ABI 实例，并在**同一把实例表锁**内执行 per-App 容量准入。
+///
+/// 计数与插入必须原子：先数后插会在并发 apply 下越过 `maxInstancesPerApp`。
+/// 返回 `Err` 时没有登记任何实例，调用方（`apply_via`）把它转成插件装载错误。
 fn register_instance_with_keepalive(
     ctx: Ctx,
     call: CallFn,
     keepalive: Option<Arc<dyn Any + Send + Sync>>,
     error_format: u32,
-) -> u64 {
+) -> std::result::Result<u64, String> {
     let dispatch_policy = dispatch_policy_for_ctx(&ctx);
-    instances().lock().unwrap().insert(Instance {
+    let host_limits = host_limits_for_ctx(&ctx);
+    let mut slab = instances().lock().unwrap();
+    let used = slab
+        .slots
+        .iter()
+        .filter_map(|slot| slot.as_ref())
+        .filter(|(_, instance)| Arc::ptr_eq(&instance.ctx.store, &ctx.store))
+        .count();
+    if used >= host_limits.max_instances_per_app {
+        return Err(format!(
+            "App 实例数已达上限 {}（maxInstancesPerApp），拒绝注册插件实例",
+            host_limits.max_instances_per_app
+        ));
+    }
+    Ok(slab.insert(Instance {
         ctx,
         call,
         error_format,
@@ -310,7 +332,8 @@ fn register_instance_with_keepalive(
         lifecycle: Arc::new(RwLock::new(())),
         reclaiming: Arc::new(Mutex::new(Vec::new())),
         dispatch_policy,
-    })
+        host_limits,
+    }))
 }
 
 fn unregister_instance(handle: u64) {
@@ -434,12 +457,35 @@ where
 }
 
 /// 与 [`with_resolved`] 相同，但允许调用点给出更具体的错误 `code` / `category`。
+#[allow(clippy::result_large_err)]
 unsafe fn with_resolved_as<T>(
     handle: u64,
     out: *mut Out,
     code: &str,
     category: &str,
     f: impl FnOnce(&Resolved) -> std::result::Result<T, String>,
+) -> i32
+where
+    T: AsRef<[u8]>,
+{
+    with_resolved_payload(handle, out, |resolved| {
+        f(resolved).map_err(|message| {
+            ErrorPayload::new(message)
+                .with_code(code)
+                .with_category(category)
+        })
+    })
+}
+
+/// [`with_resolved_as`] 的载荷版：调用点可以直接给出完整的 [`ErrorPayload`]。
+///
+/// 容量拒绝经它返回 `host_capacity` / `capacity` / `not_executed`，而不是被
+/// 压平成一条只有消息的字符串错误。
+#[allow(clippy::result_large_err)]
+unsafe fn with_resolved_payload<T>(
+    handle: u64,
+    out: *mut Out,
+    f: impl FnOnce(&Resolved) -> std::result::Result<T, ErrorPayload>,
 ) -> i32
 where
     T: AsRef<[u8]>,
@@ -455,13 +501,7 @@ where
         Some(resolved) => {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&resolved))) {
                 Ok(Ok(bytes)) => reply(out, bytes.as_ref()),
-                Ok(Err(message)) => fail_to(
-                    out,
-                    resolved.instance.error_format,
-                    &message,
-                    code,
-                    category,
-                ),
+                Ok(Err(payload)) => fail_payload(out, resolved.instance.error_format, &payload),
                 Err(payload) => fail_to(
                     out,
                     resolved.instance.error_format,
@@ -902,6 +942,205 @@ fn dispatch_policy_for_ctx(ctx: &Ctx) -> DispatchPolicy {
     }
 }
 
+/// 宿主容量/准入上限（P0-3）。
+///
+/// 这是**宿主侧表项准入**：限制每个 App 的实例数、每个实例的派发记录、挂起续延
+/// 与流数量。超限时宿主拒绝这次准入，返回可读的结构化错误，**不执行插件代码**。
+///
+/// 它不是每插件的内存/CPU 硬上限——T2 插件与宿主同进程共享地址空间；真正的
+/// 资源硬限制需要 cgroup/Job Object 或进程外载体（T3）。
+///
+/// 所有字段都必须大于 0。0 **不是**“无限”，而是非法配置：装载器 / 设置入口会
+/// 拒绝它，避免把“忘记填”静默解释成“永不接纳”。缺省值有意放宽以保持既有行为：
+/// 1024 / 1024 / 256 / 32。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HostLimits {
+    /// 单个 App 内同时注册的实例上限。
+    #[serde(deserialize_with = "deserialize_nonzero_usize")]
+    pub max_instances_per_app: usize,
+    /// 单个实例的在飞派发记录总上限（入站、iface、出站与流共用这张表）。
+    #[serde(deserialize_with = "deserialize_nonzero_usize")]
+    pub max_dispatches_per_instance: usize,
+    /// 单个实例同时挂起的入站续延上限。
+    #[serde(deserialize_with = "deserialize_nonzero_usize")]
+    pub max_pending_per_instance: usize,
+    /// 单个实例同时存在的流上限。
+    #[serde(deserialize_with = "deserialize_nonzero_usize")]
+    pub max_streams_per_instance: usize,
+}
+
+/// 手写 `Default`：派生 `Default` 会给 usize 全 0，而 0 是非法配置。
+impl Default for HostLimits {
+    fn default() -> Self {
+        Self {
+            max_instances_per_app: 1024,
+            max_dispatches_per_instance: 1024,
+            max_pending_per_instance: 256,
+            max_streams_per_instance: 32,
+        }
+    }
+}
+
+impl HostLimits {
+    fn validate(self) -> std::result::Result<(), String> {
+        let fields = [
+            ("maxInstancesPerApp", self.max_instances_per_app),
+            ("maxDispatchesPerInstance", self.max_dispatches_per_instance),
+            ("maxPendingPerInstance", self.max_pending_per_instance),
+            ("maxStreamsPerInstance", self.max_streams_per_instance),
+        ];
+        for (name, value) in fields {
+            if value == 0 {
+                return Err(format!(
+                    "HostLimits.{name} 不能为 0；0 不是“无限”，请给出正整数"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_nonzero_usize<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "HostLimits 的容量上限不能为 0（0 不是“无限”）",
+        ));
+    }
+    Ok(value)
+}
+
+static DEFAULT_HOST_LIMITS: RwLock<HostLimits> = RwLock::new(HostLimits {
+    max_instances_per_app: 1024,
+    max_dispatches_per_instance: 1024,
+    max_pending_per_instance: 256,
+    max_streams_per_instance: 32,
+});
+
+/// 设置**进程级**容量准入上限（覆盖式，后设生效）。
+///
+/// 与 [`set_dispatch_policy`] 同一套回落语义：只有没有 per-App 条目（或条目随
+/// App 释放被清掉）的 App 才读这里。传入 0 会返回错误且不改动当前值。
+pub fn set_default_host_limits(limits: HostLimits) -> std::result::Result<(), String> {
+    limits.validate()?;
+    *DEFAULT_HOST_LIMITS.write().unwrap() = limits;
+    Ok(())
+}
+
+fn default_host_limits() -> HostLimits {
+    *DEFAULT_HOST_LIMITS.read().unwrap()
+}
+
+/// 一个 App 的容量上限条目：弱引用 Store，App 释放后条目可被清理。
+struct AppHostLimits {
+    store: Weak<Store>,
+    limits: HostLimits,
+}
+
+/// 键是 `Arc::as_ptr(&ctx.store)`（App 的身份；派生 ctx 共享同一个 `Arc<Store>`）。
+fn app_host_limits() -> &'static Mutex<HashMap<usize, AppHostLimits>> {
+    static LIMITS: OnceLock<Mutex<HashMap<usize, AppHostLimits>>> = OnceLock::new();
+    LIMITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 设置**单个 App** 的容量准入上限。
+///
+/// App 由 `ctx.store` 的同一性标识：同一个 `App` 上派生的所有 ctx（isolate /
+/// intercept / 装载器行）共享这套上限；不同 `App` 互不影响。装载器在
+/// `LoaderConfig.host_limits` 有值时会在挂载前调用它。
+///
+/// 只影响**之后注册**的实例（实例在注册时取快照）；已注册实例不会被追溯修改。
+/// 任一项为 0 会返回错误且不改动当前值。
+pub fn set_host_limits_for(ctx: &Ctx, limits: HostLimits) -> std::result::Result<(), String> {
+    limits.validate()?;
+    let key = Arc::as_ptr(&ctx.store) as usize;
+    let mut registry = app_host_limits().lock().unwrap();
+    registry.retain(|_, entry| entry.store.strong_count() > 0);
+    registry.insert(
+        key,
+        AppHostLimits {
+            store: Arc::downgrade(&ctx.store),
+            limits,
+        },
+    );
+    Ok(())
+}
+
+/// 内部读取：per-App 优先；缺失或 App 已释放时回落到进程级默认。
+fn host_limits_for_ctx(ctx: &Ctx) -> HostLimits {
+    let key = Arc::as_ptr(&ctx.store) as usize;
+    let mut registry = app_host_limits().lock().unwrap();
+    registry.retain(|_, entry| entry.store.strong_count() > 0);
+    registry
+        .get(&key)
+        .map(|entry| entry.limits)
+        .unwrap_or_else(default_host_limits)
+}
+
+/// 一条容量拒绝的结构化载荷：`host_capacity` / `capacity` / `not_executed`。
+fn capacity_payload(scope: &str, used: usize, limit: usize) -> ErrorPayload {
+    ErrorPayload::new(format!(
+        "宿主容量上限：{scope} 已用 {used}/{limit}，拒绝这次派发（插件代码未执行）"
+    ))
+    .with_code("host_capacity")
+    .with_category("capacity")
+    .with_certainty("not_executed")
+    .with_detail(json!({ "scope": scope, "used": used, "limit": limit }))
+}
+
+/// 派发记录的唯一插入口（P0-3）：容量检查与插入在同一把表锁内完成。
+///
+/// 拒绝时返回可读的结构化载荷，**不插入**任何记录；调用方必须在这之后直接
+/// 返回错误，绝不能继续调用插件代码。
+#[allow(clippy::result_large_err)]
+fn insert_dispatch(
+    instance: &Instance,
+    dispatch_id: u64,
+    record: DispatchRecord,
+) -> std::result::Result<(), ErrorPayload> {
+    let limits = instance.host_limits;
+    let mut table = instance.dispatches.lock().unwrap();
+    if table.len() >= limits.max_dispatches_per_instance {
+        return Err(capacity_payload(
+            "maxDispatchesPerInstance",
+            table.len(),
+            limits.max_dispatches_per_instance,
+        ));
+    }
+    if record.sink.is_some() {
+        let pending = table
+            .values()
+            .filter(|record| record.sink.is_some())
+            .count();
+        if pending >= limits.max_pending_per_instance {
+            return Err(capacity_payload(
+                "maxPendingPerInstance",
+                pending,
+                limits.max_pending_per_instance,
+            ));
+        }
+    }
+    if record.stream.is_some() {
+        let streams = table
+            .values()
+            .filter(|record| record.stream.is_some())
+            .count();
+        if streams >= limits.max_streams_per_instance {
+            return Err(capacity_payload(
+                "maxStreamsPerInstance",
+                streams,
+                limits.max_streams_per_instance,
+            ));
+        }
+    }
+    table.insert(dispatch_id, record);
+    Ok(())
+}
+
 /// 一个实例的**在飞派发记录**总数（诊断口径）：含挂起续延、waterfall 帧与出站节点。
 /// 句柄已失效 ⇒ 0（实例连同它的记录一起被排水）。
 pub fn dispatches_len(handle: u64) -> usize {
@@ -1167,8 +1406,10 @@ unsafe fn call_inbound(
         }));
     }
     // **先 insert 再调用**：插件在回调内部就能看到自己的条目。
+    // 容量拒绝在这里发生：记录不插入，插件代码也不会被调用。
     let (tx, rx) = tokio::sync::oneshot::channel();
-    instance.dispatches.lock().unwrap().insert(
+    if let Err(payload) = insert_dispatch(
+        instance,
         dispatch_id,
         DispatchRecord {
             sink: Some(tx),
@@ -1178,7 +1419,9 @@ unsafe fn call_inbound(
             stream,
             task: None,
         },
-    );
+    ) {
+        return Err(CallFailure::from_payload(payload));
+    }
     let (status, text) = {
         // 调用期间把"正在执行的那次派发"压进作用域：插件在回调内部发起的
         // 出站派发因此能记下父节点（取消级联）。
@@ -1418,16 +1661,24 @@ unsafe fn fail_to(
     code: &str,
     category: &str,
 ) -> i32 {
+    let payload = ErrorPayload::new(message)
+        .with_code(code)
+        .with_category(category);
+    fail_payload(out, error_format, &payload)
+}
+
+/// 与 [`fail_to`] 相同，但完整保留载荷（含 `certainty` / `detail`）。
+///
+/// 容量拒绝（`host_capacity`）必须让插件看到 `certainty = not_executed`：
+/// “插件代码没有执行”是调用方可以据此决定是否重试的事实，不能被压成 unknown。
+unsafe fn fail_payload(out: *mut Out, error_format: u32, payload: &ErrorPayload) -> i32 {
     if error_format >= cordis_abi::ERROR_FORMAT_V1 {
-        let payload = cordis_abi::ErrorPayload::new(message)
-            .with_code(code)
-            .with_category(category)
-            .to_json();
-        if reply(out, payload.as_bytes()) == STATUS_OK {
+        let text = payload.to_json();
+        if reply(out, text.as_bytes()) == STATUS_OK {
             return STATUS_ERR;
         }
     }
-    fail(out, message)
+    fail(out, &payload.error)
 }
 
 /// 插件→宿主：只有插件声明了能力位时才尝试解析；解析失败保留原文。
@@ -1519,12 +1770,34 @@ where
 }
 
 /// 与 [`with_instance`] 相同，但允许调用点给出更具体的错误 `code` / `category`。
+#[allow(clippy::result_large_err)]
 unsafe fn with_instance_as<T>(
     handle: u64,
     out: *mut Out,
     code: &str,
     category: &str,
     f: impl FnOnce(&Instance) -> std::result::Result<T, String>,
+) -> i32
+where
+    T: AsRef<[u8]>,
+{
+    with_instance_payload(handle, out, |instance| {
+        f(instance).map_err(|message| {
+            ErrorPayload::new(message)
+                .with_code(code)
+                .with_category(category)
+        })
+    })
+}
+
+/// [`with_instance_as`] 的载荷版：调用点可以直接给出完整的 [`ErrorPayload`]。
+///
+/// 仅用于需要保留 `certainty` / `detail` 的拒绝路径（容量准入）。
+#[allow(clippy::result_large_err)]
+unsafe fn with_instance_payload<T>(
+    handle: u64,
+    out: *mut Out,
+    f: impl FnOnce(&Instance) -> std::result::Result<T, ErrorPayload>,
 ) -> i32
 where
     T: AsRef<[u8]>,
@@ -1538,7 +1811,7 @@ where
         Some(instance) => {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&instance))) {
                 Ok(Ok(bytes)) => reply(out, bytes.as_ref()),
-                Ok(Err(message)) => fail_to(out, instance.error_format, &message, code, category),
+                Ok(Err(payload)) => fail_payload(out, instance.error_format, &payload),
                 Err(payload) => fail_to(
                     out,
                     instance.error_format,
@@ -2301,6 +2574,7 @@ unsafe extern "C" fn host_ctx_provide_iface(
     })
 }
 
+#[allow(clippy::result_large_err)]
 unsafe extern "C" fn host_ctx_call_iface(
     handle: u64,
     service: Blob,
@@ -2316,11 +2590,13 @@ unsafe extern "C" fn host_ctx_call_iface(
         Ok(value) => value,
         Err(err) => return fail(out, &format!("call_iface 的 args 不是合法 JSON: {err}")),
     };
-    // M3：走 [`with_resolved`] 而不是 [`with_instance`]——调用点上叠的 intercept 层
-    // 挂在**派生 ctx** 上，用实例 ctx 调用等于把它丢掉（"use-site 元数据"就无从谈起）。
-    // 实例句柄照旧可用（派生表在实例表之后解析）；续延仍发回**根实例句柄**
-    // （派生句柄不是回调目标，与 `ctx_isolate` 的派生条目同一约定）。
-    with_resolved(handle, out, move |resolved| {
+    // M3：走 [`with_resolved_payload`] 而不是 [`with_instance`]——调用点上叠的
+    // intercept 层挂在**派生 ctx** 上，用实例 ctx 调用等于把它丢掉（"use-site
+    // 元数据"就无从谈起）。实例句柄照旧可用（派生表在实例表之后解析）；续延仍
+    // 发回**根实例句柄**（派生句柄不是回调目标，与 `ctx_isolate` 的派生条目同一约定）。
+    //
+    // 用载荷版是为了让容量拒绝保留 `host_capacity` / `capacity` / `not_executed`。
+    with_resolved_payload(handle, out, move |resolved| {
         let timeout_service = service.clone();
         let timeout_method = method.clone();
         let error_format = resolved.instance.error_format;
@@ -2334,10 +2610,12 @@ unsafe extern "C" fn host_ctx_call_iface(
         let consumer = resolved.owner;
         // 把这次 iface 调用登记成消费者实例的一条在飞记录：
         // 消费者卸载时 `apply_via` 的排水会把它撤掉，避免延迟 on_done 打进已释放的库。
+        // 容量拒绝时直接返回：future 还没有被 poll，提供者代码不会执行。
         let iface_id = next_dispatch_id();
         let parent = scope_top().map(|(_, id)| id);
         let (task, cancel, done) = dispatch_task();
-        resolved.instance.dispatches.lock().unwrap().insert(
+        insert_dispatch(
+            &resolved.instance,
             iface_id,
             DispatchRecord {
                 sink: None,
@@ -2351,7 +2629,7 @@ unsafe extern "C" fn host_ctx_call_iface(
                 stream: None,
                 task: Some(task),
             },
-        );
+        )?;
         let deferred = complete_or_defer(
             future,
             move |result| {
@@ -2395,9 +2673,11 @@ unsafe extern "C" fn host_ctx_call_iface(
             }
             // 未就绪：结果会通过 `OP_CALLBACK` 送到同一个续延 id 上。
             Ok(None) => Ok(json!({ "pending": true }).to_string()),
-            Err(err) => {
+            Err(message) => {
                 unregister_dispatch_node(consumer, iface_id);
-                Err(err)
+                Err(ErrorPayload::new(message)
+                    .with_code("host_call")
+                    .with_category("protocol"))
             }
         }
     })
@@ -2757,6 +3037,7 @@ fn dispatch_by_mode(ctx: &Ctx, mode: &str, event: &str, args: Vec<Dyn>) -> BoxFu
 /// M2c：每次出站派发都在**发起实例**的记录表里登记一个节点（`parent` 来自
 /// 派发作用域），响应带回它的 `dispatch_id`——`ctx_abort` 因此可以取消它，
 /// 取消树也因此能把它的后代一网打尽。
+#[allow(clippy::result_large_err)]
 unsafe fn dispatch_impl(
     handle: u64,
     event: Blob,
@@ -2775,7 +3056,8 @@ unsafe fn dispatch_impl(
         .and_then(|value| value.as_str())
         .unwrap_or("emit")
         .to_string();
-    with_instance(handle, out, move |instance| {
+    // 载荷版：容量拒绝必须保留 `host_capacity` / `capacity` / `not_executed`。
+    with_instance_payload(handle, out, move |instance| {
         let ctx = instance.ctx.clone();
         let consumer = handle;
         let error_format = instance.error_format;
@@ -2784,7 +3066,9 @@ unsafe fn dispatch_impl(
         // 作用域栈顶就是它；不在派发里时为 None）。
         let parent = scope_top().map(|(_, id)| id);
         let (task, cancel, done) = dispatch_task();
-        instance.dispatches.lock().unwrap().insert(
+        // 容量拒绝时直接返回：future 还没有被创建/驱动，订阅者不会收到派发。
+        insert_dispatch(
+            instance,
             dispatch_id,
             DispatchRecord {
                 sink: None,
@@ -2798,7 +3082,7 @@ unsafe fn dispatch_impl(
                 stream: None,
                 task: Some(task),
             },
-        );
+        )?;
         let future = dispatch_by_mode(&ctx, &mode, &event, args);
         // 作用域：这次派发**交付给插件**的入站回调据此记下父节点（取消级联）。
         let future: BoxFuture<Ret> = Box::pin(Scoped {
@@ -2811,7 +3095,11 @@ unsafe fn dispatch_impl(
             let Ok(runtime) = tokio::runtime::Handle::try_current() else {
                 // 没有运行时就没有人驱动 future：不能假装 emit 成功。
                 unregister_dispatch_node(handle, dispatch_id);
-                return Err("emit 需要异步运行时（当前在同步上下文里，派发无法被驱动）".into());
+                return Err(ErrorPayload::new(
+                    "emit 需要异步运行时（当前在同步上下文里，派发无法被驱动）",
+                )
+                .with_code("host_call")
+                .with_category("protocol"));
             };
             runtime.spawn(async move {
                 let _done = done;
@@ -2879,11 +3167,13 @@ unsafe fn dispatch_impl(
                 payload.to_string()
             }
             Ok(None) => json!({ "pending": true, "dispatch_id": dispatch_id }).to_string(),
-            Err(err) => {
+            Err(message) => {
                 // 没有运行时，future 已被丢弃：必须把登记节点也摘掉，
                 // 否则取消/排水会看到一条永远不会结算的记录。
                 finished();
-                return Err(err);
+                return Err(ErrorPayload::new(message)
+                    .with_code("host_call")
+                    .with_category("protocol"));
             }
         })
     })
@@ -3376,7 +3666,9 @@ fn apply_via_with_keepalive_and_format(
 ) -> BoxFuture<Result<()>> {
     let name = name.to_string();
     Box::pin(async move {
-        let handle = register_instance_with_keepalive(ctx.clone(), call, keepalive, error_format);
+        // 容量准入失败 = 插件装载失败；此时还没有登记实例、也没有 effect 需要清理。
+        let handle = register_instance_with_keepalive(ctx.clone(), call, keepalive, error_format)
+            .map_err(|err| format!("插件 {name} 装载失败: {err}"))?;
         let applied = Arc::new(AtomicBool::new(false));
         let applied_flag = applied.clone();
         // 用 `try_effect`：若注册时 fiber 已被并发处置，不能让 `effect` 的 assert
@@ -4127,6 +4419,7 @@ mod tests {
             reclaiming: Arc::new(Mutex::new(Vec::new())),
             error_format: 0,
             dispatch_policy: DispatchPolicy::default(),
+            host_limits: HostLimits::default(),
         }
     }
 
@@ -4474,11 +4767,13 @@ mod tests {
             stream_unused_call,
             None,
             cordis_abi::ERROR_FORMAT_V1,
-        );
+        )
+        .expect("默认容量下实例必须能登记");
         {
             let instances = instances().lock().unwrap();
             let instance = instances.get(handle).expect("实例必须已登记");
-            instance.dispatches.lock().unwrap().insert(
+            insert_dispatch(
+                &instance,
                 1,
                 DispatchRecord {
                     sink: None,
@@ -4488,7 +4783,8 @@ mod tests {
                     stream: None,
                     task: None,
                 },
-            );
+            )
+            .expect("默认容量下派发记录必须能插入");
         }
 
         let mut buffer = vec![0u8; 4096];
@@ -4519,7 +4815,8 @@ mod tests {
             stream_unused_call,
             None,
             cordis_abi::ERROR_FORMAT_V1,
-        );
+        )
+        .expect("默认容量下实例必须能登记");
         let mut buffer = vec![0u8; 4096];
         let mut out = Out {
             ptr: buffer.as_mut_ptr(),

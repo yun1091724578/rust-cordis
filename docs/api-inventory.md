@@ -115,6 +115,8 @@
 | `set_plugin_source` | fn | `crates/host/src/lib.rs` |
 | `set_dispatch_policy` | fn | `crates/host/src/lib.rs` |
 | `set_dispatch_policy_for` | fn | `crates/host/src/lib.rs` |
+| `set_host_limits_for` | fn | `crates/host/src/lib.rs` |
+| `set_default_host_limits` | fn | `crates/host/src/lib.rs` |
 | `open_verified` | fn | `crates/host/src/lib.rs` |
 | `open_staged_verified` | fn | `crates/host/src/lib.rs` |
 | `PluginSourcePolicy` | struct | `crates/host/src/source.rs` |
@@ -132,6 +134,7 @@
 | `sha256_file` | fn | `crates/host/src/source.rs` |
 | `mounted_sources` | fn | `crates/host/src/loader.rs` |
 | `DispatchPolicy` | struct | `crates/host/src/lib.rs` |
+| `HostLimits` | struct | `crates/host/src/lib.rs` |
 | `streams_len` | fn | `crates/host/src/lib.rs` |
 | `pending_len` | fn | `crates/host/src/lib.rs` |
 | `waterfall_len` | fn | `crates/host/src/lib.rs` |

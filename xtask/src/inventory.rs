@@ -247,6 +247,18 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub fn set_dispatch_policy_for",
     },
     PublicItem {
+        item: "set_host_limits_for",
+        kind: "fn",
+        source: "crates/host/src/lib.rs",
+        marker: "pub fn set_host_limits_for",
+    },
+    PublicItem {
+        item: "set_default_host_limits",
+        kind: "fn",
+        source: "crates/host/src/lib.rs",
+        marker: "pub fn set_default_host_limits",
+    },
+    PublicItem {
         item: "open_verified",
         kind: "fn",
         source: "crates/host/src/lib.rs",
@@ -347,6 +359,12 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         kind: "struct",
         source: "crates/host/src/lib.rs",
         marker: "pub struct DispatchPolicy",
+    },
+    PublicItem {
+        item: "HostLimits",
+        kind: "struct",
+        source: "crates/host/src/lib.rs",
+        marker: "pub struct HostLimits",
     },
     PublicItem {
         item: "streams_len",
@@ -1094,7 +1112,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 73, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 76, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 

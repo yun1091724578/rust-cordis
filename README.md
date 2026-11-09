@@ -25,6 +25,16 @@ Cordis 的 Rust 实现：服务容器 + epoch 驱动的 fiber 生命周期 + 可
 `set_dispatch_policy`。策略在实例注册时取快照，只影响之后注册的实例；
 目前的粒度是 App（以及装载器所在 App），还不是按插件/方法配置。
 
+容量准入同样按 App / 装载器子树配置：`LoaderConfig.hostLimits`
+（camelCase，如 `{ maxInstancesPerApp: 64, maxDispatchesPerInstance: 256,
+maxPendingPerInstance: 64, maxStreamsPerInstance: 8 }`），嵌入方也可调用
+`set_host_limits_for(&ctx, limits)`；进程级 `set_default_host_limits` 只是回落。
+缺省 **1024 / 1024 / 256 / 32**，保持既有行为。超限时宿主拒绝准入并返回可读的
+结构化错误（`code=host_capacity`、`category=capacity`、
+`certainty=not_executed`），**不执行插件代码**；所有字段都必须大于 0，**0 不是
+“无限”而是非法配置**。这些是宿主侧表项准入（实例数、派发记录、挂起续延、流），
+不是每插件的内存/CPU 硬上限；T2 插件与宿主同进程，真正隔离仍属 T3。
+
 当前执行入口见 [`docs/roadmap.md`](docs/roadmap.md)：仓外真实接入与发布收尾并行。
 已知交付缺口、调用通道边界和维护事项见 [`docs/architecture-review.md`](docs/architecture-review.md)。
 根目录设计长文保留历史背景，不作为当前进度或支持承诺。

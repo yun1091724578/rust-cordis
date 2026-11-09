@@ -25,7 +25,7 @@
 |---|---|---|---|
 | A. 低层 ABI 与发布 | **基本完成** | 0.1.0/0.1.1 已发布；正式 `/2` 封存已从 tag 生成并归档；公开仓 CI、版本矩阵、SCM 一次实测 | 严格同版本封存证据、历史兼容可重复测试 |
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离，不能升级成安全承诺 |
-| C. 可信单租户底座 P0 | **进行中** | 来源策略完成；per-App dispatch policy；不可抢占披露 | per-plugin/method 策略、容量准入、锁纪律 |
+| C. 可信单租户底座 P0 | **进行中** | 来源策略完成；per-App dispatch policy；宿主容量准入（instances/dispatches/pending/streams）；不可抢占披露 | per-plugin/method 策略、锁纪律 |
 | D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI | semver range/依赖图求解、缓冲池 |
 | E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型、取消/预算 |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 只有第三方/模型生成/多租户触发时另立 ADR |
@@ -34,7 +34,7 @@
 阶段基线：
 
 - 支持契约 **26 行 / 17 条保证**
-- API 清单 **23 常量 / 4 结构 / 41 字段 / 73 公开入口 / 32 载荷**
+- API 清单 **23 常量 / 4 结构 / 41 字段 / 76 公开入口 / 32 载荷**
 - 0.1.1 三平台 CI：`42332542433`、tag `42332542329`
 - 公开仓 CI：`42605690959` success
 - 版本矩阵：`42606045837` success
@@ -42,40 +42,48 @@
 - 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal` 与 GitHub Release assets
 - 仓库已公开：标准 GitHub-hosted Runner 不再消耗私有仓库 Actions 分钟
 
+## 最近交付
+
+### P0-3：容量与准入（2026-11-09，已交付）
+
+- `HostLimits`（`maxInstancesPerApp` / `maxDispatchesPerInstance` /
+  `maxPendingPerInstance` / `maxStreamsPerInstance`），按 App 注册表 + 进程级回落；
+  `LoaderConfig.hostLimits` 在挂载前登记，实例注册时取快照。
+- 实例准入与插入在同一把实例表锁内完成；四类派发记录插入统一经
+  `insert_dispatch`，超限返回 `host_capacity` / `capacity` / `not_executed`，
+  不插入记录、不执行插件代码。
+- 默认 1024 / 1024 / 256 / 32；0 是非法配置，不是“无限”。
+- 证据：`crates/host/tests/capacity.rs`（实例 / 派发 / 挂起 / 流四条拒绝路径与
+  计数回基线）、`crates/host/src/loader.rs::loader_config_parses_host_limits_from_yaml`。
+- 边界：这是宿主侧表项准入，不是每插件的内存/CPU 硬上限；硬上限仍属 T3。
+
 ## 下一步（按顺序）
 
-### 1. P0-3：容量与准入
-
-- 给 instances / dispatches / 待处理队列设置上限。
-- 按 App/实例配置；超限返回可读错误，不无限增长。
-- 覆盖：实例表满、派发记录满、stream 队列满、拒绝后资源回基线。
-- 边界：不能给 T2 插件内存硬上限；硬上限仍属 T3。
-
-### 2. P0-4：锁纪律与故障注入
+### 1. P0-4：锁纪律与故障注入
 
 - 审计不持锁调用插件；重点看 `call_inbound` 的 lifecycle 读锁跨调用。
 - 覆盖 hang / panic / 重入 / 卸载竞态。
 - 锁中毒只在找到可达 trigger 后升级为缺陷；不统一吞掉 poison。
 - 对照真实宿主：同步 `apply`/回调不可抢占，部署级 supervisor 才是兜底。
 
-### 3. P0-2 收口
+### 2. P0-2 收口
 
 - 当前是 App 粒度；补 per-plugin/per-method 配置，或明确写死“只支持 App 粒度”。
 - 同一 App 多 loader 目前是后设置覆盖；要么隔离，要么文档化为限制。
 - 策略在实例注册时快照；运行期变更不追溯，需在文档中保留。
 
-### 4. P1-1：semver range 与依赖求解
+### 3. P1-1：semver range 与依赖求解
 
 - 当前只校验 manifest `version` 是 semver；没有 `provides`/`requires` range。
 - 先决定 manifest 字段和 ABI 尾字段，再做 mount 前解析、歧义/缺失拒绝、`(id, version)` 身份。
 - ABI 仍精确匹配；不要同时引入互相冲突的 `abi_min/abi_max` 规则。
 
-### 5. P1-4：缓冲池化与性能
+### 4. P1-4：缓冲池化与性能
 
 - 去掉每次调用 16 KiB 临时分配，先 benchmark 再改。
 - 线程池仍不能取消同步调用；若保留，只能作为故障隔离，必须证明超时后不卸载、不释放插件，线程泄漏要登记。
 
-### 6. agent 有界增量交付
+### 5. agent 有界增量交付
 
 - 单事件/队列/累计文本/终止快照分别限大小。
 - 慢消费者、sink 失败、无终止事件 EOF、超大事件、终止写入与取消竞争。

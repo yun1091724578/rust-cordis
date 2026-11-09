@@ -281,6 +281,7 @@ fn loader_config_for(path: &Path) -> LoaderConfig {
             timeout_ms: Some(50),
             ..DispatchPolicy::default()
         }),
+        host_limits: None,
     }
 }
 
