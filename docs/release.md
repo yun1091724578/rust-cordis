@@ -60,9 +60,9 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 脚本从指定宿主版本创建临时 worktree、构建 `cordis-cli`，对封存插件执行
 `inspect`（打开 + PING）和 `status`（挂载 + cleanup），最后清理 worktree。
 
-2026-11-07 已用 **正式 v0.1.1 宿主**加载 0.1.0 封存插件并通过
-`inspect + mount + cleanup`。支持契约仍保持“历史发布版 × 新宿主 = 待验证”，
-因为这是一次发布级验证，不是可重复测试。
+2026-11-07 已用 **v0.1.1 宿主**加载 **0.1.0-rc2 封存插件**并通过
+`inspect + mount + cleanup`。支持契约仍保持“历史发布版 × 新宿主 = 待验证”：
+这是发布候选封存物的一次验证，不是正式 0.1.0 产物的可重复测试。
 
 ```powershell
 .\scripts\historical-compat.ps1 -Seal dist\cordis-0.1.0-rc2 -HostRef v0.1.1

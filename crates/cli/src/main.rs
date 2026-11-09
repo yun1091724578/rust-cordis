@@ -43,6 +43,10 @@ fn main() -> ExitCode {
         Some("validate") => validate(&args[1..]),
         Some("run") => run(&args[1..]),
         Some("service") => service(&args[1..]),
+        Some("version" | "--version" | "-V") => {
+            println!("cordis {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         Some("help" | "--help" | "-h") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS

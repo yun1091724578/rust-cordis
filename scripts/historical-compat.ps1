@@ -93,6 +93,13 @@ try {
         throw "could not read host workspace version from $manifest"
     }
     $hostVersion = [version]$Matches[1]
+    $versionText = (& $exe --version 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $versionText -match '(\d+\.\d+\.\d+)') {
+        $builtVersion = [version]$Matches[1]
+        if ($builtVersion -ne $hostVersion) {
+            throw "built host version $builtVersion does not match manifest $hostVersion"
+        }
+    }
     if ($hostSourceVersion -le $sealVersion) {
         throw "host source $hostSourceVersion is not later than seal $sealVersion; choose a later HostRef"
     }
