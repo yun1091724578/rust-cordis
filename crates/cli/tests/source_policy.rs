@@ -268,7 +268,10 @@ fn inspect_with_source_policy_shows_manifest_provenance() {
         "{text}"
     );
     let sha = cordis_host::source::sha256_file(&fixture.artifact()).unwrap();
+    assert!(text.contains("admission: enforced"), "{text}");
     assert!(text.contains(&format!("sha256: {sha}")), "{text}");
+    assert!(text.contains(&format!("manifest sha256: {sha}")), "{text}");
+    assert!(text.contains("hash matches manifest: true"), "{text}");
     assert!(
         text.contains(&format!("artifact: {}", fixture.artifact().display())),
         "provenance 必须给出原始 artifact 路径：{text}"
@@ -280,7 +283,10 @@ fn inspect_with_source_policy_shows_manifest_provenance() {
     let json: Value = serde_json::from_slice(&output.stdout).expect("stdout 必须是 JSON");
     let provenance = &json["rows"][0]["provenance"];
     assert_eq!(provenance["source"], "manifest", "{json}");
+    assert_eq!(provenance["admission"], "enforced", "{json}");
     assert_eq!(provenance["sha256"], sha, "{json}");
+    assert_eq!(provenance["manifest_sha256"], sha, "{json}");
+    assert_eq!(provenance["manifest_hash_matches"], true, "{json}");
     assert_eq!(provenance["source_revision"], "tree:test", "{json}");
     assert_eq!(provenance["manifest"]["id"], "abi-v1-frozen", "{json}");
     assert_eq!(provenance["manifest"]["version"], "0.1.1", "{json}");
@@ -295,6 +301,8 @@ fn status_with_source_policy_shows_manifest_provenance() {
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(text.contains("mounted = 1"), "{text}");
     assert!(text.contains("provenance source = manifest"), "{text}");
+    assert!(text.contains("admission: enforced"), "{text}");
+    assert!(text.contains("hash matches manifest: true"), "{text}");
     assert!(text.contains("- frozen"), "{text}");
     assert!(text.contains("source_revision: tree:test"), "{text}");
 
@@ -305,6 +313,11 @@ fn status_with_source_policy_shows_manifest_provenance() {
     assert_eq!(json["mounted"], 1, "{json}");
     assert_eq!(json["provenance"][0]["label"], "frozen", "{json}");
     assert_eq!(json["provenance"][0]["source"], "manifest", "{json}");
+    assert_eq!(json["provenance"][0]["admission"], "enforced", "{json}");
+    assert_eq!(
+        json["provenance"][0]["manifest_hash_matches"], true,
+        "{json}"
+    );
     assert_eq!(
         json["provenance"][0]["manifest"]["id"], "abi-v1-frozen",
         "{json}"

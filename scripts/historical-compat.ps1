@@ -40,6 +40,14 @@ try {
     $exe = Join-Path $Target "debug\cordis.exe"
     if (-not (Test-Path $exe)) { throw "missing host executable: $exe" }
 
+    # Old hosts do not know this flag; new hosts default-deny without it.
+    $helpText = (& $exe --help 2>&1 | Out-String)
+    $admissionArgs = if ($helpText -match "--allow-unverified") {
+        @("--allow-unverified")
+    } else {
+        @()
+    }
+
     $config = Join-Path $Worktree "forward-greeting.yml"
     @(
         "- id: greeting",
@@ -48,9 +56,14 @@ try {
 
     Write-Output "forward compatibility drill"
     Write-Output "host ref=$HostRef bump=$BumpVersion seal=$Seal"
-    & $exe inspect $smoke --plugin-dir $plugins
+    $inspectArgs = @("inspect", $smoke, "--plugin-dir", $plugins)
+    if ($admissionArgs.Count -gt 0) { $inspectArgs += $admissionArgs }
+    & $exe @inspectArgs
     if ($LASTEXITCODE -ne 0) { throw "inspect failed" }
-    & $exe status $config --plugin-dir $plugins
+
+    $statusArgs = @("status", $config, "--plugin-dir", $plugins)
+    if ($admissionArgs.Count -gt 0) { $statusArgs += $admissionArgs }
+    & $exe @statusArgs
     if ($LASTEXITCODE -ne 0) { throw "status/mount failed" }
     Write-Output "forward drill passed: inspect + mount + cleanup"
 }

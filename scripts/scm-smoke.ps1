@@ -40,7 +40,13 @@ $config = Join-Path $env:TEMP "cordis-scm-$PID.yml"
     "  name: greeting"
 ) | Set-Content -Encoding ASCII $config
 
-$binPath = "`"$Exe`" service `"$config`" --name $ServiceName --plugin-dir `"$plugins`" --allow-unverified"
+$policy = Join-Path $Seal "allow-list.json"
+$admission = if (Test-Path $policy) {
+    "--source-policy `"$policy`""
+} else {
+    "--allow-unverified"
+}
+$binPath = "`"$Exe`" service `"$config`" --name $ServiceName --plugin-dir `"$plugins`" $admission"
 $created = $false
 try {
     & sc.exe create $ServiceName binPath= $binPath start= demand | Out-Null
