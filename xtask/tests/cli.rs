@@ -483,11 +483,30 @@ fn seal_refuses_to_overwrite_a_nonempty_output() {
 
 #[test]
 fn seal_rejects_conflicting_modes() {
-    let output = Command::new(bin())
-        .args(["seal", "--out", "a", "--verify", "b"])
-        .output()
-        .expect("spawn xtask");
-    assert_eq!(output.status.code(), Some(2));
+    for args in [
+        vec!["seal", "--out", "a", "--verify", "b"],
+        vec!["seal", "--root", "a", "--verify", "b"],
+    ] {
+        let output = Command::new(bin())
+            .args(args)
+            .output()
+            .expect("spawn xtask");
+        assert_eq!(output.status.code(), Some(2));
+    }
+}
+
+#[test]
+fn seal_root_requires_a_value_and_may_not_repeat() {
+    for args in [
+        vec!["seal", "--root"],
+        vec!["seal", "--root", "a", "--root", "b"],
+    ] {
+        let output = Command::new(bin())
+            .args(args)
+            .output()
+            .expect("spawn xtask");
+        assert_eq!(output.status.code(), Some(2));
+    }
 }
 
 #[test]

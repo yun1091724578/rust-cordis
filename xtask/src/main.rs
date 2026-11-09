@@ -28,9 +28,9 @@ cargo xtask <命令>
   matrix [support] [platform]
                    检查保证 × 平台矩阵结构（默认 docs/support-contract.md +
                    docs/platform-matrix.md；不验证真实平台结果）
-  seal [--out <dir>]
+  seal [--out <dir>] [--root <workspace>]
                    构建宿主目标 release 插件并封存（源码树 / 工具链 / ABI /
-                   SHA256），保存同版本 inspect 证据
+                   SHA256），保存同版本 inspect 证据；--root 可为历史 tag worktree
   seal --verify <dir>
                    只读校验预期 artifact 集合、SHA256、smoke 与 inspect 证据
   soak [cycles]    运行被忽略的宿主资源 soak（默认 1000 轮；不进入 ci）

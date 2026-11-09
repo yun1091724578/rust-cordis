@@ -206,9 +206,20 @@ fn field_u32(value: &Value, key: &str) -> Result<u32, String> {
 pub fn command(args: Vec<String>) -> i32 {
     let mut out: Option<PathBuf> = None;
     let mut verify: Option<PathBuf> = None;
+    let mut root: Option<PathBuf> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--root" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("seal --root 缺少目录\n\n{}", crate::USAGE);
+                    return 2;
+                };
+                if root.replace(PathBuf::from(value)).is_some() {
+                    eprintln!("seal --root 只能出现一次\n\n{}", crate::USAGE);
+                    return 2;
+                }
+            }
             "--out" => {
                 let Some(value) = iter.next() else {
                     eprintln!("seal --out 缺少目录\n\n{}", crate::USAGE);
@@ -243,6 +254,13 @@ pub fn command(args: Vec<String>) -> i32 {
         eprintln!("seal --out 与 --verify 只能选一个\n\n{}", crate::USAGE);
         return 2;
     }
+    if root.is_some() && verify.is_some() {
+        eprintln!(
+            "seal --root 只用于生成封存，不能与 --verify 同用\n\n{}",
+            crate::USAGE
+        );
+        return 2;
+    }
     if let Some(dir) = verify {
         let dir = crate::resolve_repo_path(dir);
         return match verify_dir(&dir) {
@@ -261,10 +279,13 @@ pub fn command(args: Vec<String>) -> i32 {
         };
     }
 
+    let source_root = root
+        .map(crate::resolve_repo_path)
+        .unwrap_or_else(crate::workspace_root);
     let out = out
         .map(crate::resolve_repo_path)
-        .unwrap_or_else(default_output_dir);
-    match seal_to(&out) {
+        .unwrap_or_else(|| default_output_dir_for(&source_root));
+    match seal_to(&out, &source_root) {
         Ok(manifest) => {
             println!("封存完成：{}", out.display());
             print_manifest(&manifest);
@@ -303,16 +324,28 @@ fn print_manifest(manifest: &SealManifest) {
     }
 }
 
-pub fn default_output_dir() -> PathBuf {
+fn default_output_dir_for(root: &Path) -> PathBuf {
     let target = host_target().unwrap_or_else(|_| "unknown-target".to_string());
-    crate::workspace_root().join("dist").join(format!(
-        "cordis-plugins-{}-{target}",
-        env!("CARGO_PKG_VERSION")
-    ))
+    let version = workspace_version(root).unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
+    root.join("dist")
+        .join(format!("cordis-plugins-{version}-{target}"))
 }
 
-fn seal_to(out: &Path) -> Result<SealManifest, String> {
-    let root = crate::workspace_root();
+fn workspace_version(root: &Path) -> Result<String, String> {
+    let text = fs::read_to_string(root.join("Cargo.toml"))
+        .map_err(|err| format!("读取 {} 失败：{err}", root.join("Cargo.toml").display()))?;
+    text.lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("version = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+                .map(str::to_string)
+        })
+        .ok_or_else(|| format!("{} 缺少 version 字段", root.join("Cargo.toml").display()))
+}
+
+fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
+    let host_root = crate::workspace_root();
     if out.exists() {
         let mut entries =
             fs::read_dir(out).map_err(|err| format!("读取 {} 失败：{err}", out.display()))?;
@@ -329,15 +362,15 @@ fn seal_to(out: &Path) -> Result<SealManifest, String> {
     let cargo_program = cargo_program();
     let cargo = tool_version(&cargo_program)?;
     let rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-    let (source_sha256, source_files) = source_tree_digest(&root, out)?;
+    let (source_sha256, source_files) = source_tree_digest(root, out)?;
 
-    let built = build_release_plugins(&root, &target)?;
-    let (after_sha256, after_files) = source_tree_digest(&root, out)?;
+    let built = build_release_plugins(root, &target)?;
+    let (after_sha256, after_files) = source_tree_digest(root, out)?;
     if source_sha256 != after_sha256 || source_files != after_files {
         return Err("构建期间源码树发生变化；请先停掉会改源码的进程，再重新封存".to_string());
     }
 
-    let parent = out.parent().unwrap_or(&root);
+    let parent = out.parent().unwrap_or(root);
     fs::create_dir_all(parent).map_err(|err| format!("创建 {} 失败：{err}", parent.display()))?;
     let file_name = out
         .file_name()
@@ -396,7 +429,7 @@ fn seal_to(out: &Path) -> Result<SealManifest, String> {
     fs::create_dir_all(temp.join("smoke")).map_err(|err| format!("创建 smoke 目录失败：{err}"))?;
     fs::write(temp.join(SMOKE_CONFIG), smoke_yaml())
         .map_err(|err| format!("写 smoke 配置失败：{err}"))?;
-    let inspect_output = run_load_check(&temp, &cargo_program, &target)?;
+    let inspect_output = run_load_check(&temp, &cargo_program, &target, &host_root)?;
     fs::write(temp.join(SMOKE_EVIDENCE), &inspect_output)
         .map_err(|err| format!("写 smoke 证据失败：{err}"))?;
     let config_bytes =
@@ -405,7 +438,7 @@ fn seal_to(out: &Path) -> Result<SealManifest, String> {
         fs::read(temp.join(SMOKE_EVIDENCE)).map_err(|err| format!("读取 smoke 证据失败：{err}"))?;
 
     let manifest = SealManifest {
-        workspace_version: env!("CARGO_PKG_VERSION").to_string(),
+        workspace_version: workspace_version(root)?,
         abi_version: cordis_abi::ABI_VERSION,
         error_format: cordis_abi::ERROR_FORMAT_V1,
         target,
@@ -570,10 +603,15 @@ fn smoke_yaml() -> String {
     text
 }
 
-fn run_load_check(seal_dir: &Path, cargo: &str, target: &str) -> Result<String, String> {
+fn run_load_check(
+    seal_dir: &Path,
+    cargo: &str,
+    target: &str,
+    host_root: &Path,
+) -> Result<String, String> {
     let config = seal_dir.join(SMOKE_CONFIG);
     let plugin_dir = seal_dir.join("plugins");
-    let manifest_path = crate::workspace_root().join("Cargo.toml");
+    let manifest_path = host_root.join("Cargo.toml");
     let output = Command::new(cargo)
         // CWD 就是封存目录：插件解析先试裸文件名，这样不会命中 workspace 根目录里的同名文件。
         .current_dir(&plugin_dir)
