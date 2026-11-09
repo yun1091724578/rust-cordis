@@ -114,7 +114,7 @@ R1 的记录必须区分“需求来源”“仓内集成”“独立工程实�
 | 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | **进行中**：2026-11-03 手动 dispatch [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 首次 20k 通过，默认 1,000,000 轮也由 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543) 验证；每日 02:17 CST 的 `nightly-soak` workflow 已配置；cron 首跑与 artifact 长期转存未闭合 |
 | 3 | **A5-3 正式首发封存** | 在干净发布源码树上重跑 `/2` `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `allow-list.json` / `plugins` / `smoke` 目录；同版本 `inspect --source-policy` 证据随产物归档 | **封存完成，严格同版本证据未满足**：`xtask seal --root <tag-worktree>` 已生成并归档 0.1.0/0.1.1 `/2`；但 smoke 的 host source 与 tag source 不同，只能算宿主加载检查 |
 | 4 | A5-4 历史产物 × 后续宿主 | 后续宿主版本加载已封存的首发产物，再把“历史发布版”从**待验证**转成**保证**或明确拒绝 | **已验证一次**：0.1.1 宿主加载 0.1.0 正式 `/2` 封存并通过 `inspect --source-policy`（`dist/cordis-0.1.0-formal/smoke/inspect.txt`）；仍缺可重复测试与严格同版本证据，因此支持契约保持待验证 |
-| 5 | A5-5 关闭其余发布前项 | `Cargo.toml` 的 `repository` / `homepage` 元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测；`release.md` 的发布前项关闭或明确延期 | 元数据已补；SCM 一次真实 elevated run 通过；剩余 nightly 长期转存与 SCM CI 重跑 |
+| 5 | A5-5 关闭其余发布前项 | `Cargo.toml` 的 `repository` / `homepage` 元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测；`release.md` 的发布前项关闭或明确延期 | 元数据已补；仓库已公开；SCM 一次真实 elevated run 通过；剩余 nightly 长期转存与 SCM CI 重跑 |
 
 **A5-1 已完成；A5-2 已启用并完成首次手动 20k；0.1.0/0.1.1 已发布并有正式 `/2` 封存；
 A5-4 已用正式 v0.1.1 宿主验证一次；A5-5 剩余 nightly 长期转存与 SCM CI 重跑。
@@ -221,7 +221,7 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
       `soak-log-41592298543-c1000000`）。后续 nightly 由 schedule 持续积累；
       cron 首跑尚未发生，artifact 保留 90 天，正式发布前需转存长期存储。
 - [ ] 关闭 `release.md` 的其余发布前项：`Cargo.toml` 的 `repository` / `homepage`
-      元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc stop`；三平台结果与
+      元数据、公开发布地址（已完成）、Windows SCM 真实 `sc create` / `sc stop`；三平台结果与
       平台矩阵见上。
 
 **阶段 0 出口（未满足）**：`docs/release.md` 必须能回答“哪些保证在哪些平台实际验证过”，
@@ -553,7 +553,7 @@ provision / volatile；能在装载后通过 `status`（或 `report.pending` / `
 
 ### A5-1：首次三平台 CI
 
-- 2026-11-02 在私有仓库 `yun1091724578/rust-cordis` 首次运行 GitHub Actions；
+- 2026-11-02 在 `yun1091724578/rust-cordis` 首次运行 GitHub Actions；仓库于 2026-11-09 转为公开；
   最终 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)
   （commit `ea0489e`）的 `test (windows-latest)`、`test (ubuntu-latest)`、
   `test (macos-latest)`、`lint`、`msrv`、`package` 全部成功；2026-11-03 评审修正后

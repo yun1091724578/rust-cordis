@@ -145,7 +145,7 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 
 ### 仍需确认
 
-1. 仓库 URL：`Cargo.toml` 已在 0.1.1 补齐 `repository` / `homepage`（`https://github.com/yun1091724578/rust-cordis`），发布 warning 消失；仓库仍是私有的，公开发布地址/可见性另行决定。
+1. 仓库 URL：`Cargo.toml` 已在 0.1.1 补齐 `repository` / `homepage`（`https://github.com/yun1091724578/rust-cordis`），发布 warning 消失；仓库已于 2026-11-09 切换为公开仓库，标准 GitHub-hosted Runner 不再消耗私有仓库 Actions 分钟。
 2. Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测：已提供 `scripts/scm-smoke.ps1`；2026-11-07 在管理员 PowerShell（Windows 10.0.26300）实际跑通 `create → RUNNING → stop → STOPPED → delete`，日志 `dist/cordis-scm-smoke.log`，服务已确认删除（`sc query` 返回 1060）。这是一次真实手工验证；持续 CI 重跑仍待补，因此不把它夸大为跨机器持续保证。
 3. **首发产物封存**：**正式 `/2` 封存已完成**。用 `xtask seal --root <tag-worktree>` 从 `v0.1.0`/`v0.1.1` 生成 `/2`，本地为 `dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal`，GitHub Release assets 为 `cordis-0.1.0-formal.tar.gz` / `cordis-0.1.1-formal.tar.gz`（SHA256 `C98EA1563D0C1F0437D942BE68BC51ECDAEADA8C65C2ACEAD340BCFE597355FB` / `4C6E69CFA8C78B76B8AA6B84A4DC91DCD57E1159107AB2E2A32D7582F223B1F5`）；均含 sidecar manifest 与 `allow-list.json`，`seal --verify` 通过。
 4. **首发产物 × 同版本宿主**：两个正式封存的 smoke 都由当前工作区 0.1.1 宿主执行；`host.source_sha256` 与各自 `source.sha256` 不同（0.1.1 也是），因此它们都是跨源码树加载检查，不是严格同版本证据。严格同版本证据仍缺，跨版本结论留给 A5-4。它只证明产物可用，**不证明跨版本兼容**。
