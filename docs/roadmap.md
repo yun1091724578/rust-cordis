@@ -33,7 +33,7 @@
 | A. 低层 ABI 交付 | **部分完成** | 0.1.0/0.1.1 发布；`/1` 候选封存、同版本加载、registry-only consumer、三平台 CI | 正式 `/2` 封存（需支持 tag 源的封存工具）、历史兼容的可重复测试 |
 | B. 信任模型 | **已接受（ADR 0005）** | README/支持契约已加入来源边界与不可抢占声明；产品口径已收口 | 来源 allow-list 实现与验证 |
 | C. 可信单租户底座 P0 | **进行中** | 来源策略模块、`LoadedPlugin::open_verified`、`--source-policy` 的 loader/CLI 强制、inspect/status provenance、per-App dispatch policy 已落地；现有生命周期/资源基线/错误通道 | per-plugin/method dispatch policy、容量准入、锁纪律、不可抢占披露 |
-| D. 长期运行 P1 | **进行中** | 1M soak、resource baseline、staged primitive、Linux RSS 增长预算 | semver/依赖求解、dhat、真实 open_staged、缓冲池、版本矩阵 |
+| D. 长期运行 P1 | **进行中** | 1M soak、resource baseline、staged primitive、Linux RSS 预算、真实 `open_staged` soak、相邻 host/plugin 版本矩阵（本地） | semver/依赖求解、dhat、缓冲池、版本矩阵 CI |
 | E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型适配器、取消/预算 |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置；无实现 | 只有第三方/模型生成/多租户需求出现时另立 T3 ADR |
 | G. 维护治理 | **持续** | R4/R5/R6 已登记 | serde_yaml 迁移、宿主模块拆分、锁/panic 审查 |

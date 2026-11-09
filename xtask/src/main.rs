@@ -374,7 +374,7 @@ fn soak_command(args: Vec<String>) -> i32 {
         }
     }
     println!(
-        "+ {cargo} test -p rust-cordis-host --test soak --locked -- --ignored --nocapture (cycles={cycles})"
+        "+ {cargo} test -p rust-cordis-host --test soak --test open_staged_soak --locked -- --ignored --nocapture (cycles={cycles})"
     );
     match Command::new(&cargo)
         .args([
@@ -383,6 +383,8 @@ fn soak_command(args: Vec<String>) -> i32 {
             "rust-cordis-host",
             "--test",
             "soak",
+            "--test",
+            "open_staged_soak",
             "--locked",
             "--",
             "--ignored",
