@@ -92,6 +92,9 @@ try {
     if ($hostSourceVersion -lt $sealVersion) {
         throw "host source $hostSourceVersion is older than seal $sealVersion; this is not a forward-compat drill"
     }
+    if ($hostVersion -le $sealVersion) {
+        throw "host $hostVersion is not later than seal $sealVersion; pass -BumpVersion for a synthetic forward host"
+    }
 
     $config = Join-Path $Worktree "forward-greeting.yml"
     @(
