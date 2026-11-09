@@ -4,108 +4,11 @@
 //! 默认被 `#[ignore]` 跳过；`cargo xtask soak` 会连同 `soak` 一起跑。夹具是
 //! `tests/fixtures/abi-v1`，只构建一次。
 
+mod fixture_support;
+
 use cordis_core::Plugin;
 use cordis_host::{loaded_instances, stage_plugin, staged_leaked, LoadedPlugin};
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "cordis-open-staged-soak-{}-{label}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("创建临时目录");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/host 的上两级是仓库根")
-        .to_path_buf()
-}
-
-fn find_artifact(root: &Path, name: &str) -> Option<PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut found = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name() != Some(OsStr::new("incremental")) {
-                    stack.push(path);
-                }
-            } else if path.file_name() == Some(OsStr::new(name)) {
-                found.push(path);
-            }
-        }
-    }
-    found.into_iter().max_by_key(|path| {
-        std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .ok()
-    })
-}
-
-fn build_fixture(target: &Path) -> PathBuf {
-    let manifest = repo_root().join("tests/fixtures/abi-v1/Cargo.toml");
-    assert!(
-        manifest.is_file(),
-        "冻结夹具源码不存在：{}",
-        manifest.display()
-    );
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let started = Instant::now();
-    let mut child = Command::new(cargo)
-        .args(["build", "--manifest-path"])
-        .arg(&manifest)
-        .arg("--target-dir")
-        .arg(target)
-        .args(["--offline", "--locked"])
-        .spawn()
-        .expect("启动冻结夹具构建");
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("等待冻结夹具构建") {
-            break status;
-        }
-        if started.elapsed() >= Duration::from_secs(180) {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("冻结夹具构建超时");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    assert!(status.success(), "冻结夹具构建失败");
-    let name = if cfg!(windows) {
-        "abi_v1_frozen.dll"
-    } else if cfg!(target_os = "macos") {
-        "libabi_v1_frozen.dylib"
-    } else {
-        "libabi_v1_frozen.so"
-    };
-    find_artifact(target, name).unwrap_or_else(|| panic!("冻结夹具产物不存在：{name}"))
-}
+use fixture_support::{build_fixture, TempDir};
 
 fn cycles() -> usize {
     std::env::var("CORDIS_STAGED_SOAK_CYCLES")
@@ -132,9 +35,9 @@ fn real_open_staged_cycles_return_to_baseline() {
     assert_eq!(loaded_instances(), 0, "soak 开始前不得有实例");
     assert_eq!(staged_leaked(), 0, "soak 开始前暂存台账必须为零");
 
-    let target = TempDir::new("target");
+    let target = TempDir::new("open-staged-target");
     let artifact = build_fixture(target.path());
-    let source_dir = TempDir::new("source");
+    let source_dir = TempDir::new("open-staged-source");
     let source = source_dir
         .path()
         .join(artifact.file_name().expect("夹具产物必须有文件名"));

@@ -2,12 +2,13 @@ param(
     [string]$Seal010 = "dist\cordis-0.1.0-formal",
     [string]$Seal011 = "dist\cordis-0.1.1-formal",
     [string]$WorkRoot = "C:\cordis-version-matrix",
-    [string]$TargetRoot = "C:\cordis-version-matrix-target"
+    [string]$TargetRoot = "C:\cordis-version-matrix-target",
+    [string]$Cargo = ""
 )
 
 $ErrorActionPreference = "Stop"
 $project = Resolve-Path (Join-Path $PSScriptRoot "..")
-$cargo = Join-Path $project "cargo.cmd"
+$cargo = if ($Cargo) { $Cargo } else { Join-Path $project "cargo.cmd" }
 
 function Invoke-Host([string]$Ref, [string]$Target, [string]$Seal, [bool]$Policy) {
     $worktree = Join-Path $WorkRoot $Ref.Replace("/", "-")

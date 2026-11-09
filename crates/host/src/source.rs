@@ -217,6 +217,12 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
     if manifest.version.trim().is_empty() {
         return Err("插件 manifest 缺少 version".to_string());
     }
+    semver::Version::parse(&manifest.version).map_err(|err| {
+        format!(
+            "插件 manifest version 不是 semver（{}）：{err}",
+            manifest.version
+        )
+    })?;
     if manifest.source_revision.trim().is_empty() {
         return Err("插件 manifest 缺少 source_revision".to_string());
     }

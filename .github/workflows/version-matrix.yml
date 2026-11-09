@@ -1,0 +1,41 @@
+name: version-matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 0"
+
+jobs:
+  matrix:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build formal seals from release tags
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pairs = @(
+            @{ ref = "v0.1.0"; out = "dist\cordis-0.1.0-formal" },
+            @{ ref = "v0.1.1"; out = "dist\cordis-0.1.1-formal" }
+          )
+          foreach ($pair in $pairs) {
+            $ref = $pair.ref
+            $out = $pair.out
+            $wt = Join-Path $env:RUNNER_TEMP "seal-$ref"
+            git worktree add --detach $wt $ref
+            if ($LASTEXITCODE -ne 0) { throw "worktree add failed: $ref" }
+            cargo xtask seal --root $wt --out $out
+            if ($LASTEXITCODE -ne 0) { throw "seal failed: $ref" }
+            cargo xtask seal --verify $out
+            if ($LASTEXITCODE -ne 0) { throw "seal verify failed: $ref" }
+          }
+      - name: Run adjacent host/plugin matrix
+        shell: pwsh
+        run: |
+          .\scripts\version-matrix.ps1 -Cargo cargo
+          if ($LASTEXITCODE -ne 0) { throw "version matrix failed" }

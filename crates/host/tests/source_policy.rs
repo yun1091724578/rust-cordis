@@ -152,6 +152,18 @@ fn open_staged_verified_rejects_different_staged_bytes() {
 }
 
 #[test]
+fn rejects_a_non_semver_manifest_version() {
+    let path = fixture("non-semver", b"abc");
+    write_manifest(&path, SHA_ABC, "abc123");
+    let manifest_path = cordis_host::source::manifest_path(&path);
+    let text = std::fs::read_to_string(&manifest_path).unwrap();
+    std::fs::write(&manifest_path, text.replace("\"0.1.0\"", "\"v1\"")).unwrap();
+    let policy = PluginSourcePolicy::new(vec![allowed(SHA_ABC)]);
+    let error = policy.verify(&path).expect_err("非 semver 版本必须被拒绝");
+    assert!(error.contains("semver"), "{error}");
+}
+
+#[test]
 fn rejects_an_allow_list_identity_mismatch() {
     let path = fixture("identity-mismatch", b"abc");
     write_manifest(&path, SHA_ABC, "abc123");

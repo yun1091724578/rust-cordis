@@ -54,6 +54,12 @@ jobs:
             printf 'cargo-lock-sha256=%s\n' "$(sha256sum Cargo.lock | cut -d' ' -f1)"
             cargo xtask soak "$CYCLES"
           } 2>&1 | tee soak.log
+      - name: Run dhat staged-load profile
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p rust-cordis-host --features dhat-heap --test dhat_profile -- --ignored --nocapture | tee dhat.log
       - name: Upload soak log
         if: ${{ always() && hashFiles('soak.log') != '' }}
         uses: actions/upload-artifact@v4
