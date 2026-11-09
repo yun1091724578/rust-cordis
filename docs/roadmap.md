@@ -94,7 +94,7 @@ P0 **不包含**“有界专用线程池 + 超时放弃等待”；线程池不�
 | 1 | **R2 交付入口闭合（已决策：首发低层 ABI）** | 2026-11-03 决定首发支持低层 ABI + 固定 revision 源码依赖；`../desolate` 已验证仓外编译、宏展开、真实 DLL 装载、调用失败、卸载、重载与 v1→v2 升级。registry typed SDK 不在首发范围（`rust-cordis-sdk` 仍 `publish = false`；`rust-cordis-macros` 可打包但不能单独提供 typed 门面）；证据见 `../desolate/R1-REPORT.md` 与 `release.md`。 |
 | 2 | **R3 调用通道使用契约（完成：仓外三入口 + 窄策略消费者）** | `../desolate/plugins/detailed-probe` 已覆盖同步启动错误、provider 业务错误回调、`HOST_TIMEOUT`、卸载/取消结算与恰好一次；2026-11-04 又覆盖 `dispatch_ok` / `dispatch_timeout`、`next_ok` / `next_timeout`，并在卸载后检查续延未再次投递。探针的窄策略消费者按 `category` / `certainty` 选择 `accept` / `fail_fast` / `degrade_unknown` / `unavailable`，记录 `automatic_retry=false`，不解析文本、不自动重试；记录见 `../desolate/R3-REPORT.md`。完整重试/补偿决策仍属阶段 4。 |
 | 2 | **真实 agent 集成（首条链路完成，待真实模型）** | `../desolate` 的 `agent` 任务已跑通六模式：正常、模型流失败、工具超时未知、普通模式下真实超时、工具错误、模型启动失败。工具结果按 `Ok(Ok)` / `Ok(Err)` / `Err(elapsed)` 实际分支分类，测试模式不负责解释结果；`Ok(Err)` 无证据时保留 `unknown`。统一收尾路径先生成结果，再发最多一个 `run.finished`、释放插件并关闭 App；部分快照按消息保存。宿主自己持有 100ms 截止时间，不把 `DispatchPolicy` 当通用预算。记录见 `../desolate/AGENT-REPORT.md`；事件协议与设计见 [agent-stream-protocol](agent-stream-protocol.md)。下一步是有界增量交付，再接真实模型适配器、取消与预算。 |
-| 2 | **A5-3 正式封存（完成）/ A5-5 剩余项** | 0.1.0/0.1.1 已封存并发布，同版本 `inspect` 与 registry-only consumer 通过；SCM 一次真实 elevated run 通过；`repository`/`homepage` 已补。剩余：nightly 持续运行与 artifact 长期转存、SCM CI 重跑、历史兼容的可重复测试。 |
+| 2 | **A5-3 候选封存完成，正式 /2 封存待完成 / A5-5 剩余项** | 0.1.0-rc2 与 0.1.1 的 `/1` 候选封存及发布已完成，同版本 `inspect` 与 registry-only consumer 通过；SCM 一次真实 elevated run 通过；`repository`/`homepage` 已补。剩余：从已发布 tag 的干净 worktree 重跑 `/2` 正式封存并归档、nightly 持续运行与 artifact 长期转存、SCM CI 重跑、历史兼容的可重复测试。 |
 | 3 | **R4 YAML 依赖治理（待启动）** | 对停止维护的 `serde_yaml` 制定替换或限期保留决定。比较真实配置语料、`!!js` 标签、patch 回写、数值/空值/重复键行为、错误诊断、MSRV 与解析资源边界；有差异就明确迁移规则。不得只换 crate 名，也不默认去掉 YAML。 |
 | 3 | **R5 宿主模块整理与 panic 边界审查（待启动）** | 先记录状态所有权、锁顺序、回调与卸载约束；按 instance/dispatch/stream/staging 等职责分批机械迁移，保持公开面与行为。每批运行相关生命周期/重入/取消测试；锁中毒仅在找出具体可达 panic 路径后升级为缺陷，不统一吞掉 poison。 |
 | 持续 | **R6 证据与文档维护** | 保留现有 CI，按变更影响选择额外验证；发布候选跑完整门禁。新增工具须说明现有命令无法覆盖的失败场景，不以行数或测试数扩充流程。历史文档加版本提示；平台结果保持绑定 run/commit，不把检查器通过写成行为证明。 |
@@ -112,11 +112,11 @@ R1 的记录必须区分“需求来源”“仓内集成”“独立工程实�
 |---|---|---|---|
 | 1 | **A5-1 三平台 CI 首跑 + 平台矩阵实填** | Linux / Windows MSVC / macOS 实际编译、运行全量测试与真 DLL e2e；把每个平台的真实结果逐条填入 `docs/platform-matrix.md` | **已完成**：2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)（commit `ea0489e`）三平台 `test` job 全绿；17 条保证 × 4 平台已填 `通过` |
 | 2 | A5-2 夜间 soak | 在专机或 CI 定时跑更长轮次，记录资源 / 暂存台账 / 失败日志并归档 | **进行中**：2026-11-03 手动 dispatch [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 首次 20k 通过，默认 1,000,000 轮也由 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543) 验证；每日 02:17 CST 的 `nightly-soak` workflow 已配置；cron 首跑与 artifact 长期转存未闭合 |
-| 3 | **A5-3 正式首发封存** | 在干净发布源码树上重跑 `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `plugins` / `smoke` 目录；同版本 `inspect` 证据随产物归档 | **已完成**：0.1.0 rc2 与 0.1.1 封存/复验通过；0.1.1 源码摘要 `a1eab4cb…` |
+| 3 | **A5-3 正式首发封存** | 在干净发布源码树上重跑 `/2` `cargo xtask seal`，归档整个 `seal.json` / `SHA256SUMS` / `allow-list.json` / `plugins` / `smoke` 目录；同版本 `inspect --source-policy` 证据随产物归档 | **未完成**：0.1.0-rc2 与 0.1.1 只有 `/1` 候选封存（无 sidecar/allow-list）；需从已发布 tag 的干净 worktree 重跑 `/2` |
 | 4 | A5-4 历史产物 × 后续宿主 | 后续宿主版本加载已封存的首发产物，再把“历史发布版”从**待验证**转成**保证**或明确拒绝 | **已验证一次**：v0.1.1 宿主加载 0.1.0-rc2 封存插件通过（`dist/cordis-0.1.1-historical.log`）；仍缺可重复测试，因此不支持契约仍为待验证 |
 | 5 | A5-5 关闭其余发布前项 | `Cargo.toml` 的 `repository` / `homepage` 元数据、公开发布地址、Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测；`release.md` 的发布前项关闭或明确延期 | 元数据已补；SCM 一次真实 elevated run 通过；剩余 nightly 长期转存与 SCM CI 重跑 |
 
-**A5-1/A5-3 已完成；A5-2 已启用并完成首次手动 20k；0.1.0/0.1.1 已发布并封存；
+**A5-1 已完成；A5-2 已启用并完成首次手动 20k；0.1.0/0.1.1 已发布并有 `/1` 候选封存；A5-3 正式 `/2` 封存待完成；
 A5-4 已用正式 v0.1.1 宿主验证一次；A5-5 剩余 nightly 长期转存与 SCM CI 重跑。
 接入线 R1 技术接入与 31 篇样例归档任务已完成，待真实数据反馈；R2 已决定首发低层
 ABI；R3 仓外使用契约与窄策略消费者已完成，完整重试/补偿留阶段 4；真实 agent
@@ -128,7 +128,7 @@ ABI；R3 仓外使用契约与窄策略消费者已完成，完整重试/补偿�
 闭合。运行时代码、依赖或工具链变更需重跑受影响的平台验证；资源生命周期变更补跑
 soak，发布候选执行完整门禁。旧 run/commit 的结果不能自动延续为新版本的验证结论。
 
-A5-3 已完成；A5-4 已有一次正式 v0.1.1 验证，但仍缺可重复测试，因此支持契约保持
+A5-3 的 `/1` 候选封存已完成，正式 `/2` 封存待从发布 tag 重跑；A5-4 已有一次正式 v0.1.1 验证，但仍缺可重复测试，因此支持契约保持
 待验证；A5-2 的持续运行与 artifact 长期归档由 A5-5 收口。R1 的技术接入与 31 篇
 样例归档任务已完成（`../desolate`），待真实数据与长期维护反馈；第三方复现只是
 额外证据。R2 已决定首发走低层 ABI + 固定 revision 源码依赖，registry typed SDK
@@ -201,7 +201,7 @@ A1 / A2 / A3 的红绿记录见文末“附录：验证记录”。
       artifact 集合；`cargo xtask seal --verify` 只读复验。2026-11-02 在 Windows GNU
       本地演练通过（r3），格式见 `docs/release-seal.md`。这只证明入口可用，
       **不是正式发布**，也不证明产物真实性 / 签名。
-- [ ] **正式首发产物封存**：`dist/cordis-0.1.0-rc2` 是候选封存，不是正式首发归档；第一次 release 时仍需在干净发布源码树上重跑 `cargo xtask seal` 并把整个封存目录归档到发布存储。
+- [ ] **正式首发产物封存**：`dist/cordis-0.1.0-rc2` 是 `/1` 候选封存，不是正式 `/2` 归档；需从已发布 tag `v0.1.0` 与 `v0.1.1` 的干净 worktree 重跑 `/2` `cargo xtask seal`，并把 sidecar/allow-list 在内的整个目录归档到发布存储。
 - [ ] **正式首发产物 × 同版本宿主**：候选封存的同版本 `inspect` 结果已存在，但正式首发时仍需重新归档；它只证明发布产物可用，**不证明跨版本兼容**。
 - [ ] **历史产物 × 后续宿主版本**：等后续宿主版本加载已封存的首发产物，才把索引中的
       “历史发布版”从**待验证**转成**保证**或明确拒绝；不能停留在模糊状态。
