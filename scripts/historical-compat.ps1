@@ -40,12 +40,16 @@ if ($LASTEXITCODE -ne 0 -or -not $hostCommit) {
 }
 
 try {
+    $manifest = Join-Path $Worktree "Cargo.toml"
+    $sourceText = Get-Content -Raw $manifest
+    if ($sourceText -notmatch '(?m)^version = "([^"]+)"') {
+        throw "could not read workspace version from $manifest"
+    }
+    $hostSourceVersion = [version]$Matches[1]
     if ($BumpVersion) {
-        $manifest = Join-Path $Worktree "Cargo.toml"
-        $text = Get-Content -Raw $manifest
-        $updated = $text -replace '(?m)^version = "[^"]+"', "version = `"$BumpVersion`""
-        if ($updated -eq $text) {
-            throw "BumpVersion=$BumpVersion did not match the workspace version in $manifest"
+        $updated = $sourceText -replace 'version = "0\.1\.[0-9]+"', "version = `"$BumpVersion`""
+        if ($updated -eq $sourceText) {
+            throw "BumpVersion=$BumpVersion did not match any 0.1.x workspace/dependency version in $manifest"
         }
         Set-Content -NoNewline -Encoding UTF8 $manifest $updated
     }
@@ -80,14 +84,13 @@ try {
         $admissionMode = "legacy-no-policy"
     }
 
-    $hostManifest = Join-Path $Worktree "Cargo.toml"
-    $hostText = Get-Content -Raw $hostManifest
+    $hostText = Get-Content -Raw $manifest
     if ($hostText -notmatch '(?m)^version = "([^"]+)"') {
-        throw "could not read host workspace version from $hostManifest"
+        throw "could not read host workspace version from $manifest"
     }
     $hostVersion = [version]$Matches[1]
-    if ($hostVersion -le $sealVersion) {
-        throw "host $hostVersion is not later than seal $sealVersion; this is not a forward-compat drill"
+    if ($hostSourceVersion -lt $sealVersion) {
+        throw "host source $hostSourceVersion is older than seal $sealVersion; this is not a forward-compat drill"
     }
 
     $config = Join-Path $Worktree "forward-greeting.yml"
@@ -97,7 +100,7 @@ try {
     ) | Set-Content -Encoding ASCII $config
 
     Write-Output "forward compatibility drill"
-    Write-Output "host ref=$HostRef commit=$hostCommit version=$hostVersion bump=$BumpVersion seal=$Seal seal_version=$sealVersion admission=$admissionMode"
+    Write-Output "host ref=$HostRef commit=$hostCommit source_version=$hostSourceVersion version=$hostVersion bump=$BumpVersion seal=$Seal seal_version=$sealVersion admission=$admissionMode"
     $inspectArgs = @("inspect", $smoke, "--plugin-dir", $plugins)
     if ($admissionArgs.Count -gt 0) { $inspectArgs += $admissionArgs }
     & $exe @inspectArgs
