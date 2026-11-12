@@ -2209,6 +2209,24 @@ impl PluginSource for DiskPluginSource {
                 manifest_path.display()
             )
         })?;
+        crate::source::validate_manifest(&manifest).map_err(|err| {
+            format!(
+                "插件 {} (id={}) 的 sidecar manifest 身份无效: {err}",
+                entry.name,
+                entry.id.as_deref().unwrap_or("<无 id>")
+            )
+        })?;
+        // 有生效来源策略时，依赖声明也必须先过 artifact/manifest 准入，
+        // 不能从未验证的 sidecar 直接做依赖决策。
+        if let Some(policy) = crate::source::active_policy() {
+            policy.verify(&path).map_err(|err| {
+                format!(
+                    "插件 {} (id={}) 的 sidecar manifest 未通过来源准入: {err}",
+                    entry.name,
+                    entry.id.as_deref().unwrap_or("<无 id>")
+                )
+            })?;
+        }
         Ok(Some(PlanEntrySpec {
             id: manifest.id,
             version: manifest.version,
@@ -2220,13 +2238,15 @@ impl PluginSource for DiskPluginSource {
 
 /// P1-1：从来源清单收集依赖计划，并在**任何 `source.load` / 挂载之前**求解。
 ///
-/// 只遍历静态启用的非 group 行：
-/// - `disabled: true` 与带 `disabled: !!js …` 的行都跳过（表达式要等决策期才有答案，
-///   不能为了一条可能休眠的行拖垮整次装载）；
+/// 只遍历非 group 行：
+/// - 静态 `disabled: true` 跳过；`disabled: !!js …` 保守纳入计划（运行时求值后才知
+///   是否挂载，不能在预检里把可能的提供者误判为缺失）；
+/// - 只要有一行没有 sidecar/manifest 计划，整次 manifest 预检跳过：混合来源下
+///   不能把“没声明”当成“没有提供者”；
 /// - group 行只下钻到子行。
 ///
-/// 没有任何 manifest 声明返回 `Ok(())`——这是**零行为变化**的路径。有声明时，
-/// 版本/范围解析失败或 [`crate::plan::resolve`] 报错都会让本次装载整体失败。
+/// 有生效来源策略时，读取 sidecar 前会先过 admission；版本/范围解析失败或
+/// [`crate::plan::resolve`] 报错都会让本次装载整体失败。
 fn preflight_source_dependency_plan(
     entries: &[Entry],
     search: &[PathBuf],
@@ -2234,7 +2254,7 @@ fn preflight_source_dependency_plan(
 ) -> std::result::Result<(), String> {
     let mut collected = Vec::new();
     let mut next_row = 0;
-    collect_source_plan_entries(
+    let missing_plan = collect_source_plan_entries(
         entries,
         false,
         search,
@@ -2242,7 +2262,9 @@ fn preflight_source_dependency_plan(
         &mut next_row,
         &mut collected,
     )?;
-    if collected.is_empty() {
+    // 混合来源（部分插件没有 sidecar）下 manifest 计划不完整；不能把
+    // “没声明”误判成“没有提供者”。此时跳过预检，保留既有运行时语义。
+    if collected.is_empty() || missing_plan {
         return Ok(());
     }
 
@@ -2287,13 +2309,21 @@ fn collect_source_plan_entries(
     source: &dyn PluginSource,
     next_row: &mut usize,
     out: &mut Vec<CollectedPlanEntry>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<bool, String> {
+    let mut missing_plan = false;
     for entry in entries {
         // 静态 disabled 可确定跳过；`disabled: !!js` 的求值需要上下文，
         // 预检阶段保守地把它纳入计划，避免把运行时 false 的提供者误判为缺失。
         let disabled = disabled_by_ancestor || entry.disabled;
         if entry.group {
-            collect_source_plan_entries(&entry.children, disabled, search, source, next_row, out)?;
+            missing_plan |= collect_source_plan_entries(
+                &entry.children,
+                disabled,
+                search,
+                source,
+                next_row,
+                out,
+            )?;
             continue;
         }
         let index = *next_row;
@@ -2310,9 +2340,11 @@ fn collect_source_plan_entries(
         })?;
         if let Some(spec) = spec {
             out.push(CollectedPlanEntry { index, label, spec });
+        } else {
+            missing_plan = true;
         }
     }
-    Ok(())
+    Ok(missing_plan)
 }
 
 async fn load(ctx: Ctx, config: LoaderConfig) -> Result<()> {

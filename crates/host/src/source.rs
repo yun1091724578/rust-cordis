@@ -221,7 +221,7 @@ pub fn read_manifest(artifact: impl AsRef<Path>) -> Result<PluginManifest, Strin
         .map_err(|err| format!("解析插件 manifest {} 失败: {err}", path.display()))
 }
 
-fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
+pub(crate) fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
     if manifest.id.trim().is_empty() {
         return Err("插件 manifest 缺少 id".to_string());
     }

@@ -379,6 +379,22 @@ fn default_output_dir_for(root: &Path) -> PathBuf {
         .join(format!("cordis-plugins-{version}-{target}"))
 }
 
+fn abi_constants(root: &Path) -> Result<(u32, u32), String> {
+    let path = root.join("crates/abi/src/lib.rs");
+    let text =
+        fs::read_to_string(&path).map_err(|err| format!("读取 {} 失败：{err}", path.display()))?;
+    let read = |name: &str| -> Result<u32, String> {
+        text.lines()
+            .find_map(|line| {
+                let line = line.trim();
+                line.strip_prefix(&format!("pub const {name}: u32 ="))
+                    .and_then(|rest| rest.trim().trim_end_matches(';').parse().ok())
+            })
+            .ok_or_else(|| format!("{} 缺少 {name}", path.display()))
+    };
+    Ok((read("ABI_VERSION")?, read("ERROR_FORMAT_V1")?))
+}
+
 fn workspace_version(root: &Path) -> Result<String, String> {
     let text = fs::read_to_string(root.join("Cargo.toml"))
         .map_err(|err| format!("读取 {} 失败：{err}", root.join("Cargo.toml").display()))?;
@@ -467,11 +483,12 @@ fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
     // sidecar manifest + allow-list 必须在 smoke 之前落盘：同版本 inspect 会用
     // `--source-policy allow-list.json` 走真实的准入路径。
     let source_version = workspace_version(root)?;
+    let (abi_version, error_format) = abi_constants(root)?;
     write_plugin_provenance(
         &temp,
         &source_version,
         &source_sha256,
-        cordis_abi::ABI_VERSION,
+        abi_version,
         &artifacts,
     )?;
 
@@ -489,8 +506,8 @@ fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
     let (host_source_sha256, host_source_files) = source_tree_digest(&host_root, out)?;
     let manifest = SealManifest {
         workspace_version: source_version,
-        abi_version: cordis_abi::ABI_VERSION,
-        error_format: cordis_abi::ERROR_FORMAT_V1,
+        abi_version,
+        error_format,
         target,
         profile: "release".to_string(),
         created_unix: SystemTime::now()
