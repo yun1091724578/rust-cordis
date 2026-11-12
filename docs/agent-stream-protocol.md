@@ -188,6 +188,7 @@ agent 协议放在**仓外消费层**，不放进 `cordis-core`：
 maxEventBytes    = 64 KiB
 maxTerminalBytes = 512 KiB（run.finished 含部分快照）
 maxEvents        = 10_000
+maxRetainedEvents = 256（流式 sink 的内存窗口；非流式 recorder 全量保留）
 maxTextBytes     = 256 KiB（单消息与总保留文本）
 maxTools         = 1_024
 ```
@@ -219,11 +220,11 @@ data: {完整事件 JSON}
 - 类型化 `AgentEvent` / `AgentEventKind` / `PartialSnapshot` / `EventError`；
 - 单 run 的 `AgentStreamRecorder`：序号、多消息快照、工具生命周期、终止一致性；
 - JSONL 写入与 SSE 帧编码；
-- 21 个 agent_stream 单测：序号单调、completed 拒绝打开文本/运行中工具、失败/
+- 23 个 agent_stream 单测：序号单调、completed 拒绝打开文本/运行中工具、失败/
   取消自动收尾、多消息快照、工具不可重复/不可 running、非法 certainty、终止后
   拒绝事件、SSE 形状；及增量 sink 可见性、无重复行、超大事件无半行、事件/
   文本/工具上限、0 值拒绝、sink 路径错误、70 KiB 终止预算、maxEvents 终止保留、
-  超大工具结果截断；
+  超大工具结果截断、显式 run_id、事件保留窗口；
 - 另有 2 个 agent 分类回归：普通模式真实超时仍是 `timed_out/unknown`，`Ok(Err)`
   读取实际错误证据、无证据保持 `unknown`。
 

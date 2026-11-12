@@ -27,7 +27,7 @@
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离，不能升级成安全承诺 |
 | C. 可信单租户底座 P0 | **按边界完成** | 来源策略；App 粒度 dispatch policy；宿主容量准入；生命周期清理不阻塞 tokio worker；P0-4 边界已记录 | per-plugin/method 明确不提供；永久 hang 属 T2 |
 | D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI、semver 依赖计划（配置 + sidecar + 对账/reload 预检）、16 KiB 调用缓冲池 | 从 `PluginDesc` 自动采集、升级/回溯求解 |
-| E. agent 流处理 | **有界增量交付完成** | 六模式状态机；21 个 agent_stream 单测；JSONL 即时写入；事件/终止/文本/工具上限；工具结果截断；sink 回滚 | 真实模型、慢消费者、取消/预算、SSE 在线 sink |
+| E. agent 流处理 | **有界增量交付完成** | 六模式状态机；23 个 agent_stream 单测；JSONL 即时写入；事件/终止/文本/工具上限；事件窗口；工具结果截断；sink 回滚；显式 run_id | 真实模型、慢消费者、取消/预算、SSE 在线 sink |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 只有第三方/模型生成/多租户触发时另立 ADR |
 | G. 维护治理 | **持续** | R4/R5/R6 已登记 | serde_yaml、宿主模块、锁/panic 审查 |
 

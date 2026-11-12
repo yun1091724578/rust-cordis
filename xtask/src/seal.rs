@@ -398,7 +398,7 @@ fn print_manifest(manifest: &SealManifest) {
 }
 
 fn default_output_dir_for(root: &Path) -> PathBuf {
-    let target = host_target().unwrap_or_else(|_| "unknown-target".to_string());
+    let target = host_target(root).unwrap_or_else(|_| "unknown-target".to_string());
     let version = workspace_version(root).unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
     root.join("dist")
         .join(format!("cordis-plugins-{version}-{target}"))
@@ -446,10 +446,13 @@ fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
         }
     }
 
-    let target = host_target()?;
-    let rustc = tool_version(&std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string()))?;
+    let target = host_target(root)?;
+    let rustc = tool_version_in(
+        &std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string()),
+        root,
+    )?;
     let cargo_program = cargo_program();
-    let cargo = tool_version(&cargo_program)?;
+    let cargo = tool_version_in(&cargo_program, root)?;
     let rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
     let (source_sha256, source_files) = source_tree_digest(root, out)?;
 
@@ -1504,10 +1507,11 @@ fn is_sha256(text: &str) -> bool {
     text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn host_target() -> Result<String, String> {
+fn host_target(root: &Path) -> Result<String, String> {
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let output = Command::new(&rustc)
         .arg("-vV")
+        .current_dir(root)
         .output()
         .map_err(|err| format!("运行 {rustc} -vV 失败：{err}"))?;
     if !output.status.success() {
@@ -1520,9 +1524,12 @@ fn host_target() -> Result<String, String> {
         .ok_or_else(|| format!("{rustc} -vV 没有 host 行"))
 }
 
-fn tool_version(program: &str) -> Result<String, String> {
+/// 在目标源码树里执行版本探测：`rust-toolchain.toml`/`.cargo/config` 的
+/// 目录语义与真正构建保持一致。
+fn tool_version_in(program: &str, root: &Path) -> Result<String, String> {
     let output = Command::new(program)
         .arg("--version")
+        .current_dir(root)
         .output()
         .map_err(|err| format!("运行 {program} --version 失败：{err}"))?;
     if !output.status.success() {
