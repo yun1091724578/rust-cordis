@@ -102,7 +102,8 @@
   - `PluginDesc` 自述仍不参与求解；manifest 声明只用于预检，不改变运行时
     `inject` / 服务可见性，也不证明插件真的提供声明的服务。
   - `cargo xtask seal` 会为三个示例插件写出 `provides` / `requires`；
-    `seal --verify` 仍要求自身规范字节，手工修改 sidecar 会失败。
+    `seal --verify` 仍要求自身规范字节，手工修改 sidecar 会失败。旧 `/2`
+    没有这两个字段时仍可兼容 verify；hello 不写硬 `requires`，保留 PENDING。
   - 没有版本升级 / 回溯求解：一个服务键仍只能解析到一个提供者。
 - ABI 仍精确匹配；不要同时引入互相冲突的 `abi_min/abi_max` 规则。
 

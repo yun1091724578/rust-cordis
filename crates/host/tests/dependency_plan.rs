@@ -325,6 +325,54 @@ async fn manifest_plan_is_collected_and_allows_the_rows_to_load() {
     assert_eq!(counters.applies(), 2, "预检通过后两行都要应用");
 }
 
+/// 同一插件挂多行是合法配置：相同 manifest 计划只应参与一次求解。
+#[tokio::test]
+async fn duplicate_plugin_instances_share_one_plan_entry() {
+    let counters = Counters::new();
+    let app = App::new();
+    let path = write_config(
+        "manifest-duplicate",
+        "- id: one\n  name: provider\n- id: two\n  name: provider\n",
+    );
+    let source = counters.source_with_plan(vec![(
+        "provider",
+        spec("provider.plugin", "1.0.0", &[("svc", "1.0.0")], &[]),
+    )]);
+
+    let state = load_with_source(app.root.clone(), config_for(&path, Vec::new()), source)
+        .await
+        .expect("同一插件的两个实例不得被当作重复声明");
+    assert_eq!(state.mounted_labels(), vec!["one", "two"]);
+    assert_eq!(counters.loads(), 2);
+    assert_eq!(counters.applies(), 2);
+}
+
+/// `disabled: !!js` 的求值需要上下文；预检不能把可能启用的提供者误判为缺失。
+#[tokio::test]
+async fn dynamic_disabled_provider_still_participates_in_preflight() {
+    let counters = Counters::new();
+    let app = App::new();
+    let path = write_config(
+        "manifest-dynamic-disabled",
+        "- id: provider\n  name: provider\n  disabled: !!js \"1 == 2\"\n- id: consumer\n  name: consumer\n",
+    );
+    let source = counters.source_with_plan(vec![
+        (
+            "provider",
+            spec("provider.plugin", "1.0.0", &[("svc", "1.0.0")], &[]),
+        ),
+        (
+            "consumer",
+            spec("consumer.plugin", "2.0.0", &[], &[("svc", "^1")]),
+        ),
+    ]);
+
+    let state = load_with_source(app.root.clone(), config_for(&path, Vec::new()), source)
+        .await
+        .expect("运行时为 false 的动态 disabled 提供者必须参与预检");
+    assert_eq!(state.mounted_labels(), vec!["consumer", "provider"]);
+}
+
 /// 组行只下钻到子行；静态禁用行不参与收集（它的坏计划不能拖垮整次装载）。
 #[tokio::test]
 async fn manifest_plan_walks_groups_and_skips_disabled_rows() {

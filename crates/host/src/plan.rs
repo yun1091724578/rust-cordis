@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 一个待装载插件的依赖声明。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanEntry {
     pub id: String,
     pub version: Version,

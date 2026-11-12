@@ -2256,6 +2256,11 @@ fn preflight_source_dependency_plan(
                 label = row.label,
             )
         })?;
+        // 同一插件挂多行是合法配置；完全相同的 manifest 计划只应算一次。
+        // 同 id/version 但声明不同仍交给 resolve 报歧义。
+        if plan.iter().any(|existing| existing == &entry) {
+            continue;
+        }
         plan.push(entry);
     }
     if let Err(findings) = crate::plan::resolve(&plan) {
@@ -2284,7 +2289,9 @@ fn collect_source_plan_entries(
     out: &mut Vec<CollectedPlanEntry>,
 ) -> std::result::Result<(), String> {
     for entry in entries {
-        let disabled = disabled_by_ancestor || entry.disabled || entry.disabled_expr.is_some();
+        // 静态 disabled 可确定跳过；`disabled: !!js` 的求值需要上下文，
+        // 预检阶段保守地把它纳入计划，避免把运行时 false 的提供者误判为缺失。
+        let disabled = disabled_by_ancestor || entry.disabled;
         if entry.group {
             collect_source_plan_entries(&entry.children, disabled, search, source, next_row, out)?;
             continue;

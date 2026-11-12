@@ -121,7 +121,9 @@ manifest 与 `allow-list.json` 是**准入输入**，不是执行隔离：它们
 ```
 
 `seal.json` 的 `format` 新写为 `cordis-plugin-seal/2`。`/2` 的唯一变化是
-sidecar manifest 与 `allow-list.json` 成为必需文件并进入 `SHA256SUMS`；
+sidecar manifest 与 `allow-list.json` 成为必需文件并进入 `SHA256SUMS`。
+2026-11-12 之后 `/2` sidecar 还写可选 `provides` / `requires`；`--verify` 对
+没有这两个字段的旧 `/2` 仍接受，但新生成器写出的字节必须完整匹配。
 `/1` 封存（例如 0.1.0/0.1.1 的 r3 目录）保持只读复验能力，但只检查
 artifact / smoke / `SHA256SUMS`，不检查 provenance 文件。`/2` 不会静默降级：
 缺少 sidecar 或 allow-list 即失败。

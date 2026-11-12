@@ -40,7 +40,8 @@ const PLUGINS: &[PluginSpec] = &[
         label: "hello",
         plugin: "hello",
         provides: &[("hello.note", "1.0.0")],
-        requires: &[("greeting", "^2")],
+        // hello 对 greeting 是 PENDING 语义，不是硬依赖；不能在预检里硬失败。
+        requires: &[],
     },
     PluginSpec {
         package: "plugin-harness-tool",
@@ -1100,6 +1101,18 @@ fn verify_plugin_provenance(
                 continue;
             }
         };
+        let legacy = strip_dependency_fields(expected.clone());
+        let legacy_bytes = match json_file_bytes(&legacy) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                errors.push(err);
+                continue;
+            }
+        };
+        if let Some(actual_hash) = accept_legacy_provenance(dir, &relative, &bytes, &legacy_bytes) {
+            expected_sums.insert(relative.clone(), actual_hash);
+            continue;
+        }
         expected_sums.insert(relative.clone(), sha256_hex(&bytes));
         verify_expected_file(dir, "插件 manifest", &relative, &bytes, errors);
     }
@@ -1123,8 +1136,59 @@ fn verify_plugin_provenance(
             return;
         }
     };
+    let mut legacy = expected.clone();
+    if let Some(allowed) = legacy.get_mut("allowed").and_then(Value::as_array_mut) {
+        for entry in allowed {
+            strip_dependency_fields_in_place(entry);
+        }
+    }
+    let legacy_bytes = match json_file_bytes(&legacy) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            errors.push(err);
+            return;
+        }
+    };
+    if let Some(actual_hash) = accept_legacy_provenance(dir, ALLOW_LIST_FILE, &bytes, &legacy_bytes)
+    {
+        expected_sums.insert(ALLOW_LIST_FILE.to_string(), actual_hash);
+        return;
+    }
     expected_sums.insert(ALLOW_LIST_FILE.to_string(), sha256_hex(&bytes));
     verify_expected_file(dir, "来源 allow-list", ALLOW_LIST_FILE, &bytes, errors);
+}
+
+fn strip_dependency_fields_in_place(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("provides");
+        object.remove("requires");
+    }
+}
+
+fn strip_dependency_fields(mut value: Value) -> Value {
+    strip_dependency_fields_in_place(&mut value);
+    value
+}
+
+/// 兼容 26f108b 之前写出的 `/2`：sidecar/allow-list 没有 provides/requires。
+/// 只有实际字节等于旧规范且不是符号链接时才接受，并把实际哈希写回 SHA 期望。
+fn accept_legacy_provenance(
+    dir: &Path,
+    relative: &str,
+    expected: &[u8],
+    legacy: &[u8],
+) -> Option<String> {
+    let path = dir.join(relative);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+    let actual = fs::read(&path).ok()?;
+    if actual == expected || actual == legacy {
+        Some(sha256_hex(&actual))
+    } else {
+        None
+    }
 }
 
 fn verify_expected_file(
