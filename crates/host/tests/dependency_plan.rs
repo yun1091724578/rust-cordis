@@ -373,6 +373,49 @@ async fn dynamic_disabled_provider_still_participates_in_preflight() {
     assert_eq!(state.mounted_labels(), vec!["consumer", "provider"]);
 }
 
+/// 启停若让依赖预检失败，必须回滚树并返回错误，不能报告成功。
+#[tokio::test]
+async fn set_disabled_rolls_back_when_preflight_rejects_the_new_tree() {
+    let counters = Counters::new();
+    let app = App::new();
+    let path = write_config(
+        "set-disabled-preflight",
+        "- id: provider\n  name: provider\n- id: consumer\n  name: consumer\n",
+    );
+    let source = counters.source_with_plan(vec![
+        (
+            "provider",
+            spec("provider.plugin", "1.0.0", &[("svc", "1.0.0")], &[]),
+        ),
+        (
+            "consumer",
+            spec("consumer.plugin", "2.0.0", &[], &[("svc", "^1")]),
+        ),
+    ]);
+    let state = load_with_source(app.root.clone(), config_for(&path, Vec::new()), source)
+        .await
+        .expect("初始计划可满足");
+
+    let error = state
+        .set_disabled("provider", Some(true))
+        .await
+        .expect_err("禁用唯一提供者必须失败");
+    assert!(
+        error.contains("依赖预检失败") || error.contains("没有提供者"),
+        "{error}"
+    );
+    assert!(
+        !state
+            .tree_snapshot()
+            .iter()
+            .find(|entry| entry.id.as_deref() == Some("provider"))
+            .expect("provider 行")
+            .disabled,
+        "失败的启停必须回滚树"
+    );
+    assert_eq!(state.mounted_labels(), vec!["consumer", "provider"]);
+}
+
 /// 组行只下钻到子行；静态禁用行不参与收集（它的坏计划不能拖垮整次装载）。
 #[tokio::test]
 async fn manifest_plan_walks_groups_and_skips_disabled_rows() {

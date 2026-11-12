@@ -1294,15 +1294,28 @@ impl LoaderState {
         // 整段"改树 → 对账"必须在互斥闸门内：否则并发的对账会中途覆盖树，
         // 刚禁用的行在下一轮里复活（或被挂成第二份）。
         let _guard = self.mutation.lock().await;
-        {
+        let (old_disabled, old_expr) = {
             let mut tree = self.tree.lock().unwrap();
             let entry = find_by_label(&mut tree, label)
                 .ok_or_else(|| format!("没有 label 为 \"{label}\" 的配置行"))?;
+            let old = (entry.disabled, entry.disabled_expr.clone());
             entry.disabled = value.unwrap_or(false);
             // 静态选项覆盖表达式：上游把选项设成布尔值时，表达式形态被整体替换。
             entry.disabled_expr = None;
+            old
+        };
+        let outcome = self.sync_inner().await;
+        if !outcome.failures.is_empty() {
+            if let Some(entry) = find_by_label(&mut self.tree.lock().unwrap(), label) {
+                entry.disabled = old_disabled;
+                entry.disabled_expr = old_expr;
+            }
+            return Err(format!(
+                "启停 {label} 未生效（对账失败）: {}",
+                outcome.failures.join("；")
+            ));
         }
-        Ok(self.sync_inner().await)
+        Ok(outcome)
     }
 
     /// **纯差异**：不下手，只列动作（`plan_reaches_fresh_load_state` 与可视化用它）。
@@ -1558,11 +1571,27 @@ impl LoaderState {
                 ))
             }
         };
+        let old_main = self.main_only.lock().unwrap().clone();
+        let old_owners = self.owners.lock().unwrap().clone();
+        let old_baseline = self.main_baseline.lock().unwrap().clone();
         match self.parse_snapshot(&snapshot) {
-            Ok(entries) => match self.request_reconcile(entries).await {
-                Some(outcome) => ReloadOutcome::Reconciled(outcome),
-                None => ReloadOutcome::Coalesced,
-            },
+            Ok(entries) => {
+                if let Err(err) = self.preflight_dependencies(&entries) {
+                    // parse_snapshot 已经推进了回写元数据；预检失败必须回滚，
+                    // 否则下一轮 self-dispose/回写会按未采纳的配置操作。
+                    {
+                        let _gate = self.config_gate.lock().unwrap();
+                        *self.main_only.lock().unwrap() = old_main;
+                        *self.owners.lock().unwrap() = old_owners;
+                        *self.main_baseline.lock().unwrap() = old_baseline;
+                    }
+                    return ReloadOutcome::Failed(format!("依赖预检失败: {err}"));
+                }
+                match self.request_reconcile(entries).await {
+                    Some(outcome) => ReloadOutcome::Reconciled(outcome),
+                    None => ReloadOutcome::Coalesced,
+                }
+            }
             Err(err) => ReloadOutcome::Failed(err),
         }
     }
