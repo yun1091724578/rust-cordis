@@ -39,7 +39,10 @@ dist/cordis-plugins-<workspace-version>-<target>/
 - 为每个 artifact 写 `plugins/<dll>.manifest.json`：
   `{id, version, source_revision, abi_version, sha256}`。`id` 是插件身份名
   （`greeting` / `hello` / `harness-tool`），`version` 是 workspace 版本，
-  `sha256` 是该 DLL 的完整 SHA-256；
+  `sha256` 是该 DLL 的完整 SHA-256。宿主 schema 还接受可选的
+  `provides` / `requires`（P1-1 的依赖预检），但 seal **不生成**这两个字段；
+  需要范围的发布方要在自己的流程里补充，且 `seal --verify` 仍然要求 sidecar
+  与生成器写出的规范字节一致；
 - 在封存根写 `allow-list.json`：`{"allowed":[...]}`，条目与三个 sidecar
   manifest 逐字段一致。它是 `cordis --source-policy` 的输入格式；
 - 记录 workspace 版本、ABI 主版本、结构化错误格式版本、目标三元组、rustc /

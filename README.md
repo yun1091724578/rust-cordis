@@ -36,12 +36,38 @@ maxPendingPerInstance: 64, maxStreamsPerInstance: 8 }`），嵌入方也可调�
 “无限”而是非法配置**。这些是宿主侧表项准入（实例数、派发记录、挂起续延、流），
 不是每插件的内存/CPU 硬上限；T2 插件与宿主同进程，真正隔离仍属 T3。
 
-依赖计划由 `LoaderConfig.dependencyPlan` **显式声明**（camelCase 数组，每项
-`{ id, version, provides, requires }`，`provides`/`requires` 可缺省）。非空时，
-装载器在**任何挂载之前**用 `host::plan::resolve` 求解：缺失、版本不可满足或
-同版本多提供者都会让本次装载失败，不加载、不应用任何插件；空（缺省）表示不做
-预检。这份计划**不是**从插件 manifest / `PluginDesc` 推导的——插件自述仍只用于
-能力展示，按 manifest 收集并在 mount 期校验自述尚未接入。
+依赖计划有两条来源，都在**任何挂载之前**求解：
+
+- **显式配置（覆盖）**：`LoaderConfig.dependencyPlan`（camelCase 数组，每项
+  `{ id, version, provides, requires }`，`provides`/`requires` 可缺省）。非空时，
+  装载器只求解它：缺失、版本不可满足或同版本多提供者都会让本次装载失败，
+  不加载、不应用任何插件，也不会读取 sidecar manifest 计划。
+- **sidecar manifest（缺省收集）**：`PluginManifest` 支持可选的 `provides`
+  （服务键 → 该插件提供的 semver 版本）与 `requires`（服务键 → semver range）。
+  显式 `dependencyPlan` 为空时，`DiskPluginSource::plan_entry` 读取每个静态启用行
+  旁的 `<artifact>.manifest.json`，由装载器汇总后调用 `host::plan::resolve`。
+  没有 sidecar 的行不参与，所以既有配置零行为变化；manifest 里的版本/范围不是
+  合法 semver 会让整次装载失败。带 `disabled: !!js …` 的行不参与初装预检。
+
+manifest 示例：
+
+```json
+{
+  "id": "example.plugin",
+  "version": "1.0.0",
+  "source_revision": "tree:…",
+  "abi_version": 1,
+  "sha256": "…",
+  "provides": { "svc": "1.2.0" },
+  "requires": { "other": "^2" }
+}
+```
+
+这份计划只用于**装载前预检**，不是运行时依赖注入或隔离：它不改变 `inject` 的服务
+可见性，也不证明插件真的提供了声明的服务。HMR / patch 对账**不会**重跑预检；
+改 manifest 或依赖声明后需要重新装载。`cargo xtask seal` 生成的 sidecar 仍只有
+身份字段，不写 `provides`/`requires`；需要范围时由发布方补充（`seal --verify`
+校验的是它自己生成的那份规范字节）。`PluginDesc` 自述仍不参与求解。
 
 当前执行入口见 [`docs/roadmap.md`](docs/roadmap.md)：仓外真实接入与发布收尾并行。
 已知交付缺口、调用通道边界和维护事项见 [`docs/architecture-review.md`](docs/architecture-review.md)。

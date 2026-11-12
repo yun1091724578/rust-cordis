@@ -104,9 +104,12 @@ pub struct LoaderConfig {
     /// 每一项给出 `id` / `version` / `provides` / `requires`；非空时，
     /// [`load_with_source`] 在**任何挂载之前**用 [`crate::plan::resolve`] 求解。
     /// 缺失、版本不可满足或同版本多提供者都会让本次装载**大声失败**，且不会
-    /// 挂上/应用任何插件。空（缺省）表示不做预检。
+    /// 挂上/应用任何插件。
     ///
-    /// 这份计划**不由** manifest 或 `PluginDesc` 推导：插件自述仍只用于能力展示。
+    /// 非空还意味着**覆盖**：装载器不会读取 [`PluginSource::plan_entry`] 收集的
+    /// sidecar manifest 计划，也不会与它们合并。空（缺省）时才会逐行收集
+    /// `PluginManifest` 的可选 `provides` / `requires`；没有任何 manifest 声明时
+    /// 不做预检（既有配置零行为变化）。`PluginDesc` 自述仍不参与求解。
     #[serde(default)]
     pub dependency_plan: Vec<PlanEntrySpec>,
 }
@@ -1303,6 +1306,12 @@ impl LoaderState {
     }
 
     /// 以**给定的新树**为目标对账一次（文件驱动的唯一驱动器）。
+    ///
+    /// # 依赖预检只在初装发生
+    /// P1-1 的 sidecar manifest 计划（以及显式 `dependencyPlan`）只在
+    /// [`load_with_source`] 创建装载器时求解。HMR / patch 对账 / 运行期启停都
+    /// **不会**重跑它：改了 manifest 或依赖声明，需要重新装载。这样对账的
+    /// 失败语义不会被"某个尚未挂载的行缺依赖"整体拖停。
     pub async fn reconcile_once(self: &Arc<Self>, entries: Vec<Entry>) -> ReconcileOutcome {
         let _guard = self.mutation.lock().await;
         self.reconcile_once_inner(entries).await
@@ -2090,6 +2099,19 @@ pub trait PluginSource: Send + Sync {
         search: &[PathBuf],
         revision: u64,
     ) -> std::result::Result<LoadedFile, String>;
+
+    /// P1-1：尝试从来源自带的清单（sidecar manifest）收集依赖声明。
+    ///
+    /// **缺省返回 `Ok(None)`**：不发布清单的来源（假源、内置插件）不参与依赖预检。
+    /// 装载器只把这里返回的 `Some` 转成 [`crate::plan::PlanEntry`] 并在挂载前求解；
+    /// 它**不是**运行时注入，也不证明插件真的提供了这些服务。
+    fn plan_entry(
+        &self,
+        _entry: &Entry,
+        _search: &[PathBuf],
+    ) -> std::result::Result<Option<PlanEntrySpec>, String> {
+        Ok(None)
+    }
 }
 
 /// 真实实现：磁盘上的动态库。预检（ABI 版本、结构尺寸、入口可调用性）全在
@@ -2132,6 +2154,129 @@ impl PluginSource for DiskPluginSource {
             fingerprint: source_fingerprint,
         })
     }
+
+    /// 与 [`PluginSource::load`] 共用 [`crate::resolve_plugin_path`]，只读 sidecar
+    /// manifest，不暂存、不打开动态库。
+    ///
+    /// 找不到 artifact 时返回 `Ok(None)`：没有 artifact 就不可能有 sidecar，
+    /// 这里不该替换 `load` 的逐行错误（`strict=false` 的降级语义保持不变）。
+    fn plan_entry(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+    ) -> std::result::Result<Option<PlanEntrySpec>, String> {
+        let Ok(path) = resolve_plugin_path(&entry.name, search) else {
+            return Ok(None);
+        };
+        let manifest_path = crate::source::manifest_path(&path);
+        if !manifest_path.is_file() {
+            return Ok(None);
+        }
+        let manifest = crate::source::read_manifest(&path).map_err(|err| {
+            format!(
+                "插件 {} (id={}) 的 sidecar manifest {} 无效: {err}",
+                entry.name,
+                entry.id.as_deref().unwrap_or("<无 id>"),
+                manifest_path.display()
+            )
+        })?;
+        Ok(Some(PlanEntrySpec {
+            id: manifest.id,
+            version: manifest.version,
+            provides: manifest.provides,
+            requires: manifest.requires,
+        }))
+    }
+}
+
+/// P1-1：从来源清单收集依赖计划，并在**任何 `source.load` / 挂载之前**求解。
+///
+/// 只遍历静态启用的非 group 行：
+/// - `disabled: true` 与带 `disabled: !!js …` 的行都跳过（表达式要等决策期才有答案，
+///   不能为了一条可能休眠的行拖垮整次装载）；
+/// - group 行只下钻到子行。
+///
+/// 没有任何 manifest 声明返回 `Ok(())`——这是**零行为变化**的路径。有声明时，
+/// 版本/范围解析失败或 [`crate::plan::resolve`] 报错都会让本次装载整体失败。
+fn preflight_source_dependency_plan(
+    entries: &[Entry],
+    search: &[PathBuf],
+    source: &dyn PluginSource,
+) -> std::result::Result<(), String> {
+    let mut collected = Vec::new();
+    let mut next_row = 0;
+    collect_source_plan_entries(
+        entries,
+        false,
+        search,
+        source,
+        &mut next_row,
+        &mut collected,
+    )?;
+    if collected.is_empty() {
+        return Ok(());
+    }
+
+    let mut plan = Vec::with_capacity(collected.len());
+    for row in collected {
+        let plugin_id = row.spec.id.clone();
+        let entry = row.spec.into_entry().map_err(|err| {
+            format!(
+                "依赖计划（来源 manifest）第 {} 行 {label} (id={plugin_id}) 无效: {err}",
+                row.index,
+                label = row.label,
+            )
+        })?;
+        plan.push(entry);
+    }
+    if let Err(findings) = crate::plan::resolve(&plan) {
+        return Err(format!(
+            "依赖计划预检失败（来源 sidecar manifest；{} 个问题）:\n  - {}",
+            findings.len(),
+            findings.join("\n  - ")
+        ));
+    }
+    Ok(())
+}
+
+struct CollectedPlanEntry {
+    /// 非 group 行的遍历序号（与跳过/收集无关，便于错误定位）。
+    index: usize,
+    label: String,
+    spec: PlanEntrySpec,
+}
+
+fn collect_source_plan_entries(
+    entries: &[Entry],
+    disabled_by_ancestor: bool,
+    search: &[PathBuf],
+    source: &dyn PluginSource,
+    next_row: &mut usize,
+    out: &mut Vec<CollectedPlanEntry>,
+) -> std::result::Result<(), String> {
+    for entry in entries {
+        let disabled = disabled_by_ancestor || entry.disabled || entry.disabled_expr.is_some();
+        if entry.group {
+            collect_source_plan_entries(&entry.children, disabled, search, source, next_row, out)?;
+            continue;
+        }
+        let index = *next_row;
+        *next_row += 1;
+        if disabled {
+            continue;
+        }
+        let label = entry.id.clone().unwrap_or_else(|| entry.name.clone());
+        let spec = source.plan_entry(entry, search).map_err(|err| {
+            format!(
+                "第 {index} 行 {label}（插件 {}）的依赖声明不可用: {err}",
+                entry.name
+            )
+        })?;
+        if let Some(spec) = spec {
+            out.push(CollectedPlanEntry { index, label, spec });
+        }
+    }
+    Ok(())
 }
 
 async fn load(ctx: Ctx, config: LoaderConfig) -> Result<()> {
@@ -2144,6 +2289,12 @@ async fn load(ctx: Ctx, config: LoaderConfig) -> Result<()> {
 ///
 /// 返回 [`LoaderState`]：装载器不是"装完就定死"——运行期启停（[`LoaderState::set_disabled`]）
 /// 与对账（[`LoaderState::reconcile_once`] / [`LoaderState::reload`]）都要在这个状态上继续做。
+///
+/// # 依赖预检（P1-1）
+/// `dependencyPlan` 非空时只求解它（覆盖、不合并）；为空时逐行调用
+/// [`PluginSource::plan_entry`] 收集 sidecar manifest 的 `provides` / `requires`。
+/// 两条路径都在**创建 [`LoaderState`]、调用 `source.load` 或挂载之前**完成；
+/// 失败会直接返回错误，不会留下半棵树。HMR / 对账不会重跑预检。
 pub async fn load_with_source(
     ctx: Ctx,
     config: LoaderConfig,
@@ -2223,6 +2374,12 @@ pub async fn load_with_source(
         Some(dir) => vec![PathBuf::from(dir)],
         None => vec![base_dir.clone()],
     };
+    // P1-1：没有显式 dependencyPlan 时，从每个静态启用行的 sidecar manifest 收集
+    // provides / requires，并在创建 LoaderState、调用 source.load 之前求解。
+    // 显式计划是**覆盖**：非空时上面的预检已经跑过，这里既不合并也不读 manifest。
+    if config.dependency_plan.is_empty() {
+        preflight_source_dependency_plan(&entries, &search, source.as_ref())?;
+    }
     // 稳读窗口取轮询周期的四分之一（下限 10ms）：编辑器的"写临时文件再 rename"
     // 通常比这快得多，于是既不会误采纳半截文件，也不会让人等一个完整周期。
     let settle = config

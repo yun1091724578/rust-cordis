@@ -713,6 +713,10 @@ fn plugin_spec_for(artifact: &SealArtifact) -> Option<&'static PluginSpec> {
         .find(|spec| spec.package == artifact.package && spec.krate == artifact.krate)
 }
 
+/// seal 只写身份字段，不生成 P1-1 的 `provides` / `requires`。
+///
+/// 宿主 schema 接受这两个可选映射；需要依赖预检的发布方要在自己的流程里补充。
+/// `--verify` 仍要求 sidecar 与这里写出的规范字节一致，所以不要手改已封存目录。
 fn plugin_manifest_value(
     artifact: &SealArtifact,
     version: &str,

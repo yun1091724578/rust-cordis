@@ -74,21 +74,36 @@
 - 策略在实例注册时快照，运行期变更不追溯。
 - 这不是临时实现遗漏，而是当前 T2 的产品边界；不要把它写成 per-plugin 保证。
 
-### 3. P1-1：semver range 与依赖求解（显式配置预检已接线；manifest 采集未做）
+### 3. P1-1：semver range 与依赖求解（显式配置与 manifest 采集已接线；仅初装预检）
 
 - `crates/host/src/plan.rs` 提供纯数据求解器：`PlanEntry` 的
   `(id, version)`、`provides`、`requires` range；选择最高满足版本，
   拒绝缺失、不可满足、重复身份和同版本多提供者。
-- **已接线（配置级）**：`LoaderConfig.dependencyPlan` 用 `PlanEntrySpec`
+- **已接线（显式配置）**：`LoaderConfig.dependencyPlan` 用 `PlanEntrySpec`
   声明 `id` / `version` / `provides` / `requires`；非空时 `load_with_source`
   在**任何挂载之前**解析并调用 `resolve`。缺失、不可满足或歧义都会让本次装载
-  大声失败，不加载、不应用任何插件；空计划表示不做预检。
-- 测试：`crates/host/src/plan.rs` 的 7 个 `plan::tests`（含 spec 解析），
-  `crates/host/tests/dependency_plan.rs`（假源计数器证明失败发生在 `load`/`apply` 之前），
+  大声失败，不加载、不应用任何插件。
+- **已接线（manifest 采集）**：`PluginManifest` 增加可选
+  `provides` / `requires`（`#[serde(default)]`，旧 manifest 仍然合法）；
+  `PluginSource::plan_entry` 缺省返回 `Ok(None)`，`DiskPluginSource` 与 `load`
+  共用 `resolve_plugin_path` 读取 sidecar manifest。显式 `dependencyPlan` 为空时，
+  装载器在创建 `LoaderState` / 调用 `source.load` 之前逐行收集并在挂载前求解；
+  非空时显式计划是**覆盖**，manifest 计划既不读取也不合并。
+  没有任何 manifest 声明时不做预检（既有配置零行为变化）。
+- 测试：`crates/host/src/plan.rs` 的 `plan::tests`，
+  `crates/host/tests/dependency_plan.rs`（假源计数器证明失败发生在 `load`/`apply`
+  之前；覆盖、空计划、损坏 manifest、DiskPluginSource 的 sidecar 采集与坏 semver），
+  `crates/host/tests/source_policy.rs`（准入接受可选依赖字段），
   以及 `crates/host/src/loader.rs` 的 `dependencyPlan` YAML 解析测试。
-- **仍待办**：manifest / `PluginDesc` 的 `PlanEntry` 采集与 mount 期
-  自述校验。当前不会从插件自述推导依赖计划，也不会按插件 manifest 的
-  semver range 拒绝依赖——只有显式 `dependencyPlan` 才生效。
+- **边界与仍待办**：
+  - 预检只在**初装**发生；HMR / patch 对账 / 运行期启停不会重跑。改 manifest
+    或依赖声明后需要重新装载。
+  - 只收集**静态启用**的非 group 行；带 `disabled: !!js …` 的行不参与初装预检。
+  - `PluginDesc` 自述仍不参与求解；manifest 声明只用于预检，不改变运行时
+    `inject` / 服务可见性，也不证明插件真的提供声明的服务。
+  - `cargo xtask seal` 目前只写身份字段，不生成 `provides` / `requires`；
+    allow-list 读取会忽略这些可选字段，但 `seal --verify` 仍要求自身规范字节。
+  - 没有版本升级 / 回溯求解：一个服务键仍只能解析到一个提供者。
 - ABI 仍精确匹配；不要同时引入互相冲突的 `abi_min/abi_max` 规则。
 
 ### 4. P1-4：缓冲池化与性能（semver 之后）

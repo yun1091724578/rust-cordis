@@ -151,6 +151,44 @@ fn open_staged_verified_rejects_different_staged_bytes() {
     assert!(text.contains("暂存副本 SHA256"), "{text}");
 }
 
+/// P1-1 的可选依赖字段：sidecar 里的 `provides` / `requires` 被读入 manifest，
+/// allow-list 里的同名字段被忽略——两者都不能破坏既有准入校验。
+#[test]
+fn tolerates_optional_dependency_declarations_in_manifest_and_allow_list() {
+    let path = fixture("dependency-fields", b"abc");
+    let manifest = path.with_extension("dll.manifest.json");
+    std::fs::write(
+        &manifest,
+        serde_json::json!({
+            "id": "example.plugin",
+            "version": "0.1.0",
+            "source_revision": "abc123",
+            "abi_version": 1,
+            "sha256": SHA_ABC,
+            "provides": { "svc": "1.0.0" },
+            "requires": { "other": "^1" },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let allow_list = serde_json::json!({
+        "allowed": [{
+            "id": "example.plugin",
+            "version": "0.1.0",
+            "source_revision": "abc123",
+            "abi_version": 1,
+            "sha256": SHA_ABC,
+            "provides": { "ignored": "9.9.9" },
+        }],
+    })
+    .to_string();
+    let policy = PluginSourcePolicy::from_json(&allow_list).expect("allow-list 必须可解析");
+
+    let verified = policy.verify(&path).expect("可选依赖字段不得破坏准入");
+    assert_eq!(verified.manifest.provides["svc"], "1.0.0");
+    assert_eq!(verified.manifest.requires["other"], "^1");
+}
+
 #[test]
 fn rejects_a_non_semver_manifest_version() {
     let path = fixture("non-semver", b"abc");

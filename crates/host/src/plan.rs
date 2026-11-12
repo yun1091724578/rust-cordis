@@ -2,8 +2,10 @@
 //!
 //! 这一层只做纯数据求解，不读写动态库、不执行插件。调用方先收集
 //! [`PlanEntry`]，再用 [`resolve`] 得到每个服务键的唯一提供者；失败时
-//! 一次性返回所有可读问题。装载器的 `dependencyPlan` 走 [`PlanEntrySpec`]
-//! 在**任何挂载之前**调用它；从 manifest / `PluginDesc` 自动收集仍是待办。
+//! 一次性返回所有可读问题。装载器在**任何挂载之前**调用它：显式
+//! `LoaderConfig.dependencyPlan` 走 [`PlanEntrySpec`]，缺省时则从各行的
+//! sidecar `PluginManifest` 收集 `provides` / `requires`（`PluginSource::plan_entry`）。
+//! `PluginDesc` 自述仍不参与求解。
 
 use semver::{Version, VersionReq};
 use serde::Deserialize;

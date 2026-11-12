@@ -4,11 +4,16 @@
 //! `dlopen`/`LoadLibrary` 之前调用 [`PluginSourcePolicy::verify`]。
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 /// 插件随产物一起发布的清单。文件名是 `<artifact>.manifest.json`。
+///
+/// `provides` / `requires` 是 **P1-1 的可选依赖声明**：前者是服务键 → 该插件提供的
+/// 版本，后者是服务键 → 版本范围。旧 manifest 不带这两个字段仍然合法（缺省为空）；
+/// 它们只用于装载前的依赖预检，不是运行时注入或隔离的证明。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct PluginManifest {
     pub id: String,
@@ -16,6 +21,12 @@ pub struct PluginManifest {
     pub source_revision: String,
     pub abi_version: u32,
     pub sha256: String,
+    /// 服务键 → 该插件提供的 semver 版本（字符串形态，转换计划时才解析）。
+    #[serde(default)]
+    pub provides: BTreeMap<String, String>,
+    /// 服务键 → 该插件要求的 semver range（字符串形态，转换计划时才解析）。
+    #[serde(default)]
+    pub requires: BTreeMap<String, String>,
 }
 
 /// 允许加载的插件身份。`sha256` 是 artifact 的完整 SHA-256。
