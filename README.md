@@ -4,8 +4,10 @@ Cordis 的 Rust 实现：服务容器 + epoch 驱动的 fiber 生命周期 + 可
 
 ## 定位与边界
 
-本仓是**可信组件**的插件式服务运行时：服务组合、依赖管理、生命周期、配置装配与可演进 ABI。
-它不是微服务底座，不提供安全沙箱，也不保证无感热插拔或自动重试安全。
+本仓是**可信组件**的插件式服务运行时 / SDK：服务组合、依赖管理、生命周期、
+配置装配与可演进 ABI。它可以作为进程内服务组合、微服务实现或 agent 消费链的
+底层运行时，但**不是 agent 产品，也不是网络微服务框架**：不提供远程协议、
+安全沙箱、独立故障域，也不保证无感热插拔或自动重试安全。
 支持契约与证据索引见 [`docs/support-contract.md`](docs/support-contract.md)。
 
 插件来源按 [ADR 0005](docs/adr/0005-trust-model-and-plugin-source-boundary.md)：
@@ -169,10 +171,13 @@ ABI 和公开 API 未变。`rust-cordis-sdk`、`cordis-components`、`cordis-cli
 首发支持路径已定为**低层 ABI + 固定 revision 的源码依赖**：仓外工程 `../desolate`
 已用真实 DLL 验证装载、调用、失败、卸载、重载和 v1→v2 升级。标准 typed 门面
 `rust-cordis-sdk` 仍为 `publish = false`，过程宏依赖其 `cordis::typed` 运行时胶水；
-registry typed SDK 不在首发范围。仓外技术接入、31 篇样例归档任务和一条真实
-agent 首链路（模型流 → 归档工具 → 超时未知 → 关闭）已完成；R1 还需真实数据与
-长期维护反馈，第三方复现是额外证据而非门禁，详见
-[`docs/release.md`](docs/release.md)。agent 事件协议设计见
+registry typed SDK 不在首发范围。仓外技术接入与 31 篇样例归档任务已完成；R1
+还需真实数据与长期维护反馈，第三方复现是额外证据而非门禁，详见
+[`docs/release.md`](docs/release.md)。
+
+`../desolate` 中的 agent 链（模型流 → 归档工具 → 超时未知 → 关闭）是**仓外
+消费者验证**，不是本仓产品主线；agent 事件、模型 provider 与 SSE 传输不会
+进入 core/host 公共 API。协议设计仅作为消费者参考保留在
 [`docs/agent-stream-protocol.md`](docs/agent-stream-protocol.md)。
 
 ## 许可证

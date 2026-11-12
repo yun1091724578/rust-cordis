@@ -27,7 +27,7 @@
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离 |
 | C. 可信单租户底座 P0 | **按边界完成** | 来源策略、App 粒度策略、容量准入、锁纪律、容量 waterfall 专项测试 | per-plugin/method 明确不提供；永久 hang 属 T2 |
 | D. 长期运行 P1 | **基本完成** | 1M soak、RSS、真实 `open_staged` soak、dhat、版本矩阵、semver 计划、调用缓冲池 | 从 `PluginDesc` 自动采集、升级/回溯求解 |
-| E. agent 流处理 | **有界增量交付完成** | 六模式、23 个 agent_stream 单测、即时 JSONL、事件/终止/文本/工具上限、事件窗口、run_id、模型 idle timeout | 真实模型、慢消费者、取消/预算、SSE 在线 sink |
+| E. 仓外消费者证据 | **外部验证，不是本仓主线** | `desolate` 的 agent 链、HTTP SSE adapter、预算 smoke | agent/model/SSE 协议不进入核心 SDK；只有被两类消费者共同需要的原语才立 ADR |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 第三方/模型生成/多租户/硬抢占触发时另立 ADR |
 | G. 维护治理 | **持续** | R4/R5/R6 已登记 | serde_yaml、宿主模块、锁/panic 审查 |
 
@@ -38,7 +38,8 @@
 - 最新全绿三平台 CI：`43196946690`
 - 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal` 与 Release assets
 - 仓库公开；标准 GitHub-hosted Runner 不再消耗私有分钟
-- `desolate` agent_stream：23 个单测通过；该工程无 git
+- `desolate` 消费者证据：27 个 host 单测 + 7 个 HTTP adapter 单测；该工程无 git，
+  不作为本仓交付门禁
 
 ## 最近交付
 
@@ -87,7 +88,7 @@
   ```
 - 这是缓冲复用，不是零拷贝，也不改变 16 KiB 初始上限。
 
-### E：agent 有界增量交付
+### E：仓外消费者证据（`desolate`，非本仓交付）
 
 - JSONL sink emit 即写/flush；超限事件在写文件前拒绝，不留下半行。
 - `StreamLimits`：事件 64 KiB、终止 512 KiB、10k 事件、256 KiB 文本、1024 工具、
@@ -101,45 +102,40 @@
 
 ## 下一步（按顺序）
 
-### 1. 真实模型适配器（基础版已落地）
+本仓是 **SDK / 运行时底座**，不是 agent 产品，也不是网络微服务框架。
+`desolate` 只是消费者验证工程；agent 事件、模型适配器、SSE 传输属于消费者侧，
+不能反向变成 host/core 的产品主线。
 
-- `desolate-agent-model` 支持可选 OpenAI-compatible 纯 HTTP SSE：
-  - `choices[0].delta.content` → `text.delta`；
-  - `[DONE]` → stream close；
-  - 流内 `error.message` → `stream_fail`；
-  - EOF without `[DONE]` → failure；
-  - `--model-api-key-env` 从环境读取凭据，不进事件。
-- `--model-endpoint` / `--model` 已接入 `desolate agent`；无 endpoint 时保留确定性模式。
-- 已测：URL、SSE token、`[DONE]`、error、EOF、停止消费，共 7 个 adapter 单测。
-- **未完成**：HTTPS/TLS、工具参数增量、usage、真实 provider 人工 smoke、
-  本地 mock HTTP 的 CI 集成。HTTPS 需要 TLS 客户端或外部 reverse proxy。
-- 不新增 `Last-Event-ID` replay，不把模型错误自动重试。
+### 1. 公开 API / ABI 稳定与版本治理
 
-### 2. 取消与预算（模型预算基础版已落地）
-
-- `desolate agent --total-timeout-ms`（默认 60000）包住整个 chain；
-  `--first-token-timeout-ms`（默认 30000）与 `--idle-timeout-ms`（默认 30000）
-  分别约束首包和 token 间隔。
-- 到期输出 `timed_out/unknown`、`HOST_TIMEOUT/timeout`，report 标
-  `incomplete=false`；模型超时不再继续调用工具。
-- 已做立即总预算和“本地 HTTP 接受连接但不回包”的 first-token 端到端 smoke：
-  4 个事件，最后是 `run.finished`。
-- **未完成**：connect/工具/sink 的独立预算；模型、工具、sink 的显式取消；
-  取消与 sink 写入竞争；provider 忽略 socket close 的兜底。
-- 记录 termination reason、certainty、run_id、last_seq，避免把“断流”写成成功。
-
-### 3. SSE 在线 sink
-
-- 先做本地 HTTP SSE；终止后关闭响应体。
-- 断流但没有终止事件 = truncated run；第一版不做 replay。
-- JSONL 继续保留为本地证据格式。
-
-### 4. P1 版本治理收尾
-
-- 从 `PluginDesc` 自动采集 provides/requires，而不是只靠 sidecar/手写表。
-- 决定是否引入 `provides`/`requires` 的 ABI 尾字段；ABI 仍精确匹配，不引入冲突的
+- 先冻结 SDK 的受控公开面：ABI 前缀/结构、host/core/SDK 入口、错误载荷。
+- 对新增公开类型评估 `#[non_exhaustive]`，建立 0.1 → 0.2 的迁移说明。
+- 版本号、ABI 精确匹配、插件 semver 分开表达；不在同一版引入冲突的
   `abi_min/abi_max` 双轨规则。
-- 版本升级/回溯求解必须另有真实消费者和测试，不先造抽象。
+- 验收：`inventory --check`、支持契约、API 文档与至少两个嵌入示例一致。
+
+### 2. 消费者中立的嵌入契约
+
+- 用两个消费者验证同一组原语：服务运行时与 agent 运行时。
+- 只把**两者都需要**的能力放进 core/host：生命周期、依赖注入、服务接口、
+  配置 schema、错误通道、容量与取消边界。
+- agent 协议、模型 provider、SSE、JSONL 继续留在消费者工程；不把它们的字段
+  加进 `PluginDesc` 或 host 公共类型。
+- 验收：两个消费者都不需要 fork runtime；核心 crate 不依赖 agent 词汇。
+
+### 3. 插件身份与依赖治理
+
+- 从 `PluginDesc` 自动采集 provides/requires，作为 sidecar 的补充，而不是只靠
+  手写表。
+- 决定是否需要 ABI 尾字段；先做真实消费者需要的版本诊断，不先造升级/回溯求解。
+- 继续保留 `strictSidecars` 的显式严格模式；默认宽松是兼容选择，不是安全承诺。
+
+### 4. 微服务运行时原语审查
+
+- 审查服务注册表、生命周期、配置装配、错误语义和取消边界是否足以支撑
+  **进程内可信服务组合**。
+- 网络协议、远程调用、独立故障域不属于 T2；需要时另立 T3/传输 ADR。
+- 不把 realm/scope 宣传成安全边界或租户隔离。
 
 ### 5. 发布证据收尾
 
@@ -149,6 +145,19 @@
   自定义 rustflags 仍待完整记录。
 - `--require-v2` 已提供，但默认 verify 仍兼容 `/1`；发布门禁必须显式使用。
 - seal source digest 仍缺 tag/commit 字段绑定。
+
+## 仓外消费者证据（非主线）
+
+### `desolate` agent 链
+
+- 可选 OpenAI-compatible 纯 HTTP SSE adapter：`delta.content`、`[DONE]`、
+  流内 error、EOF without `[DONE]`；7 个 adapter 单测。
+- `--total-timeout-ms` / `--first-token-timeout-ms` / `--idle-timeout-ms`
+  已验证 `timed_out/unknown` 收尾；属于消费者预算，不是 host 取消协议。
+- 未完成：HTTPS/TLS、工具参数增量、usage、真实 provider smoke、SSE sink、
+  显式 provider cancel。
+- 这些能力不进入本仓 roadmap 主队列；如果某个原语被服务运行时和 agent
+  运行时共同需要，先写 ADR 再进 core/host。
 
 ## 阶段 0：验证基线
 
