@@ -38,6 +38,7 @@ pub mod dylib;
 pub mod js;
 pub mod loader;
 pub mod patch;
+pub mod plan;
 pub mod source;
 
 use crate::source::PluginSourcePolicy;

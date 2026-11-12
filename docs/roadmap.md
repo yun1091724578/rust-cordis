@@ -26,7 +26,7 @@
 | A. 低层 ABI 与发布 | **基本完成** | 0.1.0/0.1.1 已发布；正式 `/2` 封存已从 tag 生成并归档；公开仓 CI、版本矩阵、SCM 一次实测 | 严格同版本封存证据、历史兼容可重复测试 |
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离，不能升级成安全承诺 |
 | C. 可信单租户底座 P0 | **按边界完成** | 来源策略；App 粒度 dispatch policy；宿主容量准入；生命周期清理不阻塞 tokio worker；P0-4 边界已记录 | per-plugin/method 明确不提供；永久 hang 属 T2 |
-| D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI | semver range/依赖图求解、缓冲池 |
+| D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI、semver 依赖计划解析核心 | semver 计划接线 mount、缓冲池 |
 | E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型、取消/预算 |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 只有第三方/模型生成/多租户触发时另立 ADR |
 | G. 维护治理 | **持续** | R4/R5/R6 已登记 | serde_yaml、宿主模块、锁/panic 审查 |
@@ -74,10 +74,15 @@
 - 策略在实例注册时快照，运行期变更不追溯。
 - 这不是临时实现遗漏，而是当前 T2 的产品边界；不要把它写成 per-plugin 保证。
 
-### 3. P1-1：semver range 与依赖求解
+### 3. P1-1：semver range 与依赖求解（解析核心已落地，未接线 mount）
 
-- 当前只校验 manifest `version` 是 semver；没有 `provides`/`requires` range。
-- 先决定 manifest 字段和 ABI 尾字段，再做 mount 前解析、歧义/缺失拒绝、`(id, version)` 身份。
+- `crates/host/src/plan.rs` 已提供纯数据求解器：`PlanEntry` 的
+  `(id, version)`、`provides`、`requires` range；选择最高满足版本，
+  拒绝缺失、不可满足、重复身份和同版本多提供者。
+- 测试：`crates/host/src/plan.rs` 的 4 个 `plan::tests`。
+- **尚未接线**：没有从 manifest / loader 收集 `PlanEntry`，也没有在 mount 前调用
+  `resolve`；因此运行时仍不会按 semver range 拒绝依赖。
+- 下一步需要决定 manifest 字段与 `PluginDesc` 尾字段，再接入 loader。
 - ABI 仍精确匹配；不要同时引入互相冲突的 `abi_min/abi_max` 规则。
 
 ### 4. P1-4：缓冲池化与性能（semver 之后）
