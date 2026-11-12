@@ -1142,6 +1142,34 @@ fn insert_dispatch(
     Ok(())
 }
 
+/// 等所有同步插件回调退出，拿到 lifecycle 写锁后立即释放。
+///
+/// 有 tokio runtime 时用 blocking pool，避免把 async worker 一起阻塞；没有
+/// runtime 时退回同步等待（调用方不在 tokio 上，不会饿死 worker）。blocking
+/// 任务被取消或 panic 时同样退回同步等待，**绝不跳过闸门继续卸载**。
+async fn wait_lifecycle_exclusive(instance: &Instance) {
+    let lifecycle = instance.lifecycle.clone();
+    if tokio::runtime::Handle::try_current().is_err() {
+        let _wait = lifecycle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        return;
+    }
+    let blocking = lifecycle.clone();
+    if tokio::task::spawn_blocking(move || {
+        let _wait = blocking
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    })
+    .await
+    .is_err()
+    {
+        let _wait = lifecycle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
 /// 一个实例的**在飞派发记录**总数（诊断口径）：含挂起续延、waterfall 帧与出站节点。
 /// 句柄已失效 ⇒ 0（实例连同它的记录一起被排水）。
 pub fn dispatches_len(handle: u64) -> usize {
@@ -1923,8 +1951,10 @@ impl Drop for CallBuffer {
     fn drop(&mut self) {
         let mut buffer = std::mem::take(&mut self.0);
         if buffer.capacity() == 16 * 1024 {
-            // 保留 16 KiB 长度；插件只会写 `out.len` 字节，下一次 take 不需要清零。
+            // 插件可以在 out.len 之外读取到 out.cap；池化缓冲必须清零，
+            // 否则同线程的下一个插件会看到上一次调用的残留数据。
             buffer.resize(16 * 1024, 0);
+            buffer.fill(0);
             CALL_BUFFER_POOL.with(|pool| pool.borrow_mut().push(buffer));
         }
     }
@@ -3739,17 +3769,7 @@ fn apply_via_with_keepalive_and_format(
                     let mut outbound = Vec::new();
                     if let Some(instance) = &instance {
                         instance.closed.store(true, Ordering::SeqCst);
-                        {
-                            // `lifecycle` 是 std::sync::RwLock：插件回调会同步持有
-                            // 读锁。这里若在 async 任务里直接等写锁，会把 tokio
-                            // worker 一起阻塞；用 blocking pool 等待，回调退出后
-                            // 再回到 async 清理路径。
-                            let lifecycle = instance.lifecycle.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                let _wait = lifecycle.write().unwrap();
-                            })
-                            .await;
-                        }
+                        wait_lifecycle_exclusive(instance).await;
                         // M2/M2b/M2c：反复排水，直到派发表与“已取消待回收”
                         // 集合都为空。取快照时必须**同时持有派发表锁**：取消
                         // 路径在同一把锁内完成“摘记录 + 登记 done”，否则关闭
@@ -4490,6 +4510,19 @@ mod tests {
 
     unsafe extern "C" fn bench_call(_: u64, _: u32, _: Blob, _: Blob, out: *mut Out) -> i32 {
         (*out).write(b"pong")
+    }
+
+    #[test]
+    fn call_buffer_pool_does_not_expose_stale_bytes() {
+        let mut first = CallBuffer::take();
+        first.0[..8].copy_from_slice(b"leftover");
+        drop(first);
+        let second = CallBuffer::take();
+        assert_eq!(second.len(), 16 * 1024);
+        assert!(
+            second.0.iter().all(|byte| *byte == 0),
+            "池化缓冲必须清零，不能把上一个插件的残留交给下一个插件"
+        );
     }
 
     /// 手动基准：`cargo test -p rust-cordis-host --lib call_buffer_pool_benchmark -- --ignored --nocapture`
