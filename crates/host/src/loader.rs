@@ -122,6 +122,27 @@ pub struct LoaderConfig {
     pub dependency_plan: Vec<PlanEntrySpec>,
 }
 
+impl LoaderConfig {
+    /// 嵌入方的稳定构造入口：只要求主配置路径，其余使用 fail-loud 默认值。
+    /// 需要 patch / HMR / 自定义策略时再显式覆盖公开字段。
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            patches: Vec::new(),
+            plugin_dir: None,
+            strict: true,
+            strict_cycles: false,
+            strict_sidecars: false,
+            hmr: None,
+            js_evaluator: None,
+            interpolation: InterpolationMode::Builtin,
+            dispatch_policy: None,
+            host_limits: None,
+            dependency_plan: Vec::new(),
+        }
+    }
+}
+
 /// `!!js` 的求值模式（M9，D5，**P2**）。
 ///
 /// 为什么需要它：内置子集是**本仓的兼容产物**（参考实现是 `new Function + with(ctx)`，
@@ -3994,6 +4015,22 @@ mod tests {
             "path: cordis.yml\nhostLimits: {maxInstancesPerApp: 0}\n",
         );
         assert!(zero.is_err(), "0 不是“无限”，必须作为非法配置拒绝");
+    }
+
+    #[test]
+    fn loader_config_new_has_safe_defaults() {
+        let config = LoaderConfig::new("cordis.yml");
+        assert_eq!(config.path, "cordis.yml");
+        assert!(config.patches.is_empty());
+        assert!(config.plugin_dir.is_none());
+        assert!(config.strict, "默认 fail loud");
+        assert!(!config.strict_cycles);
+        assert!(!config.strict_sidecars);
+        assert!(config.hmr.is_none());
+        assert!(config.js_evaluator.is_none());
+        assert!(config.dispatch_policy.is_none());
+        assert!(config.host_limits.is_none());
+        assert!(config.dependency_plan.is_empty());
     }
 
     /// P1-1：`dependencyPlan` 是 `LoaderConfig` 的 camelCase 字段；缺省为空表示

@@ -155,6 +155,7 @@
 | `PluginSource` | trait | `crates/host/src/loader.rs` |
 | `LoadedFile` | struct | `crates/host/src/loader.rs` |
 | `load_with_source` | fn | `crates/host/src/loader.rs` |
+| `LoaderConfig::new` | fn | `crates/host/src/loader.rs` |
 | `Entry` | struct | `crates/host/src/patch.rs` |
 | `service` | attribute macro | `crates/macros/src/lib.rs` |
 | `service_impl` | attribute macro | `crates/macros/src/lib.rs` |

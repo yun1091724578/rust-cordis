@@ -487,6 +487,12 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub async fn load_with_source",
     },
     PublicItem {
+        item: "LoaderConfig::new",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub fn new(path: impl Into<String>) -> Self",
+    },
+    PublicItem {
         item: "Entry",
         kind: "struct",
         source: "crates/host/src/patch.rs",
@@ -1112,7 +1118,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 76, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 77, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 
