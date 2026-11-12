@@ -115,12 +115,16 @@
   本地 mock HTTP 的 CI 集成。HTTPS 需要 TLS 客户端或外部 reverse proxy。
 - 不新增 `Last-Event-ID` replay，不把模型错误自动重试。
 
-### 2. 取消与预算（总预算基础版已落地）
+### 2. 取消与预算（模型预算基础版已落地）
 
-- `desolate agent --total-timeout-ms`（默认 60000）已包住整个 chain；
-  到期输出 `timed_out/unknown`、`HOST_TIMEOUT/timeout`，report 标 `incomplete=false`。
-- 已做立即预算端到端 smoke：4 个事件，最后是 `run.finished`。
-- **未完成**：connect / first-token / idle 独立预算；模型、工具、sink 的显式取消；
+- `desolate agent --total-timeout-ms`（默认 60000）包住整个 chain；
+  `--first-token-timeout-ms`（默认 30000）与 `--idle-timeout-ms`（默认 30000）
+  分别约束首包和 token 间隔。
+- 到期输出 `timed_out/unknown`、`HOST_TIMEOUT/timeout`，report 标
+  `incomplete=false`；模型超时不再继续调用工具。
+- 已做立即总预算和“本地 HTTP 接受连接但不回包”的 first-token 端到端 smoke：
+  4 个事件，最后是 `run.finished`。
+- **未完成**：connect/工具/sink 的独立预算；模型、工具、sink 的显式取消；
   取消与 sink 写入竞争；provider 忽略 socket close 的兜底。
 - 记录 termination reason、certainty、run_id、last_seq，避免把“断流”写成成功。
 
