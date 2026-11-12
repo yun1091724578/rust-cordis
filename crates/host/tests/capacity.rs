@@ -319,6 +319,85 @@ async fn dispatch_cap_rejects_before_plugin_code_and_leaves_no_residue() {
     app.close().await;
 }
 
+// ---------------------------------------------------------------- waterfall 容量拒绝
+
+static WATERFALL_HANDLE: AtomicU64 = AtomicU64::new(0);
+static WATERFALL_DOWNSTREAM: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn waterfall_cap_call(
+    handle: u64,
+    op: u32,
+    a: Blob,
+    _: Blob,
+    out: *mut Out,
+) -> i32 {
+    match op {
+        OP_APPLY => {
+            WATERFALL_HANDLE.store(handle, Ordering::SeqCst);
+            if !register_event(handle, b"cap/hold", 7)
+                || !register_event(handle, b"cap/waterfall", 8)
+            {
+                return STATUS_UNSUPPORTED;
+            }
+            (*out).write(b"")
+        }
+        OP_CALLBACK => {
+            let payload: Value = serde_json::from_slice(a.as_bytes()).unwrap_or(Value::Null);
+            let event = payload.get("event").and_then(Value::as_str).unwrap_or("");
+            if event == "cap/hold" {
+                STATUS_PENDING
+            } else {
+                (*out).write(b"")
+            }
+        }
+        OP_DISPOSE => (*out).write(b""),
+        _ => STATUS_UNSUPPORTED,
+    }
+}
+
+/// 事件监听器因容量被拒绝时，waterfall 的剩余链仍必须执行。
+#[tokio::test]
+async fn capacity_rejection_does_not_drop_waterfall_tail() {
+    WATERFALL_HANDLE.store(0, Ordering::SeqCst);
+    WATERFALL_DOWNSTREAM.store(0, Ordering::SeqCst);
+    let app = App::new();
+    set_host_limits_for(
+        &app.root,
+        HostLimits {
+            max_dispatches_per_instance: 1,
+            ..HostLimits::default()
+        },
+    )
+    .expect("正整数上限必须被接受");
+    let fiber = mount(&app, "cap-waterfall", waterfall_cap_call).await;
+    let handle = WATERFALL_HANDLE.load(Ordering::SeqCst);
+    assert_ne!(handle, 0);
+
+    // 占住唯一派发名额：监听器挂起，不再结算。
+    let hold = {
+        let root = app.root.clone();
+        tokio::spawn(async move { root.emit("cap/hold", Vec::new()).await })
+    };
+    wait_until("挂起记录进入派发表", || pending_len(handle) == 1).await;
+
+    // 后注册的下游 handler：如果容量拒绝吞掉 frame，它不会执行。
+    app.root.on("cap/waterfall", move |_call| {
+        WATERFALL_DOWNSTREAM.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { None })
+    });
+    let result = app.root.bail("cap/waterfall", Vec::new()).await;
+    assert!(result.is_none());
+    assert_eq!(
+        WATERFALL_DOWNSTREAM.load(Ordering::SeqCst),
+        1,
+        "容量拒绝不能吞掉 waterfall 下游"
+    );
+
+    hold.abort();
+    fiber.dispose().await;
+    app.close().await;
+}
+
 // ---------------------------------------------------------------- 挂起上限
 
 static PENDING_HANDLE: AtomicU64 = AtomicU64::new(0);
