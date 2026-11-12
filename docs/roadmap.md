@@ -19,136 +19,132 @@
 - 阶段结束时同时更新本文件、支持契约和发布门禁；只改代码不改状态视为未完成。
 - “完成”只指验收出口满足，不等于交付物存在或局部测试通过。
 
-## 当前判断（2026-11-09）
+## 当前判断（2026-11-12）
 
 | 工作线 | 状态 | 已落地 | 未闭合 |
 |---|---|---|---|
-| A. 低层 ABI 与发布 | **基本完成** | 0.1.0/0.1.1 已发布；正式 `/2` 封存已从 tag 生成并归档；公开仓 CI、版本矩阵、SCM 一次实测 | 严格同版本封存证据、历史兼容可重复测试 |
-| B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离，不能升级成安全承诺 |
-| C. 可信单租户底座 P0 | **按边界完成** | 来源策略；App 粒度 dispatch policy；宿主容量准入；生命周期清理不阻塞 tokio worker；P0-4 边界已记录 | per-plugin/method 明确不提供；永久 hang 属 T2 |
-| D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI、semver 依赖计划（配置 + sidecar + 对账/reload 预检）、16 KiB 调用缓冲池 | 从 `PluginDesc` 自动采集、升级/回溯求解 |
-| E. agent 流处理 | **有界增量交付完成** | 六模式状态机；23 个 agent_stream 单测；JSONL 即时写入；事件/终止/文本/工具上限；事件窗口；工具结果截断；sink 回滚；显式 run_id | 真实模型、慢消费者、取消/预算、SSE 在线 sink |
-| F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 只有第三方/模型生成/多租户触发时另立 ADR |
+| A. 低层 ABI 与发布 | **基本完成** | 0.1.0/0.1.1 发布；正式 `/2` 封存；公开仓 CI；版本矩阵；SCM 一次实测 | 严格同版本封存证据、历史发布版可重复测试 |
+| B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离 |
+| C. 可信单租户底座 P0 | **按边界完成** | 来源策略、App 粒度策略、容量准入、锁纪律、容量 waterfall 专项测试 | per-plugin/method 明确不提供；永久 hang 属 T2 |
+| D. 长期运行 P1 | **基本完成** | 1M soak、RSS、真实 `open_staged` soak、dhat、版本矩阵、semver 计划、调用缓冲池 | 从 `PluginDesc` 自动采集、升级/回溯求解 |
+| E. agent 流处理 | **有界增量交付完成** | 六模式、23 个 agent_stream 单测、即时 JSONL、事件/终止/文本/工具上限、事件窗口、run_id、模型 idle timeout | 真实模型、慢消费者、取消/预算、SSE 在线 sink |
+| F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 第三方/模型生成/多租户/硬抢占触发时另立 ADR |
 | G. 维护治理 | **持续** | R4/R5/R6 已登记 | serde_yaml、宿主模块、锁/panic 审查 |
 
-阶段基线：
+### 基线
 
-- 支持契约 **26 行 / 17 条保证**
-- API 清单 **23 常量 / 4 结构 / 41 字段 / 76 公开入口 / 32 载荷**
-- 0.1.1 三平台 CI：`42332542433`、tag `42332542329`
-- 公开仓 CI：`42605690959` success
-- 版本矩阵：`42606045837` success
-- nightly 小轮次 + dhat：`42606720459` success
-- 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal` 与 GitHub Release assets
-- 仓库已公开：标准 GitHub-hosted Runner 不再消耗私有仓库 Actions 分钟
+- 支持契约：**26 行 / 17 条保证**
+- API 清单：**23 常量 / 4 结构 / 41 字段 / 76 公开入口 / 32 载荷**
+- 最新全绿三平台 CI：`43196946690`
+- 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal` 与 Release assets
+- 仓库公开；标准 GitHub-hosted Runner 不再消耗私有分钟
+- `desolate` agent_stream：23 个单测通过；该工程无 git
 
 ## 最近交付
 
-### P0-3：容量与准入（2026-11-09，已交付）
+### P0-3：容量与准入
 
-- `HostLimits`（`maxInstancesPerApp` / `maxDispatchesPerInstance` /
-  `maxPendingPerInstance` / `maxStreamsPerInstance`），按 App 注册表 + 进程级回落；
-  `LoaderConfig.hostLimits` 在挂载前登记，实例注册时取快照。
-- 实例准入与插入在同一把实例表锁内完成；四类派发记录插入统一经
-  `insert_dispatch`，超限返回 `host_capacity` / `capacity` / `not_executed`，
-  不插入记录、不执行插件代码。
-- 默认 1024 / 1024 / 256 / 32；0 是非法配置，不是“无限”。
-- 证据：`crates/host/tests/capacity.rs`（实例 / 派发 / 挂起 / 流四条拒绝路径与
-  计数回基线）、`crates/host/src/loader.rs::loader_config_parses_host_limits_from_yaml`。
-- 边界：这是宿主侧表项准入，不是每插件的内存/CPU 硬上限；硬上限仍属 T3。
+- `HostLimits`：instances / dispatches / pending / streams；默认 1024/1024/256/32；
+  0 非法，不解释成无限。
+- 检查与插入同锁；拒绝返回 `host_capacity/capacity/not_executed`，不执行插件代码。
+- 实例、派发、挂起、流拒绝与计数回基线：`crates/host/tests/capacity.rs`。
+- 入站事件容量拒绝会**继续执行 waterfall 下游**；专项测试
+  `capacity_rejection_does_not_drop_waterfall_tail`。
 
-## 下一步（按顺序）
+### P0-4：锁纪律（按 T2 边界关闭）
 
-### 1. P0-4：锁纪律（按边界关闭）
+- 回调期间不持实例表/派发表锁；卸载清理等待 lifecycle 写锁不再阻塞 tokio worker。
+- `wait_lifecycle_exclusive`：有 runtime 用 blocking pool；无 runtime 同步等待；
+  JoinError/取消退回同步等待；锁中毒取回 poisoned guard。
+- 测试：回调自卸载、阻塞回调 + 并发 dispose、实例归零。
+- **永久 hang 不可抢占**；panic/锁中毒未发现可达 trigger，但不承诺不存在。
 
-- 已审计 `call_inbound` 的 lifecycle 读锁跨调用：回调期间不持实例表/派发表锁。
-- 已修：卸载清理等待 `std::RwLock` 写锁时改用 `spawn_blocking`，不再阻塞 tokio worker。
-- 已测：回调内 `ctx_dispose_self`、阻塞回调 + 并发 dispose，均无死锁且实例归零。
-- **接受为 T2 边界**：永久 hang 不可抢占；panic/锁中毒没有找到可达 trigger，因此不承诺不存在。
-- 后续只在真实故障或 T3 需求出现时重开；不为此引入伪抢占线程池。
+### P1-1：semver 依赖计划
 
-### 2. P0-2：App 粒度决策（关闭）
+- `crates/host/src/plan.rs`：`(id, version)`、provides、requires range；选择最高满足版本；
+  拒绝缺失、不可满足、重复身份、同版本多提供者。
+- 显式 `LoaderConfig.dependencyPlan` 在挂载前求解；非空时覆盖 manifest 计划。
+- sidecar manifest 可选 `provides` / `requires`；`DiskPluginSource::plan_entry`
+  读取 sidecar；初装、对账、`reload_one` 前都重跑预检。
+- 同插件多实例的相同计划去重；`disabled: !!js` 保守纳入；混合来源（部分行无
+  sidecar）跳过整次 manifest 预检，避免误拒。
+- 有来源策略时 sidecar 先过 admission。
+- reload 预检失败回滚 `main_only` / `owners` / `main_baseline`；
+  `set_disabled` 失败回滚树并返回 `Err`。
+- `LoaderConfig.strictSidecars` 默认 false：坏 sidecar 跳过预检；true 则装载前硬失败。
+- seal 写真实 key：`sessions@1`、`tool.harness-echo@1`、`harness.status@1`、
+  `harness.stream@1`，并保留 hello 的 PENDING 语义（不写硬 requires）。
+- 旧 `/2` 没有依赖字段仍可 verify；`--require-v2` 可拒绝把 `/2` 改成 `/1` 绕过 provenance。
+- 剩余：`PluginDesc` 自动采集、版本升级/回溯求解；manifest 声明只做预检，不是运行时授权。
 
-- **明确只提供 App 粒度**，不提供 per-plugin/per-method 配置。
-- 同一 App 下多个 loader 的 `dispatchPolicy` / `hostLimits` 是后设置覆盖；不是每 loader 独立。
-- 策略在实例注册时快照，运行期变更不追溯。
-- 这不是临时实现遗漏，而是当前 T2 的产品边界；不要把它写成 per-plugin 保证。
+### P1-4：调用缓冲池
 
-### 3. P1-1：semver range 与依赖求解（初装/对账/reload 预检）
-
-- `crates/host/src/plan.rs` 提供纯数据求解器：`PlanEntry` 的
-  `(id, version)`、`provides`、`requires` range；选择最高满足版本，
-  拒绝缺失、不可满足、重复身份和同版本多提供者。
-- **已接线（显式配置）**：`LoaderConfig.dependencyPlan` 用 `PlanEntrySpec`
-  声明 `id` / `version` / `provides` / `requires`；非空时 `load_with_source`
-  在**任何挂载之前**解析并调用 `resolve`。缺失、不可满足或歧义都会让本次装载
-  大声失败，不加载、不应用任何插件。
-- **已接线（manifest 采集）**：`PluginManifest` 增加可选
-  `provides` / `requires`（`#[serde(default)]`，旧 manifest 仍然合法）；
-  `PluginSource::plan_entry` 缺省返回 `Ok(None)`，`DiskPluginSource` 与 `load`
-  共用 `resolve_plugin_path` 读取 sidecar manifest。显式 `dependencyPlan` 为空时，
-  装载器在创建 `LoaderState` / 调用 `source.load` 之前逐行收集并在挂载前求解；
-  非空时显式计划是**覆盖**，manifest 计划既不读取也不合并。
-  没有任何 manifest 声明时不做预检（既有配置零行为变化）。
-- 测试：`crates/host/src/plan.rs` 的 `plan::tests`，
-  `crates/host/tests/dependency_plan.rs`（假源计数器证明失败发生在 `load`/`apply`
-  之前；覆盖、空计划、损坏 manifest、DiskPluginSource 的 sidecar 采集与坏 semver），
-  `crates/host/tests/source_policy.rs`（准入接受可选依赖字段），
-  以及 `crates/host/src/loader.rs` 的 `dependencyPlan` YAML 解析测试。
-- **边界与仍待办**：
-  - 初装、对账和 `reload_one` 前都会重跑预检；对账失败不采纳新树，只把问题
-    放进 outcome。
-  - 只收集**静态启用**的非 group 行；带 `disabled: !!js …` 的行不参与初装预检。
-  - `PluginDesc` 自述仍不参与求解；manifest 声明只用于预检，不改变运行时
-    `inject` / 服务可见性，也不证明插件真的提供声明的服务。
-  - `cargo xtask seal` 会为三个示例插件写出 `provides` / `requires`；
-    `seal --verify` 仍要求自身规范字节，手工修改 sidecar 会失败。旧 `/2`
-    没有这两个字段时仍可兼容 verify；hello 不写硬 `requires`，保留 PENDING。
-  - 没有版本升级 / 回溯求解：一个服务键仍只能解析到一个提供者。
-- ABI 仍精确匹配；不要同时引入互相冲突的 `abi_min/abi_max` 规则。
-
-### 4. P1-4：缓冲池化与性能（已交付）
-
-- `invoke_raw_with` 使用线程本地 16 KiB `CallBuffer`；标准大小回收，`TOO_SMALL`
-  扩容后的异常大缓冲不进入池。
+- `invoke_raw_with` 使用线程本地 16 KiB `CallBuffer`；标准大小复用；
+  `TOO_SMALL` 扩容后的大缓冲不入池；回收前清零，避免跨插件残留。
 - 手动基准：
   ```text
   cargo test -p rust-cordis-host --lib call_buffer_pool_benchmark -- --ignored --nocapture
-  100000 calls / 32.487ms / 324.9 ns/call
   ```
-- 这是调用缓冲复用，不是零拷贝，也不改变 16 KiB 初始上限。
-- 线程池仍不能取消同步调用；若保留，只能作为故障隔离，必须证明超时后不卸载、不释放插件，线程泄漏要登记。
+- 这是缓冲复用，不是零拷贝，也不改变 16 KiB 初始上限。
 
-### 5. agent 有界增量交付（已交付）
+### E：agent 有界增量交付
 
-- `desolate/host/src/agent_stream.rs` 增加 `StreamLimits`：
-  - `maxEventBytes` / `maxEvents` / `maxTextBytes` / `maxTools`
-  - 0 值拒绝。
-- JSONL sink 改为**即时逐行写入并 flush**，不再等 run 结束一次性写。
-- 超限在序列化/写文件前拒绝，不留下半行；sink 路径错误可读。
-- 未完成：慢消费者（同步文件 sink 没有队列）、无终止事件 EOF 的进程外重放、
-  取消与 sink 写入竞争；这些留给下一批。
+- JSONL sink emit 即写/flush；超限事件在写文件前拒绝，不留下半行。
+- `StreamLimits`：事件 64 KiB、终止 512 KiB、10k 事件、256 KiB 文本、1024 工具、
+  流式内存窗口 256 条；0 值拒绝。
+- 终止事件独立预算，不被 `maxEvents` 饿死。
+- 工具 arguments/result 超预算截断为 `{truncated:true,...}`，保留原 status。
+- sink 写入/flush 失败回退到写入前偏移；显式 `run_id` 进事件与 report；
+  模型流 30 秒 idle timeout。
+- 剩余：真实模型适配器、慢消费者/队列、取消与预算贯穿、sink 故障注入测试、
+  SSE 在线 sink。
 
-### 6. 真实模型与取消预算
+## 下一步（按顺序）
 
-- 接一个真实模型适配器，验证文本增量、工具参数增量、正常终止、流内错误和 EOF。
-- 再把取消/预算贯穿模型等待、工具执行与 sink 阻塞。
-- SSE 在线 sink 最后接；第一版仍不启用 `Last-Event-ID` replay。
+### 1. 真实模型适配器
+
+- 选一个真实 streaming 提供方，先支持一种协议；凭据只从环境读取，不进日志/事件。
+- 验证文本增量、工具参数增量、正常终止、流内 error、意外 EOF、usage。
+- 本地 mock SSE/HTTP 做 CI；真实 provider 只做人工 smoke，不把网络放进必需门禁。
+- 不新增 `Last-Event-ID` replay，不把模型错误自动重试。
+
+### 2. 取消与预算
+
+- connect / first-token / idle / total 超时贯穿模型、工具、sink。
+- 取消必须让模型流、工具和事件 sink 收尾；未知结果不自动重试。
+- 记录 termination reason、certainty、run_id、last_seq，避免把“断流”写成成功。
+
+### 3. SSE 在线 sink
+
+- 先做本地 HTTP SSE；终止后关闭响应体。
+- 断流但没有终止事件 = truncated run；第一版不做 replay。
+- JSONL 继续保留为本地证据格式。
+
+### 4. P1 版本治理收尾
+
+- 从 `PluginDesc` 自动采集 provides/requires，而不是只靠 sidecar/手写表。
+- 决定是否引入 `provides`/`requires` 的 ABI 尾字段；ABI 仍精确匹配，不引入冲突的
+  `abi_min/abi_max` 双轨规则。
+- 版本升级/回溯求解必须另有真实消费者和测试，不先造抽象。
+
+### 5. 发布证据收尾
+
+- 严格同版本封存：用与封存 `source.sha256` 相同的源码树构建宿主再跑 smoke。
+- 历史发布版 × 新宿主补可重复测试，不把单次手工演练写成保证。
+- `--root` 的 toolchain 探测已走目标树目录；`RUSTFLAGS`/`.cargo/config`
+  自定义 rustflags 仍待完整记录。
+- `--require-v2` 已提供，但默认 verify 仍兼容 `/1`；发布门禁必须显式使用。
+- seal source digest 仍缺 tag/commit 字段绑定。
 
 ## 阶段 0：验证基线
 
-**已完成：**
-
-- 三平台 CI 与平台矩阵 17 条保证
-- 支持契约、API 清单、冻结 ABI v1
-- 资源基线 / 暂存台账 / 1M soak
-- 正式 `/2` 封存（0.1.0/0.1.1）
-- 公开仓库；Actions 不再按私有分钟计费
+**已完成：** 三平台 CI、平台矩阵、支持契约、API 清单、冻结 ABI v1、资源基线、
+1M soak、正式 `/2` 封存、公开仓。
 
 **仍未闭合：**
 
 - 严格同版本封存证据：两个正式封存的 smoke 都由当前 0.1.1 工作区宿主执行，
-  `host.source_sha256 != source.sha256`；不能写成 strict same-version。
+  `host.source_sha256 != source.sha256`。
 - 历史发布版 × 新宿主仍缺可重复测试。
 - nightly cron 首跑与 artifact 长期转存。
 
@@ -157,35 +153,24 @@
 
 ## 阶段 1：结果与错误语义
 
-**完成：**
-
-- `Returned / Failed / TimedOut / Cancelled / Disconnected`
-- `NotExecuted / Reported / Unknown`
-- 结构化错误载荷、旧 ABI 文本降级、bounded message
-- 事件路径仍无返回协议，是已知例外
+**完成：** `Returned/Failed/TimedOut/Cancelled/Disconnected`；
+`NotExecuted/Reported/Unknown`；结构化错误载荷、旧 ABI 文本降级、bounded message；
+事件路径仍无返回协议，是已知例外。
 
 **边界：** 不承诺自动重试安全或 exactly-once；SDK 提供事实，不提供重试许可。
 
 ## 阶段 2：结构化错误与调用通道
 
-**完成：**
+**完成：** `error_format` 能力位、sidecar 载荷、host/SDK detailed 入口；
+iface/dispatch/next 超时、卸载/取消、provider 业务错误；旧插件文本错误端到端。
 
-- `error_format` 能力位、sidecar 载荷、host/SDK detailed 入口
-- iface/dispatch/next 超时、卸载/取消、provider 业务错误
-- 旧插件文本错误端到端
-
-**未完成：**
-
-- 异步 `fulfill_error`
-- 所有同步失败路径的 detailed payload
-- 真实旧宿主四格矩阵仍部分是桩
+**未完成：** 异步 `fulfill_error`；所有同步失败路径的 detailed payload；
+真实旧宿主四格矩阵仍部分是桩。
 
 ## 阶段 3：声明与装载诊断
 
-**完成：**
-
-- 配置 schema 可见性、Pending 精确原因、来源/注入声明
-- inspect/status provenance、默认拒绝来源策略
+**完成：** 配置 schema 可见性、Pending 精确原因、来源/注入声明；
+inspect/status provenance、默认拒绝来源策略。
 
 **边界：** schema 只展示，不在宿主侧校验；`related` 是全局候选，不证明隔离域可见。
 
@@ -212,7 +197,7 @@
 |---|---|---|
 | A5-1 三平台 CI | 完成 | `41460414477`；17 × 4 矩阵 |
 | A5-2 nightly soak | 进行中 | 1M Linux、RSS 预算、dhat；cron 首跑/长期转存待补 |
-| A5-3 正式 `/2` 封存 | 封存完成，strict same-version 未满足 | `xtask seal --root`；`dist/cordis-0.1.0-formal`、`0.1.1-formal`；Release assets |
+| A5-3 正式 `/2` 封存 | 封存完成，strict same-version 未满足 | `xtask seal --root`；`dist/cordis-0.1.0-formal`、`0.1.1-formal`；Release assets；`--require-v2` 可用 |
 | A5-4 历史 × 新宿主 | 已验证一次，仍待验证 | 0.1.1 宿主加载 0.1.0 formal smoke；缺可重复测试 |
 | A5-5 其余发布项 | 大部分完成 | 公开仓、元数据、SCM 一次实测；nightly 转存/SCM CI 重跑待补 |
 
