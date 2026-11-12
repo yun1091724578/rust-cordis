@@ -17,8 +17,11 @@ package job 产出 `.crate`，其校验和不在本封存内。
 
 ```text
 cargo xtask seal [--out <dir>] [--root <workspace>]
-cargo xtask seal --verify <dir>
+cargo xtask seal --verify <dir> [--require-v2]
 ```
+
+发布门禁使用 `--require-v2`；它拒绝把 `/2` 的 format 改成 `/1` 来跳过
+sidecar/allow-list/provenance 校验。默认 `--verify` 仍兼容历史 `/1`。
 
 `--root` 用于给已发布 tag 的干净 worktree 生成正式 `/2` 封存：构建与源码摘要
 来自 `--root` 指定的树，smoke 的 `inspect` 仍使用当前工作区的宿主 CLI（这样

@@ -31,7 +31,7 @@ const PLUGINS: &[PluginSpec] = &[
         krate: "greeting",
         label: "greeting",
         plugin: "greeting",
-        provides: &[("greeting", "2.0.0")],
+        provides: &[("greeting", "2.0.0"), ("greeting.text", "1.0.0")],
         requires: &[],
     },
     PluginSpec {
@@ -49,10 +49,11 @@ const PLUGINS: &[PluginSpec] = &[
         label: "harness",
         plugin: "harness-tool",
         provides: &[
-            ("sessions", "1.0.0"),
-            ("tool.harness-echo", "1.0.0"),
+            ("sessions@1", "1.0.0"),
+            ("tool.harness-echo@1", "1.0.0"),
+            ("harness.status@1", "1.0.0"),
+            ("harness.stream@1", "1.0.0"),
             ("harness.status", "1.0.0"),
-            ("harness.stream", "1.0.0"),
         ],
         // `tools` is provided by the T1 harness host, which is not part of this seal.
         requires: &[],
@@ -247,6 +248,7 @@ fn field_u32(value: &Value, key: &str) -> Result<u32, String> {
 pub fn command(args: Vec<String>) -> i32 {
     let mut out: Option<PathBuf> = None;
     let mut verify: Option<PathBuf> = None;
+    let mut require_v2 = false;
     let mut root: Option<PathBuf> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -281,6 +283,7 @@ pub fn command(args: Vec<String>) -> i32 {
                     return 2;
                 }
             }
+            "--require-v2" => require_v2 = true,
             "-h" | "--help" => {
                 print!("{}", crate::USAGE);
                 return 0;
@@ -290,6 +293,10 @@ pub fn command(args: Vec<String>) -> i32 {
                 return 2;
             }
         }
+    }
+    if require_v2 && verify.is_none() {
+        eprintln!("seal --require-v2 只能与 --verify 同用\n\n{}", crate::USAGE);
+        return 2;
     }
     if out.is_some() && verify.is_some() {
         eprintln!("seal --out 与 --verify 只能选一个\n\n{}", crate::USAGE);
@@ -304,6 +311,24 @@ pub fn command(args: Vec<String>) -> i32 {
     }
     if let Some(dir) = verify {
         let dir = crate::resolve_repo_path(dir);
+        if require_v2 {
+            let format = fs::read_to_string(dir.join(SEAL_FILE))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|value| {
+                    value
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            if format.as_deref() != Some(SEAL_FORMAT) {
+                eprintln!(
+                    "封存校验失败：{} 的 format 不是 {SEAL_FORMAT}（--require-v2）",
+                    dir.display()
+                );
+                return 1;
+            }
+        }
         return match verify_dir(&dir) {
             Ok(manifest) => {
                 println!("封存校验通过：{}", dir.display());

@@ -383,14 +383,18 @@ fn seal_verify_accepts_a_complete_seal() {
     ];
     let manifest_value = |id: &str| {
         let (provides, requires) = match id {
-            "greeting" => (json!({ "greeting": "2.0.0" }), json!({})),
+            "greeting" => (
+                json!({ "greeting": "2.0.0", "greeting.text": "1.0.0" }),
+                json!({}),
+            ),
             "hello" => (json!({ "hello.note": "1.0.0" }), json!({})),
             "harness-tool" => (
                 json!({
-                    "sessions": "1.0.0",
-                    "tool.harness-echo": "1.0.0",
+                    "sessions@1": "1.0.0",
+                    "tool.harness-echo@1": "1.0.0",
+                    "harness.status@1": "1.0.0",
+                    "harness.stream@1": "1.0.0",
                     "harness.status": "1.0.0",
-                    "harness.stream": "1.0.0",
                 }),
                 json!({}),
             ),

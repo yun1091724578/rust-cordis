@@ -31,8 +31,9 @@ cargo xtask <命令>
   seal [--out <dir>] [--root <workspace>]
                    构建宿主目标 release 插件并封存（源码树 / 工具链 / ABI /
                    SHA256），保存同版本 inspect 证据；--root 可为历史 tag worktree
-  seal --verify <dir>
+  seal --verify <dir> [--require-v2]
                    只读校验预期 artifact 集合、SHA256、smoke 与 inspect 证据
+                   --require-v2 拒绝把 /2 伪装成 /1 绕过 provenance
   soak [cycles]    运行被忽略的宿主资源 soak（默认 1000 轮；不进入 ci）
   doctor           打印本机构建环境诊断
 ";
