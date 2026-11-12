@@ -101,11 +101,18 @@
 
 ## 下一步（按顺序）
 
-### 1. 真实模型适配器
+### 1. 真实模型适配器（基础版已落地）
 
-- 选一个真实 streaming 提供方，先支持一种协议；凭据只从环境读取，不进日志/事件。
-- 验证文本增量、工具参数增量、正常终止、流内 error、意外 EOF、usage。
-- 本地 mock SSE/HTTP 做 CI；真实 provider 只做人工 smoke，不把网络放进必需门禁。
+- `desolate-agent-model` 支持可选 OpenAI-compatible 纯 HTTP SSE：
+  - `choices[0].delta.content` → `text.delta`；
+  - `[DONE]` → stream close；
+  - 流内 `error.message` → `stream_fail`；
+  - EOF without `[DONE]` → failure；
+  - `--model-api-key-env` 从环境读取凭据，不进事件。
+- `--model-endpoint` / `--model` 已接入 `desolate agent`；无 endpoint 时保留确定性模式。
+- 已测：URL、SSE token、`[DONE]`、error、EOF、停止消费，共 7 个 adapter 单测。
+- **未完成**：HTTPS/TLS、工具参数增量、usage、真实 provider 人工 smoke、
+  本地 mock HTTP 的 CI 集成。HTTPS 需要 TLS 客户端或外部 reverse proxy。
 - 不新增 `Last-Event-ID` replay，不把模型错误自动重试。
 
 ### 2. 取消与预算
