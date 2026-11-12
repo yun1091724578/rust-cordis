@@ -116,7 +116,12 @@
 
 ### 2. 消费者中立的嵌入契约
 
-- 用两个消费者验证同一组原语：服务运行时与 agent 运行时。
+- **已落地基础测试**：`crates/host/tests/embedding_contract.rs` 只使用公开
+  API（`App` + `LoaderConfig::new` + `load_with_source` + `PluginSource`），
+  完成装载、挂载、关闭；不引用 `crate::` 内部模块或 agent 词汇。
+- 该测试同时固定了一个边界：进程内 fake plugin 不经过 ABI 实例表，
+  `loaded_instances()` 只适合 cdylib 路径，不能拿它当通用挂载计数。
+- 仍需用两个真实消费者验证同一组原语：服务运行时与 agent 运行时。
 - 只把**两者都需要**的能力放进 core/host：生命周期、依赖注入、服务接口、
   配置 schema、错误通道、容量与取消边界。
 - agent 协议、模型 provider、SSE、JSONL 继续留在消费者工程；不把它们的字段
