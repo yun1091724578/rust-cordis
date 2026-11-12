@@ -3687,7 +3687,15 @@ fn apply_via_with_keepalive_and_format(
                     if let Some(instance) = &instance {
                         instance.closed.store(true, Ordering::SeqCst);
                         {
-                            let _wait = instance.lifecycle.write().unwrap();
+                            // `lifecycle` 是 std::sync::RwLock：插件回调会同步持有
+                            // 读锁。这里若在 async 任务里直接等写锁，会把 tokio
+                            // worker 一起阻塞；用 blocking pool 等待，回调退出后
+                            // 再回到 async 清理路径。
+                            let lifecycle = instance.lifecycle.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _wait = lifecycle.write().unwrap();
+                            })
+                            .await;
                         }
                         // M2/M2b/M2c：反复排水，直到派发表与“已取消待回收”
                         // 集合都为空。取快照时必须**同时持有派发表锁**：取消

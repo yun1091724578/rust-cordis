@@ -25,7 +25,7 @@
 |---|---|---|---|
 | A. 低层 ABI 与发布 | **基本完成** | 0.1.0/0.1.1 已发布；正式 `/2` 封存已从 tag 生成并归档；公开仓 CI、版本矩阵、SCM 一次实测 | 严格同版本封存证据、历史兼容可重复测试 |
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离，不能升级成安全承诺 |
-| C. 可信单租户底座 P0 | **进行中** | 来源策略完成；per-App dispatch policy；宿主容量准入（instances/dispatches/pending/streams）；不可抢占披露 | per-plugin/method 策略、锁纪律 |
+| C. 可信单租户底座 P0 | **进行中** | 来源策略完成；per-App dispatch policy；宿主容量准入（instances/dispatches/pending/streams）；生命周期清理不再阻塞 tokio worker；不可抢占披露 | per-plugin/method 策略、永久 hang/锁中毒/更多卸载竞态 |
 | D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI | semver range/依赖图求解、缓冲池 |
 | E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型、取消/预算 |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 只有第三方/模型生成/多租户触发时另立 ADR |
@@ -59,11 +59,12 @@
 
 ## 下一步（按顺序）
 
-### 1. P0-4：锁纪律与故障注入
+### 1. P0-4：锁纪律与故障注入（进行中）
 
-- 审计不持锁调用插件；重点看 `call_inbound` 的 lifecycle 读锁跨调用。
-- 覆盖 hang / panic / 重入 / 卸载竞态。
-- 锁中毒只在找到可达 trigger 后升级为缺陷；不统一吞掉 poison。
+- 已审计 `call_inbound` 的 lifecycle 读锁跨调用：回调期间不持实例表/派发表锁。
+- 已修：卸载清理等待 `std::RwLock` 写锁时改用 `spawn_blocking`，不再阻塞 tokio worker。
+- 已测：回调内 `ctx_dispose_self`、阻塞回调 + 并发 dispose，均无死锁且实例归零。
+- 未闭合：永久 hang 仍然不可抢占（T2 已知边界）；panic/锁中毒可达路径；更多卸载竞态。
 - 对照真实宿主：同步 `apply`/回调不可抢占，部署级 supervisor 才是兜底。
 
 ### 2. P0-2 收口
