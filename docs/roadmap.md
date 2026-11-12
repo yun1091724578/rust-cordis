@@ -27,7 +27,7 @@
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离，不能升级成安全承诺 |
 | C. 可信单租户底座 P0 | **按边界完成** | 来源策略；App 粒度 dispatch policy；宿主容量准入；生命周期清理不阻塞 tokio worker；P0-4 边界已记录 | per-plugin/method 明确不提供；永久 hang 属 T2 |
 | D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI、semver 依赖计划（配置 + sidecar + 对账/reload 预检）、16 KiB 调用缓冲池 | 从 `PluginDesc` 自动采集、升级/回溯求解 |
-| E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型、取消/预算 |
+| E. agent 流处理 | **有界增量交付完成** | 六模式状态机；18 个 agent_stream 单测；JSONL 即时写入；事件/累计文本/工具上限；sink 失败测试 | 真实模型、慢消费者、取消/预算、SSE 在线 sink |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 只有第三方/模型生成/多租户触发时另立 ADR |
 | G. 维护治理 | **持续** | R4/R5/R6 已登记 | serde_yaml、宿主模块、锁/panic 审查 |
 
@@ -118,11 +118,21 @@
 - 这是调用缓冲复用，不是零拷贝，也不改变 16 KiB 初始上限。
 - 线程池仍不能取消同步调用；若保留，只能作为故障隔离，必须证明超时后不卸载、不释放插件，线程泄漏要登记。
 
-### 5. agent 有界增量交付
+### 5. agent 有界增量交付（已交付）
 
-- 单事件/队列/累计文本/终止快照分别限大小。
-- 慢消费者、sink 失败、无终止事件 EOF、超大事件、终止写入与取消竞争。
-- 之后接一个真实模型适配器，再做取消/预算；SSE 在线 sink 最后接。
+- `desolate/host/src/agent_stream.rs` 增加 `StreamLimits`：
+  - `maxEventBytes` / `maxEvents` / `maxTextBytes` / `maxTools`
+  - 0 值拒绝。
+- JSONL sink 改为**即时逐行写入并 flush**，不再等 run 结束一次性写。
+- 超限在序列化/写文件前拒绝，不留下半行；sink 路径错误可读。
+- 未完成：慢消费者（同步文件 sink 没有队列）、无终止事件 EOF 的进程外重放、
+  取消与 sink 写入竞争；这些留给下一批。
+
+### 6. 真实模型与取消预算
+
+- 接一个真实模型适配器，验证文本增量、工具参数增量、正常终止、流内错误和 EOF。
+- 再把取消/预算贯穿模型等待、工具执行与 sink 阻塞。
+- SSE 在线 sink 最后接；第一版仍不启用 `Last-Event-ID` replay。
 
 ## 阶段 0：验证基线
 
