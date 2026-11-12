@@ -1876,6 +1876,60 @@ unsafe fn invoke_raw_read(call: CallFn, handle: u64, op: u32, payload: &str) -> 
     invoke_raw_with(call, handle, op, payload, true)
 }
 
+/// 同步 ABI 调用的线程本地缓冲。
+///
+/// 16 KiB 是调用协议的初始输出上限；高频调用不应每次向 allocator 要一块。
+/// 只回收标准大小，`STATUS_TOO_SMALL` 扩容后的大缓冲直接释放，避免池被
+/// 异常大响应永久撑大。
+struct CallBuffer(Vec<u8>);
+
+thread_local! {
+    static CALL_BUFFER_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl CallBuffer {
+    fn take() -> Self {
+        let mut buffer = CALL_BUFFER_POOL
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_else(|| vec![0u8; 16 * 1024]);
+        // `Drop` 会 clear 池里的 buffer；取出时必须恢复可写的标准长度。
+        buffer.resize(16 * 1024, 0);
+        Self(buffer)
+    }
+
+    fn with_capacity(cap: usize) -> Self {
+        if cap == 16 * 1024 {
+            Self::take()
+        } else {
+            Self(vec![0u8; cap])
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn text(&self, len: usize) -> String {
+        String::from_utf8_lossy(&self.0[..len]).into_owned()
+    }
+}
+
+impl Drop for CallBuffer {
+    fn drop(&mut self) {
+        let mut buffer = std::mem::take(&mut self.0);
+        if buffer.capacity() == 16 * 1024 {
+            // 保留 16 KiB 长度；插件只会写 `out.len` 字节，下一次 take 不需要清零。
+            buffer.resize(16 * 1024, 0);
+            CALL_BUFFER_POOL.with(|pool| pool.borrow_mut().push(buffer));
+        }
+    }
+}
+
 unsafe fn invoke_raw_with(
     call: CallFn,
     handle: u64,
@@ -1883,7 +1937,7 @@ unsafe fn invoke_raw_with(
     payload: &str,
     retry: bool,
 ) -> (i32, String) {
-    let mut buffer = vec![0u8; 16 * 1024];
+    let mut buffer = CallBuffer::take();
     let mut out = Out {
         ptr: buffer.as_mut_ptr(),
         cap: buffer.len(),
@@ -1906,7 +1960,7 @@ unsafe fn invoke_raw_with(
                 ),
             );
         }
-        buffer = vec![0u8; out.len.max(16 * 1024)];
+        buffer = CallBuffer::with_capacity(out.len.max(16 * 1024));
         out = Out {
             ptr: buffer.as_mut_ptr(),
             cap: buffer.len(),
@@ -1929,8 +1983,7 @@ unsafe fn invoke_raw_with(
                 ),
             );
         }
-        buffer.truncate(out.len);
-        return (retried, String::from_utf8_lossy(&buffer).into_owned());
+        return (retried, buffer.text(out.len));
     }
     if out.len > buffer.len() {
         // `Out` 契约要求插件只在 cap 内回填；超限时原消息一个字节都没写，
@@ -1944,8 +1997,7 @@ unsafe fn invoke_raw_with(
             ),
         );
     }
-    buffer.truncate(out.len);
-    (status, String::from_utf8_lossy(&buffer).into_owned())
+    (status, buffer.text(out.len))
 }
 
 /// 同步调用插件的回调入口（**带状态码**的版本）。
@@ -4434,6 +4486,29 @@ mod tests {
 
     unsafe extern "C" fn fake_call(_: u64, _: u32, _: Blob, _: Blob, _: *mut Out) -> i32 {
         STATUS_OK
+    }
+
+    unsafe extern "C" fn bench_call(_: u64, _: u32, _: Blob, _: Blob, out: *mut Out) -> i32 {
+        (*out).write(b"pong")
+    }
+
+    /// 手动基准：`cargo test -p rust-cordis-host --lib call_buffer_pool_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual buffer-pool benchmark"]
+    fn call_buffer_pool_benchmark() {
+        const CALLS: u32 = 100_000;
+        let started = std::time::Instant::now();
+        for _ in 0..CALLS {
+            let (status, text) = unsafe { invoke_raw(bench_call, 1, cordis_abi::OP_PING, "{}") };
+            assert_eq!(status, STATUS_OK);
+            assert_eq!(text, "pong");
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "call buffer benchmark: {CALLS} calls in {:?} ({:.1} ns/call)",
+            elapsed,
+            elapsed.as_nanos() as f64 / CALLS as f64
+        );
     }
 
     /// 句柄带代际号：槽位复用后，**陈旧句柄必须被拒绝**。

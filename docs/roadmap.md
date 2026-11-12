@@ -26,7 +26,7 @@
 | A. 低层 ABI 与发布 | **基本完成** | 0.1.0/0.1.1 已发布；正式 `/2` 封存已从 tag 生成并归档；公开仓 CI、版本矩阵、SCM 一次实测 | 严格同版本封存证据、历史兼容可重复测试 |
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离，不能升级成安全承诺 |
 | C. 可信单租户底座 P0 | **按边界完成** | 来源策略；App 粒度 dispatch policy；宿主容量准入；生命周期清理不阻塞 tokio worker；P0-4 边界已记录 | per-plugin/method 明确不提供；永久 hang 属 T2 |
-| D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI、semver 依赖计划解析核心、显式 `LoaderConfig.dependencyPlan` 装载前预检 | manifest/`PluginDesc` 采集与 mount 期自述校验、缓冲池 |
+| D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI、semver 依赖计划（配置 + sidecar + 对账/reload 预检）、16 KiB 调用缓冲池 | 从 `PluginDesc` 自动采集、升级/回溯求解 |
 | E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型、取消/预算 |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 只有第三方/模型生成/多租户触发时另立 ADR |
 | G. 维护治理 | **持续** | R4/R5/R6 已登记 | serde_yaml、宿主模块、锁/panic 审查 |
@@ -106,9 +106,16 @@
   - 没有版本升级 / 回溯求解：一个服务键仍只能解析到一个提供者。
 - ABI 仍精确匹配；不要同时引入互相冲突的 `abi_min/abi_max` 规则。
 
-### 4. P1-4：缓冲池化与性能（semver 之后）
+### 4. P1-4：缓冲池化与性能（已交付）
 
-- 去掉每次调用 16 KiB 临时分配，先 benchmark 再改。
+- `invoke_raw_with` 使用线程本地 16 KiB `CallBuffer`；标准大小回收，`TOO_SMALL`
+  扩容后的异常大缓冲不进入池。
+- 手动基准：
+  ```text
+  cargo test -p rust-cordis-host --lib call_buffer_pool_benchmark -- --ignored --nocapture
+  100000 calls / 32.487ms / 324.9 ns/call
+  ```
+- 这是调用缓冲复用，不是零拷贝，也不改变 16 KiB 初始上限。
 - 线程池仍不能取消同步调用；若保留，只能作为故障隔离，必须证明超时后不卸载、不释放插件，线程泄漏要登记。
 
 ### 5. agent 有界增量交付
