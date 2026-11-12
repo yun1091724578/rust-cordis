@@ -1102,14 +1102,17 @@ fn insert_dispatch(
     instance: &Instance,
     dispatch_id: u64,
     record: DispatchRecord,
-) -> std::result::Result<(), ErrorPayload> {
+) -> std::result::Result<(), (ErrorPayload, DispatchRecord)> {
     let limits = instance.host_limits;
     let mut table = instance.dispatches.lock().unwrap();
     if table.len() >= limits.max_dispatches_per_instance {
-        return Err(capacity_payload(
-            "maxDispatchesPerInstance",
-            table.len(),
-            limits.max_dispatches_per_instance,
+        return Err((
+            capacity_payload(
+                "maxDispatchesPerInstance",
+                table.len(),
+                limits.max_dispatches_per_instance,
+            ),
+            record,
         ));
     }
     if record.sink.is_some() {
@@ -1118,10 +1121,13 @@ fn insert_dispatch(
             .filter(|record| record.sink.is_some())
             .count();
         if pending >= limits.max_pending_per_instance {
-            return Err(capacity_payload(
-                "maxPendingPerInstance",
-                pending,
-                limits.max_pending_per_instance,
+            return Err((
+                capacity_payload(
+                    "maxPendingPerInstance",
+                    pending,
+                    limits.max_pending_per_instance,
+                ),
+                record,
             ));
         }
     }
@@ -1131,10 +1137,13 @@ fn insert_dispatch(
             .filter(|record| record.stream.is_some())
             .count();
         if streams >= limits.max_streams_per_instance {
-            return Err(capacity_payload(
-                "maxStreamsPerInstance",
-                streams,
-                limits.max_streams_per_instance,
+            return Err((
+                capacity_payload(
+                    "maxStreamsPerInstance",
+                    streams,
+                    limits.max_streams_per_instance,
+                ),
+                record,
             ));
         }
     }
@@ -1437,7 +1446,7 @@ unsafe fn call_inbound(
     // **先 insert 再调用**：插件在回调内部就能看到自己的条目。
     // 容量拒绝在这里发生：记录不插入，插件代码也不会被调用。
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if let Err(payload) = insert_dispatch(
+    if let Err((payload, rejected)) = insert_dispatch(
         instance,
         dispatch_id,
         DispatchRecord {
@@ -1449,7 +1458,7 @@ unsafe fn call_inbound(
             task: None,
         },
     ) {
-        return Err(CallFailure::from_payload(payload));
+        return Err(CallFailure::from_payload(payload).with_frame(rejected.frame));
     }
     let (status, text) = {
         // 调用期间把"正在执行的那次派发"压进作用域：插件在回调内部发起的
@@ -1723,9 +1732,27 @@ fn decode_plugin_error(error_format: u32, text: &str) -> cordis_abi::ErrorPayloa
 
 /// 异步通道内部携带的结构化失败。它实现了 `std::error::Error`，因此可以穿过
 /// 内核的 `Box<dyn Error>`，在 `host_ctx_*` 的交付闭包里再 downcast 回载荷。
-#[derive(Debug)]
 struct CallFailure {
     payload: ErrorPayload,
+    /// 容量拒绝时把 waterfall 的剩余链保留下来，交给事件派发继续执行。
+    /// `Mutex` 让 `CallFailure` 仍满足内核错误的 `Send + Sync` 约束。
+    frame: Mutex<Option<cordis_core::Next>>,
+}
+
+impl std::fmt::Debug for CallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallFailure")
+            .field("payload", &self.payload)
+            .field(
+                "has_frame",
+                &self
+                    .frame
+                    .lock()
+                    .map(|frame| frame.is_some())
+                    .unwrap_or(false),
+            )
+            .finish()
+    }
 }
 
 impl CallFailure {
@@ -1736,6 +1763,7 @@ impl CallFailure {
         certainty: impl Into<String>,
     ) -> Self {
         Self {
+            frame: Mutex::new(None),
             payload: ErrorPayload::new(message)
                 .with_code(code)
                 .with_category(category)
@@ -1744,7 +1772,18 @@ impl CallFailure {
     }
 
     fn from_payload(payload: ErrorPayload) -> Self {
-        Self { payload }
+        Self {
+            payload,
+            frame: Mutex::new(None),
+        }
+    }
+
+    fn with_frame(mut self, frame: Option<cordis_core::Next>) -> Self {
+        *self
+            .frame
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = frame;
+        self
     }
 }
 
@@ -2712,7 +2751,8 @@ unsafe extern "C" fn host_ctx_call_iface(
                 stream: None,
                 task: Some(task),
             },
-        )?;
+        )
+        .map_err(|(payload, _)| payload)?;
         let deferred = complete_or_defer(
             future,
             move |result| {
@@ -3003,6 +3043,7 @@ unsafe extern "C" fn host_ctx_on(handle: u64, event: Blob, cb: u64, out: *mut Ou
                 None
             };
             let cancel = call_args.cancel.clone();
+            let next_args = call_args.args.clone();
             let mut payload = json!({
                 "kind": KIND_EVENT,
                 "id": cb,
@@ -3047,7 +3088,19 @@ unsafe extern "C" fn host_ctx_on(handle: u64, event: Blob, cb: u64, out: *mut Ou
                     Ok(Value::Null) => None,
                     Ok(value) => Some(Dyn::new(ExternValue(value))),
                     Err(message) => {
-                        // 监听器失败：记日志并当作"没有意见"。
+                        // 容量拒绝不是“监听器没有意见”：把剩余 waterfall 链继续跑完，
+                        // 否则事件派发会静默吞掉下游。
+                        if message.payload.code == "host_capacity" {
+                            let frame = message
+                                .frame
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take();
+                            if let Some(frame) = frame {
+                                return frame.call(next_args).await;
+                            }
+                        }
+                        // 其他监听器失败：记日志并当作"没有意见"。
                         // 内核的 handler 签名不可失败（见 `cordis_core::event` 的说明）。
                         call_ctx.log(Level::Error, &format!("事件监听器失败: {message}"));
                         None
@@ -3165,7 +3218,8 @@ unsafe fn dispatch_impl(
                 stream: None,
                 task: Some(task),
             },
-        )?;
+        )
+        .map_err(|(payload, _)| payload)?;
         let future = dispatch_by_mode(&ctx, &mode, &event, args);
         // 作用域：这次派发**交付给插件**的入站回调据此记下父节点（取消级联）。
         let future: BoxFuture<Ret> = Box::pin(Scoped {
@@ -4889,19 +4943,22 @@ mod tests {
         {
             let instances = instances().lock().unwrap();
             let instance = instances.get(handle).expect("实例必须已登记");
-            insert_dispatch(
-                &instance,
-                1,
-                DispatchRecord {
-                    sink: None,
-                    frame: None,
-                    parent: None,
-                    outbound: None,
-                    stream: None,
-                    task: None,
-                },
-            )
-            .expect("默认容量下派发记录必须能插入");
+            assert!(
+                insert_dispatch(
+                    &instance,
+                    1,
+                    DispatchRecord {
+                        sink: None,
+                        frame: None,
+                        parent: None,
+                        outbound: None,
+                        stream: None,
+                        task: None,
+                    },
+                )
+                .is_ok(),
+                "默认容量下派发记录必须能插入"
+            );
         }
 
         let mut buffer = vec![0u8; 4096];
