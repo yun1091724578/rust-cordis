@@ -131,6 +131,7 @@ fn config_for(path: &Path, evaluator: Option<Arc<dyn JsEvaluator>>, strict: bool
         plugin_dir: None,
         strict,
         strict_cycles: strict,
+        strict_sidecars: false,
         hmr: None,
         js_evaluator: evaluator,
         interpolation: InterpolationMode::Builtin,

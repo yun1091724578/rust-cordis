@@ -672,6 +672,7 @@ impl RunSession {
                 .map(|path| path.to_string_lossy().into_owned()),
             strict: options.strict,
             strict_cycles: false,
+            strict_sidecars: false,
             hmr: None,
             js_evaluator: None,
             interpolation: InterpolationMode::Builtin,

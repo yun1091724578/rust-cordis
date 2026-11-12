@@ -471,6 +471,7 @@ async fn abi_dispose_self_marks_the_loader_row_disabled_and_persists() {
             plugin_dir: None,
             strict: true,
             strict_cycles: false,
+            strict_sidecars: false,
             hmr: None,
             js_evaluator: None,
             interpolation: cordis_host::loader::InterpolationMode::Builtin,

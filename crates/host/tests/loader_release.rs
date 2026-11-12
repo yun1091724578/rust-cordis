@@ -211,6 +211,7 @@ fn config_for(path: &Path) -> LoaderConfig {
         plugin_dir: None,
         strict: true,
         strict_cycles: false,
+        strict_sidecars: false,
         hmr: None,
         js_evaluator: None,
         interpolation: InterpolationMode::Builtin,

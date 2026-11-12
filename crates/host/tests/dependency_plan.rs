@@ -160,6 +160,7 @@ fn config_for(path: &Path, dependency_plan: Vec<PlanEntrySpec>) -> LoaderConfig 
         plugin_dir: None,
         strict: true,
         strict_cycles: false,
+        strict_sidecars: true,
         hmr: None,
         js_evaluator: None,
         interpolation: InterpolationMode::Builtin,
@@ -495,6 +496,28 @@ async fn malformed_source_plan_fails_before_any_load_or_apply() {
     );
     assert_eq!(counters.loads(), 0, "manifest 损坏时不得调用 source.load");
     assert_eq!(counters.applies(), 0, "manifest 损坏时不得应用任何插件");
+}
+
+/// `strictSidecars: false`（默认）：损坏的 sidecar 视为"没有计划"，
+/// 整次 manifest 预检保守跳过，逐行装载照常进行。
+#[tokio::test]
+async fn malformed_source_plan_is_skipped_when_not_strict() {
+    let counters = Counters::new();
+    let app = App::new();
+    let path = write_config("manifest-broken-lenient", "- id: broken\n  name: broken\n");
+    let source = counters.source_with_plan_error("sidecar manifest 解析失败");
+    let config = LoaderConfig {
+        strict_sidecars: false,
+        ..config_for(&path, Vec::new())
+    };
+
+    let state = load_with_source(app.root.clone(), config, source)
+        .await
+        .expect("strictSidecars=false 时损坏的 sidecar 不得拖垮装载");
+    assert_eq!(state.mounted_labels(), vec!["broken"]);
+    assert_eq!(counters.plans(), 1, "每行仍会被询问一次");
+    assert_eq!(counters.loads(), 1, "预检跳过后照常加载");
+    assert_eq!(counters.applies(), 1, "预检跳过后照常应用");
 }
 
 /// 显式 `dependencyPlan` 是**覆盖**：manifest 计划即使会失败也不能被合并进来，

@@ -121,6 +121,7 @@ fn config_for(path: &Path, strict: bool, strict_cycles: bool) -> LoaderConfig {
         plugin_dir: None,
         strict,
         strict_cycles,
+        strict_sidecars: false,
         hmr: None,
         js_evaluator: None,
         interpolation: cordis_host::loader::InterpolationMode::Builtin,

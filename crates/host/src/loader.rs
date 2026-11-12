@@ -70,6 +70,14 @@ pub struct LoaderConfig {
     /// 直接 boot 失败。
     #[serde(default)]
     pub strict_cycles: bool,
+    /// 损坏/不可用的 sidecar manifest 是否升级为装载失败。
+    ///
+    /// **默认 `false`**（兼容既有配置）：[`PluginSource::plan_entry`] 报错时按
+    /// "这一行没有计划"处理，并让**整次** manifest 预检保守跳过——混合来源里
+    /// 读不到 sidecar 不等于"没有提供者"，跳过比误判安全。设为 `true` 时，
+    /// 错误会带上行号、插件名与原因让整次装载失败。
+    #[serde(default)]
+    pub strict_sidecars: bool,
     /// 热重载。缺省关闭——生产宿主不该默认轮询文件系统。
     #[serde(default)]
     pub hmr: Option<HmrConfig>,
@@ -149,6 +157,7 @@ impl std::fmt::Debug for LoaderConfig {
             .field("plugin_dir", &self.plugin_dir)
             .field("strict", &self.strict)
             .field("strict_cycles", &self.strict_cycles)
+            .field("strict_sidecars", &self.strict_sidecars)
             .field("hmr", &self.hmr)
             .field(
                 "js_evaluator",
@@ -732,6 +741,8 @@ pub struct LoaderState {
     host_limits: Option<HostLimits>,
     /// 显式依赖计划（P1-1）。非空时覆盖 sidecar 收集；对账/重载前重新预检。
     dependency_plan: Vec<PlanEntrySpec>,
+    /// `plan_entry` 报错时的策略（`LoaderConfig.strict_sidecars`）：对账/重载沿用同一份。
+    strict_sidecars: bool,
     /// 初装已经预检过；第一次 reconcile 不再重复问 source。
     skip_next_preflight: AtomicBool,
 }
@@ -823,6 +834,7 @@ impl LoaderState {
         dispatch_policy: Option<DispatchPolicy>,
         host_limits: Option<HostLimits>,
         dependency_plan: Vec<PlanEntrySpec>,
+        strict_sidecars: bool,
     ) -> Self {
         let fingerprint = config_fingerprint(&files);
         Self {
@@ -853,6 +865,7 @@ impl LoaderState {
             dispatch_policy,
             host_limits,
             dependency_plan,
+            strict_sidecars,
             skip_next_preflight: AtomicBool::new(false),
         }
     }
@@ -861,7 +874,12 @@ impl LoaderState {
     /// 否则收集启用行的 manifest `provides` / `requires`。
     fn preflight_dependencies(&self, entries: &[Entry]) -> std::result::Result<(), String> {
         if self.dependency_plan.is_empty() {
-            preflight_source_dependency_plan(entries, &self.search, self.source.as_ref())
+            preflight_source_dependency_plan(
+                entries,
+                &self.search,
+                self.source.as_ref(),
+                self.strict_sidecars,
+            )
         } else {
             Ok(())
         }
@@ -2275,11 +2293,13 @@ impl PluginSource for DiskPluginSource {
 /// - group 行只下钻到子行。
 ///
 /// 有生效来源策略时，读取 sidecar 前会先过 admission；版本/范围解析失败或
-/// [`crate::plan::resolve`] 报错都会让本次装载整体失败。
+/// [`crate::plan::resolve`] 报错都会让本次装载整体失败。`strict_sidecars` 只决定
+/// [`PluginSource::plan_entry`] 报错时是整体失败，还是当作"该行没有计划"并跳过整次预检。
 fn preflight_source_dependency_plan(
     entries: &[Entry],
     search: &[PathBuf],
     source: &dyn PluginSource,
+    strict_sidecars: bool,
 ) -> std::result::Result<(), String> {
     let mut collected = Vec::new();
     let mut next_row = 0;
@@ -2288,6 +2308,7 @@ fn preflight_source_dependency_plan(
         false,
         search,
         source,
+        strict_sidecars,
         &mut next_row,
         &mut collected,
     )?;
@@ -2336,6 +2357,7 @@ fn collect_source_plan_entries(
     disabled_by_ancestor: bool,
     search: &[PathBuf],
     source: &dyn PluginSource,
+    strict_sidecars: bool,
     next_row: &mut usize,
     out: &mut Vec<CollectedPlanEntry>,
 ) -> std::result::Result<bool, String> {
@@ -2350,6 +2372,7 @@ fn collect_source_plan_entries(
                 disabled,
                 search,
                 source,
+                strict_sidecars,
                 next_row,
                 out,
             )?;
@@ -2361,12 +2384,20 @@ fn collect_source_plan_entries(
             continue;
         }
         let label = entry.id.clone().unwrap_or_else(|| entry.name.clone());
-        let spec = source.plan_entry(entry, search).map_err(|err| {
-            format!(
-                "第 {index} 行 {label}（插件 {}）的依赖声明不可用: {err}",
-                entry.name
-            )
-        })?;
+        let spec = match source.plan_entry(entry, search) {
+            Ok(spec) => spec,
+            Err(err) if strict_sidecars => {
+                return Err(format!(
+                    "第 {index} 行 {label}（插件 {}）的依赖声明不可用: {err}",
+                    entry.name
+                ));
+            }
+            // 非严格：把损坏/不可用的 sidecar 当成"没有计划"，整次预检保守跳过。
+            Err(_) => {
+                missing_plan = true;
+                continue;
+            }
+        };
         if let Some(spec) = spec {
             out.push(CollectedPlanEntry { index, label, spec });
         } else {
@@ -2475,7 +2506,12 @@ pub async fn load_with_source(
     // provides / requires，并在创建 LoaderState、调用 source.load 之前求解。
     // 显式计划是**覆盖**：非空时上面的预检已经跑过，这里既不合并也不读 manifest。
     if config.dependency_plan.is_empty() {
-        preflight_source_dependency_plan(&entries, &search, source.as_ref())?;
+        preflight_source_dependency_plan(
+            &entries,
+            &search,
+            source.as_ref(),
+            config.strict_sidecars,
+        )?;
     }
     // 稳读窗口取轮询周期的四分之一（下限 10ms）：编辑器的"写临时文件再 rename"
     // 通常比这快得多，于是既不会误采纳半截文件，也不会让人等一个完整周期。
@@ -2521,6 +2557,7 @@ pub async fn load_with_source(
         config.dispatch_policy,
         config.host_limits,
         config.dependency_plan.clone(),
+        config.strict_sidecars,
     ));
     // 初装预检已经跑过：第一次 reconcile 不重复访问 source。
     state.skip_next_preflight.store(true, Ordering::SeqCst);
@@ -3977,6 +4014,18 @@ mod tests {
         assert!(absent.dependency_plan.is_empty(), "缺省表示不做依赖预检");
     }
 
+    /// `strictSidecars` 是 `LoaderConfig` 的 camelCase 字段；缺省 `false` 保持既有行为。
+    #[test]
+    fn loader_config_parses_strict_sidecars_from_yaml() {
+        let absent: LoaderConfig =
+            serde_yaml::from_str("path: cordis.yml\n").expect("缺省 strictSidecars 不报错");
+        assert!(!absent.strict_sidecars, "缺省必须是 false（兼容既有配置）");
+
+        let strict: LoaderConfig = serde_yaml::from_str("path: cordis.yml\nstrictSidecars: true\n")
+            .expect("camelCase strictSidecars 必须能解析");
+        assert!(strict.strict_sidecars);
+    }
+
     /// M1-4 → M4-4（改写）：装载点对 `!!js` 的处置。
     ///
     /// M1-4 的判据是"任何 `!!js` 都不许上线（报'暂不支持'）"——那时的前提是**没有求值器**。
@@ -4001,6 +4050,7 @@ mod tests {
             plugin_dir: None,
             strict,
             strict_cycles: strict,
+            strict_sidecars: false,
             hmr: None,
             js_evaluator: None,
             interpolation: InterpolationMode::Builtin,
@@ -4127,6 +4177,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            false,
         );
         state
             .mounted

@@ -46,8 +46,10 @@ maxPendingPerInstance: 64, maxStreamsPerInstance: 8 }`），嵌入方也可调�
   （服务键 → 该插件提供的 semver 版本）与 `requires`（服务键 → semver range）。
   显式 `dependencyPlan` 为空时，`DiskPluginSource::plan_entry` 读取每个静态启用行
   旁的 `<artifact>.manifest.json`，由装载器汇总后调用 `host::plan::resolve`。
-  没有 sidecar 的行不参与，所以既有配置零行为变化；manifest 里的版本/范围不是
-  合法 semver 会让整次装载失败。带 `disabled: !!js …` 的行不参与初装预检。
+  混合来源下只要有一行没有 sidecar/manifest 计划，整次 manifest 预检会保守跳过，
+  避免把“未声明”误判成“无提供者”。`LoaderConfig.strictSidecars`（默认 false）
+  控制坏 sidecar：false 跳过预检并保留历史行为，true 在装载前硬失败。manifest
+  里的版本/范围不是合法 semver 时，解析该行的计划仍会失败。
 
 manifest 示例：
 
