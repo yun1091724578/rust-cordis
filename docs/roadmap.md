@@ -25,7 +25,7 @@
 |---|---|---|---|
 | A. 低层 ABI 与发布 | **基本完成** | 0.1.0/0.1.1 已发布；正式 `/2` 封存已从 tag 生成并归档；公开仓 CI、版本矩阵、SCM 一次实测 | 严格同版本封存证据、历史兼容可重复测试 |
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离，不能升级成安全承诺 |
-| C. 可信单租户底座 P0 | **进行中** | 来源策略完成；per-App dispatch policy；宿主容量准入（instances/dispatches/pending/streams）；生命周期清理不再阻塞 tokio worker；不可抢占披露 | per-plugin/method 策略、永久 hang/锁中毒/更多卸载竞态 |
+| C. 可信单租户底座 P0 | **按边界完成** | 来源策略；App 粒度 dispatch policy；宿主容量准入；生命周期清理不阻塞 tokio worker；P0-4 边界已记录 | per-plugin/method 明确不提供；永久 hang 属 T2 |
 | D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI | semver range/依赖图求解、缓冲池 |
 | E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型、取消/预算 |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 只有第三方/模型生成/多租户触发时另立 ADR |
@@ -59,19 +59,20 @@
 
 ## 下一步（按顺序）
 
-### 1. P0-4：锁纪律与故障注入（进行中）
+### 1. P0-4：锁纪律（按边界关闭）
 
 - 已审计 `call_inbound` 的 lifecycle 读锁跨调用：回调期间不持实例表/派发表锁。
 - 已修：卸载清理等待 `std::RwLock` 写锁时改用 `spawn_blocking`，不再阻塞 tokio worker。
 - 已测：回调内 `ctx_dispose_self`、阻塞回调 + 并发 dispose，均无死锁且实例归零。
-- 未闭合：永久 hang 仍然不可抢占（T2 已知边界）；panic/锁中毒可达路径；更多卸载竞态。
-- 对照真实宿主：同步 `apply`/回调不可抢占，部署级 supervisor 才是兜底。
+- **接受为 T2 边界**：永久 hang 不可抢占；panic/锁中毒没有找到可达 trigger，因此不承诺不存在。
+- 后续只在真实故障或 T3 需求出现时重开；不为此引入伪抢占线程池。
 
-### 2. P0-2 收口
+### 2. P0-2：App 粒度决策（关闭）
 
-- 当前是 App 粒度；补 per-plugin/per-method 配置，或明确写死“只支持 App 粒度”。
-- 同一 App 多 loader 目前是后设置覆盖；要么隔离，要么文档化为限制。
-- 策略在实例注册时快照；运行期变更不追溯，需在文档中保留。
+- **明确只提供 App 粒度**，不提供 per-plugin/per-method 配置。
+- 同一 App 下多个 loader 的 `dispatchPolicy` / `hostLimits` 是后设置覆盖；不是每 loader 独立。
+- 策略在实例注册时快照，运行期变更不追溯。
+- 这不是临时实现遗漏，而是当前 T2 的产品边界；不要把它写成 per-plugin 保证。
 
 ### 3. P1-1：semver range 与依赖求解
 
@@ -79,7 +80,7 @@
 - 先决定 manifest 字段和 ABI 尾字段，再做 mount 前解析、歧义/缺失拒绝、`(id, version)` 身份。
 - ABI 仍精确匹配；不要同时引入互相冲突的 `abi_min/abi_max` 规则。
 
-### 4. P1-4：缓冲池化与性能
+### 4. P1-4：缓冲池化与性能（semver 之后）
 
 - 去掉每次调用 16 KiB 临时分配，先 benchmark 再改。
 - 线程池仍不能取消同步调用；若保留，只能作为故障隔离，必须证明超时后不卸载、不释放插件，线程泄漏要登记。

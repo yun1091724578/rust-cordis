@@ -22,8 +22,9 @@ Cordis 的 Rust 实现：服务容器 + epoch 驱动的 fiber 生命周期 + 可
 （camelCase，如 `{ timeoutMs: 50, outboundTimeoutMs: 20 }`）在挂载前按
 `ctx.store` 身份登记，嵌入方也可调用 `set_dispatch_policy_for(&ctx, policy)`。
 同一进程的其他 App 不受影响；没有 per-App 条目的 App 才回落到进程级
-`set_dispatch_policy`。策略在实例注册时取快照，只影响之后注册的实例；
-目前的粒度是 App（以及装载器所在 App），还不是按插件/方法配置。
+`set_dispatch_policy`。策略在实例注册时取快照，只影响之后注册的实例。
+**明确只支持 App 粒度**，不提供 per-plugin/per-method 配置；同一 App 下多个 loader
+的配置是后设置覆盖，不是每 loader 独立。当前 T2 边界如此，不要把它当成插件级策略。
 
 容量准入同样按 App / 装载器子树配置：`LoaderConfig.hostLimits`
 （camelCase，如 `{ maxInstancesPerApp: 64, maxDispatchesPerInstance: 256,
