@@ -382,12 +382,31 @@ fn seal_verify_accepts_a_complete_seal() {
         ("plugins/harness_tool.bin", "harness-tool"),
     ];
     let manifest_value = |id: &str| {
+        let (provides, requires) = match id {
+            "greeting" => (json!({ "greeting": "2.0.0" }), json!({})),
+            "hello" => (
+                json!({ "hello.note": "1.0.0" }),
+                json!({ "greeting": "^2" }),
+            ),
+            "harness-tool" => (
+                json!({
+                    "sessions": "1.0.0",
+                    "tool.harness-echo": "1.0.0",
+                    "harness.status": "1.0.0",
+                    "harness.stream": "1.0.0",
+                }),
+                json!({}),
+            ),
+            _ => (json!({}), json!({})),
+        };
         json!({
             "id": id,
             "version": "0.1.0",
             "source_revision": source_revision,
             "abi_version": 1,
             "sha256": sha,
+            "provides": provides,
+            "requires": requires,
         })
     };
     let mut sidecars = Vec::new();

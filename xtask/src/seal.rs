@@ -31,18 +31,30 @@ const PLUGINS: &[PluginSpec] = &[
         krate: "greeting",
         label: "greeting",
         plugin: "greeting",
+        provides: &[("greeting", "2.0.0")],
+        requires: &[],
     },
     PluginSpec {
         package: "plugin-hello",
         krate: "hello",
         label: "hello",
         plugin: "hello",
+        provides: &[("hello.note", "1.0.0")],
+        requires: &[("greeting", "^2")],
     },
     PluginSpec {
         package: "plugin-harness-tool",
         krate: "harness_tool",
         label: "harness",
         plugin: "harness-tool",
+        provides: &[
+            ("sessions", "1.0.0"),
+            ("tool.harness-echo", "1.0.0"),
+            ("harness.status", "1.0.0"),
+            ("harness.stream", "1.0.0"),
+        ],
+        // `tools` is provided by the T1 harness host, which is not part of this seal.
+        requires: &[],
     },
 ];
 
@@ -51,6 +63,8 @@ struct PluginSpec {
     krate: &'static str,
     label: &'static str,
     plugin: &'static str,
+    provides: &'static [(&'static str, &'static str)],
+    requires: &'static [(&'static str, &'static str)],
 }
 
 #[derive(Debug)]
@@ -713,10 +727,10 @@ fn plugin_spec_for(artifact: &SealArtifact) -> Option<&'static PluginSpec> {
         .find(|spec| spec.package == artifact.package && spec.krate == artifact.krate)
 }
 
-/// seal 只写身份字段，不生成 P1-1 的 `provides` / `requires`。
+/// seal 写身份字段，并从 [`PluginSpec`] 写入示例插件的 semver 依赖声明。
 ///
-/// 宿主 schema 接受这两个可选映射；需要依赖预检的发布方要在自己的流程里补充。
-/// `--verify` 仍要求 sidecar 与这里写出的规范字节一致，所以不要手改已封存目录。
+/// 这些声明只用于 loader 的 mount 前预检，不是 ABI 能力或授权；`--verify` 仍要求
+/// sidecar 与这里写出的规范字节一致，所以不要手改已封存目录。
 fn plugin_manifest_value(
     artifact: &SealArtifact,
     version: &str,
@@ -729,12 +743,24 @@ fn plugin_manifest_value(
             artifact.package, artifact.krate
         )
     })?;
+    let provides = spec
+        .provides
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), json!(value)))
+        .collect::<serde_json::Map<_, _>>();
+    let requires = spec
+        .requires
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), json!(value)))
+        .collect::<serde_json::Map<_, _>>();
     Ok(json!({
         "id": spec.plugin,
         "version": version,
         "source_revision": source_revision,
         "abi_version": abi_version,
         "sha256": artifact.sha256.to_ascii_lowercase(),
+        "provides": provides,
+        "requires": requires,
     }))
 }
 

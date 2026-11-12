@@ -730,6 +730,10 @@ pub struct LoaderState {
     dispatch_policy: Option<DispatchPolicy>,
     /// 本装载器登记的容量准入上限（P0-3）：与 `dispatch_policy` 同一套快照语义。
     host_limits: Option<HostLimits>,
+    /// 显式依赖计划（P1-1）。非空时覆盖 sidecar 收集；对账/重载前重新预检。
+    dependency_plan: Vec<PlanEntrySpec>,
+    /// 初装已经预检过；第一次 reconcile 不再重复问 source。
+    skip_next_preflight: AtomicBool,
 }
 
 /// 对账驱动者的取消安全闸门。
@@ -776,6 +780,7 @@ impl std::fmt::Debug for LoaderState {
             .field("interpolation_failed", &self.interpolation_failures())
             .field("dispatch_policy", &self.dispatch_policy)
             .field("host_limits", &self.host_limits)
+            .field("dependency_plan", &self.dependency_plan)
             .finish()
     }
 }
@@ -817,6 +822,7 @@ impl LoaderState {
         main_baseline: String,
         dispatch_policy: Option<DispatchPolicy>,
         host_limits: Option<HostLimits>,
+        dependency_plan: Vec<PlanEntrySpec>,
     ) -> Self {
         let fingerprint = config_fingerprint(&files);
         Self {
@@ -846,6 +852,18 @@ impl LoaderState {
             interpolation_mode,
             dispatch_policy,
             host_limits,
+            dependency_plan,
+            skip_next_preflight: AtomicBool::new(false),
+        }
+    }
+
+    /// 对当前条目树重新做 P1-1 预检：显式计划覆盖 sidecar；
+    /// 否则收集启用行的 manifest `provides` / `requires`。
+    fn preflight_dependencies(&self, entries: &[Entry]) -> std::result::Result<(), String> {
+        if self.dependency_plan.is_empty() {
+            preflight_source_dependency_plan(entries, &self.search, self.source.as_ref())
+        } else {
+            Ok(())
         }
     }
 
@@ -1307,11 +1325,10 @@ impl LoaderState {
 
     /// 以**给定的新树**为目标对账一次（文件驱动的唯一驱动器）。
     ///
-    /// # 依赖预检只在初装发生
-    /// P1-1 的 sidecar manifest 计划（以及显式 `dependencyPlan`）只在
-    /// [`load_with_source`] 创建装载器时求解。HMR / patch 对账 / 运行期启停都
-    /// **不会**重跑它：改了 manifest 或依赖声明，需要重新装载。这样对账的
-    /// 失败语义不会被"某个尚未挂载的行缺依赖"整体拖停。
+    /// # 依赖预检
+    /// P1-1 的 sidecar manifest 计划（以及显式 `dependencyPlan`）在初装、对账和
+    /// `reload_one` 前都会重新求解。预检失败时对账不采纳新树、不卸载已有实例，
+    /// 只把问题写进对账产物。
     pub async fn reconcile_once(self: &Arc<Self>, entries: Vec<Entry>) -> ReconcileOutcome {
         let _guard = self.mutation.lock().await;
         self.reconcile_once_inner(entries).await
@@ -1319,6 +1336,18 @@ impl LoaderState {
 
     /// [`reconcile_once`] 的无锁内核：调用方已经持有 `mutation`。
     async fn reconcile_once_inner(self: &Arc<Self>, entries: Vec<Entry>) -> ReconcileOutcome {
+        // P1-1：HMR/patch/启停触发的对账也要在挂载前重跑依赖预检。
+        // 初装已经在创建状态前预检过，第一次 reconcile 用标记跳过，避免重复访问 source。
+        if !self.skip_next_preflight.swap(false, Ordering::SeqCst) {
+            if let Err(err) = self.preflight_dependencies(&entries) {
+                self.ctx
+                    .log(Level::Error, &format!("依赖预检失败（对账未执行）: {err}"));
+                return ReconcileOutcome {
+                    failures: vec![format!("依赖预检失败: {err}")],
+                    ..ReconcileOutcome::default()
+                };
+            }
+        }
         // 期望态与动作表**先算出来**：这一步会求值 `!!js`、派生上下文（可能分配私有域）。
         let desired = self.desired(&entries);
         let actions = self.diff(&desired.rows);
@@ -2294,7 +2323,7 @@ async fn load(ctx: Ctx, config: LoaderConfig) -> Result<()> {
 /// `dependencyPlan` 非空时只求解它（覆盖、不合并）；为空时逐行调用
 /// [`PluginSource::plan_entry`] 收集 sidecar manifest 的 `provides` / `requires`。
 /// 两条路径都在**创建 [`LoaderState`]、调用 `source.load` 或挂载之前**完成；
-/// 失败会直接返回错误，不会留下半棵树。HMR / 对账不会重跑预检。
+/// 失败会直接返回错误，不会留下半棵树。对账与 `reload_one` 会重跑同一预检。
 pub async fn load_with_source(
     ctx: Ctx,
     config: LoaderConfig,
@@ -2423,7 +2452,10 @@ pub async fn load_with_source(
         text,
         config.dispatch_policy,
         config.host_limits,
+        config.dependency_plan.clone(),
     ));
+    // 初装预检已经跑过：第一次 reconcile 不重复访问 source。
+    state.skip_next_preflight.store(true, Ordering::SeqCst);
 
     // 4) `!!js` 的插值挂上 `internal/config` 链（M4-4b）——**必须在第一次对账之前**：
     //    首挂那一行的配置解析就要走它，否则原始标记会流进插件。
@@ -3035,6 +3067,10 @@ pub async fn reload_one(
     state: &Arc<LoaderState>,
     label: &str,
 ) -> std::result::Result<(), String> {
+    // P1-1：插件文件变化也可能改变 sidecar 依赖，先按当前树重跑预检。
+    if let Err(err) = state.preflight_dependencies(&state.tree_snapshot()) {
+        return Err(format!("依赖预检失败（reload 未执行）: {err}"));
+    }
     // 预检 → 换实例 → 改记录 → 发布报告：整个变更序列与对账/启停互斥。
     // 不互斥时，一次在飞的对账会把这里刚卸下的行按旧目标重新挂回去（或挂成两份）。
     let guard = state.mutation.lock().await;
@@ -4022,6 +4058,7 @@ mod tests {
             String::new(),
             None,
             None,
+            Vec::new(),
         );
         state
             .mounted

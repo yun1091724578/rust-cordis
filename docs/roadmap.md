@@ -74,7 +74,7 @@
 - 策略在实例注册时快照，运行期变更不追溯。
 - 这不是临时实现遗漏，而是当前 T2 的产品边界；不要把它写成 per-plugin 保证。
 
-### 3. P1-1：semver range 与依赖求解（显式配置与 manifest 采集已接线；仅初装预检）
+### 3. P1-1：semver range 与依赖求解（初装/对账/reload 预检）
 
 - `crates/host/src/plan.rs` 提供纯数据求解器：`PlanEntry` 的
   `(id, version)`、`provides`、`requires` range；选择最高满足版本，
@@ -96,13 +96,13 @@
   `crates/host/tests/source_policy.rs`（准入接受可选依赖字段），
   以及 `crates/host/src/loader.rs` 的 `dependencyPlan` YAML 解析测试。
 - **边界与仍待办**：
-  - 预检只在**初装**发生；HMR / patch 对账 / 运行期启停不会重跑。改 manifest
-    或依赖声明后需要重新装载。
+  - 初装、对账和 `reload_one` 前都会重跑预检；对账失败不采纳新树，只把问题
+    放进 outcome。
   - 只收集**静态启用**的非 group 行；带 `disabled: !!js …` 的行不参与初装预检。
   - `PluginDesc` 自述仍不参与求解；manifest 声明只用于预检，不改变运行时
     `inject` / 服务可见性，也不证明插件真的提供声明的服务。
-  - `cargo xtask seal` 目前只写身份字段，不生成 `provides` / `requires`；
-    allow-list 读取会忽略这些可选字段，但 `seal --verify` 仍要求自身规范字节。
+  - `cargo xtask seal` 会为三个示例插件写出 `provides` / `requires`；
+    `seal --verify` 仍要求自身规范字节，手工修改 sidecar 会失败。
   - 没有版本升级 / 回溯求解：一个服务键仍只能解析到一个提供者。
 - ABI 仍精确匹配；不要同时引入互相冲突的 `abi_min/abi_max` 规则。
 

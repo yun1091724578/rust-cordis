@@ -64,10 +64,10 @@ manifest 示例：
 ```
 
 这份计划只用于**装载前预检**，不是运行时依赖注入或隔离：它不改变 `inject` 的服务
-可见性，也不证明插件真的提供了声明的服务。HMR / patch 对账**不会**重跑预检；
-改 manifest 或依赖声明后需要重新装载。`cargo xtask seal` 生成的 sidecar 仍只有
-身份字段，不写 `provides`/`requires`；需要范围时由发布方补充（`seal --verify`
-校验的是它自己生成的那份规范字节）。`PluginDesc` 自述仍不参与求解。
+可见性，也不证明插件真的提供了声明的服务。初装、HMR / patch 对账和 `reload_one`
+前都会重跑预检；对账失败不采纳新树、不卸载已有实例。`cargo xtask seal` 会为三个
+示例插件写出 `provides` / `requires`；`seal --verify` 校验的是生成器写出的规范
+字节。`PluginDesc` 自述仍不参与求解。
 
 当前执行入口见 [`docs/roadmap.md`](docs/roadmap.md)：仓外真实接入与发布收尾并行。
 已知交付缺口、调用通道边界和维护事项见 [`docs/architecture-review.md`](docs/architecture-review.md)。
