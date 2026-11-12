@@ -26,7 +26,7 @@
 | A. 低层 ABI 与发布 | **基本完成** | 0.1.0/0.1.1 已发布；正式 `/2` 封存已从 tag 生成并归档；公开仓 CI、版本矩阵、SCM 一次实测 | 严格同版本封存证据、历史兼容可重复测试 |
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离，不能升级成安全承诺 |
 | C. 可信单租户底座 P0 | **按边界完成** | 来源策略；App 粒度 dispatch policy；宿主容量准入；生命周期清理不阻塞 tokio worker；P0-4 边界已记录 | per-plugin/method 明确不提供；永久 hang 属 T2 |
-| D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI、semver 依赖计划解析核心 | semver 计划接线 mount、缓冲池 |
+| D. 长期运行 P1 | **进行中** | 1M soak、RSS 预算、真实 `open_staged` soak、dhat（Linux nightly）、版本矩阵 CI、semver 依赖计划解析核心、显式 `LoaderConfig.dependencyPlan` 装载前预检 | manifest/`PluginDesc` 采集与 mount 期自述校验、缓冲池 |
 | E. agent 流处理 | **原型完成** | 六模式状态机、9+2 单测、多消息快照、统一收尾 | 有界增量交付、真实模型、取消/预算 |
 | F. T3 / 不可信插件 | **条件性待启动** | ADR 0001 预留位置 | 只有第三方/模型生成/多租户触发时另立 ADR |
 | G. 维护治理 | **持续** | R4/R5/R6 已登记 | serde_yaml、宿主模块、锁/panic 审查 |
@@ -74,15 +74,21 @@
 - 策略在实例注册时快照，运行期变更不追溯。
 - 这不是临时实现遗漏，而是当前 T2 的产品边界；不要把它写成 per-plugin 保证。
 
-### 3. P1-1：semver range 与依赖求解（解析核心已落地，未接线 mount）
+### 3. P1-1：semver range 与依赖求解（显式配置预检已接线；manifest 采集未做）
 
-- `crates/host/src/plan.rs` 已提供纯数据求解器：`PlanEntry` 的
+- `crates/host/src/plan.rs` 提供纯数据求解器：`PlanEntry` 的
   `(id, version)`、`provides`、`requires` range；选择最高满足版本，
   拒绝缺失、不可满足、重复身份和同版本多提供者。
-- 测试：`crates/host/src/plan.rs` 的 4 个 `plan::tests`。
-- **尚未接线**：没有从 manifest / loader 收集 `PlanEntry`，也没有在 mount 前调用
-  `resolve`；因此运行时仍不会按 semver range 拒绝依赖。
-- 下一步需要决定 manifest 字段与 `PluginDesc` 尾字段，再接入 loader。
+- **已接线（配置级）**：`LoaderConfig.dependencyPlan` 用 `PlanEntrySpec`
+  声明 `id` / `version` / `provides` / `requires`；非空时 `load_with_source`
+  在**任何挂载之前**解析并调用 `resolve`。缺失、不可满足或歧义都会让本次装载
+  大声失败，不加载、不应用任何插件；空计划表示不做预检。
+- 测试：`crates/host/src/plan.rs` 的 7 个 `plan::tests`（含 spec 解析），
+  `crates/host/tests/dependency_plan.rs`（假源计数器证明失败发生在 `load`/`apply` 之前），
+  以及 `crates/host/src/loader.rs` 的 `dependencyPlan` YAML 解析测试。
+- **仍待办**：manifest / `PluginDesc` 的 `PlanEntry` 采集与 mount 期
+  自述校验。当前不会从插件自述推导依赖计划，也不会按插件 manifest 的
+  semver range 拒绝依赖——只有显式 `dependencyPlan` 才生效。
 - ABI 仍精确匹配；不要同时引入互相冲突的 `abi_min/abi_max` 规则。
 
 ### 4. P1-4：缓冲池化与性能（semver 之后）

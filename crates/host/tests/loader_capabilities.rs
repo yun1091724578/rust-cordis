@@ -112,6 +112,7 @@ async fn capabilities_report_aggregates_inject_provision_and_volatile() {
         interpolation: cordis_host::loader::InterpolationMode::Builtin,
         dispatch_policy: None,
         host_limits: None,
+        dependency_plan: Vec::new(),
     };
     load_with_source(app.root.clone(), config, Arc::new(CapabilitySource))
         .await
@@ -153,6 +154,7 @@ async fn loader_accepts_scoped_inject_and_optional_dependency_does_not_block() {
         interpolation: cordis_host::loader::InterpolationMode::Builtin,
         dispatch_policy: None,
         host_limits: None,
+        dependency_plan: Vec::new(),
     };
     let state = load_with_source(app.root.clone(), config, Arc::new(CapabilitySource))
         .await

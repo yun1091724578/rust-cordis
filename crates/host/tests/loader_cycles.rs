@@ -126,6 +126,7 @@ fn config_for(path: &Path, strict: bool, strict_cycles: bool) -> LoaderConfig {
         interpolation: cordis_host::loader::InterpolationMode::Builtin,
         dispatch_policy: None,
         host_limits: None,
+        dependency_plan: Vec::new(),
     }
 }
 

@@ -36,6 +36,13 @@ maxPendingPerInstance: 64, maxStreamsPerInstance: 8 }`），嵌入方也可调�
 “无限”而是非法配置**。这些是宿主侧表项准入（实例数、派发记录、挂起续延、流），
 不是每插件的内存/CPU 硬上限；T2 插件与宿主同进程，真正隔离仍属 T3。
 
+依赖计划由 `LoaderConfig.dependencyPlan` **显式声明**（camelCase 数组，每项
+`{ id, version, provides, requires }`，`provides`/`requires` 可缺省）。非空时，
+装载器在**任何挂载之前**用 `host::plan::resolve` 求解：缺失、版本不可满足或
+同版本多提供者都会让本次装载失败，不加载、不应用任何插件；空（缺省）表示不做
+预检。这份计划**不是**从插件 manifest / `PluginDesc` 推导的——插件自述仍只用于
+能力展示，按 manifest 收集并在 mount 期校验自述尚未接入。
+
 当前执行入口见 [`docs/roadmap.md`](docs/roadmap.md)：仓外真实接入与发布收尾并行。
 已知交付缺口、调用通道边界和维护事项见 [`docs/architecture-review.md`](docs/architecture-review.md)。
 根目录设计长文保留历史背景，不作为当前进度或支持承诺。

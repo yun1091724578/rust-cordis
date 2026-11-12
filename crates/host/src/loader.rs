@@ -18,6 +18,7 @@
 //!    所以新库落到 `<name>.r<修订号>.<ext>`，旧句柄继续指向旧文件。
 
 use crate::patch::{apply_entry_patches_tracked, parse_entries, parse_patches, Entry, PatchOwners};
+use crate::plan::PlanEntrySpec;
 use crate::{
     mount, resolve_plugin_path, set_dispatch_policy_for, set_host_limits_for, stage_plugin,
     DispatchPolicy, HostLimits, LoadedPlugin, StagedFile,
@@ -98,6 +99,16 @@ pub struct LoaderConfig {
     /// 进程级 [`crate::set_default_host_limits`]；任何字段为 0 都会在挂载前报错。
     #[serde(default)]
     pub host_limits: Option<HostLimits>,
+    /// **显式**的依赖计划（P1-1）：配置级声明，不是插件自述。
+    ///
+    /// 每一项给出 `id` / `version` / `provides` / `requires`；非空时，
+    /// [`load_with_source`] 在**任何挂载之前**用 [`crate::plan::resolve`] 求解。
+    /// 缺失、版本不可满足或同版本多提供者都会让本次装载**大声失败**，且不会
+    /// 挂上/应用任何插件。空（缺省）表示不做预检。
+    ///
+    /// 这份计划**不由** manifest 或 `PluginDesc` 推导：插件自述仍只用于能力展示。
+    #[serde(default)]
+    pub dependency_plan: Vec<PlanEntrySpec>,
 }
 
 /// `!!js` 的求值模式（M9，D5，**P2**）。
@@ -143,6 +154,7 @@ impl std::fmt::Debug for LoaderConfig {
             .field("interpolation", &self.interpolation)
             .field("dispatch_policy", &self.dispatch_policy)
             .field("host_limits", &self.host_limits)
+            .field("dependency_plan", &self.dependency_plan)
             .finish()
     }
 }
@@ -2149,6 +2161,28 @@ pub async fn load_with_source(
         set_host_limits_for(&ctx, limits)
             .map_err(|err| format!("LoaderConfig.hostLimits 无效: {err}"))?;
     }
+    // P1-1：显式依赖计划在**任何挂载之前**求解。失败即整体失败：预检之后
+    // 才轮得到读配置、解析插件路径与 `source.load`，所以不会有半棵树被挂上。
+    if !config.dependency_plan.is_empty() {
+        let mut plan = Vec::with_capacity(config.dependency_plan.len());
+        for (index, spec) in config.dependency_plan.iter().enumerate() {
+            let entry = spec.clone().into_entry().map_err(|err| {
+                format!(
+                    "LoaderConfig.dependencyPlan[{index}] (id={}) 无效: {err}",
+                    spec.id
+                )
+            })?;
+            plan.push(entry);
+        }
+        if let Err(findings) = crate::plan::resolve(&plan) {
+            return Err(format!(
+                "依赖计划预检失败（LoaderConfig.dependencyPlan；{} 个问题）:\n  - {}",
+                findings.len(),
+                findings.join("\n  - ")
+            )
+            .into());
+        }
+    }
     let main_path = PathBuf::from(&config.path);
     let base_dir = main_path
         .parent()
@@ -3664,6 +3698,24 @@ mod tests {
         assert!(zero.is_err(), "0 不是“无限”，必须作为非法配置拒绝");
     }
 
+    /// P1-1：`dependencyPlan` 是 `LoaderConfig` 的 camelCase 字段；缺省为空表示
+    /// 不做预检。条目里的 `provides` / `requires` 也允许缺省。
+    #[test]
+    fn loader_config_parses_dependency_plan_from_yaml() {
+        let config: LoaderConfig = serde_yaml::from_str(
+            "path: cordis.yml\ndependencyPlan:\n  - id: a\n    version: 1.0.0\n    provides: {svc: 1.0.0}\n    requires: {svc: \"^1\"}\n",
+        )
+        .expect("camelCase dependencyPlan 必须能解析");
+        assert_eq!(config.dependency_plan.len(), 1);
+        assert_eq!(config.dependency_plan[0].id, "a");
+        assert_eq!(config.dependency_plan[0].provides["svc"], "1.0.0");
+        assert_eq!(config.dependency_plan[0].requires["svc"], "^1");
+
+        let absent: LoaderConfig =
+            serde_yaml::from_str("path: cordis.yml\n").expect("缺省 dependencyPlan 不报错");
+        assert!(absent.dependency_plan.is_empty(), "缺省表示不做依赖预检");
+    }
+
     /// M1-4 → M4-4（改写）：装载点对 `!!js` 的处置。
     ///
     /// M1-4 的判据是"任何 `!!js` 都不许上线（报'暂不支持'）"——那时的前提是**没有求值器**。
@@ -3693,6 +3745,7 @@ mod tests {
             interpolation: InterpolationMode::Builtin,
             dispatch_policy: None,
             host_limits: None,
+            dependency_plan: Vec::new(),
         };
 
         // ① 算得出：休眠行 ⇒ 一行都不挂，但装载成功。

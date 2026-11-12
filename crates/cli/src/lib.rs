@@ -677,6 +677,7 @@ impl RunSession {
             interpolation: InterpolationMode::Builtin,
             dispatch_policy: None,
             host_limits: None,
+            dependency_plan: Vec::new(),
         };
         match load_with_source(app.root.clone(), config, source).await {
             Ok(state) => Ok(Self { app, state }),

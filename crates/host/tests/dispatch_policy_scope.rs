@@ -282,6 +282,7 @@ fn loader_config_for(path: &Path) -> LoaderConfig {
             ..DispatchPolicy::default()
         }),
         host_limits: None,
+        dependency_plan: Vec::new(),
     }
 }
 

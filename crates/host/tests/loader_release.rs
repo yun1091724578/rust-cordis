@@ -216,6 +216,7 @@ fn config_for(path: &Path) -> LoaderConfig {
         interpolation: InterpolationMode::Builtin,
         dispatch_policy: None,
         host_limits: None,
+        dependency_plan: Vec::new(),
     }
 }
 
