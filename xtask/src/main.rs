@@ -35,6 +35,8 @@ cargo xtask <命令>
   seal --verify <dir> [--require-v2]
                    只读校验预期 artifact 集合、SHA256、smoke 与 inspect 证据
                    --require-v2 拒绝把 /2 伪装成 /1 绕过 provenance
+  seal-consume <dir>
+                   用正式封存的 allow-list 跑独立消费者（发布门禁，不进入 ci）
   soak [cycles]    运行被忽略的宿主资源 soak（默认 1000 轮；不进入 ci）
   doctor           打印本机构建环境诊断
 ";
@@ -64,6 +66,7 @@ fn main() -> ExitCode {
         "inventory" => inventory_command(std::env::args().skip(2).collect()),
         "matrix" => matrix_command(std::env::args().skip(2).collect()),
         "seal" => seal::command(std::env::args().skip(2).collect()),
+        "seal-consume" => seal_consume(std::env::args().skip(2).collect()),
         "soak" => soak_command(std::env::args().skip(2).collect()),
         "doctor" => {
             doctor();
@@ -405,6 +408,53 @@ fn soak_command(args: Vec<String>) -> i32 {
         Ok(status) => status.code().unwrap_or(1),
         Err(err) => {
             eprintln!("执行 {cargo} 失败: {err}");
+            1
+        }
+    }
+}
+
+/// 用正式封存的 allow-list 跑独立消费者；发布门禁，不进入普通 ci。
+fn seal_consume(args: Vec<String>) -> i32 {
+    if args.len() != 1 {
+        eprintln!("seal-consume 需要且只需要一个封存目录\n\n{USAGE}");
+        return 2;
+    }
+    let dir = PathBuf::from(&args[0]);
+    let dir = if dir.is_absolute() {
+        dir
+    } else {
+        workspace_root().join(dir)
+    };
+    for required in ["seal.json", "allow-list.json", "plugins"] {
+        if !dir.join(required).exists() {
+            eprintln!(
+                "封存目录缺少 {required}：{}（先运行 `cargo xtask seal --verify`）",
+                dir.display()
+            );
+            return 1;
+        }
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = Command::new(&cargo)
+        .args([
+            "test",
+            "--manifest-path",
+            "tests/consumer-service/Cargo.toml",
+            "--test",
+            "formal_seal",
+            "--locked",
+        ])
+        .env("CORDIS_CONSUMER_SEAL_DIR", &dir)
+        .current_dir(workspace_root())
+        .status();
+    match status {
+        Ok(status) if status.success() => 0,
+        Ok(status) => {
+            eprintln!("正式封存消费者测试失败：{status}");
+            1
+        }
+        Err(err) => {
+            eprintln!("运行正式封存消费者测试失败：{err}");
             1
         }
     }

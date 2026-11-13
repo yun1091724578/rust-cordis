@@ -18,7 +18,12 @@ package job 产出 `.crate`，其校验和不在本封存内。
 ```text
 cargo xtask seal [--out <dir>] [--root <workspace>]
 cargo xtask seal --verify <dir> [--require-v2]
+cargo xtask seal-consume <dir>
 ```
+
+`seal-consume` 是发布门禁：读取封存的 `allow-list.json`，用独立消费者工程
+装载 `greeting` / `hello` 并关闭。它不进入普通 PR CI，要求目录包含
+`seal.json`、`allow-list.json` 与 `plugins/`。
 
 发布门禁使用 `--require-v2`；它拒绝把 `/2` 的 format 改成 `/1` 来跳过
 sidecar/allow-list/provenance 校验。默认 `--verify` 仍兼容历史 `/1`。

@@ -503,6 +503,33 @@ fn seal_refuses_to_overwrite_a_nonempty_output() {
 }
 
 #[test]
+fn seal_consume_requires_one_existing_seal() {
+    let output = Command::new(bin())
+        .arg("seal-consume")
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing dir is a usage error"
+    );
+
+    let missing =
+        std::env::temp_dir().join(format!("cordis-xtask-missing-seal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing);
+    let output = Command::new(bin())
+        .arg("seal-consume")
+        .arg(&missing)
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("seal.json"),
+        "error must name the missing required file"
+    );
+}
+
+#[test]
 fn seal_rejects_conflicting_modes() {
     for args in [
         vec!["seal", "--out", "a", "--verify", "b"],
