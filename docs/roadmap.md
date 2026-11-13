@@ -109,7 +109,11 @@
 ### 1. 公开 API / ABI 稳定与版本治理
 
 - 先冻结 SDK 的受控公开面：ABI 前缀/结构、host/core/SDK 入口、错误载荷。
-- 对新增公开类型评估 `#[non_exhaustive]`，建立 0.1 → 0.2 的迁移说明。
+- 0.1 **保留** `DispatchPolicy` / `HostLimits` 的公开字面量构造；
+  `crates/host/tests/embedding_contract.rs::config_dtos_remain_literal_constructible_in_0_1`
+  故意固定它，未来加 `#[non_exhaustive]` 会先让测试变红。
+- `Capabilities` 已有私有 schema 字段，外部本来就不能字面量构造；无需额外 opaque 化。
+- `#[non_exhaustive]` 与 builder 移到 0.2 迁移评估，不在 0.1 静默破坏。
 - 版本号、ABI 精确匹配、插件 semver 分开表达；不在同一版引入冲突的
   `abi_min/abi_max` 双轨规则。
 - 验收：`inventory --check`、支持契约、API 文档与至少两个嵌入示例一致。
