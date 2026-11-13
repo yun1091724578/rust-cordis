@@ -4,7 +4,7 @@
 //! It pins the SDK path an external service runtime would take:
 //! App -> LoaderConfig::new -> load_with_source -> mounted lifecycle -> close.
 
-use cordis_core::{plugin_fn, App, Config, Ctx, Inject, Plugin};
+use cordis_core::{plugin_fn, App, Config, Ctx, Dyn, FiberState, Inject, Plugin};
 use cordis_host::loaded_instances;
 use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
 use cordis_host::patch::Entry;
@@ -136,6 +136,89 @@ fn config_dtos_remain_literal_constructible_in_0_1() {
         max_pending_per_instance: 4,
         max_streams_per_instance: 2,
     };
+}
+
+struct Tagged {
+    inner: Arc<dyn Plugin>,
+    version: &'static str,
+}
+
+impl Plugin for Tagged {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn key(&self) -> cordis_core::PluginKey {
+        self.inner.key()
+    }
+    fn inject(&self) -> Inject {
+        self.inner.inject()
+    }
+    fn version(&self) -> Option<&str> {
+        Some(self.version)
+    }
+    fn provision(&self) -> Vec<String> {
+        self.inner.provision()
+    }
+    fn volatile_paths(&self) -> Vec<String> {
+        self.inner.volatile_paths()
+    }
+    fn config_schema(&self) -> Option<String> {
+        self.inner.config_schema()
+    }
+    fn validate(&self, raw: Config) -> Result<Config, cordis_core::ValidationError> {
+        self.inner.validate(raw)
+    }
+    fn apply(&self, ctx: Ctx, config: Config) -> cordis_core::BoxFuture<cordis_core::Result<()>> {
+        self.inner.apply(ctx, config)
+    }
+}
+
+#[tokio::test]
+async fn plugin_versions_do_not_gate_service_composition() {
+    let app = App::new();
+    let provider: Arc<dyn Plugin> = Arc::new(Tagged {
+        inner: plugin_fn("versioned-provider", Inject::default(), |ctx: Ctx, _| {
+            Box::pin(async move {
+                ctx.provide("versioned.svc", Dyn::new(7u32))?;
+                Ok(())
+            })
+        }),
+        version: "1.0.0",
+    });
+    let provider_fiber = app.root.plugin(provider, Config::Null);
+    tokio::time::timeout(std::time::Duration::from_secs(5), provider_fiber.settle())
+        .await
+        .expect("provider settle");
+    assert_eq!(provider_fiber.state(), FiberState::Active);
+
+    let consumer: Arc<dyn Plugin> = Arc::new(Tagged {
+        inner: plugin_fn(
+            "versioned-consumer",
+            Inject::of(&["versioned.svc"]),
+            |ctx: Ctx, _| {
+                Box::pin(async move {
+                    assert_eq!(
+                        ctx.get("versioned.svc")
+                            .and_then(|value| value.downcast::<u32>())
+                            .map(|value| *value),
+                        Some(7)
+                    );
+                    Ok(())
+                })
+            },
+        ),
+        version: "9.9.9",
+    });
+    let consumer_fiber = app.root.plugin(consumer, Config::Null);
+    tokio::time::timeout(std::time::Duration::from_secs(5), consumer_fiber.settle())
+        .await
+        .expect("consumer settle");
+    assert_eq!(
+        consumer_fiber.state(),
+        FiberState::Active,
+        "Plugin::version 差异不得成为服务组合门禁"
+    );
+    app.close().await;
 }
 
 #[tokio::test]

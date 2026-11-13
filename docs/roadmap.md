@@ -7,6 +7,7 @@
 - 结果与错误契约：`docs/adr/0003-result-and-error-contract.md`、`docs/adr/0004-abi-error-evolution.md`
 - 信任模型与插件来源：`docs/adr/0005-trust-model-and-plugin-source-boundary.md`
 - 公开 API 稳定与 0.2 边界：`docs/adr/0006-public-api-stability.md`
+- 版本诊断边界：`docs/adr/0007-version-is-diagnostic-only.md`
 - 发布门禁与未确认项：`docs/release.md`
 - 封存格式：`docs/release-seal.md`
 - 公开 API / 载荷清单：`docs/api-inventory.md`
@@ -144,6 +145,11 @@
   与 `inspect` 文本/JSON 已展示该字段；`#[cordis::plugin(version = "…")]`
   可在 typed 插件上声明。它只是诊断/身份元数据，不替代 ABI 精确匹配或来源策略。
   冻结的 `PluginDesc` 没有 semver 字段，ABI 路径仍为 None。
+- 版本诊断边界见 ADR 0007：`Plugin::version` **只展示**，不参与服务解析、
+  挂载准入、ABI 匹配或来源策略；`plugin_versions_do_not_gate_service_composition`
+  故意让未来误用变红。
+- sidecar `PluginManifest.version` 仍只作为 manifest 身份/诊断字段，并在依赖
+  计划里参与重复身份判断；它不推导 semver range，也不替代 ABI。
 - 从 `PluginDesc` 自动采集 provides/requires，作为 sidecar 的补充，而不是只靠
   手写表。
 - 决定是否需要 ABI 尾字段；先做真实消费者需要的版本诊断，不先造升级/回溯求解。
