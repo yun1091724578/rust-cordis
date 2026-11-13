@@ -132,6 +132,9 @@
 - **独立服务消费者**：`tests/consumer-service` 是独立 workspace，只用公开
   path 依赖 + 公开 API；`cargo xtask consumer` 已接入 `xtask ci`，三平台
   GitHub CI 也直接运行该步骤和 consumer fmt 检查。
+- `xtask consumer` 先构建真实 `greeting` / `hello` cdylib，再验证 ABI 装载、
+  跨插件服务注入（hello inject greeting）与 `App::close` 后实例归零；另有
+  进程内 fake service 基础契约。
 - 该测试同时固定了一个边界：进程内 fake plugin 不经过 ABI 实例表，
   `loaded_instances()` 只适合 cdylib 路径，不能拿它当通用挂载计数。
 - 仍需用两个真实消费者验证同一组原语：服务运行时与 agent 运行时。

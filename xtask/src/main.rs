@@ -413,6 +413,29 @@ fn soak_command(args: Vec<String>) -> i32 {
 /// 独立服务消费者：独立 workspace，只通过公开 path 依赖使用 SDK。
 fn consumer_check() -> i32 {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let build = Command::new(&cargo)
+        .args([
+            "build",
+            "--locked",
+            "-p",
+            "plugin-greeting",
+            "-p",
+            "plugin-hello",
+        ])
+        .current_dir(workspace_root())
+        .status();
+    if !matches!(build, Ok(status) if status.success()) {
+        eprintln!("构建真实 ABI 消费者插件失败：{build:?}");
+        return 1;
+    }
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"));
+    let target = if target.is_absolute() {
+        target
+    } else {
+        workspace_root().join(target)
+    };
     let status = Command::new(&cargo)
         .args([
             "test",
@@ -420,6 +443,7 @@ fn consumer_check() -> i32 {
             "tests/consumer-service/Cargo.toml",
             "--locked",
         ])
+        .env("CORDIS_CONSUMER_PLUGIN_DIR", target.join("debug"))
         .current_dir(workspace_root())
         .status();
     match status {
