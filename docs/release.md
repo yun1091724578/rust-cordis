@@ -151,8 +151,8 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 
 1. 仓库 URL：`Cargo.toml` 已在 0.1.1 补齐 `repository` / `homepage`（`https://github.com/yun1091724578/rust-cordis`），发布 warning 消失；仓库已于 2026-11-09 切换为公开仓库，标准 GitHub-hosted Runner 不再消耗私有仓库 Actions 分钟。
 2. Windows SCM 真实 `sc create` / `sc start` / `sc stop` 实测：已提供 `scripts/scm-smoke.ps1`；2026-11-07 在管理员 PowerShell（Windows 10.0.26300）实际跑通 `create → RUNNING → stop → STOPPED → delete`，日志 `dist/cordis-scm-smoke.log`，服务已确认删除（`sc query` 返回 1060）。这是一次真实手工验证；持续 CI 重跑仍待补，因此不把它夸大为跨机器持续保证。
-3. **首发产物封存**：**正式 `/2` 封存已完成**。`v0.1.0`/`v0.1.1` 生成 `dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal`；`v0.1.2` 生成严格同源 `dist/cordis-0.1.2-formal`。GitHub Release assets：`cordis-0.1.0-formal.tar.gz`、`cordis-0.1.1-formal.tar.gz`、`cordis-0.1.2-formal.tar.gz`（0.1.2 SHA256 `66ED0BACFBCE81A14CBDB668CFB340C281694083A44DDDD51DD73A5DA3E9F467`）。均含 sidecar manifest 与 `allow-list.json`，`seal --verify --require-v2` 通过；旧 `/2` 无依赖字段仍兼容默认 verify。
-4. **首发产物 × 同版本宿主**：0.1.2 正式封存的 `source.sha256 == host.source_sha256 == b2a976458edfe8b54f42584418639733dc5c90a49cd383e44c491594eed607e2`（224 文件），`same_source=true`，`seal --verify --require-v2` 与 `seal-consume` 均通过。0.1.0/0.1.1 仍由当前工作区宿主 smoke，属于跨源码树证据；历史 tag 不回溯补严格同源。
+3. **首发产物封存**：**正式 `/2` 封存已完成**。`v0.1.0`/`v0.1.1` 生成 `dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal`；`v0.1.2` 生成严格同源 `dist/cordis-0.1.2-formal`。GitHub Release assets：`cordis-0.1.0-formal.tar.gz`、`cordis-0.1.1-formal.tar.gz`、`cordis-0.1.2-formal.tar.gz`（0.1.2 SHA256 `AFEE05783B35443F209F28EE6A22484A35FD3268B773E21FCB186BD607522B4A`）。均含 sidecar manifest 与 `allow-list.json`，`seal --verify --require-v2` 通过；旧 `/2` 无依赖字段仍兼容默认 verify。
+4. **首发产物 × 同版本宿主**：0.1.2 正式封存的 `source.sha256 == host.source_sha256 == 830bf97d7d494612bbb53c19aa7eb3168aed5b8185b6b43e3faa911cae4271b5`（224 文件），`same_source=true`，`seal --verify --require-v2` 与 `seal-consume` 均通过。0.1.0/0.1.1 仍由当前工作区宿主 smoke，属于跨源码树证据；历史 tag 不回溯补严格同源。
 5. **历史产物 × 后续宿主版本**：0.1.0 正式 `/2` 封存的 smoke 由 0.1.1 宿主加载并通过 `inspect --source-policy`（`dist/cordis-0.1.0-formal/smoke/inspect.txt`）。支持契约仍要求可重复测试，因此状态保持待验证，不把单次结果写成保证。
 6. **nightly artifact 长期转存**：当前 `soak.log` 由 GitHub Actions artifact 保存，保留期按仓库设置；正式发布前需把首次与后续 nightly 结果转存到发布存储。nightly schedule 可能在仓库无活动时被 GitHub 自动暂停，发布前需确认最近一次结果。
 
@@ -203,3 +203,4 @@ registry 交付。
 执行状态以 `roadmap.md` 的 R1/R2/R3 与真实 agent 链路为准。仓外验收不必等待
 A5-4：后者只能在后续宿主版本出现后验证；首发时保持跨版本兼容待验证，并明确其
 范围。
+

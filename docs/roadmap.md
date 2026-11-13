@@ -203,7 +203,7 @@
 **仍未闭合：**
 
 - 0.1.2 正式 tag 已生成严格同源封存：`source.sha256 == host.source_sha256`
-  （`b2a97645…`，224 文件），`seal --verify --require-v2` 与 `seal-consume`
+  （`830bf97d…`，224 文件），`seal --verify --require-v2` 与 `seal-consume`
   均通过。0.1.0/0.1.1 仍是历史跨源证据；历史 tag 不回溯补严格同源。
 - 历史发布版 × 新宿主仍缺可重复测试。
 - nightly cron 首跑与 artifact 长期转存。
@@ -257,7 +257,7 @@ inspect/status provenance、默认拒绝来源策略。
 |---|---|---|
 | A5-1 三平台 CI | 完成 | `41460414477`；17 × 4 矩阵 |
 | A5-2 nightly soak | 进行中 | 1M Linux、RSS 预算、dhat；cron 首跑/长期转存待补 |
-| A5-3 正式 `/2` 封存 | 0.1.2 完成，strict same-version 满足 | `xtask seal --root v0.1.2`；`dist/cordis-0.1.2-formal`（`source == host`，`b2a97645…`）；0.1.0/0.1.1 保留为历史跨源封存；Release assets；`--require-v2` 可用 |
+| A5-3 正式 `/2` 封存 | 0.1.2 完成，strict same-version 满足 | `xtask seal --root v0.1.2`；`dist/cordis-0.1.2-formal`（`source == host`，`830bf97d…`）；0.1.0/0.1.1 保留为历史跨源封存；Release assets；`--require-v2` 可用 |
 | A5-4 历史 × 新宿主 | 已验证一次，仍待验证 | 0.1.1 宿主加载 0.1.0 formal smoke；缺可重复测试 |
 | A5-5 其余发布项 | 大部分完成 | 公开仓、元数据、SCM 一次实测；nightly 转存/SCM CI 重跑待补 |
 
@@ -290,3 +290,4 @@ cargo xtask seal ...  # 正式 /2 封存与 verify（不进入 ci）
 - 为了统一形式新增事件返回协议
 - 没有消费者和 ADR 的阶段 4/5/6 能力
 - 把单次 SCM 实测或单次历史演练写成持续保证
+
