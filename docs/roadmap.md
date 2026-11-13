@@ -6,6 +6,7 @@
 - 支持范围、非目标与保证索引：`docs/support-contract.md`
 - 结果与错误契约：`docs/adr/0003-result-and-error-contract.md`、`docs/adr/0004-abi-error-evolution.md`
 - 信任模型与插件来源：`docs/adr/0005-trust-model-and-plugin-source-boundary.md`
+- 公开 API 稳定与 0.2 边界：`docs/adr/0006-public-api-stability.md`
 - 发布门禁与未确认项：`docs/release.md`
 - 封存格式：`docs/release-seal.md`
 - 公开 API / 载荷清单：`docs/api-inventory.md`
@@ -108,6 +109,7 @@
 
 ### 1. 公开 API / ABI 稳定与版本治理
 
+- 决策记录：`docs/adr/0006-public-api-stability.md`。
 - 先冻结 SDK 的受控公开面：ABI 前缀/结构、host/core/SDK 入口、错误载荷。
 - 0.1 **保留** `DispatchPolicy` / `HostLimits` 的公开字面量构造；
   `crates/host/tests/embedding_contract.rs::config_dtos_remain_literal_constructible_in_0_1`
