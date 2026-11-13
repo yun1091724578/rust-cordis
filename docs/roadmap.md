@@ -135,6 +135,8 @@
 - `xtask consumer` 先构建真实 `greeting` / `hello` cdylib，再验证 ABI 装载、
   跨插件服务注入（hello inject greeting）与 `App::close` 后实例归零；另有
   进程内 fake service 基础契约。
+- 生产准入路径已有独立测试：真实 sidecar + `PluginSourcePolicy` 校验通过后
+  才装载并组合；`set_allow_unverified(true)` 的开发模式测试仍保留。
 - 该测试同时固定了一个边界：进程内 fake plugin 不经过 ABI 实例表，
   `loaded_instances()` 只适合 cdylib 路径，不能拿它当通用挂载计数。
 - 仍需用两个真实消费者验证同一组原语：服务运行时与 agent 运行时。
