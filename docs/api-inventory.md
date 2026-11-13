@@ -94,6 +94,7 @@
 | `ResolveError` | enum | `crates/core/src/store.rs` |
 | `IfaceVersionMismatch` | struct | `crates/core/src/dyn_value.rs` |
 | `ErrorPayload` | struct | `crates/abi/src/error.rs` |
+| `Plugin::version` | method | `crates/core/src/store.rs` |
 | `Plugin::config_schema` | method | `crates/core/src/store.rs` |
 | `PendingReason` | enum | `crates/core/src/fiber.rs` |
 | `PendingInject` | struct | `crates/core/src/fiber.rs` |

@@ -178,6 +178,10 @@ impl Plugin for VolatilePlugin {
         self.inner.name()
     }
 
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
+    }
+
     fn key(&self) -> PluginKey {
         self.inner.key()
     }

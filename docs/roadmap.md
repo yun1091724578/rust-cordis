@@ -35,7 +35,7 @@
 ### 基线
 
 - 支持契约：**26 行 / 17 条保证**
-- API 清单：**23 常量 / 4 结构 / 41 字段 / 78 公开入口 / 32 载荷**
+- API 清单：**23 常量 / 4 结构 / 41 字段 / 79 公开入口 / 32 载荷**
 - 最新全绿三平台 CI：`43196946690`
 - 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal` 与 Release assets
 - 仓库公开；标准 GitHub-hosted Runner 不再消耗私有分钟
@@ -139,6 +139,9 @@
 
 ### 3. 插件身份与依赖治理
 
+- **已落地最小原语**：`Plugin::version() -> Option<&str>`，默认 None；
+  `Provisioned` / `VolatilePlugin` wrapper 会保留版本。它只是诊断/身份元数据，
+  不替代 ABI 精确匹配或来源策略。
 - 从 `PluginDesc` 自动采集 provides/requires，作为 sidecar 的补充，而不是只靠
   手写表。
 - 决定是否需要 ABI 尾字段；先做真实消费者需要的版本诊断，不先造升级/回溯求解。

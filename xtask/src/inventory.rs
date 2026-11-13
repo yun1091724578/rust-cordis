@@ -121,6 +121,12 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub struct ErrorPayload",
     },
     PublicItem {
+        item: "Plugin::version",
+        kind: "method",
+        source: "crates/core/src/store.rs",
+        marker: "/// 可选的插件版本（诊断/身份用，不是 ABI 授权）。",
+    },
+    PublicItem {
         item: "Plugin::config_schema",
         kind: "method",
         source: "crates/core/src/store.rs",
@@ -1124,7 +1130,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 78, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 79, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 

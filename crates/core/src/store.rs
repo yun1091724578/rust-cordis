@@ -143,6 +143,14 @@ pub trait Plugin: Send + Sync + 'static {
         Arc::from(self.name())
     }
 
+    /// 可选的插件版本（诊断/身份用，不是 ABI 授权）。
+    ///
+    /// 默认 `None` = 未声明；loader 与 CLI 只能把它当展示信息，不能据此替代
+    /// `abi_version` 的精确匹配或来源策略。
+    fn version(&self) -> Option<&str> {
+        None
+    }
+
     fn inject(&self) -> Inject {
         Inject::default()
     }
@@ -225,6 +233,10 @@ struct Provisioned {
 impl Plugin for Provisioned {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
     }
 
     fn key(&self) -> PluginKey {
