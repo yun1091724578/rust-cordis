@@ -135,6 +135,7 @@
 | `mounted_sources` | fn | `crates/host/src/loader.rs` |
 | `DispatchPolicy` | struct | `crates/host/src/lib.rs` |
 | `HostLimits` | struct | `crates/host/src/lib.rs` |
+| `HostLimits::new` | fn | `crates/host/src/lib.rs` |
 | `streams_len` | fn | `crates/host/src/lib.rs` |
 | `pending_len` | fn | `crates/host/src/lib.rs` |
 | `waterfall_len` | fn | `crates/host/src/lib.rs` |

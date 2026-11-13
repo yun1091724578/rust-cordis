@@ -34,7 +34,7 @@
 ### 基线
 
 - 支持契约：**26 行 / 17 条保证**
-- API 清单：**23 常量 / 4 结构 / 41 字段 / 77 公开入口 / 32 载荷**
+- API 清单：**23 常量 / 4 结构 / 41 字段 / 78 公开入口 / 32 载荷**
 - 最新全绿三平台 CI：`43196946690`
 - 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal` 与 Release assets
 - 仓库公开；标准 GitHub-hosted Runner 不再消耗私有分钟
@@ -112,6 +112,7 @@
 - 0.1 **保留** `DispatchPolicy` / `HostLimits` 的公开字面量构造；
   `crates/host/tests/embedding_contract.rs::config_dtos_remain_literal_constructible_in_0_1`
   故意固定它，未来加 `#[non_exhaustive]` 会先让测试变红。
+- `HostLimits::new` 已提供带校验的安全构造入口；0 在注册前失败。
 - `Capabilities` 已有私有 schema 字段，外部本来就不能字面量构造；无需额外 opaque 化。
 - `#[non_exhaustive]` 与 builder 移到 0.2 迁移评估，不在 0.1 静默破坏。
 - 版本号、ABI 精确匹配、插件 semver 分开表达；不在同一版引入冲突的

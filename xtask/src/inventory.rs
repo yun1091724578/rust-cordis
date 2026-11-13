@@ -367,6 +367,12 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub struct HostLimits",
     },
     PublicItem {
+        item: "HostLimits::new",
+        kind: "fn",
+        source: "crates/host/src/lib.rs",
+        marker: "pub fn new(\n        max_instances_per_app: usize,",
+    },
+    PublicItem {
         item: "streams_len",
         kind: "fn",
         source: "crates/host/src/lib.rs",
@@ -1118,7 +1124,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 77, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 78, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 

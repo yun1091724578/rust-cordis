@@ -984,6 +984,24 @@ impl Default for HostLimits {
 }
 
 impl HostLimits {
+    /// 带校验的构造入口：嵌入方可在注册前发现 0/非法上限。
+    /// 0.1 仍保留公开字段与字面量构造，这个入口只是更安全的路径。
+    pub fn new(
+        max_instances_per_app: usize,
+        max_dispatches_per_instance: usize,
+        max_pending_per_instance: usize,
+        max_streams_per_instance: usize,
+    ) -> std::result::Result<Self, String> {
+        let limits = Self {
+            max_instances_per_app,
+            max_dispatches_per_instance,
+            max_pending_per_instance,
+            max_streams_per_instance,
+        };
+        limits.validate()?;
+        Ok(limits)
+    }
+
     fn validate(self) -> std::result::Result<(), String> {
         let fields = [
             ("maxInstancesPerApp", self.max_instances_per_app),

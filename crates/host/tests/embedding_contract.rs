@@ -88,6 +88,16 @@ impl PluginSource for ServiceSource {
 /// 0.1 的配置 DTO 是公开可字面量构造的。这个测试故意让未来加
 /// `#[non_exhaustive]` 时在这里变红，逼出一次显式迁移决策。
 #[test]
+fn host_limits_constructor_rejects_zero_and_preserves_valid_values() {
+    let limits = HostLimits::new(8, 16, 4, 2).expect("valid limits");
+    assert_eq!(limits.max_instances_per_app, 8);
+    assert_eq!(limits.max_dispatches_per_instance, 16);
+    assert_eq!(limits.max_pending_per_instance, 4);
+    assert_eq!(limits.max_streams_per_instance, 2);
+    assert!(HostLimits::new(0, 16, 4, 2).is_err());
+}
+
+#[test]
 fn config_dtos_remain_literal_constructible_in_0_1() {
     let _policy = DispatchPolicy {
         timeout_ms: Some(1),
