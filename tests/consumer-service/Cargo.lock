@@ -72,14 +72,14 @@ dependencies = [
 
 [[package]]
 name = "rust-cordis-abi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "rust-cordis-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde_json",
  "tokio",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "rust-cordis-host"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rust-cordis-abi",
  "rust-cordis-core",

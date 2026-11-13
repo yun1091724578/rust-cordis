@@ -433,8 +433,20 @@ fn workspace_version(root: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("{} 缺少 version 字段", root.join("Cargo.toml").display()))
 }
 
+fn cli_supports_source_policy(root: &Path) -> bool {
+    fs::read_to_string(root.join("crates/cli/src/lib.rs"))
+        .map(|source| source.contains("--source-policy"))
+        .unwrap_or(false)
+}
+
 fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
-    let host_root = crate::workspace_root();
+    // tag 树支持 `--source-policy` 时，宿主 smoke 也来自同一棵树，得到严格
+    // 同源证据；历史 tag 不支持时退回当前宿主，manifest 会如实记录跨源。
+    let host_root = if cli_supports_source_policy(root) {
+        root.to_path_buf()
+    } else {
+        crate::workspace_root()
+    };
     if out.exists() {
         let mut entries =
             fs::read_dir(out).map_err(|err| format!("读取 {} 失败：{err}", out.display()))?;
@@ -2049,6 +2061,17 @@ mod tests {
         let output = expected_inspect().replace("mounted = 0", "mounted = 1");
         let errors = verify_inspect_output(&output).expect_err("mounted 非零必须失败");
         assert!(errors.contains("mounted = 0"));
+    }
+
+    #[test]
+    fn detects_source_policy_cli_support() {
+        let tree = TempTree::new("policy-detect");
+        let cli = tree.path.join("crates/cli/src/lib.rs");
+        fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        fs::write(&cli, "pub const FLAG: &str = \"--source-policy\";").unwrap();
+        assert!(cli_supports_source_policy(&tree.path));
+        fs::write(&cli, "pub fn no_policy_here() {}").unwrap();
+        assert!(!cli_supports_source_policy(&tree.path));
     }
 
     #[test]
