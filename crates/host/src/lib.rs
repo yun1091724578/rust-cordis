@@ -4032,6 +4032,8 @@ pub const CAPABILITY_ORIGIN: &str = "plugin-self-description";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
     pub plugin: String,
+    /// 插件自述的可选版本（诊断/身份用，不是 ABI 授权）。
+    pub version: Option<String>,
     pub inject: Vec<String>,
     pub provision: Vec<String>,
     pub volatile: Vec<String>,
@@ -4052,6 +4054,7 @@ impl Capabilities {
             .unwrap_or_default();
         Self {
             plugin: plugin.name().to_string(),
+            version: plugin.version().map(str::to_string),
             inject: plugin
                 .inject()
                 .0
@@ -4142,6 +4145,8 @@ impl Capabilities {
         let schema = schema_from_blob((*desc).schema);
         Self {
             plugin: (*desc).id.as_str().to_string(),
+            // 冻结的 PluginDesc 没有 semver 字段；sidecar 版本不会从这里冒充。
+            version: None,
             inject,
             provision: parse_provision(&provision),
             volatile,

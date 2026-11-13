@@ -8,7 +8,7 @@ use cordis_core::{plugin_fn, App, Config, Ctx, Inject, Plugin};
 use cordis_host::loaded_instances;
 use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
 use cordis_host::patch::Entry;
-use cordis_host::{DispatchPolicy, HostLimits};
+use cordis_host::{Capabilities, DispatchPolicy, HostLimits};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -85,8 +85,33 @@ impl PluginSource for ServiceSource {
     }
 }
 
-/// 0.1 的配置 DTO 是公开可字面量构造的。这个测试故意让未来加
-/// `#[non_exhaustive]` 时在这里变红，逼出一次显式迁移决策。
+struct VersionedPlugin;
+
+impl Plugin for VersionedPlugin {
+    fn name(&self) -> &str {
+        "versioned-embedding"
+    }
+    fn inject(&self) -> Inject {
+        Inject::default()
+    }
+    fn version(&self) -> Option<&str> {
+        Some("3.4.5")
+    }
+    fn apply(&self, _ctx: Ctx, _config: Config) -> cordis_core::BoxFuture<cordis_core::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[test]
+fn capabilities_expose_optional_plugin_version() {
+    let caps = Capabilities::of_plugin(&VersionedPlugin);
+    assert_eq!(caps.version.as_deref(), Some("3.4.5"));
+    let anonymous = plugin_fn("anonymous-caps", Inject::default(), |_, _| {
+        Box::pin(async { Ok(()) })
+    });
+    assert_eq!(Capabilities::of_plugin(&*anonymous).version, None);
+}
+
 #[test]
 fn host_limits_constructor_rejects_zero_and_preserves_valid_values() {
     let limits = HostLimits::new(8, 16, 4, 2).expect("valid limits");
@@ -97,6 +122,8 @@ fn host_limits_constructor_rejects_zero_and_preserves_valid_values() {
     assert!(HostLimits::new(0, 16, 4, 2).is_err());
 }
 
+/// 0.1 的配置 DTO 是公开可字面量构造的。这个测试故意让未来加
+/// `#[non_exhaustive]` 时在这里变红，逼出一次显式迁移决策。
 #[test]
 fn config_dtos_remain_literal_constructible_in_0_1() {
     let _policy = DispatchPolicy {

@@ -25,6 +25,7 @@ impl PluginSource for FakeSource {
             provision: Vec<String>,
             volatile: Vec<String>,
             schema: Option<String>,
+            version: Option<String>,
         }
         impl Plugin for Fake {
             fn name(&self) -> &str {
@@ -45,6 +46,9 @@ impl PluginSource for FakeSource {
             fn config_schema(&self) -> Option<String> {
                 self.schema.clone()
             }
+            fn version(&self) -> Option<&str> {
+                self.version.as_deref()
+            }
             fn apply(
                 &self,
                 _ctx: Ctx,
@@ -53,15 +57,21 @@ impl PluginSource for FakeSource {
                 Box::pin(async { Ok(()) })
             }
         }
-        let (provision, volatile, schema) = match entry.name.as_str() {
+        let (provision, volatile, schema, version) = match entry.name.as_str() {
             "agent" => (
                 vec!["tools".to_string(), "llm".to_string()],
                 vec!["data".to_string()],
                 Some(r#"{"type":"object","required":["tools"]}"#.to_string()),
+                Some("9.9.9".to_string()),
             ),
             // 未声明 provision 的行：**要被列出来**（M11 表里的那一行）。
-            "legacy" => (vec![], vec![], None),
-            "invalid" => (vec![], vec![], Some(r#"{"type":"object","#.to_string())),
+            "legacy" => (vec![], vec![], None, None),
+            "invalid" => (
+                vec![],
+                vec![],
+                Some(r#"{"type":"object","#.to_string()),
+                None,
+            ),
             other => return Err(format!("假插件源不认识 \"{other}\"")),
         };
         let name = entry.name.clone();
@@ -72,6 +82,7 @@ impl PluginSource for FakeSource {
                 provision,
                 volatile,
                 schema,
+                version,
             }),
             source: path.clone(),
             staged: path,
@@ -108,6 +119,7 @@ async fn inspect_lists_capabilities_before_any_mount() {
     let agent = &report.rows[0];
     assert_eq!(agent.label, "agent");
     assert_eq!(agent.plugin, "agent");
+    assert_eq!(agent.version.as_deref(), Some("9.9.9"));
     assert_eq!(
         agent.inject_required,
         vec!["tools".to_string()],
@@ -144,6 +156,7 @@ async fn inspect_lists_capabilities_before_any_mount() {
         serde_json::json!(["telemetry"]),
         "JSON 的 optional 必须单独给出"
     );
+    assert_eq!(json["rows"][0]["version"], "9.9.9");
     assert_eq!(json["source"], "plugin-self-description");
     assert_eq!(json["inject_source"], "plugin+config-entry");
     assert_eq!(
@@ -189,6 +202,7 @@ async fn inspect_lists_capabilities_before_any_mount() {
     assert!(text.contains("mounted = 0"), "{text}");
     assert!(text.contains("inject required: tools"), "{text}");
     assert!(text.contains("inject optional: telemetry"), "{text}");
+    assert!(text.contains("version: 9.9.9"), "{text}");
     assert!(text.contains("provision: tools, llm"), "{text}");
     assert!(
         text.contains("schema: {\"required\":[\"tools\"],\"type\":\"object\"}"),

@@ -189,6 +189,8 @@ pub struct InspectRow {
     pub label: String,
     /// 插件显示名（来自 desc 或插件自己）。
     pub plugin: String,
+    /// 插件自述的可选版本（不是 ABI 授权）。
+    pub version: Option<String>,
     /// 这一行要消费的服务：**行级 inject ∪ 插件声明**（升序去重）。
     pub inject: Vec<String>,
     /// 必需依赖：插件声明 + 行级 `required`（升序去重）。
@@ -245,6 +247,10 @@ impl InspectReport {
                 "  inject optional: {}\n",
                 list(&row.inject_optional)
             ));
+            out.push_str(&format!(
+                "  version: {}\n",
+                row.version.as_deref().unwrap_or("(none)")
+            ));
             out.push_str(&format!("  provision: {}\n", list(&row.provision)));
             out.push_str(&format!("  volatile: {}\n", list(&row.volatile)));
             let schema = match (&row.schema, &row.schema_error) {
@@ -267,6 +273,7 @@ impl InspectReport {
             "rows": self.rows.iter().map(|row| serde_json::json!({
                 "label": row.label,
                 "plugin": row.plugin,
+                "version": row.version,
                 "inject": {
                     "required": row.inject_required,
                     "optional": row.inject_optional,
@@ -358,6 +365,7 @@ pub fn inspect_entries(entries: &[Entry], search: &[PathBuf]) -> Result<InspectR
         let row = InspectRow {
             label,
             plugin: caps.plugin,
+            version: caps.version,
             inject,
             inject_required: required,
             inject_optional: optional,
