@@ -434,6 +434,10 @@ fn seal_consume(args: Vec<String>) -> i32 {
             return 1;
         }
     }
+    if let Err(errors) = seal::verify_for_consume(&dir) {
+        eprintln!("封存校验失败：{}", errors.join("；"));
+        return 1;
+    }
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let status = Command::new(&cargo)
         .args([

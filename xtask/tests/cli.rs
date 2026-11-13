@@ -503,6 +503,29 @@ fn seal_refuses_to_overwrite_a_nonempty_output() {
 }
 
 #[test]
+fn seal_consume_verifies_integrity_before_consumer() {
+    let dir =
+        std::env::temp_dir().join(format!("cordis-xtask-invalid-seal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("plugins")).unwrap();
+    std::fs::write(dir.join("seal.json"), "{}").unwrap();
+    std::fs::write(dir.join("allow-list.json"), "{\"allowed\":[]}").unwrap();
+
+    let output = Command::new(bin())
+        .arg("seal-consume")
+        .arg(&dir)
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("封存校验失败"),
+        "must fail integrity before trying the consumer: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn seal_consume_requires_one_existing_seal() {
     let output = Command::new(bin())
         .arg("seal-consume")

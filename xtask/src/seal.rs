@@ -912,6 +912,10 @@ fn write_manifest_files(dir: &Path, manifest: &SealManifest) -> Result<(), Strin
     fs::write(dir.join(SUMS_FILE), sums).map_err(|err| format!("写 {SUMS_FILE} 失败：{err}"))
 }
 
+pub(crate) fn verify_for_consume(dir: &Path) -> Result<(), Vec<String>> {
+    verify_dir(dir).map(|_| ())
+}
+
 fn verify_dir(dir: &Path) -> Result<SealManifest, Vec<String>> {
     let mut errors = Vec::new();
     let text = match fs::read_to_string(dir.join(SEAL_FILE)) {
