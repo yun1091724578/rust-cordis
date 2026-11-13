@@ -25,7 +25,7 @@
 
 | 工作线 | 状态 | 已落地 | 未闭合 |
 |---|---|---|---|
-| A. 低层 ABI 与发布 | **基本完成** | 0.1.0/0.1.1 发布；正式 `/2` 封存；公开仓 CI；版本矩阵；SCM 一次实测 | 严格同版本封存证据、历史发布版可重复测试 |
+| A. 低层 ABI 与发布 | **基本完成** | 0.1.2 发布；0.1.2 严格同源 `/2` 封存；0.1.0/0.1.1 正式封存；公开仓 CI；版本矩阵；SCM 一次实测 | 历史发布版可重复测试 |
 | B. 信任模型 | **已接受并实现** | ADR 0005；来源 allow-list、默认拒绝、seal sidecar、inspect/status provenance | 来源治理不是执行隔离 |
 | C. 可信单租户底座 P0 | **按边界完成** | 来源策略、App 粒度策略、容量准入、锁纪律、容量 waterfall 专项测试 | per-plugin/method 明确不提供；永久 hang 属 T2 |
 | D. 长期运行 P1 | **基本完成** | 1M soak、RSS、真实 `open_staged` soak、dhat、版本矩阵、semver 计划、调用缓冲池 | 从 `PluginDesc` 自动采集、升级/回溯求解 |
@@ -38,7 +38,7 @@
 - 支持契约：**26 行 / 17 条保证**
 - API 清单：**23 常量 / 4 结构 / 41 字段 / 79 公开入口 / 32 载荷**
 - 最新全绿三平台 CI：`43196946690`
-- 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal` 与 Release assets
+- 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal`、`dist/cordis-0.1.2-formal`（0.1.2 严格同源）与 Release assets
 - 仓库公开；标准 GitHub-hosted Runner 不再消耗私有分钟
 - `desolate` 消费者证据：27 个 host 单测 + 7 个 HTTP adapter 单测；该工程无 git，
   不作为本仓交付门禁
@@ -202,10 +202,9 @@
 
 **仍未闭合：**
 
-- 严格同版本封存证据：两个正式封存的 smoke 都由当前 0.1.1 工作区宿主执行，
-  `host.source_sha256 != source.sha256`。2026-11-13 已用当前 0.1.1 工作树生成
-  严格同源开发封存（`74df99df…`，224 文件，verify + consume 通过），但这不是
-  正式 tag 证据；正式 tag 仍待下一次包含 `--source-policy` 的 release。
+- 0.1.2 正式 tag 已生成严格同源封存：`source.sha256 == host.source_sha256`
+  （`b2a97645…`，224 文件），`seal --verify --require-v2` 与 `seal-consume`
+  均通过。0.1.0/0.1.1 仍是历史跨源证据；历史 tag 不回溯补严格同源。
 - 历史发布版 × 新宿主仍缺可重复测试。
 - nightly cron 首跑与 artifact 长期转存。
 
@@ -258,7 +257,7 @@ inspect/status provenance、默认拒绝来源策略。
 |---|---|---|
 | A5-1 三平台 CI | 完成 | `41460414477`；17 × 4 矩阵 |
 | A5-2 nightly soak | 进行中 | 1M Linux、RSS 预算、dhat；cron 首跑/长期转存待补 |
-| A5-3 正式 `/2` 封存 | 封存完成，strict same-version 未满足 | `xtask seal --root`；`dist/cordis-0.1.0-formal`、`0.1.1-formal`；Release assets；`--require-v2` 可用 |
+| A5-3 正式 `/2` 封存 | 0.1.2 完成，strict same-version 满足 | `xtask seal --root v0.1.2`；`dist/cordis-0.1.2-formal`（`source == host`，`b2a97645…`）；0.1.0/0.1.1 保留为历史跨源封存；Release assets；`--require-v2` 可用 |
 | A5-4 历史 × 新宿主 | 已验证一次，仍待验证 | 0.1.1 宿主加载 0.1.0 formal smoke；缺可重复测试 |
 | A5-5 其余发布项 | 大部分完成 | 公开仓、元数据、SCM 一次实测；nightly 转存/SCM CI 重跑待补 |
 
