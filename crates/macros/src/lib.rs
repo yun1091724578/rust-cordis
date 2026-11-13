@@ -104,7 +104,7 @@ pub fn events(args: TokenStream, input: TokenStream) -> TokenStream {
 /// 声明一个插件：生成 `impl Plugin`，`apply` 由作者写成普通 `async fn`。
 ///
 /// ```ignore
-/// #[cordis::plugin(inject("greeter@1"), provision("agentLoop@1"), volatile("cache.dir"), config(LoopConfig))]
+/// #[cordis::plugin(version = "1.2.3", inject("greeter@1"), provision("agentLoop@1"), volatile("cache.dir"), config(LoopConfig))]
 /// #[derive(Clone)]
 /// pub struct AgentLoop { /* … */ }
 ///
@@ -115,6 +115,7 @@ pub fn events(args: TokenStream, input: TokenStream) -> TokenStream {
 ///
 /// **参数**（都可省略）：
 /// - `name = "…"`：显示名（默认 = 类型名）；`key = "…"`：注册表身份键（默认 = 显示名）；
+/// - `version = "…"`：可选诊断/身份元数据；不是 ABI 版本，不参与 ABI 匹配；
 /// - `inject(a, "b@1")`：依赖声明。裸标识符当**字符串**用（`inject(tools)` = `"tools"`）；
 ///   要命名空间就写字面量（`inject("tools@1")`）——宏不替你猜 major；
 /// - `provision(a, "b@1")`、`volatile("cache.dir", data)`：同一套字面规则；

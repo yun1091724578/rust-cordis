@@ -36,6 +36,7 @@ pub fn plugin(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     }
     let ident = item.ident.clone();
     let mut name = ident.to_string();
+    let mut version: Option<String> = None;
     let mut key: Option<String> = None;
     let mut inject: Vec<TokenStream> = Vec::new();
     let mut provision: Vec<TokenStream> = Vec::new();
@@ -46,6 +47,9 @@ pub fn plugin(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     for meta in attr::metas(args)? {
         match &meta {
             Meta::NameValue(pair) if pair.path.is_ident("name") => name = attr::string_value(pair)?,
+            Meta::NameValue(pair) if pair.path.is_ident("version") => {
+                version = Some(attr::string_value(pair)?)
+            }
             Meta::NameValue(pair) if pair.path.is_ident("key") => {
                 key = Some(attr::string_value(pair)?)
             }
@@ -69,8 +73,8 @@ pub fn plugin(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
             other => {
                 return Err(syn::Error::new_spanned(
                     other,
-                    "只认 `name = \"…\"` / `key = \"…\"` / `schema = \"…\"` / `inject(…)` / \
-                     `provision(…)` / `volatile(…)` / `config(Type)`",
+                    "只认 `name = \"…\"` / `version = \"…\"` / `key = \"…\"` / `schema = \"…\"` / \
+                     `inject(…)` / `provision(…)` / `volatile(…)` / `config(Type)`",
                 ))
             }
         }
@@ -84,6 +88,14 @@ pub fn plugin(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
             }
         }
     });
+    let version_fn = version.map(|version| {
+        quote! {
+            fn version(&self) -> ::core::option::Option<&str> {
+                ::core::option::Option::Some(#version)
+            }
+        }
+    });
+
     // `schema = "…"` 在宏展开期校验是 JSON 对象；它仍是展示用声明，
     // 真正的配置校验由 `config(Type)` / 插件自己负责。
     let schema_fn = schema.map(|schema| {
@@ -132,6 +144,8 @@ pub fn plugin(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
             fn name(&self) -> &str {
                 #name
             }
+
+            #version_fn
 
             #key_fn
 

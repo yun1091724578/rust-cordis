@@ -25,6 +25,7 @@ pub struct LoopConfig {
 
 #[plugin(
     name = "agent-loop",
+    version = "1.2.3",
     inject("greeter@1", llm),
     provision("agentLoop@1"),
     volatile("cache.dir"),
@@ -68,6 +69,7 @@ fn plugin_macro_emits_inject_provision_and_volatile() {
     assert_eq!(inject, vec!["greeter@1".to_string(), "llm".to_string()]);
     assert_eq!(plugin.provision(), vec!["agentLoop@1".to_string()]);
     assert_eq!(plugin.volatile_paths(), vec!["cache.dir".to_string()]);
+    assert_eq!(plugin.version(), Some("1.2.3"));
     assert_eq!(
         plugin.config_schema().as_deref(),
         Some(r#"{"type":"object","required":["prompt"]}"#)

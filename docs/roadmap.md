@@ -141,8 +141,9 @@
 
 - **已落地最小原语**：`Plugin::version() -> Option<&str>`，默认 None；
   `Provisioned` / `VolatilePlugin` wrapper 会保留版本；`Capabilities.version`
-  与 `inspect` 文本/JSON 已展示该字段。它只是诊断/身份元数据，不替代 ABI
-  精确匹配或来源策略。冻结的 `PluginDesc` 没有 semver 字段，ABI 路径仍为 None。
+  与 `inspect` 文本/JSON 已展示该字段；`#[cordis::plugin(version = "…")]`
+  可在 typed 插件上声明。它只是诊断/身份元数据，不替代 ABI 精确匹配或来源策略。
+  冻结的 `PluginDesc` 没有 semver 字段，ABI 路径仍为 None。
 - 从 `PluginDesc` 自动采集 provides/requires，作为 sidecar 的补充，而不是只靠
   手写表。
 - 决定是否需要 ABI 尾字段；先做真实消费者需要的版本诊断，不先造升级/回溯求解。
