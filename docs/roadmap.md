@@ -137,6 +137,10 @@
   进程内 fake service 基础契约。
 - 生产准入路径已有独立测试：真实 sidecar + `PluginSourcePolicy` 校验通过后
   才装载并组合；`set_allow_unverified(true)` 的开发模式测试仍保留。
+- 正式 `/2` 封存消费者演练：设置 `CORDIS_CONSUMER_SEAL_DIR` 后运行
+  `tests/consumer-service/tests/formal_seal.rs`；`0.1.0-formal` 与
+  `0.1.1-formal` 均通过 allow-list、装载 `greeting`/`hello` 并关闭。该测试
+  env-gated，不拖慢 PR CI。
 - 该测试同时固定了一个边界：进程内 fake plugin 不经过 ABI 实例表，
   `loaded_instances()` 只适合 cdylib 路径，不能拿它当通用挂载计数。
 - 仍需用两个真实消费者验证同一组原语：服务运行时与 agent 运行时。
