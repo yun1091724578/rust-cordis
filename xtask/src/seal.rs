@@ -434,9 +434,13 @@ fn workspace_version(root: &Path) -> Result<String, String> {
 }
 
 fn cli_supports_source_policy(root: &Path) -> bool {
-    fs::read_to_string(root.join("crates/cli/src/lib.rs"))
-        .map(|source| source.contains("--source-policy"))
-        .unwrap_or(false)
+    ["crates/cli/src/lib.rs", "crates/cli/src/main.rs"]
+        .iter()
+        .any(|relative| {
+            fs::read_to_string(root.join(relative))
+                .map(|source| source.contains("--source-policy"))
+                .unwrap_or(false)
+        })
 }
 
 fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
@@ -2072,6 +2076,10 @@ mod tests {
         assert!(cli_supports_source_policy(&tree.path));
         fs::write(&cli, "pub fn no_policy_here() {}").unwrap();
         assert!(!cli_supports_source_policy(&tree.path));
+
+        let main = tree.path.join("crates/cli/src/main.rs");
+        fs::write(&main, "const FLAG: &str = \"--source-policy\";").unwrap();
+        assert!(cli_supports_source_policy(&tree.path));
     }
 
     #[test]
