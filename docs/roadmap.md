@@ -119,6 +119,8 @@
 - **已落地基础测试**：`crates/host/tests/embedding_contract.rs` 只使用公开
   API（`App` + `LoaderConfig::new` + `load_with_source` + `PluginSource`），
   完成装载、挂载、关闭；不引用 `crate::` 内部模块或 agent 词汇。
+- 同一文件增加服务组合用例：provider 通过公开 `ctx.provide` 注册，
+  consumer 通过 `Inject::of` 注入；证明 SDK 可作为进程内服务运行时底座。
 - 该测试同时固定了一个边界：进程内 fake plugin 不经过 ABI 实例表，
   `loaded_instances()` 只适合 cdylib 路径，不能拿它当通用挂载计数。
 - 仍需用两个真实消费者验证同一组原语：服务运行时与 agent 运行时。

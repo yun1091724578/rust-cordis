@@ -44,6 +44,68 @@ fn config_path(tag: &str) -> PathBuf {
     path
 }
 
+struct ServiceSource;
+
+impl PluginSource for ServiceSource {
+    fn load(
+        &self,
+        entry: &Entry,
+        _search: &[PathBuf],
+        _revision: u64,
+    ) -> Result<LoadedFile, String> {
+        let plugin: Arc<dyn Plugin> = match entry.name.as_str() {
+            "provider" => plugin_fn("embedding-provider", Inject::default(), |ctx: Ctx, _| {
+                Box::pin(async move {
+                    ctx.provide("demo.svc", cordis_core::Dyn::new(String::from("value")))?;
+                    Ok(())
+                })
+            }),
+            "consumer" => plugin_fn(
+                "embedding-consumer",
+                Inject::of(&["demo.svc"]),
+                |ctx: Ctx, _| {
+                    Box::pin(async move {
+                        let value = ctx.get("demo.svc").expect("injected service");
+                        let text = value.downcast::<String>().expect("service type");
+                        assert_eq!(&*text, "value");
+                        Ok(())
+                    })
+                },
+            ),
+            other => return Err(format!("unexpected embedding plugin {other}")),
+        };
+        let path = PathBuf::from(format!("<embedding:{}>", entry.name));
+        Ok(LoadedFile {
+            plugin,
+            source: path.clone(),
+            staged: path,
+            fingerprint: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn public_api_composes_two_services_without_agent_concepts() {
+    let path = config_path("services");
+    std::fs::write(
+        &path,
+        "- id: provider\n  name: provider\n- id: consumer\n  name: consumer\n",
+    )
+    .expect("write service config");
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(path.to_string_lossy().into_owned()),
+        Arc::new(ServiceSource),
+    )
+    .await
+    .expect("service composition must load");
+
+    assert_eq!(state.mounted_labels(), ["consumer", "provider"]);
+    app.close().await;
+    let _ = std::fs::remove_file(Path::new(&path));
+}
+
 #[tokio::test]
 async fn public_api_can_load_embed_and_close() {
     let path = config_path("basic");
