@@ -1,0 +1,15 @@
+[package]
+name = "cordis-consumer-service"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+# Standalone consumer workspace: only public path dependencies, never the
+# repository's internal test helpers.
+[workspace]
+
+[dependencies]
+cordis-core = { package = "rust-cordis-core", path = "../../crates/core" }
+cordis-host = { package = "rust-cordis-host", path = "../../crates/host" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

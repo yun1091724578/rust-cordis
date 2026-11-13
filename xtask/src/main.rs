@@ -18,10 +18,11 @@ cargo xtask <命令>
   fmt              cargo fmt --all -- --check
   clippy           cargo clippy --workspace --all-targets --locked -- -D warnings
   test             cargo test --workspace --all-targets --locked
+  consumer         测试独立服务消费者（只使用公开 path 依赖）
   build-plugins    构建 greeting / hello / harness-tool 三个 cdylib
   demo             构建插件并运行 demo
   e2e              构建插件并运行 harness-spike
-  ci               fmt + inventory + docs + matrix + clippy + test + demo + e2e
+  ci               fmt + inventory + docs + matrix + clippy + test + consumer + demo + e2e
   docs [path]      检查支持契约的保证索引（默认 docs/support-contract.md）
   inventory [--write|--check] [path]
                    检查/写入公开 API 清单（默认 docs/api-inventory.md）
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
             "warnings",
         ]),
         "test" => run(&["test", "--workspace", "--all-targets", "--locked"]),
+        "consumer" => consumer_check(),
         "build-plugins" => build_plugins(),
         "demo" => demo_check(),
         "e2e" => build_then(&["run", "--locked", "-p", "harness-spike"]),
@@ -131,6 +133,10 @@ fn ci() -> i32 {
         if code != 0 {
             return code;
         }
+    }
+    let code = consumer_check();
+    if code != 0 {
+        return code;
     }
     let code = demo_check();
     if code != 0 {
@@ -398,6 +404,31 @@ fn soak_command(args: Vec<String>) -> i32 {
         Ok(status) => status.code().unwrap_or(1),
         Err(err) => {
             eprintln!("执行 {cargo} 失败: {err}");
+            1
+        }
+    }
+}
+
+/// 独立服务消费者：独立 workspace，只通过公开 path 依赖使用 SDK。
+fn consumer_check() -> i32 {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = Command::new(&cargo)
+        .args([
+            "test",
+            "--manifest-path",
+            "tests/consumer-service/Cargo.toml",
+            "--locked",
+        ])
+        .current_dir(workspace_root())
+        .status();
+    match status {
+        Ok(status) if status.success() => 0,
+        Ok(status) => {
+            eprintln!("独立消费者测试失败：{status}");
+            1
+        }
+        Err(err) => {
+            eprintln!("运行独立消费者测试失败：{err}");
             1
         }
     }
