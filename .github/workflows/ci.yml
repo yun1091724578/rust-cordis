@@ -26,6 +26,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path tests/consumer-service/Cargo.toml -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
@@ -40,6 +41,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets --locked
+      - run: cargo xtask consumer
       - run: cargo xtask demo
       - run: cargo xtask e2e
 

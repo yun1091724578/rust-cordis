@@ -91,6 +91,7 @@ fn fmt_check() -> i32 {
         "tests/fixtures/abi-v1/Cargo.toml",
         "tests/fixtures/abi-error/Cargo.toml",
         "tests/fixtures/abi-err-v1/Cargo.toml",
+        "tests/consumer-service/Cargo.toml",
     ] {
         let code = run(&["fmt", "--manifest-path", manifest, "--", "--check"]);
         if code != 0 {
