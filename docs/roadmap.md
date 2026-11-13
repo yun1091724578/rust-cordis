@@ -203,7 +203,9 @@
 **仍未闭合：**
 
 - 严格同版本封存证据：两个正式封存的 smoke 都由当前 0.1.1 工作区宿主执行，
-  `host.source_sha256 != source.sha256`。
+  `host.source_sha256 != source.sha256`。2026-11-13 已用当前 0.1.1 工作树生成
+  严格同源开发封存（`74df99df…`，224 文件，verify + consume 通过），但这不是
+  正式 tag 证据；正式 tag 仍待下一次包含 `--source-policy` 的 release。
 - 历史发布版 × 新宿主仍缺可重复测试。
 - nightly cron 首跑与 artifact 长期转存。
 
