@@ -79,11 +79,12 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 | 三平台运行 | GitHub Actions `test` job | Linux / Windows MSVC / macOS 实际编译、运行测试与真 DLL e2e（Windows GNU 是本地工具链，不是 CI 的 Windows 目标）；2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477) 首次通过（一次通过；后续变更需重跑） |
 | MSRV | GitHub Actions `msrv` job | 用 Rust 1.85.0 检查声明的 `rust-version`（Windows GNU 本地已用 `cargo.cmd +1.85.0-x86_64-pc-windows-gnu check --workspace --all-targets` 通过） |
 | 打包 | GitHub Actions `package` job | `rust-cordis-core` / `rust-cordis-abi` / `rust-cordis-host` / `rust-cordis-macros` 的 `cargo package --no-verify --locked` |
-| 格式 | `cargo xtask fmt`（含独立夹具）/ CI lint job | 本地检查 workspace + `tests/fixtures/abi-v1` + `tests/fixtures/abi-error` + `tests/fixtures/abi-err-v1`；CI lint job 跑 `cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets --locked -- -D warnings`，夹具格式目前不在 CI 门禁内 |
+| 格式 | `cargo xtask fmt`（含独立夹具）/ CI lint job | 本地检查 workspace + `tests/fixtures/abi-v1` + `tests/fixtures/abi-error` + `tests/fixtures/abi-err-v1` + `tests/consumer-service`；CI lint job 跑 `cargo fmt --all -- --check`、consumer fmt 检查与 clippy `-D warnings` |
+| 独立消费者 | `cargo xtask consumer`（三平台 CI test job） | 独立 workspace 只用公开 path 依赖；fake service、真实 ABI 服务组合、sidecar/`PluginSourcePolicy` 准入；`xtask consumer` 先构建 greeting/hello cdylib |
 | 支持契约 | `cargo xtask docs`（CI 由 `cargo test --workspace` 覆盖索引检查） | 保证索引必须引用带 `#[test]` / `#[tokio::test]` 的测试；违规非零退出 |
 | API 清单 | `cargo xtask inventory --check`（CI 由 xtask 的 inventory CLI 用例覆盖） | ABI 常量/字段与受控 marker 漂移即失败；新增宿主入口需人工加入清单 |
 | 平台矩阵（结构 + 结果） | `.\cargo.cmd xtask matrix`（Windows GNU 本地；CI 用裸 `cargo`）/ 已接入 `xtask ci` | 17 条保证逐条有行、四平台状态合法、证据引用 `.rs` 文件；结构检查本身不验证真实平台结果。2026-11-02 首次三平台 CI 通过后，17 条保证在四个平台列均已实填 `通过`；表内注明这是快照，后续变更需重跑 |
-| 首发封存入口 | `cargo xtask seal [--out <dir>]` / `cargo xtask seal --verify <dir> --require-v2` | 构建三个宿主目标 release 插件，记录源码树 / 工具链 / ABI / SHA256，为每个 DLL 写 sidecar manifest 与根 `allow-list.json`，用同版本 `inspect --source-policy` 逐插件核对身份，并把 stdout、smoke 配置、artifact、manifest 与 allow-list 一起写入校验和；2026-11-02 Windows GNU 本地演练通过（旧 `/1` 格式）。封存对象是 `publish = false` 的示例插件，不是可发布 crate。格式与边界见 `docs/release-seal.md`；**不是 CI 门禁**，正式首发时必须运行并把整个目录归档 |
+| 首发封存入口 | `cargo xtask seal [--out <dir>]` / `cargo xtask seal --verify <dir> --require-v2` / `cargo xtask seal-consume <dir>` | 构建三个宿主目标 release 插件，记录源码树 / 工具链 / ABI / SHA256，为每个 DLL 写 sidecar manifest 与根 `allow-list.json`，用同版本 `inspect --source-policy` 逐插件核对身份，并把 stdout、smoke 配置、artifact、manifest 与 allow-list 一起写入校验和；2026-11-02 Windows GNU 本地演练通过（旧 `/1` 格式）。封存对象是 `publish = false` 的示例插件，不是可发布 crate。格式与边界见 `docs/release-seal.md`；**不是 CI 门禁**，正式首发时必须运行并把整个目录归档 |
 | 资源增长回归 | `cargo test -p rust-cordis-host --test resource_baseline` / `--test staged`（三平台 CI 已包含；2026-11-02 首次通过） | 实例 / 派发 / 挂起 / 派发帧 / 流 / effect / 暂存台账回到基线；独立 soak 见 A5-2 |
 | 真实 `open_staged` soak | `cargo xtask soak`（同时运行 `soak` 与 `open_staged_soak`） | 200 轮真实 cdylib：`stage_plugin` → `LoadedPlugin::open_staged` → `OP_PING` → drop；暂存台账/实例表归零，Linux RSS 预算 128 MiB |
 | 相邻版本矩阵 | `.\scripts\version-matrix.ps1`（本地）/ `.github/workflows/version-matrix.yml`（手动或每周日 04:00 UTC） | host v0.1.0/v0.1.1/HEAD × 正式 0.1.0/0.1.1 `/2` 封存；五组 `inspect` 均 `mounted=0` 且三个插件齐全；HEAD 组使用 `--source-policy`；workflow 会从 tag 重新生成封存。2026-11-09 手动 run [42606045837](https://github.com/yun1091724578/rust-cordis/actions/runs/42606045837) 通过 |
@@ -99,13 +100,16 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 2. 确认输出目录包含 `seal.json`、`SHA256SUMS`、`allow-list.json`、`plugins/`
    （每个 DLL 旁边有 `.manifest.json`）、`smoke/cordis.yml` 与
    `smoke/inspect.txt`，且命令末尾报告同版本加载检查通过。
-3. 用 `cargo xtask seal --verify <dir>` 做一次只读的目录 / 校验和复验（不重跑
-   加载检查）。
-4. 把**整个目录**归档到发布存储；不要用第二次运行覆盖首发表。格式、字段与
+3. 用 `cargo xtask seal --verify <dir> --require-v2` 做一次只读的目录 / 校验和
+   复验（不重跑加载检查）。
+4. 用 `cargo xtask seal-consume <dir>` 做发布门禁：它先做同样的完整性校验，
+   再用独立消费者读取 allow-list、装载 `greeting`/`hello` 并关闭。
+5. 把**整个目录**归档到发布存储；不要用第二次运行覆盖首发表。格式、字段与
    加载检查边界见 `docs/release-seal.md`。
 
-本流程只证明发布产物可被同版本宿主加载；跨版本兼容仍要等后续宿主版本加载
-已归档的首发产物。
+本流程证明发布产物可被当前宿主加载，并由独立消费者走 allow-list 准入；它不
+自动证明严格同版本宿主，也不证明跨版本兼容。严格同源需要下一次包含
+`--source-policy` 的发布 tag。
 
 ## 关闭契约
 
