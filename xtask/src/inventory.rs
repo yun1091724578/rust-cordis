@@ -367,6 +367,12 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub struct DispatchPolicy",
     },
     PublicItem {
+        item: "DispatchPolicy::new",
+        kind: "fn",
+        source: "crates/host/src/lib.rs",
+        marker: "pub fn new(timeout_ms: Option<u64>, outbound_timeout_ms: Option<u64>) -> Self",
+    },
+    PublicItem {
         item: "HostLimits",
         kind: "struct",
         source: "crates/host/src/lib.rs",
@@ -1130,7 +1136,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 79, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 80, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 

@@ -878,6 +878,16 @@ pub struct DispatchPolicy {
     pub outbound_timeout_ms: Option<u64>,
 }
 
+impl DispatchPolicy {
+    /// 与 [`HostLimits::new`] 对应的最小构造入口；0.1 仍保留公开字段。
+    pub fn new(timeout_ms: Option<u64>, outbound_timeout_ms: Option<u64>) -> Self {
+        Self {
+            timeout_ms,
+            outbound_timeout_ms,
+        }
+    }
+}
+
 static DISPATCH_POLICY: RwLock<DispatchPolicy> = RwLock::new(DispatchPolicy {
     timeout_ms: None,
     outbound_timeout_ms: None,

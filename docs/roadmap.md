@@ -36,7 +36,7 @@
 ### 基线
 
 - 支持契约：**26 行 / 17 条保证**
-- API 清单：**23 常量 / 4 结构 / 41 字段 / 79 公开入口 / 32 载荷**
+- API 清单：**23 常量 / 4 结构 / 41 字段 / 80 公开入口 / 32 载荷**
 - 最新全绿三平台 CI：`43196946690`
 - 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal`、`dist/cordis-0.1.2-formal`（0.1.2 严格同源）与 Release assets
 - 仓库公开；标准 GitHub-hosted Runner 不再消耗私有分钟

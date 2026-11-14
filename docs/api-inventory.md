@@ -135,6 +135,7 @@
 | `sha256_file` | fn | `crates/host/src/source.rs` |
 | `mounted_sources` | fn | `crates/host/src/loader.rs` |
 | `DispatchPolicy` | struct | `crates/host/src/lib.rs` |
+| `DispatchPolicy::new` | fn | `crates/host/src/lib.rs` |
 | `HostLimits` | struct | `crates/host/src/lib.rs` |
 | `HostLimits::new` | fn | `crates/host/src/lib.rs` |
 | `streams_len` | fn | `crates/host/src/lib.rs` |

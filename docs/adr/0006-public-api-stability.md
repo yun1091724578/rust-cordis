@@ -16,6 +16,7 @@
 - 为需要校验的配置增加**最小构造函数**，而不是 builder：
   - `LoaderConfig::new(path)`
   - `HostLimits::new(instances, dispatches, pending, streams) -> Result<Self, String>`
+  - `DispatchPolicy::new(timeout_ms, outbound_timeout_ms)`
 - `Capabilities` 已有私有 `schema` / `schema_error` 字段，外部本来就不能字面量构造；
   不再额外加 opaque 标记。
 - `crates/host/tests/embedding_contract.rs` 故意固定 0.1 字面量构造契约：

@@ -113,6 +113,13 @@ fn capabilities_expose_optional_plugin_version() {
 }
 
 #[test]
+fn dispatch_policy_constructor_preserves_optional_timeouts() {
+    let policy = DispatchPolicy::new(Some(10), None);
+    assert_eq!(policy.timeout_ms, Some(10));
+    assert_eq!(policy.outbound_timeout_ms, None);
+}
+
+#[test]
 fn host_limits_constructor_rejects_zero_and_preserves_valid_values() {
     let limits = HostLimits::new(8, 16, 4, 2).expect("valid limits");
     assert_eq!(limits.max_instances_per_app, 8);
