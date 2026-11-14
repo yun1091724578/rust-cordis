@@ -118,6 +118,9 @@
 - `HostLimits::new` 已提供带校验的安全构造入口；0 在注册前失败。
 - `Capabilities` 已有私有 schema 字段，外部本来就不能字面量构造；无需额外 opaque 化。
 - `#[non_exhaustive]` 与 builder 移到 0.2 迁移评估，不在 0.1 静默破坏。
+- 已加外部消费者迁移契约：`tests/consumer-service/tests/constructor_migration.rs`
+  只用 `LoaderConfig::new` / `HostLimits::new` / `DispatchPolicy::new` 构造，
+  不依赖公开字段字面量；`xtask consumer` 会持续编译运行。
 - 版本号、ABI 精确匹配、插件 semver 分开表达；不在同一版引入冲突的
   `abi_min/abi_max` 双轨规则。
 - 验收：`inventory --check`、支持契约、API 文档与至少两个嵌入示例一致。
