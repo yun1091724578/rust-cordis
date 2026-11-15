@@ -81,6 +81,6 @@ jobs:
               --title "nightly-soak logs" \
               --notes "Rolling long-term storage for nightly soak logs. Assets are unique per run."
           fi
-          gh release upload nightly-soak \
-            "soak.log#soak-log-${GITHUB_RUN_ID}-c${CYCLES}.log" \
-            --clobber
+          asset="soak-log-${GITHUB_RUN_ID}-c${CYCLES}.log"
+          cp soak.log "$asset"
+          gh release upload nightly-soak "$asset" --clobber
