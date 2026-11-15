@@ -186,9 +186,10 @@ breaking 变更。
 - 0.1.2 严格同源封存已完成；0.1.0/0.1.1 保留历史跨源证据。
 - 历史发布版 × 新宿主已加手动 `compat-historical.yml`，不在 PR 门禁。
 - `--require-v2` 与 `seal-consume` 已进入发布 checklist。
-- 仍需：nightly cron/artifact 长期转存、SCM 持续重跑、`RUSTFLAGS`/
-  `.cargo/config` 自定义 rustflags 记录；seal 已记录 `source.commit` /
-  `source.tag`，但 `--verify` 保持兼容、不要求它们。
+- nightly 首次 cron 已通过（`43527774240`），仍需 artifact 长期转存。
+- 仍需：SCM 持续重跑、`RUSTFLAGS`/`.cargo/config` 自定义 rustflags 记录；
+  seal 已记录 `source.commit` / `source.tag`，但 `--verify` 保持兼容、
+  不要求它们。
 - `--root` 的 toolchain 探测已走目标树目录；历史 tag 无 `--source-policy` 时
   明确回退当前宿主并记录跨源，不伪装 strict。
 
@@ -215,8 +216,8 @@ breaking 变更。
 - 0.1.2 正式 tag 已生成严格同源封存：`source.sha256 == host.source_sha256`
   （`830bf97d…`，224 文件），`seal --verify --require-v2` 与 `seal-consume`
   均通过。0.1.0/0.1.1 仍是历史跨源证据；历史 tag 不回溯补严格同源。
-- 历史发布版 × 新宿主仍缺可重复测试。
-- nightly cron 首跑与 artifact 长期转存。
+- 历史发布版 × 新宿主已有手动 `compat-historical.yml`，仍不在 PR 门禁。
+- nightly 首次 cron 已通过；artifact 长期转存仍缺。
 
 **出口：** `docs/release.md` 能逐条回答“哪个保证、哪个平台、哪次 run/commit”；
 没有把结构检查或单次手工验证写成持续保证。
@@ -266,7 +267,7 @@ inspect/status provenance、默认拒绝来源策略。
 | 项 | 状态 | 证据 / 边界 |
 |---|---|---|
 | A5-1 三平台 CI | 完成 | `41460414477`；17 × 4 矩阵 |
-| A5-2 nightly soak | 进行中 | 1M Linux、RSS 预算、dhat；cron 首跑/长期转存待补 |
+| A5-2 nightly soak | 进行中 | 1M Linux、RSS 预算、dhat；首次 cron [43527774240](https://github.com/yun1091724578/rust-cordis/actions/runs/43527774240) 通过（40m49s，log SHA256 `0E2117B8…`）；长期转存待补 |
 | A5-3 正式 `/2` 封存 | 0.1.2 完成，strict same-version 满足 | `xtask seal --root v0.1.2`；`dist/cordis-0.1.2-formal`（`source == host`，`830bf97d…`）；0.1.0/0.1.1 保留为历史跨源封存；Release assets；`--require-v2` 可用 |
 | A5-4 历史 × 新宿主 | 手动 CI 通过，不在 PR 门禁 | `compat-historical.yml` 在 Windows runner 下载 0.1.0/0.1.1/0.1.2 assets 并依次 `seal-consume`；run [43674995479](https://github.com/yun1091724578/rust-cordis/actions/runs/43674995479) 通过 |
 | A5-5 其余发布项 | 大部分完成 | 公开仓、元数据、SCM 一次实测；nightly 转存/SCM CI 重跑待补 |
