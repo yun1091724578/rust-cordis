@@ -104,6 +104,9 @@
 
 ## 下一步（按顺序）
 
+0.2 公开类型迁移**暂缓**；当前优先收口发布证据与维护线，不为了版本号而制造
+breaking 变更。
+
 本仓是 **SDK / 运行时底座**，不是 agent 产品，也不是网络微服务框架。
 `desolate` 只是消费者验证工程；agent 事件、模型适配器、SSE 传输属于消费者侧，
 不能反向变成 host/core 的产品主线。
@@ -117,7 +120,9 @@
   故意固定它，未来加 `#[non_exhaustive]` 会先让测试变红。
 - `HostLimits::new` 已提供带校验的安全构造入口；0 在注册前失败。
 - `Capabilities` 已有私有 schema 字段，外部本来就不能字面量构造；无需额外 opaque 化。
-- `#[non_exhaustive]` 与 builder 移到 0.2 迁移评估，不在 0.1 静默破坏。
+- **0.2 暂缓（2026-11-15）**：没有真实消费者要求 breaking 变更；0.1.x 继续
+  保留字面量构造。启动条件与迁移要求见 ADR 0006 §4；在此之前不引入
+  `#[non_exhaustive]`、builder 或 0.2 版本号。
 - 已加外部消费者迁移契约：`tests/consumer-service/tests/constructor_migration.rs`
   只用 `LoaderConfig::new` / `HostLimits::new` / `DispatchPolicy::new` 构造，
   不依赖公开字段字面量；`xtask consumer` 会持续编译运行。
@@ -178,12 +183,13 @@
 
 ### 5. 发布证据收尾
 
-- 严格同版本封存：用与封存 `source.sha256` 相同的源码树构建宿主再跑 smoke。
-- 历史发布版 × 新宿主补可重复测试，不把单次手工演练写成保证。
-- `--root` 的 toolchain 探测已走目标树目录；`RUSTFLAGS`/`.cargo/config`
-  自定义 rustflags 仍待完整记录。
-- `--require-v2` 已提供，但默认 verify 仍兼容 `/1`；发布门禁必须显式使用。
-- seal source digest 仍缺 tag/commit 字段绑定。
+- 0.1.2 严格同源封存已完成；0.1.0/0.1.1 保留历史跨源证据。
+- 历史发布版 × 新宿主已加手动 `compat-historical.yml`，不在 PR 门禁。
+- `--require-v2` 与 `seal-consume` 已进入发布 checklist。
+- 仍需：nightly cron/artifact 长期转存、SCM 持续重跑、`RUSTFLAGS`/
+  `.cargo/config` 自定义 rustflags 记录、seal source digest 的 tag/commit 绑定。
+- `--root` 的 toolchain 探测已走目标树目录；历史 tag 无 `--source-policy` 时
+  明确回退当前宿主并记录跨源，不伪装 strict。
 
 ## 仓外消费者证据（非主线）
 
