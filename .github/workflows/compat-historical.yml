@@ -1,0 +1,31 @@
+name: compat-historical
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  consume:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Consume historical formal seals
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($version in @('0.1.0', '0.1.1', '0.1.2')) {
+            $archive = "dist/cordis-$version-formal.tar.gz"
+            gh release download "v$version" --pattern "cordis-$version-formal.tar.gz" --dir dist --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            tar -xzf $archive -C dist
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            cargo xtask seal-consume "dist/cordis-$version-formal"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
