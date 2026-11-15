@@ -13,7 +13,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: nightly-soak
@@ -68,3 +68,19 @@ jobs:
           path: soak.log
           if-no-files-found: error
           retention-days: 90
+      - name: Publish soak log to nightly-soak release
+        if: ${{ always() && hashFiles('soak.log') != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CYCLES: ${{ github.event.inputs.cycles || '1000000' }}
+        run: |
+          set -euo pipefail
+          if ! gh release view nightly-soak >/dev/null 2>&1; then
+            gh release create nightly-soak \
+              --title "nightly-soak logs" \
+              --notes "Rolling long-term storage for nightly soak logs. Assets are unique per run."
+          fi
+          gh release upload nightly-soak \
+            "soak.log#soak-log-${GITHUB_RUN_ID}-c${CYCLES}.log" \
+            --clobber
