@@ -187,7 +187,8 @@ breaking 变更。
 - 历史发布版 × 新宿主已加手动 `compat-historical.yml`，不在 PR 门禁。
 - `--require-v2` 与 `seal-consume` 已进入发布 checklist。
 - 仍需：nightly cron/artifact 长期转存、SCM 持续重跑、`RUSTFLAGS`/
-  `.cargo/config` 自定义 rustflags 记录、seal source digest 的 tag/commit 绑定。
+  `.cargo/config` 自定义 rustflags 记录；seal 已记录 `source.commit` /
+  `source.tag`，但 `--verify` 保持兼容、不要求它们。
 - `--root` 的 toolchain 探测已走目标树目录；历史 tag 无 `--source-policy` 时
   明确回退当前宿主并记录跨源，不伪装 strict。
 

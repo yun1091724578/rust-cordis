@@ -91,6 +91,8 @@ struct SealManifest {
     rustflags: String,
     source_sha256: String,
     source_files: u64,
+    source_commit: Option<String>,
+    source_tag: Option<String>,
     host_source_sha256: String,
     host_source_files: u64,
     host_workspace_version: String,
@@ -123,6 +125,8 @@ impl SealManifest {
                 "kind": "workspace-tree",
                 "sha256": self.source_sha256,
                 "files": self.source_files,
+                "commit": self.source_commit,
+                "tag": self.source_tag,
             },
             "host": {
                 "workspace_version": self.host_workspace_version,
@@ -190,6 +194,8 @@ impl SealManifest {
                 .to_string(),
             source_sha256: field_str(source, "sha256")?,
             source_files: field_u64(source, "files")?,
+            source_commit: field_opt_str(source, "commit"),
+            source_tag: field_opt_str(source, "tag"),
             host_source_sha256: value
                 .get("host")
                 .and_then(|host| host.get("source_sha256"))
@@ -235,6 +241,28 @@ fn field_u64(value: &Value, key: &str) -> Result<u64, String> {
         .get(key)
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("封存清单缺少无符号整数字段 {key}"))
+}
+
+fn git_identity(root: &Path) -> (Option<String>, Option<String>) {
+    let read = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|text| !text.is_empty())
+    };
+    (
+        read(&["rev-parse", "HEAD"]),
+        read(&["describe", "--tags", "--exact-match", "HEAD"]),
+    )
+}
+
+fn field_opt_str(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
 fn field_u32(value: &Value, key: &str) -> Result<u32, String> {
@@ -548,6 +576,7 @@ fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
         fs::read(temp.join(SMOKE_EVIDENCE)).map_err(|err| format!("读取 smoke 证据失败：{err}"))?;
 
     let (host_source_sha256, host_source_files) = source_tree_digest(&host_root, out)?;
+    let (source_commit, source_tag) = git_identity(root);
     let manifest = SealManifest {
         workspace_version: source_version,
         abi_version,
@@ -563,6 +592,8 @@ fn seal_to(out: &Path, root: &Path) -> Result<SealManifest, String> {
         rustflags,
         source_sha256,
         source_files,
+        source_commit,
+        source_tag,
         host_source_sha256,
         host_source_files,
         host_workspace_version: workspace_version(&host_root)?,
@@ -1796,6 +1827,8 @@ mod tests {
             rustflags: String::new(),
             source_sha256: sha256_hex(b"source"),
             source_files: 3,
+            source_commit: None,
+            source_tag: None,
             host_source_sha256: sha256_hex(b"host"),
             host_source_files: 2,
             host_workspace_version: "0.1.0".to_string(),
@@ -2065,6 +2098,37 @@ mod tests {
         let output = expected_inspect().replace("mounted = 0", "mounted = 1");
         let errors = verify_inspect_output(&output).expect_err("mounted 非零必须失败");
         assert!(errors.contains("mounted = 0"));
+    }
+
+    #[test]
+    fn records_git_commit_and_exact_tag() {
+        let tree = TempTree::new("git-identity");
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&tree.path)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        run(&["init", "-q"]);
+        fs::write(tree.path.join("file.txt"), "seal").unwrap();
+        run(&["add", "file.txt"]);
+        run(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "test",
+        ]);
+        run(&["tag", "v-test"]);
+        let (commit, tag) = git_identity(&tree.path);
+        assert_eq!(commit.as_deref().map(str::len), Some(40));
+        assert_eq!(tag.as_deref(), Some("v-test"));
     }
 
     #[test]

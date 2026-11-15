@@ -55,6 +55,8 @@ dist/cordis-plugins-<workspace-version>-<target>/
   manifest 逐字段一致。它是 `cordis --source-policy` 的输入格式；
 - 记录 workspace 版本、ABI 主版本、结构化错误格式版本、目标三元组、rustc /
   cargo / RUSTFLAGS，以及封存时 workspace 工作树的聚合 SHA256；
+- `source.commit` / `source.tag` 记录源树的 git 身份（非 git 树为 null）；
+  `--verify` 保持向后兼容，不把它当唯一身份；
 - 记录 smoke 宿主身份 `host.workspace_version` / `host.source_sha256` /
   `host.source_files`。普通 `seal` 的 host 与 source 是同一棵树；`--root`
   的 host 是当前工作区，若两者 `source_sha256` 不同，smoke 只是跨版本加载检查，
