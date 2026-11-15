@@ -261,7 +261,7 @@ inspect/status provenance、默认拒绝来源策略。
 | A5-1 三平台 CI | 完成 | `41460414477`；17 × 4 矩阵 |
 | A5-2 nightly soak | 进行中 | 1M Linux、RSS 预算、dhat；cron 首跑/长期转存待补 |
 | A5-3 正式 `/2` 封存 | 0.1.2 完成，strict same-version 满足 | `xtask seal --root v0.1.2`；`dist/cordis-0.1.2-formal`（`source == host`，`830bf97d…`）；0.1.0/0.1.1 保留为历史跨源封存；Release assets；`--require-v2` 可用 |
-| A5-4 历史 × 新宿主 | 本地通过，手动 CI 已加 | `compat-historical.yml` 在 Windows runner 下载 0.1.0/0.1.1/0.1.2 assets 并依次 `seal-consume`；手动，不在 PR 门禁 |
+| A5-4 历史 × 新宿主 | 手动 CI 通过，不在 PR 门禁 | `compat-historical.yml` 在 Windows runner 下载 0.1.0/0.1.1/0.1.2 assets 并依次 `seal-consume`；run [43674995479](https://github.com/yun1091724578/rust-cordis/actions/runs/43674995479) 通过 |
 | A5-5 其余发布项 | 大部分完成 | 公开仓、元数据、SCM 一次实测；nightly 转存/SCM CI 重跑待补 |
 
 ### 当前门禁
