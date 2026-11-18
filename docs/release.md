@@ -75,10 +75,11 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 
 | 门禁 | 命令 / 位置 | 说明 |
 |---|---|---|
-| 本地统一入口 | `.\cargo.cmd xtask ci` | 格式检查 + inventory/docs/平台矩阵检查 + clippy（`-D warnings`）+ 全量测试 + demo 快照 + harness e2e；2026-11-02 在 Windows GNU 全量通过。**限制**：仅 Windows/cmd；硬编码 `CARGO_HOME=C:\cordis-rs-cargo-home`、`CARGO_TARGET_DIR=C:\cordis-rs-target`、本地代理 `127.0.0.1:7897` 与 rustup self-contained PATH；`RUSTFLAGS` 与 CI 裸 `cargo test` 不同。换机或 CI 仍以三平台结果为准，裸 `cargo xtask ci` 不作为受支持入口 |
+| 本地统一入口 | `.\cargo.cmd xtask ci` | 格式检查 + inventory/docs/平台矩阵检查 + clippy（`-D warnings`、`--all-features`）+ 全 target 的 `--all-features` 编译检查（`check --workspace --all-targets --all-features`）+ 全量测试 + doctest（`cargo test --workspace --doc`，`--all-targets` 不含它）+ demo 快照 + harness e2e；2026-11-02 在 Windows GNU 全量通过。**限制**：仅 Windows/cmd；硬编码 `CARGO_HOME=C:\cordis-rs-cargo-home`、`CARGO_TARGET_DIR=C:\cordis-rs-target`、本地代理 `127.0.0.1:7897` 与 rustup self-contained PATH；`RUSTFLAGS` 与 CI 裸 `cargo test` 不同。换机或 CI 仍以三平台结果为准，裸 `cargo xtask ci` 不作为受支持入口 |
 | 三平台运行 | GitHub Actions `test` job | Linux / Windows MSVC / macOS 实际编译、运行测试与真 DLL e2e（Windows GNU 是本地工具链，不是 CI 的 Windows 目标）；2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477) 首次通过（一次通过；后续变更需重跑） |
 | MSRV | GitHub Actions `msrv` job | 用 Rust 1.85.0 检查声明的 `rust-version`（Windows GNU 本地已用 `cargo.cmd +1.85.0-x86_64-pc-windows-gnu check --workspace --all-targets` 通过） |
 | 打包 | GitHub Actions `package` job | `rust-cordis-core` / `rust-cordis-abi` / `rust-cordis-host` / `rust-cordis-macros` 的 `cargo package --no-verify --locked` |
+| package 隔离验收 | `cargo xtask package-check [--keep] [--offline\|--online] [--reuse-dir] [--dir <绝对路径>]`（本地；不进入 `ci`） | 把 core/abi/macros/host 四个 crate 打包成 `.crate`、解包到仓库外的 ASCII 临时目录，再用**产物**（不是仓库源码 path）构建独立消费者并跑一次跨 ABI 服务调用（`ctx.require` → `ctx.provide` → 宿主读回比对，并断言关闭后实例归零）。本地、离线，不发布、不写 registry、不改 `Cargo.lock`；与上面 `cargo package --no-verify` 的区别是它真的解包、真的编译、真的调用服务，并用三层判据（生成清单文本 / 解包清单文本 / `cargo metadata` 溯源）挡住源码 path 后门。**限制**：不能替代真实 registry 消费者验证（从 registry 拉发布版本）与三平台验证 —— 目前只在 Windows GNU 实测，解包依赖系统 `tar` |
 | 格式 | `cargo xtask fmt`（含独立夹具）/ CI lint job | 本地检查 workspace + `tests/fixtures/abi-v1` + `tests/fixtures/abi-error` + `tests/fixtures/abi-err-v1` + `tests/consumer-service`；CI lint job 跑 `cargo fmt --all -- --check`、consumer fmt 检查与 clippy `-D warnings` |
 | 独立消费者 | `cargo xtask consumer`（三平台 CI test job） | 独立 workspace 只用公开 path 依赖；fake service、真实 ABI 服务组合、sidecar/`PluginSourcePolicy` 准入；`xtask consumer` 先构建 greeting/hello cdylib |
 | 支持契约 | `cargo xtask docs`（CI 由 `cargo test --workspace` 覆盖索引检查） | 保证索引必须引用带 `#[test]` / `#[tokio::test]` 的测试；违规非零退出 |
@@ -87,6 +88,7 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 | 首发封存入口 | `cargo xtask seal [--out <dir>]` / `cargo xtask seal --verify <dir> --require-v2` / `cargo xtask seal-consume <dir>` | 构建三个宿主目标 release 插件，记录源码树 / 工具链 / ABI / SHA256，为每个 DLL 写 sidecar manifest 与根 `allow-list.json`，用同版本 `inspect --source-policy` 逐插件核对身份，并把 stdout、smoke 配置、artifact、manifest 与 allow-list 一起写入校验和；2026-11-02 Windows GNU 本地演练通过（旧 `/1` 格式）。封存对象是 `publish = false` 的示例插件，不是可发布 crate。格式与边界见 `docs/release-seal.md`；**不是 CI 门禁**，正式首发时必须运行并把整个目录归档 |
 | 资源增长回归 | `cargo test -p rust-cordis-host --test resource_baseline` / `--test staged`（三平台 CI 已包含；2026-11-02 首次通过） | 实例 / 派发 / 挂起 / 派发帧 / 流 / effect / 暂存台账回到基线；独立 soak 见 A5-2 |
 | 真实 `open_staged` soak | `cargo xtask soak`（同时运行 `soak` 与 `open_staged_soak`） | 200 轮真实 cdylib：`stage_plugin` → `LoadedPlugin::open_staged` → `OP_PING` → drop；暂存台账/实例表归零，Linux RSS 预算 128 MiB |
+| dhat 堆剖析 | `cargo xtask dhat`（手工 / nightly；不进入 `ci`） | 开 `--features dhat-heap` 运行真实 `open_staged` 堆剖析并打印 stats；运行前带该 feature 做 `--ignored --list` 守卫，缺 feature 时目标会被裁成 0 个测试；`.github/workflows/nightly-soak.yml` 的 dhat 步骤尚未改用该入口（待授权） |
 | 相邻版本矩阵 | `.\scripts\version-matrix.ps1`（本地）/ `.github/workflows/version-matrix.yml`（手动或每周日 04:00 UTC） | host v0.1.0/v0.1.1/HEAD × 正式 0.1.0/0.1.1 `/2` 封存；五组 `inspect` 均 `mounted=0` 且三个插件齐全；HEAD 组使用 `--source-policy`；workflow 会从 tag 重新生成封存。2026-11-09 手动 run [42606045837](https://github.com/yun1091724578/rust-cordis/actions/runs/42606045837) 通过 |
 | 夜间 soak | `cargo xtask soak [cycles]` / `.github/workflows/nightly-soak.yml`（每日 02:17 CST 或手动 dispatch） | workflow 默认 1,000,000 轮（约 38 分钟，Linux 单测试；手动 dispatch 可覆盖）；2026-11-03 首次手动 20,000 轮 [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 通过；1M 默认已由 [run 41592298543](https://github.com/yun1091724578/rust-cordis/actions/runs/41592298543) 验证（`elapsed_ms=2265533`，artifact `soak-log-41592298543-c1000000`）；2026-11-09 小轮次手动 run [42606720459](https://github.com/yun1091724578/rust-cordis/actions/runs/42606720459) 同时通过 dhat staged-load profile；2026-11-13 **首次 cron** [43527774240](https://github.com/yun1091724578/rust-cordis/actions/runs/43527774240) 通过：`elapsed_ms=2449504`（约 40m49s），`calls=applies=cleanups=disposes=2916668`，`rss_kb=6828`，`rss_growth_bytes=483328`；artifact `soak-log-43527774240-c1000000`（zip 16,485 字节，`soak.log` 172,046 字节，SHA256 `0E2117B890FF064A1E4F8AB75F2145A01D6D173855D7AEEC1C84FAE8B316B75B`）。Linux 运行时额外断言进程 RSS 增长不超过 128 MiB，Windows 只记录 0（无 `/proc`）；artifact 保留 90 天；2026-11-15 起每次运行把 `soak.log` 以唯一 asset 名发布到 Release [`nightly-soak`](https://github.com/yun1091724578/rust-cordis/releases/tag/nightly-soak)，手动 run [43703088323](https://github.com/yun1091724578/rust-cordis/actions/runs/43703088323) 验证 asset `soak-log-43703088323-c10.log`（8,667 字节，SHA256 `f593955c…`） |
 | 冻结 ABI v1 兼容 | `cargo test -p rust-cordis-host --test frozen_plugin`（三平台 CI 已包含；2026-11-02 首次通过） | 真 72B v1 结构体（无 `provision`）；volatile / 回调 / dispose；版本与尺寸拒绝；哈希冻结；夹具按 LF 字节固定 |
@@ -129,8 +131,17 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 ### A5-2 已启用（首次 20k / 默认 1M 通过，持续运行未闭合）
 
 - [x] `.github/workflows/nightly-soak.yml` 已配置每日 02:17 CST（18:17 UTC）运行默认 1,000,000 轮，支持 `workflow_dispatch` 覆盖轮次并上传 `soak.log` artifact。
-- [x] `cargo xtask soak` 先以 `--ignored --list` 确认目标测试仍存在且被忽略；
-  0 个 ignored 测试不会再被当成通过。
+- [x] `cargo xtask soak` / `cargo xtask dhat` 运行前对 `soak`、`open_staged_soak`、`dhat_profile` 三个 target 逐一做
+  `--ignored --list` 注册检查（dhat 必须带 `--features dhat-heap`，否则整个 target 被
+  `#![cfg]` 裁成 0 个测试的假绿入口）；匹配按行级等值而不是子串，0 个 ignored 测试或
+  「未注册为 `#[ignore]` 测试」都直接拒绝，失败时打印子进程 stderr。
+- [x] `cargo xtask dhat`：开 `--features dhat-heap` 后执行真实 `open_staged` 堆剖析并打印
+  stats，不进入 `ci`；与 `soak` 一样只在手工/nightly 入口运行。本机（Windows GNU
+  self-contained 工具链）端到端跑不通，缺 `as` 时 `backtrace` 的 dbghelp 导入库链接失败，
+  因此本机只验证到 feature 守卫与编译期。
+- **待授权**：`.github/workflows/nightly-soak.yml` 里的 dhat 步骤仍是裸 `cargo test` 调用，
+  尚未改用 `cargo xtask dhat`，因此夜间证据不经过上面这条 `--ignored --list` 守卫。workflow
+  变更需单独授权，本次只记录不改。
 - [x] `.cargo/config.toml` 的 `xtask` alias 已加 `--locked`；nightly 最外层
   构建不会在 runner 上静默重写 `Cargo.lock`。
 - [x] 2026-11-03 **手动 dispatch** 首次 [run 41562347773](https://github.com/yun1091724578/rust-cordis/actions/runs/41562347773) 通过：`loaded_instances=0`、`staged_leaked=0`、`runtime=0`、`hooks=0`；artifact `soak-log-41562347773`。

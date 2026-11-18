@@ -19,6 +19,7 @@
 
 use crate::patch::{apply_entry_patches_tracked, parse_entries, parse_patches, Entry, PatchOwners};
 use crate::plan::PlanEntrySpec;
+use crate::source::{PluginSourcePolicy, SourceAdmission};
 use crate::{
     mount, resolve_plugin_path, set_dispatch_policy_for, set_host_limits_for, stage_plugin,
     DispatchPolicy, HostLimits, LoadedPlugin, StagedFile,
@@ -585,10 +586,21 @@ pub struct ReconcileOutcome {
     /// **只差 volatile 字段**的行：值原地提交，实例没动（M4-5）。
     pub volatile: Vec<String>,
     /// 动作被 `loader/patch-context` 的监听者短路（尾链没跑到）。
+    ///
+    /// 只有 `Mount`/`Update` 会落在这里：它们的短路等于"什么都没发生"。`Replace` 的
+    /// 短路意味着**旧实例已经卸下**（先卸后装），所以它进 [`Self::failures`]（O5b）。
     pub skipped: Vec<String>,
     /// `internal/update` 被否决（`UpdateOutcome::Vetoed`）⇒ 内存里记着、实例上没落地。
     pub lagging: Vec<String>,
     /// 逐行失败消息（`<label>: <原因>`，与装载失败通道同格式）。
+    ///
+    /// `Replace` 的失败分两档，文案必须能区分开（O5b）：
+    /// - **artifact 预检失败**（O5b-2：写错 `name` / artifact 缺失、stage/open/ping 报错）⇒
+    ///   拆卸根本没发生，文案写"保留当前实例"；
+    /// - 预检通过之后（`apply` 失败 / 被 `loader/patch-context` 短路）⇒ 旧实例已经卸下、
+    ///   不回滚，文案写明"旧实例已卸下"。
+    ///
+    /// 后者与 HMR 路径上"保留当前实例"的错误文案含义正好相反，所以措辞不能共用。
     pub failures: Vec<String>,
 }
 
@@ -628,7 +640,10 @@ pub enum Action {
     /// 之所以是独立动作而不是 `Update` 的一个标志：它对上层是**另一种事**
     /// （实例继续活着），报告与测试都要看得见这个区别。
     Volatile { label: String, config: Config },
-    /// 身份或上下文变了（`name`/`inject`/`isolate`/`intercept`）：先卸后装。
+    /// 身份或上下文变了（`name`/`inject`/`isolate`/`intercept`）：先预检、再卸、再装。
+    ///
+    /// 顺序是**决策 → 前移预检 → 拆卸 → 挂载**（O5b-2）：artifact 的 stage/open/ping
+    /// 在旧实例还活着时跑完，预检失败就不拆（旧实例继续服务），预检通过才先卸后装。
     Replace(String),
 }
 
@@ -648,7 +663,10 @@ pub enum ReloadOutcome {
     Unsettled,
     /// 读取或解析失败：**保留上一快照**，只记警告（编辑中的半截文件是常态）。
     Failed(String),
-    /// 已并入**在飞**的那一轮对账（只有最新的一份树会被应用）。
+    /// 这次调用**没有应用**自己的候选：已并入**在飞**的那一轮对账（只有最新的一份树
+    /// 会被应用），或候选因**代次更旧 / 回写版本过期**被丢弃（更新的意图已经存在，
+    /// 或者它基于一棵已被运行时回写改过的树——后者会按磁盘重建一次，
+    /// 见 [`LoaderState::reload`]）。
     Coalesced,
     /// 本次调用驱动完成的对账。
     Reconciled(ReconcileOutcome),
@@ -666,6 +684,119 @@ struct ConfigFiles {
 struct FileSnapshot {
     main: String,
     patches: Vec<String>,
+}
+
+/// [`LoaderState::parse_snapshot`] 的产物：目标树 + **随它一起被采纳**的回写元数据。
+///
+/// 两件事必须是一份：回写落到哪一层（`owners`）、以哪份文本做比较（`baseline`）、
+/// 主配置自己长什么样（`main`）——都是"这份配置被采纳了"的一部分。
+struct ParsedSnapshot {
+    entries: Vec<Entry>,
+    main: Vec<Entry>,
+    owners: PatchOwners,
+    baseline: String,
+}
+
+/// 一份**待采纳**的配置候选：目标树与回写元数据一起排队、一起校验、一起提交。
+///
+/// 为什么必须整份带着走：`main_only` / `owners` / `main_baseline` 决定**之后的回写**
+/// 落到哪个文件、以哪份文本做比较。解析完就提前写它们，会让一份永远不会被采纳的配置
+/// 参与回写决策——预检失败或候选过期之后，插件自我卸载与 `fiber.update` 会按
+/// "没生效的配置"操作磁盘。
+struct Candidate {
+    /// 登记代次（[`LoaderState::next_candidate_gen`]）：**请求登记顺序**，不是解析完成顺序。
+    ///
+    /// `0` 表示本地候选（`sync` / `set_disabled` / 显式 `reconcile_once`）：它们在
+    /// `mutation` 下立即执行，目标就是"当前状态"，不参与代次比较。
+    gen: u64,
+    /// 候选构造时的**回写版本**（[`LoaderState::writeback`]）。
+    ///
+    /// 运行时回写（`fiber.update` / 插件自我卸载）会改已采纳的目标；基于旧版本的候选
+    /// 一旦采纳就会把树退回候选内容，而 watcher 的指纹早已对齐磁盘、不会自动补偿。
+    base_writeback: u64,
+    /// 目标条目树（主配置 + patch 合并结果）。
+    entries: Vec<Entry>,
+    /// 是否连同回写元数据一起采纳（文件驱动的候选）。
+    ///
+    /// `set_disabled` / `sync` / 显式 `reconcile_once` 这类**本地**候选只换树：
+    /// 它们不改文件基线，硬塞一份元数据反而会把已采纳的回写状态退回去。
+    adopt_metadata: bool,
+    /// 主配置自己的条目树（`adopt_metadata` 时生效）。
+    main: Vec<Entry>,
+    /// `config` / `disabled` 的字段归属（决定回写落到哪一层 patch）。
+    owners: PatchOwners,
+    /// 候选对应的主配置原文（回写前的"未改动"比较基线）。
+    baseline: String,
+}
+
+impl Candidate {
+    /// 本地候选：只换树，不动回写元数据、不参与代次与回写版本比较。
+    fn local(entries: Vec<Entry>) -> Self {
+        Self {
+            gen: 0,
+            base_writeback: 0,
+            entries,
+            adopt_metadata: false,
+            main: Vec::new(),
+            owners: PatchOwners::default(),
+            baseline: String::new(),
+        }
+    }
+
+    /// 排队候选：带登记代次与构造时的回写版本，参与"新旧"与"过期"判断。
+    fn queued(entries: Vec<Entry>, gen: u64, base_writeback: u64) -> Self {
+        Self {
+            gen,
+            base_writeback,
+            ..Self::local(entries)
+        }
+    }
+}
+
+/// 一次对账内核的完整产物：对账结果 + 采纳被拒的原因（没有拒绝时为 `None`）。
+struct ReconcileAttempt {
+    outcome: ReconcileOutcome,
+    rejection: Option<AdoptRejection>,
+}
+
+/// 候选被 `adopt` 拒绝的**原因**：驱动器要区分"能重建"与"已经过期得没救"。
+///
+/// 两者都不得采纳，但后续动作相反：
+/// - 代次更旧 ⇒ 更新的意图已经在路上，重建只会白白覆盖它 ⇒ **直接丢弃**；
+/// - 回写版本过期 ⇒ 候选本身仍是**当前意图**（文件还是那份文件），只是构造时看到的
+///   树已经被运行时回写改过了 ⇒ 必须**重新读取/构造并预检**（规格 §O5），
+///   否则 watcher 的指纹早已对齐磁盘、文件不变就不会再来一次 `reload`——
+///   用户那次编辑会永久停在"只剩一条 Error 日志"。
+enum AdoptRejection {
+    /// 代次 ≤ 已采纳代次：迟到的旧解析，丢弃（不得复活）。
+    StaleGeneration(String),
+    /// 构造时回写版本 ≠ 当前：基于一棵已经被运行时回写改过的树。
+    StaleWriteback(String),
+}
+
+impl AdoptRejection {
+    fn message(&self) -> &str {
+        match self {
+            AdoptRejection::StaleGeneration(message) | AdoptRejection::StaleWriteback(message) => {
+                message
+            }
+        }
+    }
+}
+
+/// 同一份候选因**回写版本过期**被拒后，最多重建几次。
+///
+/// 每次重建都重新稳读磁盘并快照新的回写版本，所以持续的重建意味着"重建期间又发生了
+/// 运行时回写"——那不是我们能在这一轮解决的竞态。上限把它变成一条可诊断的失败
+/// （日志 + `failures`），而不是无限循环。
+const MAX_STALE_REBUILDS: u32 = 3;
+
+/// 一次过期候选重建的结局（[`LoaderState::rebuild_stale_candidate`]）。
+enum StaleRebuild {
+    /// 新候选已登记进合并槽：调用方继续用同一个单飞位驱动它。
+    Queued,
+    /// 这一轮拿不到可驱动的候选：附带的说明要进 `failures`（不得静默）。
+    Stopped(String),
 }
 
 /// 一行**派生挂载上下文的输入**：链上每层的 label + `isolate`/`intercept` 声明。
@@ -720,14 +851,32 @@ pub struct LoaderState {
     config_fingerprint: Mutex<Vec<Option<(u64, u64)>>>,
     /// `config` / `disabled` 最后一次被哪一层 patch 覆盖（运行期回写落点）。
     owners: Mutex<PatchOwners>,
-    /// 待应用的最新一份树（`request_reconcile` 的合并槽：旧的那份会被覆盖）。
-    pending: Mutex<Option<Vec<Entry>>>,
+    /// 待应用的最新一份候选（`request_reconcile` 的合并槽：旧的那份会被覆盖）。
+    ///
+    /// 存**整份候选**（树 + 回写元数据）而不是只存树：采纳是一次事务，
+    /// 只有整份候选一起被采纳，"已采纳的配置"才只有一个含义。
+    pending: Mutex<Option<Candidate>>,
     /// 是否有一轮对账在飞（重入保护）。
     reconciling: AtomicBool,
+    /// 候选代次取号器。取号发生在**请求登记时**（`reload` 在解析之前），所以
+    /// "谁是最新意图"由请求先后决定，而不是由谁先解析完决定。
+    next_gen: AtomicU64,
+    /// 最近一次被采纳的候选代次。迟到的旧解析（代次更小）不得复活。
+    adopted_gen: AtomicU64,
+    /// 回写版本：`persist` 成功写盘、提交观察者与自我卸载**改了已采纳目标**时推进。
+    ///
+    /// 在飞/排队的候选记下构造时的版本；版本变了就说明候选基于一棵已经过时的树，
+    /// 采纳它会悄悄退回运行时回写的结果（watcher 的指纹已对齐磁盘，不会补偿）。
+    writeback: AtomicU64,
     /// 装载器**有意**卸载中的行：`internal/plugin` 观察者据此把它与"插件自我卸载"区分开。
     disposing: Mutex<HashSet<String>>,
     /// 最近一次真正执行过的对账产物（`report.reconcile` 与测试用）。
     last: Mutex<Option<ReconcileOutcome>>,
+    /// 最近一次声明预检的分类结论（O7，`report.preflight`）。
+    ///
+    /// 与 `last` 同构：**只做诊断**，不参与任何门禁。`None` 只可能出现在"还没跑过
+    /// 预检"的实例上（crate 内部直接构造的测试状态）。
+    preflight: Mutex<Option<PreflightReport>>,
     /// 最近一次对账里**休眠**的叶子行标（M4-6：报告要能回答"我配了它，为什么没生效"）。
     disabled: Mutex<Vec<String>>,
     /// `loader.report` 出版过没有：装载期的第一次对账发生在 `provide` **之前**，
@@ -766,6 +915,196 @@ pub struct LoaderState {
     strict_sidecars: bool,
     /// 初装已经预检过；第一次 reconcile 不再重复问 source。
     skip_next_preflight: AtomicBool,
+    /// 测试闸门（`#[cfg(test)]` 每实例一份：不用全局 static，release 构建零成本）。
+    ///
+    /// 用它把"解析完了但还没登记""预检完了但还没采纳"这两个瞬间钉成确定性的，
+    /// 于是"迟到的旧解析""回写在飞插入""采纳前被取消"都能被断言而不是靠 sleep 竞态。
+    #[cfg(test)]
+    hooks: AdoptHooks,
+    /// `#[cfg(test)]`：**没持** `config_gate` 就写 `main_only` 的次数。
+    ///
+    /// 锁序纪律不能只写在注释里：这条计数让"写入与采纳交织"变成一个可断言的数字。
+    /// release 构建没有这个字段。
+    #[cfg(test)]
+    ungated_main_writes: AtomicU64,
+    /// `#[cfg(test)]`：过期候选按磁盘重建的次数（断言"有限重试"用）。
+    #[cfg(test)]
+    stale_rebuilds: AtomicU64,
+}
+
+/// 一次对账的**推进点**上的测试闸门（`#[cfg(test)]`）。
+///
+/// 每个点是独立的 `Option<Arc<TestGate>>`：测试装一个、用一次、再
+/// [`LoaderState::clear_hooks`] 摘掉，后续轮次不会被同一个闸门绊住。
+#[cfg(test)]
+#[derive(Default)]
+struct AdoptHooks {
+    /// `reload` 解析完成之后（还没预检、没登记）。
+    after_parse: Mutex<Option<Arc<TestGate>>>,
+    /// `reconcile_once_inner` 的预检之后、采纳之前（已持 `mutation`）。
+    before_adopt: Mutex<Option<Arc<TestGate>>>,
+    /// `adopt` 的 `config_gate` 段内：校验通过、写树之前（**持闸门、同步**）。
+    inside_gate: Mutex<Option<Arc<BlockGate>>>,
+    /// `ReconcileDriver::drop` 里：候选已回填、单飞位**还没**放开（**同步回调**）。
+    ///
+    /// 这个瞬间就是"回填 → 清位"的两条指令之间：此刻登记的更新候选，它的
+    /// `drive_pending` 仍会读到 `true` 而返回 `None`。回调而不是闸门：`Drop` 不能
+    /// await，而阻塞一个 worker 会连带卡住 timer driver。
+    before_release_flight: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 提交观察者**已进入**的到达信号（每实例一份 `Semaphore`，不是闸门）。
+    ///
+    /// 观察者不在这里停：报到后继续去取 `config_gate`。测试用它把"回写任务真的跑到
+    /// 观察者里了"变成一个可观测的前提——否则"回写还没完成"只能靠墙钟猜，慢 CI 上
+    /// "任务还没被调度"会被误读成"被闸门挡住了"（假绿）。
+    commit_entered: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// `reload_one` 里**暂存之后、打开暂存副本之前**（O9）。
+    ///
+    /// 回调而不是闸门：这个瞬间没有 `.await` 点（持着 `mutation`、流水线是同步的），
+    /// 而测试要做的动作（用别的字节覆盖 `.rN`）本身也是同步的。回调在 `open_staged_verified`
+    /// 之前**就地**执行，于是"校验的到底是哪个字节"变成一个确定性的断言，而不是
+    /// 靠 sleep 去赌竞态窗口。
+    before_staged_open: Mutex<Option<StagedOpenHook>>,
+}
+
+/// 暂存副本落地之后、被打开之前的同步回调（O9，`#[cfg(test)]`）。
+#[cfg(test)]
+type StagedOpenHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+impl AdoptHooks {
+    async fn pass_after_parse(&self) {
+        let gate = self.after_parse.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
+    }
+
+    async fn pass_before_adopt(&self) {
+        let gate = self.before_adopt.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
+    }
+
+    /// 同步版：`adopt` 的 `config_gate` 段里没有 `.await` 点可用，只能用阻塞闸门。
+    fn pass_inside_gate(&self) {
+        let gate = self.inside_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.pass();
+        }
+    }
+
+    /// 同步版：`Drop` 里没有 `.await` 点可用；也**不能阻塞**——堵住一个 runtime worker
+    /// 会把 timer driver 一起卡住（同 runtime 里的 `sleep` 再也不推进）。
+    fn pass_before_release_flight(&self) {
+        let hook = self.before_release_flight.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// 同步版：提交观察者入口报到（只给许可、不阻塞）。
+    fn pass_commit_entered(&self) {
+        let signal = self.commit_entered.lock().unwrap().clone();
+        if let Some(signal) = signal {
+            signal.add_permits(1);
+        }
+    }
+
+    /// 同步版：暂存副本已落地、还没被打开（O9）。回调拿到的是**那个** `.rN` 路径。
+    fn pass_before_staged_open(&self, staged: &Path) {
+        let hook = self.before_staged_open.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(staged);
+        }
+    }
+}
+
+/// 一进一出的测试闸门：`pass()` 到达并等放行；测试侧 `wait_arrived()` + `release()`。
+///
+/// 两个 `Semaphore` 而不是 `Notify`：`add_permits` 会**记住**许可，于是
+/// "先放行后到达"也不会丢信号（`Notify::notify_waiters` 会）。
+#[cfg(test)]
+struct TestGate {
+    arrived: tokio::sync::Semaphore,
+    released: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl TestGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            arrived: tokio::sync::Semaphore::new(0),
+            released: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    async fn pass(&self) {
+        self.arrived.add_permits(1);
+        let permit = self.released.acquire().await.expect("闸门未关闭");
+        permit.forget();
+    }
+
+    async fn wait_arrived(&self) {
+        let permit = self.arrived.acquire().await.expect("闸门未关闭");
+        permit.forget();
+    }
+
+    fn release(&self) {
+        self.released.add_permits(1);
+    }
+}
+
+/// [`LoaderState::install_hook`] 能装的推进点（`#[cfg(test)]`）。
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum HookPoint {
+    AfterParse,
+    BeforeAdopt,
+    /// `adopt` 的 `config_gate` 段内：**校验通过、写树之前**（持闸门、同步）。
+    InsideAdoptGate,
+}
+
+/// **阻塞式**测试闸门：给"持 `config_gate`、不含 `.await`"的同步临界区用。
+///
+/// [`TestGate`] 只能在 `.await` 点停住；而 TOCTOU 的窗口（校验返回 → 写树）里没有
+/// await 点，要在其中停住只能用阻塞原语：到达信号仍走 `Semaphore`（非阻塞，测试侧
+/// 照旧 `.await`），放行则用 `Condvar` 唤醒被阻塞的工作线程。
+#[cfg(test)]
+struct BlockGate {
+    arrived: tokio::sync::Semaphore,
+    released: std::sync::Mutex<bool>,
+    cond: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl BlockGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            arrived: tokio::sync::Semaphore::new(0),
+            released: std::sync::Mutex::new(false),
+            cond: std::sync::Condvar::new(),
+        })
+    }
+
+    /// 同步侧：报到后阻塞，直到测试放行（`release` 会记住已放行）。
+    fn pass(&self) {
+        self.arrived.add_permits(1);
+        let mut open = self.released.lock().unwrap();
+        while !*open {
+            open = self.cond.wait(open).unwrap();
+        }
+    }
+
+    async fn wait_arrived(&self) {
+        let permit = self.arrived.acquire().await.expect("闸门未关闭");
+        permit.forget();
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.cond.notify_all();
+    }
 }
 
 /// 对账驱动者的取消安全闸门。
@@ -777,6 +1116,8 @@ pub struct LoaderState {
 struct ReconcileDriver {
     state: Arc<LoaderState>,
     active: bool,
+    /// 已 take 但**尚未落定**的候选：取消/超时时回填合并槽（不丢、也不静默丢弃）。
+    taken: Option<Candidate>,
 }
 
 impl ReconcileDriver {
@@ -784,19 +1125,50 @@ impl ReconcileDriver {
         Self {
             state,
             active: true,
+            taken: None,
         }
     }
 
+    /// 正常收尾：候选已经落定（采纳或**明确拒绝**），不再回填。
     fn finish(&mut self) {
         self.active = false;
+        self.taken = None;
     }
 }
 
 impl Drop for ReconcileDriver {
     fn drop(&mut self) {
-        if self.active {
-            // 取消/panic：释放单飞位。`pending` 保留给下一次请求驱动。
-            self.state.reconciling.store(false, Ordering::SeqCst);
+        if !self.active {
+            return;
+        }
+        // 取消/超时/panic：先把候选还回合并槽，**再**释放单飞位。
+        //
+        // 顺序不能反：先放开 `reconciling` 的话，别人可能进来 take 到空槽并收工，
+        // 紧接着我们才回填——那份候选就再也没人驱动了（幽灵滞后）。
+        //
+        // 代次先记下来：清位之后要靠它辨认"槽里那份还是不是我们这份"。
+        let held_gen = self.taken.as_ref().map(|candidate| candidate.gen);
+        let restored = self
+            .taken
+            .take()
+            .map(|candidate| self.state.restore_candidate(candidate));
+        // 测试停点：钉住"已回填、还没清位"的两条指令之间（R1 的窗口）。
+        #[cfg(test)]
+        self.state.hooks.pass_before_release_flight();
+        self.state.reconciling.store(false, Ordering::SeqCst);
+        // 两条都会永久滞留的路径，都必须安排**一次**补偿驱动把它带走
+        // （本函数不能 await，只能 spawn；抢不到单飞位就安静退出）：
+        //
+        // ① 回填**被拒**（`false`）：槽里已经有一份我们没持有的更新候选；
+        // ② 回填**成功**、但清位之后槽里已经**不是**我们这份了：在回填与清位之间，
+        //    另一线程登记了更新的候选——它的 `drive_pending` 读到单飞位仍是 `true`，
+        //    于是返回 `None`，我们这份又被它顶掉。清位后槽里就是一份没人驱动的更新候选。
+        //
+        // 两种情况下 watcher 的指纹都早已对齐磁盘、不会再来一次：用户看到的是
+        // "最后一次编辑永不生效"。反之，若清位后槽里仍是**我们回填的这份**，就保持
+        // 既有语义：不自动驱动，等下一次请求（`request_reconcile` / `reload`）接管。
+        if restored == Some(false) || self.state.has_foreign_pending(held_gen) {
+            self.state.schedule_compensation();
         }
     }
 }
@@ -873,8 +1245,12 @@ impl LoaderState {
             owners: Mutex::new(owners),
             pending: Mutex::new(None),
             reconciling: AtomicBool::new(false),
+            next_gen: AtomicU64::new(0),
+            adopted_gen: AtomicU64::new(0),
+            writeback: AtomicU64::new(0),
             disposing: Mutex::new(HashSet::new()),
             last: Mutex::new(None),
+            preflight: Mutex::new(None),
             disabled: Mutex::new(Vec::new()),
             published: AtomicBool::new(false),
             main_baseline: Mutex::new(main_baseline),
@@ -888,12 +1264,127 @@ impl LoaderState {
             dependency_plan,
             strict_sidecars,
             skip_next_preflight: AtomicBool::new(false),
+            #[cfg(test)]
+            hooks: AdoptHooks::default(),
+            #[cfg(test)]
+            ungated_main_writes: AtomicU64::new(0),
+            #[cfg(test)]
+            stale_rebuilds: AtomicU64::new(0),
         }
+    }
+
+    /// 装/摘测试闸门（`#[cfg(test)]`）：装在哪个推进点由调用方决定。
+    #[cfg(test)]
+    fn install_hook(&self, hook: HookPoint) -> Arc<TestGate> {
+        let gate = TestGate::new();
+        let slot = match hook {
+            HookPoint::AfterParse => &self.hooks.after_parse,
+            HookPoint::BeforeAdopt => &self.hooks.before_adopt,
+            HookPoint::InsideAdoptGate => {
+                panic!("`InsideAdoptGate` 是同步闸门：用 `install_block_hook`")
+            }
+        };
+        *slot.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// 装一个**阻塞式**闸门（`#[cfg(test)]`）：只能装在同步临界区里的推进点。
+    #[cfg(test)]
+    fn install_block_hook(&self, hook: HookPoint) -> Arc<BlockGate> {
+        let gate = BlockGate::new();
+        match hook {
+            HookPoint::InsideAdoptGate => {
+                *self.hooks.inside_gate.lock().unwrap() = Some(gate.clone())
+            }
+            HookPoint::AfterParse | HookPoint::BeforeAdopt => {
+                panic!("`{hook:?}` 在 `.await` 点上：用 `install_hook`")
+            }
+        }
+        gate
+    }
+
+    /// 装一个**同步回调**（`#[cfg(test)]`）：只能在 `Drop` 这种"既不能 await、也不该
+    /// 阻塞 runtime 线程"的推进点上用。回调跑在驱动被丢弃的那个线程上，就在
+    /// "候选已回填、单飞位还没放开"这两条指令之间。
+    #[cfg(test)]
+    fn install_release_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.hooks.before_release_flight.lock().unwrap() = Some(hook);
+    }
+
+    /// 装一个"提交观察者已进入"的**到达信号**（`#[cfg(test)]`）：只报到、不阻塞。
+    ///
+    /// 用 `Semaphore` 而不是 `Notify`：许可会被记住，于是"信号先到、测试后等"也不丢。
+    #[cfg(test)]
+    fn install_commit_entered(&self) -> Arc<tokio::sync::Semaphore> {
+        let signal = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.hooks.commit_entered.lock().unwrap() = Some(signal.clone());
+        signal
+    }
+
+    /// 装一个"暂存副本已落地、还没打开"的**同步回调**（`#[cfg(test)]`，O9）。
+    ///
+    /// 回调拿到的是 `.rN` 的路径：用它可以在 `open_staged_verified` 之前把副本
+    /// 换成别的字节，于是"二次校验真的跑了"变成一个确定性的断言。
+    #[cfg(test)]
+    fn install_before_staged_open_hook(&self, hook: StagedOpenHook) {
+        *self.hooks.before_staged_open.lock().unwrap() = Some(hook);
+    }
+
+    /// 摘掉所有测试闸门：已经卡在闸门里的那一轮仍由它自己持有的 `Arc` 放行。
+    #[cfg(test)]
+    fn clear_hooks(&self) {
+        *self.hooks.after_parse.lock().unwrap() = None;
+        *self.hooks.before_adopt.lock().unwrap() = None;
+        *self.hooks.inside_gate.lock().unwrap() = None;
+        *self.hooks.before_release_flight.lock().unwrap() = None;
+        *self.hooks.commit_entered.lock().unwrap() = None;
+        *self.hooks.before_staged_open.lock().unwrap() = None;
+    }
+
+    /// 已采纳的候选代次（`#[cfg(test)]` 只读观测）。
+    #[cfg(test)]
+    fn adopted_generation(&self) -> u64 {
+        self.adopted_gen.load(Ordering::SeqCst)
+    }
+
+    /// 当前回写版本（`#[cfg(test)]` 只读观测）。
+    #[cfg(test)]
+    fn writeback_version(&self) -> u64 {
+        self.writeback.load(Ordering::SeqCst)
+    }
+
+    /// 过期候选按磁盘重建的次数（`#[cfg(test)]` 只读观测；断言"有限重试"）。
+    #[cfg(test)]
+    fn stale_rebuild_count(&self) -> u64 {
+        self.stale_rebuilds.load(Ordering::SeqCst)
+    }
+
+    /// 合并槽里待采纳候选的条目树（`#[cfg(test)]` 只读观测；`None` = 槽空）。
+    #[cfg(test)]
+    fn pending_entries(&self) -> Option<Vec<Entry>> {
+        self.pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|candidate| candidate.entries.clone())
+    }
+
+    /// 没持 `config_gate` 就写 `main_only` 的次数（`#[cfg(test)]` 只读观测）。
+    #[cfg(test)]
+    fn ungated_main_write_count(&self) -> u64 {
+        self.ungated_main_writes.load(Ordering::SeqCst)
     }
 
     /// 对当前条目树重新做 P1-1 预检：显式计划覆盖 sidecar；
     /// 否则收集启用行的 manifest `provides` / `requires`。
-    fn preflight_dependencies(&self, entries: &[Entry]) -> std::result::Result<(), String> {
+    ///
+    /// **只求解、不落报告**（O7）：结论由调用方在"这棵树真的成了当前树"之后才用
+    /// [`Self::record_preflight`] 写进去。被 `adopt` 拒绝的候选、预检本身就失败的
+    /// 那一轮都不该覆盖上一份已采纳结论。
+    fn preflight_dependencies(
+        &self,
+        entries: &[Entry],
+    ) -> std::result::Result<PreflightReport, String> {
         if self.dependency_plan.is_empty() {
             preflight_source_dependency_plan(
                 entries,
@@ -902,8 +1393,18 @@ impl LoaderState {
                 self.strict_sidecars,
             )
         } else {
-            Ok(())
+            Ok(PreflightReport::NotApplicable {
+                reason: PreflightNotApplicable::ExplicitPlan,
+            })
         }
+    }
+
+    /// 记下最近一次**已采纳**树的声明预检结论（O7，纯诊断）。
+    ///
+    /// 调用点必须保证"这棵树是当前树"：初装（`load_with_source` 建状态时）、
+    /// 对账 `adopt` 成功之后、`reload_one` 对当前树重跑预检之后。
+    fn record_preflight(&self, report: PreflightReport) {
+        *self.preflight.lock().unwrap() = Some(report);
     }
 
     /// 当前装载表里的行标（排序）。诊断与断言都在用它——加载器不该只有日志这一种观测面。
@@ -1212,10 +1713,33 @@ impl LoaderState {
     /// - `stagedLeaked`：已暂存但无人认领的副本文件数（G11，M0b）——装成功归零，
     ///   失败/泄漏 >0；
     /// - `pending`：未就绪行的精确缺失键与原因（阶段 3）；
-    /// - `failed`：最近一次对账的**逐行失败消息**（不是"历史累计"——历史在日志里）。
+    /// - `failed`：最近一次对账的**逐行失败消息**，外加"没执行就失败"的热重载
+    ///   （准入/校验/预检/打开/探活被拒）——它不是"历史累计"，历史在日志里。
+    /// - `preflight`：最近一次**声明预检**的分类结论（O7）。它明确标注
+    ///   `scope=declaration` / `runtimeVerified=false` / `realmModel=notModeled`，
+    ///   并用 `skipped=true` 表达"整次预检被跳过"：
+    ///   [ADR 0007] 的立场是声明检查不做运行时保证，这里不出现"已绑定/已满足"的口径。
+    ///
+    /// 预检结论只描述**已采纳**的那棵树：被 `adopt` 拒绝的候选不会覆盖它，
+    /// 于是 `preflight` 与 `mounted` / `disabled` 永远描述同一棵树。
+    ///
+    /// [ADR 0007]: ../../docs/adr/0007-version-is-diagnostic-only.md
     pub fn report(&self) -> serde_json::Value {
         let outcome = self.last.lock().unwrap().clone().unwrap_or_default();
         let (declared, supported) = self.volatile_summary();
+        let preflight = self
+            .preflight
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(PreflightReport::to_json)
+            .unwrap_or_else(|| {
+                // 还没跑过预检（crate 内部直接构造的测试状态）：没有任何声明结论。
+                PreflightReport::NotApplicable {
+                    reason: PreflightNotApplicable::NoEnabledRows,
+                }
+                .to_json()
+            });
         json!({
             "mounted": self.mounted_labels().len(),
             "disabled": self.disabled.lock().unwrap().clone(),
@@ -1246,6 +1770,7 @@ impl LoaderState {
             })).collect::<Vec<_>>(),
             "capabilities": self.capabilities(),
             "failed": outcome.failures,
+            "preflight": preflight,
         })
     }
 
@@ -1358,6 +1883,11 @@ impl LoaderState {
     }
 
     /// **纯差异**：不下手，只列动作（`plan_reaches_fresh_load_state` 与可视化用它）。
+    ///
+    /// 它也是"目标要求挂载、当前却没有实例"的**诊断入口**（O5b）：换实例失败一轮之后
+    /// （先卸后装 ⇒ 实例没了、目标不回滚），`plan(&state.tree_snapshot())` 会明确给出
+    /// `Action::Mount`，配合 `report().failed` / `mounted == 0` 就足够判断"它该在、但它不在"。
+    /// 所以这里不需要额外的公开字段。
     pub fn plan(&self, entries: &[Entry]) -> Vec<Action> {
         let desired = self.desired(entries);
         self.diff(&desired.rows)
@@ -1371,8 +1901,9 @@ impl LoaderState {
 
     /// [`sync`] 的无锁内核：调用方已经持有 `mutation`。
     async fn sync_inner(self: &Arc<Self>) -> ReconcileOutcome {
-        let entries = self.tree_snapshot();
-        self.reconcile_once_inner(entries).await
+        // 本地候选：目标就是**当前**树，不改回写元数据（运行期启停不改文件基线）。
+        let candidate = Candidate::local(self.tree_snapshot());
+        self.reconcile_once_inner(&candidate).await
     }
 
     /// 以**给定的新树**为目标对账一次（文件驱动的唯一驱动器）。
@@ -1383,31 +1914,76 @@ impl LoaderState {
     /// 只把问题写进对账产物。
     pub async fn reconcile_once(self: &Arc<Self>, entries: Vec<Entry>) -> ReconcileOutcome {
         let _guard = self.mutation.lock().await;
-        self.reconcile_once_inner(entries).await
+        let candidate = Candidate::local(entries);
+        self.reconcile_once_inner(&candidate).await
     }
 
     /// [`reconcile_once`] 的无锁内核：调用方已经持有 `mutation`。
-    async fn reconcile_once_inner(self: &Arc<Self>, entries: Vec<Entry>) -> ReconcileOutcome {
+    async fn reconcile_once_inner(self: &Arc<Self>, candidate: &Candidate) -> ReconcileOutcome {
+        self.reconcile_attempt(candidate).await.outcome
+    }
+
+    /// [`reconcile_once_inner`] 的完整形态：多交出**采纳被拒的原因**。
+    ///
+    /// 只有驱动器需要它——"代次过期"直接丢弃，而"回写版本过期"要重建候选，
+    /// 光看 `ReconcileOutcome` 里那条失败消息无法可靠地区分两者（字符串不是契约）。
+    async fn reconcile_attempt(self: &Arc<Self>, candidate: &Candidate) -> ReconcileAttempt {
         // P1-1：HMR/patch/启停触发的对账也要在挂载前重跑依赖预检。
         // 初装已经在创建状态前预检过，第一次 reconcile 用标记跳过，避免重复访问 source。
+        //
+        // O7：结论**先扣着**，等 `adopt` 真的采纳了这棵树才写进报告。候选可能随后被判
+        // 过期拒绝，那时树还是旧的——把被丢弃候选的结论写进 `report.preflight`，会让
+        // 报告里"声明走到了哪一步"与 `mounted`/`disabled`（当前树）描述两棵不同的树。
+        let mut accepted_preflight = None;
         if !self.skip_next_preflight.swap(false, Ordering::SeqCst) {
-            if let Err(err) = self.preflight_dependencies(&entries) {
-                self.ctx
-                    .log(Level::Error, &format!("依赖预检失败（对账未执行）: {err}"));
-                return ReconcileOutcome {
-                    failures: vec![format!("依赖预检失败: {err}")],
-                    ..ReconcileOutcome::default()
-                };
+            match self.preflight_dependencies(&candidate.entries) {
+                Ok(report) => accepted_preflight = Some(report),
+                Err(err) => {
+                    // 与"采纳被拒"同构：门禁失败也要进 `last` 并刷新报告，
+                    // 否则 `report.failed` 只表现为"什么都没有"，答案只剩日志里一句。
+                    let failure = format!("依赖预检失败: {err}");
+                    self.ctx
+                        .log(Level::Error, &format!("依赖预检失败（对账未执行）: {err}"));
+                    let outcome = ReconcileOutcome {
+                        failures: vec![failure],
+                        ..ReconcileOutcome::default()
+                    };
+                    *self.last.lock().unwrap() = Some(outcome.clone());
+                    self.publish_report();
+                    return ReconcileAttempt {
+                        outcome,
+                        rejection: None,
+                    };
+                }
             }
         }
+        #[cfg(test)]
+        self.hooks.pass_before_adopt().await;
         // 期望态与动作表**先算出来**：这一步会求值 `!!js`、派生上下文（可能分配私有域）。
-        let desired = self.desired(&entries);
+        let desired = self.desired(&candidate.entries);
         let actions = self.diff(&desired.rows);
-        // 采纳新树：**意图**先落地（文件是真相）。执行失败不回滚树——下一轮对账会带着
-        // 同一份目标重试，把它慢慢推到位；回滚树反而会让"文件说的"和"树说的"长期分叉。
-        *self.tree.lock().unwrap() = entries;
-        // 休眠行进报告（M4-6）：用户问的"为什么没生效"，答案通常就在这张表里。
-        *self.disabled.lock().unwrap() = desired.disabled;
+        // 采纳：**同一同步临界区**内校验并提交整份候选（无 await、不调用户代码）。
+        // 采纳的是**意图**（文件是真相）；动作执行失败不回滚树——下一轮对账会带着同一份
+        // 目标重试，把它慢慢推到位；回滚树反而会让"文件说的"和"树说的"长期分叉。
+        if let Err(rejection) = self.adopt(candidate, &desired.disabled) {
+            // 不采纳就必须**说出来**：静默丢弃候选等于让配置悄悄撒谎。
+            let failure = rejection.message().to_string();
+            self.ctx.log(Level::Error, &format!("对账：{failure}"));
+            let outcome = ReconcileOutcome {
+                failures: vec![failure],
+                ..ReconcileOutcome::default()
+            };
+            *self.last.lock().unwrap() = Some(outcome.clone());
+            self.publish_report();
+            return ReconcileAttempt {
+                outcome,
+                rejection: Some(rejection),
+            };
+        }
+        // 采纳成功：这一刻候选才成为当前树，这一轮的预检结论才配进报告（O7）。
+        if let Some(report) = accepted_preflight {
+            self.record_preflight(report);
+        }
         let mut rows: HashMap<String, FlatRow> = desired
             .rows
             .into_iter()
@@ -1442,7 +2018,7 @@ impl LoaderState {
                     let Some(row) = rows.remove(&label) else {
                         continue;
                     };
-                    match self.patch_context(&row, PatchWork::Mount).await {
+                    match self.patch_context(&row, PatchWork::Mount, None).await {
                         Some(ActionOutcome::Done) => {
                             self.ctx.log(Level::Info, &format!("{label}: 已挂载"));
                             outcome.mounted.push(label);
@@ -1459,19 +2035,59 @@ impl LoaderState {
                     let Some(row) = rows.remove(&label) else {
                         continue;
                     };
+                    // O5b-2：**先决策、再前移**——artifact 的预检（resolve → stage → open → ping）
+                    // 必须在拆卸之前跑完。写错 `name` / artifact 缺失时旧实例仍在服务：
+                    // 这一行本轮到此为止（不拆卸、不回滚、更不重建旧实例）。
+                    let preflight =
+                        self.source
+                            .load(&row.entry, &self.search, self.next_revision());
+                    let loaded = match preflight {
+                        Ok(loaded) => loaded,
+                        Err(err) => {
+                            let issue = format!("换实例预检失败（保留当前实例）：{err}");
+                            self.ctx.log(Level::Error, &format!("{label}: {issue}"));
+                            outcome.failures.push(format!("{label}: {issue}"));
+                            continue;
+                        }
+                    };
                     // 先卸后装：同一隔离域里一个服务名只能有一个实现（内核不变量）。
                     self.emit_partial_dispose(Some(&row), &label, true).await;
                     self.dispose_row(&label).await;
-                    match self.patch_context(&row, PatchWork::Mount).await {
+                    // 预检拿到的 artifact 交给尾链**复用**：绝不二次 `load`（那会再跑一次
+                    // stage/open/ping，把前移的收益抵消掉）。
+                    match self
+                        .patch_context(&row, PatchWork::Mount, Some(loaded))
+                        .await
+                    {
                         Some(ActionOutcome::Done) => {
                             self.ctx.log(Level::Info, &format!("{label}: 已换实例"));
                             outcome.replaced.push(label);
                         }
-                        Some(ActionOutcome::Vetoed) | None => outcome.skipped.push(label),
+                        // `Mount` 的尾链只会给出 `Done`/`Failed`（`Vetoed` 来自
+                        // `internal/update`）；与 `None` 同处一档：动作没跑完，
+                        // 而旧实例已经在上面被拆掉了。
+                        //
+                        // 这里**不能**沿用 `Mount`/`Dispose` 的 `skipped`：那两条路径上
+                        // "短路"等于"什么都没发生"，而 `Replace` 的 `emit_partial_dispose`
+                        // + `dispose_row` 已经跑过，短路只挡住了"装"——记成 `skipped`
+                        // 会让"实例已经没了"和"跳过没做"读起来一模一样（O5b 的有意语义修正）。
+                        Some(ActionOutcome::Vetoed) | None => {
+                            let issue =
+                                "换实例被 loader/patch-context 短路（旧实例已卸下、新实例未挂）";
+                            self.ctx.log(Level::Warn, &format!("{label}: {issue}"));
+                            outcome.failures.push(format!("{label}: {issue}"));
+                        }
                         Some(ActionOutcome::Failed(err)) => {
-                            self.ctx
-                                .log(Level::Error, &format!("{label}: 换实例失败 {err}"));
-                            outcome.failures.push(format!("{label}: {err}"));
+                            // 拆卸已经发生且**不回滚**（文件是真相，下一轮对账按同一目标重试），
+                            // 所以文案必须写明"旧实例已卸下"——否则它与 HMR 路径上
+                            // 同款错误文案（那里的含义是"保留当前实例"）读起来正好相反。
+                            self.ctx.log(
+                                Level::Error,
+                                &format!("{label}: 换实例失败（旧实例已卸下、未恢复）：{err}"),
+                            );
+                            outcome.failures.push(format!(
+                                "{label}: 换实例失败（旧实例已卸下、未恢复）：{err}"
+                            ));
                         }
                     }
                 }
@@ -1482,7 +2098,10 @@ impl LoaderState {
                     // 上游 `entry.ts:130`：更新路径同样先发 partial-dispose（`by_update=true`），
                     // 再走 `patch-context` 的尾链去执行 `fiber.update`。
                     self.emit_partial_dispose(Some(&row), &label, true).await;
-                    match self.patch_context(&row, PatchWork::Update(config)).await {
+                    match self
+                        .patch_context(&row, PatchWork::Update(config), None)
+                        .await
+                    {
                         Some(ActionOutcome::Done) => outcome.updated.push(label),
                         // 否决：内存记录照旧推进，实例上没落地 ⇒ 记进 lagging（M4-6 报告）。
                         Some(ActionOutcome::Vetoed) => outcome.lagging.push(label),
@@ -1519,7 +2138,10 @@ impl LoaderState {
                                 &format!("{label}: volatile 前置条件不成立，改走普通更新"),
                             );
                             self.emit_partial_dispose(Some(&row), &label, true).await;
-                            match self.patch_context(&row, PatchWork::Update(config)).await {
+                            match self
+                                .patch_context(&row, PatchWork::Update(config), None)
+                                .await
+                            {
                                 Some(ActionOutcome::Done) => outcome.updated.push(label),
                                 Some(ActionOutcome::Vetoed) => outcome.lagging.push(label),
                                 None => outcome.skipped.push(label),
@@ -1546,36 +2168,212 @@ impl LoaderState {
         *self.last.lock().unwrap() = Some(outcome.clone());
         // M4-6：报告是**实时**的——每轮对账后刷新（`reconcile.*`/`failed`/`disabled` 才有意义）。
         self.publish_report();
-        outcome
+        ReconcileAttempt {
+            outcome,
+            rejection: None,
+        }
     }
 
     /// 请求一次对账（watcher 每轮只调它）：**合并 + 重入保护**。
     ///
-    /// 已经有一轮在飞时直接返回 `None`——那一轮结束前会顺手把**最新**的那份树带走，
+    /// 已经有一轮在飞时直接返回 `None`——那一轮结束前会顺手把**最新**的那份候选带走，
     /// 于是"排队期间来的旧树"根本不会被应用（上游 `_pendingTree` 的同一语义）。
     pub async fn request_reconcile(
         self: &Arc<Self>,
         entries: Vec<Entry>,
     ) -> Option<ReconcileOutcome> {
-        *self.pending.lock().unwrap() = Some(entries);
+        let gen = self.next_candidate_gen();
+        let base_writeback = self.writeback();
+        self.request_candidate(Candidate::queued(entries, gen, base_writeback))
+            .await
+    }
+
+    /// 候选代次取号：**请求登记时**取（`reload` 在解析之前就取），所以"谁是最新意图"
+    /// 由请求先后决定。晚到的旧解析因此拿不到更大的代次，也就顶不掉新请求。
+    fn next_candidate_gen(&self) -> u64 {
+        self.next_gen.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// 当前回写版本：候选构造时快照它，采纳前再比一次。
+    fn writeback(&self) -> u64 {
+        self.writeback.load(Ordering::SeqCst)
+    }
+
+    /// 推进回写版本：已采纳的目标（树 / 主树 / 基线 / 磁盘）被运行时回写改过了。
+    ///
+    /// 推进点只有三处：`persist` 成功写盘、提交观察者改 `tree`/`main_only`
+    /// （含 `no_save` 纯内存分支）、插件自我卸载改 `tree`/`main_only`。
+    /// 后两处必须与它所改的 `tree` 落在**同一个** `config_gate` 临界区里（见 [`Self::adopt`]）。
+    fn bump_writeback(&self) {
+        self.writeback.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 登记候选：在**同一个临界区**里比较代次并写入合并槽。
+    ///
+    /// - 代次 ≤ 已采纳代次 ⇒ 迟到的旧解析，丢弃（不得复活）；
+    /// - 合并槽里已有更新的候选 ⇒ 保留新的（旧的不覆盖新请求）；
+    /// - 否则替换合并槽（"只有最新的一份会被应用"）。
+    ///
+    /// 返回 `false` 表示候选已过期：调用方不得再驱动它。
+    fn register_candidate(&self, candidate: Candidate) -> bool {
+        let gen = candidate.gen;
+        let stale = {
+            let mut pending = self.pending.lock().unwrap();
+            let superseded = if gen == 0 {
+                false
+            } else {
+                // 与 `adopt` 的已采纳代次比较：adopt 在 `config_gate` 下推进它，
+                // 这里读到的值可能稍旧——最坏情况是候选被登记后又在对账里被判过期，
+                // 那条路同样会报出可诊断的失败（不会静默采纳）。
+                gen <= self.adopted_gen.load(Ordering::SeqCst)
+            };
+            let newer_queued = pending
+                .as_ref()
+                .is_some_and(|existing| existing.gen > candidate.gen);
+            if superseded || newer_queued {
+                true
+            } else {
+                *pending = Some(candidate);
+                false
+            }
+        };
+        if stale {
+            self.ctx.log(
+                Level::Warn,
+                &format!(
+                    "配置候选已过期（代次 {gen} ≤ 已采纳 {} 或合并槽里已有更新的请求）：丢弃这次解析结果",
+                    self.adopted_gen.load(Ordering::SeqCst)
+                ),
+            );
+        }
+        !stale
+    }
+
+    /// 登记候选并（必要时）驱动它：合并槽只保留**最新**的一份。
+    async fn request_candidate(self: &Arc<Self>, candidate: Candidate) -> Option<ReconcileOutcome> {
+        if !self.register_candidate(candidate) {
+            return None;
+        }
+        self.drive_pending().await
+    }
+
+    /// 把"已 take 但未落定"的候选还回合并槽（取消/超时路径）。
+    ///
+    /// 只有它的代次仍是最新时才回填：更新的请求已经在槽里，旧候选不该复活。
+    /// 返回是否真的回填了（诊断/测试用）。
+    fn restore_candidate(&self, candidate: Candidate) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if candidate.gen != 0 && candidate.gen <= self.adopted_gen.load(Ordering::SeqCst) {
+            return false;
+        }
+        if pending
+            .as_ref()
+            .is_some_and(|existing| existing.gen > candidate.gen)
+        {
+            return false;
+        }
+        *pending = Some(candidate);
+        true
+    }
+
+    /// 合并槽里是否有一份**不是** `held_gen` 那份的候选。
+    ///
+    /// [`ReconcileDriver::drop`] 清位之后用它复查"这一窗口里有没有别人登记的候选"：
+    /// `held_gen == None`（本 driver 还没 take 到候选就被取消）时，槽里的任何一份都算
+    /// "别人的"——它登记时单飞位被我们占着，它的驱动请求只会拿到 `None`。
+    ///
+    /// 只按代次辨认（合并槽里只会有排队候选，`gen >= 1` 且每次请求唯一），
+    /// 于是"还是我们刚回填的那份"能被准确认出来，既有语义（不自动驱动）不受影响。
+    fn has_foreign_pending(&self, held_gen: Option<u64>) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|queued| Some(queued.gen) != held_gen)
+    }
+
+    /// 安排一次**补偿驱动**：`Drop` 里发现槽里有一份没人处理的候选时用。
+    ///
+    /// 不能 await（`Drop` 是同步的），所以 spawn 一个**只做 [`Self::drive_pending`]** 的
+    /// 任务：它照常 `reconciling.swap(true)` 抢单飞位，抢不到就安静退出——于是不会与
+    /// 别的驱动竞争出两份采纳，也不绕过任何既有协议（回填/代次/回写版本照旧生效）。
+    ///
+    /// 边界：拿不到 runtime 句柄（非 runtime 上下文，例如 runtime 正在关闭时丢弃驱动）
+    /// 就**不安排**——补偿不保证执行；调用方下一次 `request_reconcile` / `reload` 仍会驱动。
+    fn schedule_compensation(self: &Arc<Self>) {
+        if self.pending.lock().unwrap().is_none() {
+            return;
+        }
+        // 整棵树正在关：没有"用户的下一次编辑"要救，别在关停途中挂新东西。
+        if self.ctx.fiber().is_disposed() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let state = self.clone();
+        handle.spawn(async move {
+            state.drive_pending().await;
+        });
+    }
+
+    /// 驱动 `pending` 里的候选（单飞）：直到槽空为止，每次只应用"当下最新"的那份。
+    async fn drive_pending(self: &Arc<Self>) -> Option<ReconcileOutcome> {
         if self.reconciling.swap(true, Ordering::SeqCst) {
             return None;
         }
         // 单飞位由这个 future 持有；被 timeout/abort 丢弃时必须复位。
         let mut driver = ReconcileDriver::new(self.clone());
         let mut last = None;
+        // 同一代次的候选因**回写版本过期**而重建的次数：有限重试，绝不无限循环。
+        // 换了代次（新的请求）就从 0 开始——新的意图有自己的预算。
+        let mut stale_rebuilds: Option<(u64, u32)> = None;
         loop {
-            // 先把要应用的树取出来（guard 只活在这一句）：`match` 的临时量会活到整个
+            // 先把要应用的候选取出来（guard 只活在这一句）：`match` 的临时量会活到整个
             // match 结束，那样 guard 就跨过了下面的 `.await`，整个 future 不再是 `Send`。
             let next = self.pending.lock().unwrap().take();
             match next {
-                Some(entries) => {
-                    // 合并逻辑归 `request_reconcile`，但**落地**必须与其它变更序列互斥：
+                Some(candidate) => {
+                    // 重建只对**文件派生**的候选成立：`adopt_metadata` 的候选带着
+                    // 从磁盘读出来的回写元数据（`reload` 的产物），重新读一遍磁盘得到的
+                    // 就是同一个意图的最新版本。`request_reconcile` 登记的候选可能来自
+                    // 调用方自己算的条目树，从磁盘重建会替换掉调用方给的内容。
+                    let rebuildable = candidate.adopt_metadata;
+                    let gen = candidate.gen;
+                    // 候选先进**驱动器**（不是循环变量）：future 被取消/超时丢弃时，
+                    // `ReconcileDriver::drop` 才能把它回填，而不是跟着栈一起蒸发。
+                    driver.taken = Some(candidate);
+                    // 合并逻辑归 `request_candidate`，但**落地**必须与其它变更序列互斥：
                     // 否则运行期启停会与这一轮对账交错，把刚卸下的行挂回去。
-                    let outcome = {
+                    let attempt = {
                         let _guard = self.mutation.lock().await;
-                        self.reconcile_once_inner(entries).await
+                        let candidate = driver.taken.as_ref().expect("刚填进去的候选");
+                        self.reconcile_attempt(candidate).await
                     };
+                    // 正常返回：候选已经落定（采纳，或明确拒绝并报出失败），不再回填。
+                    driver.taken = None;
+                    let ReconcileAttempt {
+                        mut outcome,
+                        rejection,
+                    } = attempt;
+                    // 回写版本过期（**只有**这一种原因）⇒ 重新读取/构造并预检，
+                    // 把新候选交给**同一个**单飞位继续处理（不另起一份采纳）。
+                    // 代次更旧仍然直接丢弃：更新的意图已经存在，重建只会顶掉它。
+                    let stale = matches!(rejection, Some(AdoptRejection::StaleWriteback(_)));
+                    if stale && rebuildable {
+                        // 重建给不出可驱动的候选时：原因必须并进这次对账产物并刷新报告
+                        // （不得静默），然后收工——槽里若有更新的请求，下一圈会把它带走。
+                        if let StaleRebuild::Stopped(note) =
+                            self.rebuild_stale_candidate(gen, &mut stale_rebuilds).await
+                        {
+                            self.ctx.log(Level::Error, &format!("对账：{note}"));
+                            outcome.failures.push(note);
+                            *self.last.lock().unwrap() = Some(outcome.clone());
+                            self.publish_report();
+                        }
+                        last = Some(outcome);
+                        continue;
+                    }
                     last = Some(outcome);
                 }
                 None => {
@@ -1595,44 +2393,183 @@ impl LoaderState {
         last
     }
 
-    /// 一条龙：稳读文件 → 解析（含 patch 层）→ 请求对账。
+    /// 过期候选的重建：**重新稳读 → 解析 → 预检 → 构造新候选（快照新的回写版本）→ 登记**。
     ///
-    /// 失败路径**一个字节都不动状态**：解析失败保留上一快照（编辑中的半截文件是常态），
-    /// 稳读不通过就下一轮再看。
+    /// 为什么必须有这条路：`adopt` 因回写版本过期拒绝候选之后，如果只记日志 + 进
+    /// `failures`，用户那次编辑就再也没人接手——watcher 的指纹早已对齐磁盘，
+    /// 文件不变就不会再来一次 `reload`（规格 §O5：失效候选必须重新读取/构造并预检）。
+    ///
+    /// 分寸：
+    /// - 读取/解析/预检**复用** [`Self::build_candidate`]（`reload` 的同一条路径），
+    ///   不复制第二份解析实现；
+    /// - 代次沿用原候选（这是**同一个请求**的重建，不是新的意图），于是登记照旧过
+    ///   [`Self::register_candidate`] 的代次/合并槽判定、采纳照旧过 [`Self::adopt`] 的
+    ///   代次与回写版本校验——既不绕过校验，也不会与刚登记的外部请求争抢出两份采纳；
+    /// - 同一代次最多重建 [`MAX_STALE_REBUILDS`] 次：超过就停在这里，让那条过期失败
+    ///   （日志 + `failures`）成为可诊断的终态，而不是无限循环。
+    async fn rebuild_stale_candidate(
+        self: &Arc<Self>,
+        gen: u64,
+        retries: &mut Option<(u64, u32)>,
+    ) -> StaleRebuild {
+        let used = match *retries {
+            Some((attempted_gen, count)) if attempted_gen == gen => count,
+            _ => 0,
+        };
+        if used >= MAX_STALE_REBUILDS {
+            return StaleRebuild::Stopped(format!(
+                "配置候选重建已达上限（{MAX_STALE_REBUILDS} 次）：运行时回写在重建期间仍在推进，停止重建"
+            ));
+        }
+        *retries = Some((gen, used + 1));
+        #[cfg(test)]
+        self.stale_rebuilds.fetch_add(1, Ordering::SeqCst);
+        let rebuilt = self.build_candidate(gen).await;
+        let candidate = match rebuilt {
+            Ok(Some(candidate)) => candidate,
+            // 文件正在被写：这一轮放弃。下一次请求 / 补偿驱动仍会读到它。
+            Ok(None) => {
+                return StaleRebuild::Stopped(
+                    "配置候选重建未执行：文件正在被写（稳读不通过），等下一轮再看".to_string(),
+                )
+            }
+            Err(err) => return StaleRebuild::Stopped(format!("配置候选重建失败: {err}")),
+        };
+        if !self.register_candidate(candidate) {
+            // 合并槽里已经有更新的请求（它的代次更大）：重建的这份不覆盖它。
+            // 那份更新请求会自己走一轮对账，过期时也会走自己的重建。
+            return StaleRebuild::Queued;
+        }
+        self.ctx.log(
+            Level::Warn,
+            &format!(
+                "配置候选因运行时回写过期而失效：已按磁盘重建第 {}/{MAX_STALE_REBUILDS} 次，继续采纳",
+                used + 1
+            ),
+        );
+        StaleRebuild::Queued
+    }
+
+    /// 采纳候选：在**已经持有 `mutation` 的同步段**里完成校验与提交。
+    ///
+    /// 锁序固定：`mutation`（调用方已持）→ `config_gate` → `main_only` / `owners` /
+    /// `main_baseline` / `tree`。全程不含 `.await`、不调用来源或用户代码——于是
+    /// "校验"与"写字段"之间没有任何窗口能让回写插进来。校验不过则**一个字段都不写**。
+    ///
+    /// 互斥的另一半在回写方：它们必须把"改 `tree` + 推进回写版本 + 写 `main_only` +
+    /// 落盘"整段放进**同一个** `config_gate` 临界区（[`Self::mark_self_disposed`] 与
+    /// 提交观察者）。否则下面"校验通过 → 整份覆盖树"仍会被一次并发的回写覆盖掉，
+    /// 而 watcher 的指纹早已对齐磁盘、不会补偿（内存树回退，记录与磁盘却是新值）。
+    fn adopt(
+        &self,
+        candidate: &Candidate,
+        disabled: &[String],
+    ) -> std::result::Result<(), AdoptRejection> {
+        let _gate = self.config_gate.lock().unwrap();
+        if candidate.gen != 0 {
+            // 代次：旧候选不得覆盖新状态，也不得让迟到的旧解析复活。
+            let adopted = self.adopted_gen.load(Ordering::SeqCst);
+            if candidate.gen <= adopted {
+                return Err(AdoptRejection::StaleGeneration(format!(
+                    "配置候选已过期（代次 {} ≤ 已采纳 {}）：不采纳，等待更新的请求",
+                    candidate.gen, adopted
+                )));
+            }
+            // 回写版本：运行时回写已经改过已采纳目标 ⇒ 本候选基于一棵过时的树。
+            let current = self.writeback.load(Ordering::SeqCst);
+            if candidate.base_writeback != current {
+                return Err(AdoptRejection::StaleWriteback(format!(
+                    "配置候选已过期（构造时回写版本 {} ≠ 当前 {}）：运行时回写已修改已采纳目标，不采纳旧候选",
+                    candidate.base_writeback, current
+                )));
+            }
+        }
+        // 测试闸门：钉住"校验通过、还没写树"这个瞬间（此刻已持 `config_gate`）。
+        // 回写方若不在闸门内改树，就能从这里插进来，让下面的整份覆盖把它退回去。
+        #[cfg(test)]
+        self.hooks.pass_inside_gate();
+        if candidate.adopt_metadata {
+            // 元数据先落地：它决定之后的回写落到哪一层、拿哪份文本做比较。
+            self.with_main_only(|main| *main = candidate.main.clone());
+            *self.owners.lock().unwrap() = candidate.owners.clone();
+            *self.main_baseline.lock().unwrap() = candidate.baseline.clone();
+        }
+        // 树随后：对账的目标态。
+        *self.tree.lock().unwrap() = candidate.entries.clone();
+        // 休眠行进报告（M4-6）：用户问的"为什么没生效"，答案通常就在这张表里。
+        *self.disabled.lock().unwrap() = disabled.to_vec();
+        if candidate.gen != 0 {
+            self.adopted_gen.store(candidate.gen, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// `main_only` 的**唯一写入口**：锁序纪律的落点（调用方必须已持 `config_gate`）。
+    fn with_main_only<T>(&self, f: impl FnOnce(&mut Vec<Entry>) -> T) -> T {
+        // `try_lock` 失败 = 有人持有闸门。唯一合法的持有人就是当前这层调用栈
+        // （锁序要求写入点已在 `config_gate` 里），所以这就是"是否守纪律"的判据。
+        #[cfg(test)]
+        if self.config_gate.try_lock().is_ok() {
+            self.ungated_main_writes.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut main = self.main_only.lock().unwrap();
+        f(&mut main)
+    }
+
+    /// 一条龙：稳读文件 → 解析（含 patch 层）→ 预检 → 登记候选。
+    ///
+    /// 失败路径**一个字节都不动已采纳状态**：解析失败保留上一快照（编辑中的半截文件
+    /// 是常态），稳读不通过就下一轮再看；预检失败时连候选都不登记，元数据也不推进。
+    ///
+    /// 可能返回 [`ReloadOutcome::Coalesced`] **而不应用这次编辑**：已经有一轮在飞
+    /// （那一轮会带走最新的一份），或登记/采纳时发现这份候选因代次更旧、回写版本过期
+    /// 被丢弃——文件派生的候选过期时会按磁盘重建（[`Self::rebuild_stale_candidate`]），
+    /// 重建也给不出可驱动的候选时才以失败报出。
     pub async fn reload(self: &Arc<Self>) -> ReloadOutcome {
+        // 代次按**请求顺序**取（解析之前）：解析更慢的旧请求不会在之后顶掉新请求。
+        let gen = self.next_candidate_gen();
+        let candidate = match self.build_candidate(gen).await {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => return ReloadOutcome::Unsettled,
+            Err(err) => return ReloadOutcome::Failed(err),
+        };
+        match self.request_candidate(candidate).await {
+            Some(outcome) => ReloadOutcome::Reconciled(outcome),
+            None => ReloadOutcome::Coalesced,
+        }
+    }
+
+    /// 从磁盘构造一份**完整的**候选（读 → 解析 → 预检 → 快照回写版本），不登记。
+    ///
+    /// `reload` 与"过期候选重建"（[`Self::rebuild_stale_candidate`]）共用这一条路径：
+    /// 重建因此不可能绕过任何一道关（稳读、解析、预检、回写版本快照）。
+    ///
+    /// 返回 `Ok(None)` = 文件正在被写（稳读不通过，这一轮什么都不做）。
+    async fn build_candidate(&self, gen: u64) -> std::result::Result<Option<Candidate>, String> {
         let snapshot = match self.read_settled().await {
             Ok(Some(snapshot)) => snapshot,
-            Ok(None) => return ReloadOutcome::Unsettled,
-            Err(err) => {
-                return ReloadOutcome::Failed(format!(
-                    "读取 {} 失败: {err}",
-                    self.files.main.display()
-                ))
-            }
+            Ok(None) => return Ok(None),
+            Err(err) => return Err(format!("读取 {} 失败: {err}", self.files.main.display())),
         };
-        let old_main = self.main_only.lock().unwrap().clone();
-        let old_owners = self.owners.lock().unwrap().clone();
-        let old_baseline = self.main_baseline.lock().unwrap().clone();
-        match self.parse_snapshot(&snapshot) {
-            Ok(entries) => {
-                if let Err(err) = self.preflight_dependencies(&entries) {
-                    // parse_snapshot 已经推进了回写元数据；预检失败必须回滚，
-                    // 否则下一轮 self-dispose/回写会按未采纳的配置操作。
-                    {
-                        let _gate = self.config_gate.lock().unwrap();
-                        *self.main_only.lock().unwrap() = old_main;
-                        *self.owners.lock().unwrap() = old_owners;
-                        *self.main_baseline.lock().unwrap() = old_baseline;
-                    }
-                    return ReloadOutcome::Failed(format!("依赖预检失败: {err}"));
-                }
-                match self.request_reconcile(entries).await {
-                    Some(outcome) => ReloadOutcome::Reconciled(outcome),
-                    None => ReloadOutcome::Coalesced,
-                }
-            }
-            Err(err) => ReloadOutcome::Failed(err),
+        // 解析是**纯**的：结果只装进候选，不碰任何共享字段。
+        let parsed = self.parse_snapshot(&snapshot)?;
+        #[cfg(test)]
+        self.hooks.pass_after_parse().await;
+        // 预检是候选的第一道关：失败时连登记都不做，已采纳的元数据一个字节不动。
+        // 结论**不进报告**：候选还没被采纳（可能被判过期拒绝），报告只能描述当前树。
+        if let Err(err) = self.preflight_dependencies(&parsed.entries) {
+            return Err(format!("依赖预检失败: {err}"));
         }
+        Ok(Some(Candidate {
+            gen,
+            // 回写版本在这里快照：此后任何运行时回写都会让这份候选过期。
+            base_writeback: self.writeback(),
+            entries: parsed.entries,
+            adopt_metadata: true,
+            main: parsed.main,
+            owners: parsed.owners,
+            baseline: parsed.baseline,
+        }))
     }
 
     /// 期望态：以 `entries` 为目标、用**这次的**求值器答案算出来的"应当挂着的行"。
@@ -1711,13 +2648,26 @@ impl LoaderState {
 
     /// 在**行的上下文**上跑 `loader/patch-context` 瀑布，尾链就是要执行的动作。
     ///
-    /// 返回 `None` 表示**尾链没被跑到**：监听者短路了整个动作（记账为 `skipped`）。
+    /// 返回 `None` 表示**尾链没被跑到**：监听者短路了整个动作。
+    /// `Mount`/`Update` 把它当作"什么都没发生"（记账为 `skipped`）；**`Replace` 是例外**——
+    /// 它在调用这里之前已经把旧实例卸下，所以短路意味着"旧实例已卸下、新实例未挂"，
+    /// 调用方把它记进 [`ReconcileOutcome::failures`]（O5b）。
+    ///
     /// 这正是 waterfall "tail=动作" 的意思（上游 `entry.ts:102-109` 把
     /// `fiber.update`/`init` 放在 `waterfall('loader/patch-context', …)` 的尾链里）。
+    ///
+    /// `preloaded` 是**调用方已经替这一行 `load` 过**的 artifact（O5b-2：换实例的预检前移，
+    /// 只有 `PatchWork::Mount` 用得上）。尾链复用它、绝不二次 `load`；尾链没跑到时
+    /// 由本函数就地丢弃（暂存副本随之回收，见 [`crate::LoadedPlugin`] 的字段声明序）。
+    ///
+    /// 代价是权限不对称：对 `Replace`，监听者短路时 artifact 已经 load 过（`stage` +
+    /// `open` + `ping`），短路只能拦住"挂载"而拦不住"加载"；新建行的 `Mount` 仍然
+    /// 可以在 `load` 之前被否决。要拦加载本身请用来源准入（`PluginSource::admission`）。
     async fn patch_context(
         self: &Arc<Self>,
         row: &FlatRow,
         work: PatchWork,
+        preloaded: Option<LoadedFile>,
     ) -> Option<ActionOutcome> {
         let action = match &work {
             PatchWork::Mount => "mount",
@@ -1725,21 +2675,32 @@ impl LoaderState {
         };
         let slot: Arc<Mutex<Option<ActionOutcome>>> = Arc::new(Mutex::new(None));
         let tail_slot = slot.clone();
+        // 前移的 artifact 单独放进槽里（而不是只留在尾链的捕获环境里）：短路时尾链
+        // 一行都不跑，甚至可能被监听者留着 `next` 换个时机跑——回收责任必须归本函数。
+        let preloaded = Arc::new(Mutex::new(preloaded));
+        let tail_preloaded = preloaded.clone();
         let state = self.clone();
         let owned = row.clone();
         let tail: BoxFuture<Ret> = Box::pin(async move {
             let outcome = match work {
-                PatchWork::Mount => match state.mount_row(&owned).await {
-                    Ok(record) => {
-                        state
-                            .mounted
-                            .lock()
-                            .unwrap()
-                            .insert(owned.label.clone(), record);
-                        ActionOutcome::Done
+                PatchWork::Mount => {
+                    let loaded = tail_preloaded.lock().unwrap().take();
+                    let mounted = match loaded {
+                        Some(loaded) => state.mount_loaded(&owned, loaded).await,
+                        None => state.mount_row(&owned).await,
+                    };
+                    match mounted {
+                        Ok(record) => {
+                            state
+                                .mounted
+                                .lock()
+                                .unwrap()
+                                .insert(owned.label.clone(), record);
+                            ActionOutcome::Done
+                        }
+                        Err(err) => ActionOutcome::Failed(err),
                     }
-                    Err(err) => ActionOutcome::Failed(err),
-                },
+                }
                 PatchWork::Update(config) => match state.fiber_of(&owned.label) {
                     Some(fiber) => match fiber.update_with(config, true).await {
                         Ok(UpdateOutcome::Restarted) => {
@@ -1773,6 +2734,11 @@ impl LoaderState {
         row.scope
             .waterfall("loader/patch-context", args, Some(tail), None)
             .await;
+        // 短路（或监听者收下 `next` 却没跑）时，前移的那份 artifact 还在这里：
+        // 就地丢弃——`LoadedFile` 一 drop，暂存副本随 `LoadedPlugin` 的字段声明序
+        // 先卸载库、后删文件，不会留下无人认领的副本。跑到过尾链时这里是 `None`。
+        let discarded = preloaded.lock().unwrap().take();
+        drop(discarded);
         let outcome = slot.lock().unwrap().take();
         outcome
     }
@@ -1895,48 +2861,69 @@ impl LoaderState {
     /// [`persist_overlay`]（追加一条 overlay 到最后一个 patch 文件）。
     fn mark_self_disposed(&self, label: &str) {
         let record = self.mounted.lock().unwrap().remove(label);
-        // 合并树（内存）先标上：下一轮对账不会把它再挂回来。
-        let marked = {
-            let mut tree = self.tree.lock().unwrap();
-            match find_by_label(&mut tree, label) {
-                Some(entry) => {
-                    entry.disabled = true;
-                    entry.disabled_expr = None;
-                    entry.clone()
+        // 闸门**先**取：从"改树"到"落盘"整段必须在同一个临界区里。与 [`adopt`] 的
+        // "校验 + 整份写树"互斥——否则采纳可以在两者之间插进来，把这次回写盖回去
+        // （树退回旧内容，而记录与磁盘是新值；watcher 指纹已对齐，不会补偿）。
+        //
+        // 闸门里**不跑任何用户代码**：`ctx.log` 是宿主/应用注入的 sink（可能 panic），
+        // 在这里调它会让 std `Mutex` 中毒、把整个装载器闸门一起带走。所以结果先攒着，
+        // 出了这个块再打日志。
+        let result = {
+            let gate = self.config_gate.lock().unwrap();
+            // 合并树（内存）先标上：下一轮对账不会把它再挂回来。
+            let marked = {
+                let mut tree = self.tree.lock().unwrap();
+                match find_by_label(&mut tree, label) {
+                    Some(entry) => {
+                        entry.disabled = true;
+                        entry.disabled_expr = None;
+                        entry.clone()
+                    }
+                    None => return,
                 }
-                None => return,
-            }
-        };
-        let origin = record
-            .map(|record| record.origin)
-            .unwrap_or(RowOrigin::Main);
-        // 字段级归属优先：主配置行也可能被 patch 的 `disabled` 覆盖。
-        let owner_layer = marked
-            .id
-            .as_deref()
-            .and_then(|id| self.owners.lock().unwrap().disabled_layer(id));
-        let result = match owner_layer {
-            Some(layer) => self.persist_overlay(layer, label, &marked, None, Some(true)),
-            None => match origin {
-                RowOrigin::Main => {
-                    let mut main = self.main_only.lock().unwrap();
-                    match find_by_label(&mut main, label) {
-                        Some(entry) => {
-                            entry.disabled = true;
-                            entry.disabled_expr = None;
-                            drop(main);
+            };
+            // 已采纳的树被改了：在飞/排队的旧候选必须以旧树为基准失效（否则会把这一行复活）。
+            self.bump_writeback();
+            let origin = record
+                .map(|record| record.origin)
+                .unwrap_or(RowOrigin::Main);
+            // 字段级归属优先：主配置行也可能被 patch 的 `disabled` 覆盖。
+            let owner_layer = marked
+                .id
+                .as_deref()
+                .and_then(|id| self.owners.lock().unwrap().disabled_layer(id));
+            match owner_layer {
+                Some(layer) => {
+                    drop(gate);
+                    self.persist_overlay(layer, label, &marked, None, Some(true))
+                }
+                None => match origin {
+                    RowOrigin::Main => {
+                        // `main_only` 的读改写与落盘落在上面取的同一个 `config_gate` 里
+                        // （`persist` 要求调用方已持闸门，这里**不再**重复取锁）。
+                        let found = self.with_main_only(|main| match find_by_label(main, label) {
+                            Some(entry) => {
+                                entry.disabled = true;
+                                entry.disabled_expr = None;
+                                true
+                            }
+                            // 记录说它是主配置行、主树里却找不到（label 漂移等）：
+                            // 退到 patch 层，**绝不**把合并树写进主配置。
+                            None => false,
+                        });
+                        if found {
                             self.persist()
-                        }
-                        // 记录说它是主配置行、主树里却找不到（label 漂移等）：
-                        // 退到 patch 层，**绝不**把合并树写进主配置。
-                        None => {
-                            drop(main);
+                        } else {
+                            drop(gate);
                             self.persist_overlay_last(label, &marked, None, Some(true))
                         }
                     }
-                }
-                RowOrigin::Patch => self.persist_overlay_last(label, &marked, None, Some(true)),
-            },
+                    RowOrigin::Patch => {
+                        drop(gate);
+                        self.persist_overlay_last(label, &marked, None, Some(true))
+                    }
+                },
+            }
         };
         match result {
             Ok(()) => self.ctx.log(
@@ -1966,9 +2953,11 @@ impl LoaderState {
     /// 把**主配置树**落盘（配置回写统一走这里）。
     ///
     /// **绝不**写 `self.tree`：它是主配置 + patch 合并后的结果（P1 的修复点）。
+    ///
+    /// 调用方**必须**已持 `config_gate`：整个"dump → 比较基线 → 原子替换"要和对候选的
+    /// 采纳、以及其它 `main_only` 写入落在同一个临界区里，否则采纳可以插在中间，
+    /// 把刚写的这一行整份盖回去。
     fn persist(&self) -> std::result::Result<(), String> {
-        // 与 parse_snapshot 串行：dump 的树和比较用的基线必须来自同一代。
-        let _gate = self.config_gate.lock().unwrap();
         let text = {
             let main = self.main_only.lock().unwrap();
             crate::patch::dump_entries(&main)?
@@ -1977,6 +2966,8 @@ impl LoaderState {
         write_atomically_if_unchanged(&self.files.main, &text, &baseline)?;
         // 只有写成功才推进基线；失败时磁盘上的外部编辑原样保留。
         *self.main_baseline.lock().unwrap() = text;
+        // 已采纳目标（磁盘 + 基线）变了：在飞/排队的旧候选基于旧版本，必须失效。
+        self.bump_writeback();
         self.refresh_config_fingerprint();
         Ok(())
     }
@@ -2005,6 +2996,8 @@ impl LoaderState {
         };
         let text = crate::patch::dump_overlay(id, config, disabled)?;
         append_atomically(patch, &text)?;
+        // 回写落到了 patch 层：已采纳目标变了，旧候选必须失效。
+        self.bump_writeback();
         self.refresh_config_fingerprint();
         Ok(())
     }
@@ -2039,9 +3032,14 @@ impl LoaderState {
 
     /// 从快照解析条目树：主配置 + 依次叠 patch 层（语义与装载时**完全同一条**路径）。
     ///
-    /// 顺手刷新 [`LoaderState::main_only`]——它是配置回写的唯一来源。刷新放在
-    /// **全部解析成功之后**：半截文件解析失败时，上一份主树必须原样保留。
-    fn parse_snapshot(&self, snapshot: &FileSnapshot) -> std::result::Result<Vec<Entry>, String> {
+    /// **纯函数**：结果只装进 [`ParsedSnapshot`]，一个共享字段都不写。落地归
+    /// [`LoaderState::adopt`]（在 `mutation` + `config_gate` 下整份提交），于是
+    /// "解析成功"与"配置被采纳"不再是同一个时刻——预检失败/候选过期时，
+    /// 已采纳的回写元数据不会指向一份永远不会生效的配置。
+    fn parse_snapshot(
+        &self,
+        snapshot: &FileSnapshot,
+    ) -> std::result::Result<ParsedSnapshot, String> {
         let main = parse_entries(&snapshot.main)?;
         let mut entries = main.clone();
         let mut owners = PatchOwners::default();
@@ -2056,23 +3054,38 @@ impl LoaderState {
             let mut warn = |message: &str| ctx.log(Level::Warn, message);
             entries = apply_entry_patches_tracked(entries, &patches, index, &mut owners, &mut warn);
         }
-        // 只有**全部解析成功**才进入提交段。解析本身可以在闸门外做；这里必须与
-        // `persist` 串行，避免回写看到“树已换、基线未换”（或反之）的半新半旧状态。
-        let _gate = self.config_gate.lock().unwrap();
-        *self.main_only.lock().unwrap() = main;
-        *self.owners.lock().unwrap() = owners;
-        *self.main_baseline.lock().unwrap() = snapshot.main.clone();
-        Ok(entries)
+        Ok(ParsedSnapshot {
+            entries,
+            main,
+            owners,
+            baseline: snapshot.main.clone(),
+        })
     }
 
     /// 挂载一条展平后的行：加载（经 [`PluginSource`]）→ 挂载 → 收敛。
     ///
     /// `row.scope` 是这一行的**派生上下文**（M4-1：隔离域与 intercept 已按祖先链叠加）；
     /// 用根 ctx 挂等于把行悄悄搬回默认域。
+    ///
+    /// 这里是**首次挂载**的入口：`load` 与挂载相邻。换实例路径不走这里——
+    /// 它先在拆卸之前 `load`（O5b-2），再调 [`Self::mount_loaded`] 复用那份 artifact。
     async fn mount_row(&self, row: &FlatRow) -> std::result::Result<Mounted, String> {
         let loaded = self
             .source
             .load(&row.entry, &self.search, self.next_revision())?;
+        self.mount_loaded(row, loaded).await
+    }
+
+    /// 用**已经加载好**的 artifact 挂载一条展平后的行（O5b-2 的复用点）。
+    ///
+    /// 与 [`Self::mount_row`] 的唯一差别是"谁 `load`"：换实例路径要让
+    /// resolve → stage → open → ping 全部发生在拆卸旧实例**之前**，所以 artifact
+    /// 由调用方先拿到，这里只负责挂载与失败自清理——绝不二次加载。
+    async fn mount_loaded(
+        &self,
+        row: &FlatRow,
+        loaded: LoadedFile,
+    ) -> std::result::Result<Mounted, String> {
         let fiber = mount(
             &row.scope,
             loaded.plugin.clone(),
@@ -2109,6 +3122,9 @@ impl LoaderState {
 }
 
 /// `loader/patch-context` 尾链要干的事（M4-3 规格 4）。
+///
+/// 换实例路径会在调用 [`LoaderState::patch_context`] 时**额外**带上已加载的
+/// `LoadedFile`（O5b-2 的预检前移）：动作仍是 `Mount`，只是 artifact 不在这里 load。
 enum PatchWork {
     Mount,
     Update(Config),
@@ -2202,6 +3218,9 @@ pub trait PluginSource: Send + Sync {
     /// **缺省返回 `Ok(None)`**：不发布清单的来源（假源、内置插件）不参与依赖预检。
     /// 装载器只把这里返回的 `Some` 转成 [`crate::plan::PlanEntry`] 并在挂载前求解；
     /// 它**不是**运行时注入，也不证明插件真的提供了这些服务。
+    ///
+    /// 准入判定**先于**清单结论：既没有显式来源策略、也没开开发模式时，凡是要读
+    /// sidecar 的预检都会以「未配置插件来源策略」失败——manifest 无效/不合法都轮不到报。
     fn plan_entry(
         &self,
         _entry: &Entry,
@@ -2209,35 +3228,200 @@ pub trait PluginSource: Send + Sync {
     ) -> std::result::Result<Option<PlanEntrySpec>, String> {
         Ok(None)
     }
+
+    /// O9：**这个来源对象**的准入结论。
+    ///
+    /// 缺省是 [`SourceAdmission::fallback`]——逐字等于今天的进程级语义，
+    /// 所以既有实现（含测试里的假源）零改动、行为零变化。想要局部策略就把来源
+    /// 包进 [`PolicyPluginSource`]：策略跟着对象走，而不是跟着全局量走。
+    fn admission(&self) -> SourceAdmission {
+        SourceAdmission::fallback()
+    }
+
+    /// O9：用**调用方给定的**准入结论装载。
+    ///
+    /// 为什么必须有它：`load` 里读的是 `self.admission()`，而包装层的 `self` 是
+    /// **内层对象**——策略传不下去。`PolicyPluginSource` 因此调这一条，把
+    /// 自己的结论显式交进来。
+    ///
+    /// **缺省实现忽略参数、逐字等于 [`Self::load`]**：不读全局量的来源（测试假源、
+    /// 内置插件）的准入结论本来就与参数无关，所以行为不变。
+    ///
+    /// # 实现要求
+    /// 1. **`load` 会读全局准入的实现必须同时覆写本方法**，并使用**传入的**
+    ///    `admission`（而不是自己再读一次 `self.admission()` / 进程级全局）。否则
+    ///    包装层、探测（[`crate::probe_capabilities`]）与热重载交进来的结论都会被丢掉，
+    ///    同一次操作里"校验按局部策略、打开按全局"又变回两份快照。
+    /// 2. **调用方显式传入的结论优先于来源自身的声明**：`load` 传的是
+    ///    `self.admission()`；包装层转发的是**外层**的。嵌套包装时最外层的显式
+    ///    声明有效，内层不得用自己的结论覆盖它。
+    fn load_admitted(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        revision: u64,
+        _admission: &SourceAdmission,
+    ) -> std::result::Result<LoadedFile, String> {
+        self.load(entry, search, revision)
+    }
+
+    /// O9：`plan_entry` 的准入版本，语义与 [`Self::load_admitted`] 相同。
+    ///
+    /// 依赖声明也要过**同一个**准入结论：否则包装源会一边用局部策略装载、
+    /// 一边用别的结论做依赖预检。
+    ///
+    /// # 实现要求
+    /// 与 [`Self::load_admitted`] 的两条一致：`plan_entry` 里会读全局准入的实现
+    /// 必须覆写本方法并用传入的 `admission`；调用方显式传入的结论优先于来源自身的
+    /// 声明。`plan_entry` 与 `load` 必须**同源**，否则"预检通过、装载被拒"（或反之）
+    /// 会变成配置层面的谜题。
+    ///
+    /// 准入判定同样**先于**清单结论：既没有显式来源策略、也没开开发模式时，凡是要读
+    /// sidecar 的预检都会以「未配置插件来源策略」失败——manifest 无效/不合法都轮不到报。
+    fn plan_entry_admitted(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        _admission: &SourceAdmission,
+    ) -> std::result::Result<Option<PlanEntrySpec>, String> {
+        self.plan_entry(entry, search)
+    }
 }
 
-/// 真实实现：磁盘上的动态库。预检（ABI 版本、结构尺寸、入口可调用性）全在
-/// 动到正在跑的实例之前完成。配置了进程级 [`crate::source::active_policy`] 时，
-/// artifact 还要先通过 sidecar manifest + allow-list 校验才会被暂存。
-pub struct DiskPluginSource;
+/// 给一个来源对象套上**局部准入结论**（O9）。
+///
+/// # 为什么是包装而不是配置项
+/// 策略必须跟着**来源对象**走：`PluginSource::load` 的签名里没有 `ctx`，来源本来就
+/// 不知道自己在哪个 App 里；而给 `LoaderConfig` 加字段会破坏所有既有字面量构造。
+/// 包装层两头都躲开了：`load` / `plan_entry` 转发时把自己的结论经
+/// [`PluginSource::load_admitted`] / [`PluginSource::plan_entry_admitted`] 交给内层，
+/// 并覆写 [`PluginSource::admission`] 让装载器（`reload_one`、探测）看到同一份结论。
+///
+/// # 三条硬语义（见 [`SourceAdmission`]）
+/// - [`Self::strict`]：显式严格，**忽略**进程级开发标志；
+/// - [`Self::dev_unverified`]：只对这个来源放行，**不写**全局标志；
+/// - 没有包装的来源仍然是 fallback，逐字等于今天的全局语义。
+///
+/// # 覆盖面
+/// 包装只对**覆写了 `*_admitted`** 的来源有效。只实现 `load` / `plan_entry`
+/// 且自己读进程级全局的第三方来源，包装层收紧不了它——转发进去的结论会被它
+/// 忽略，`admission()` 也只是多摆一个没人看的声明。
+pub struct PolicyPluginSource {
+    inner: Arc<dyn PluginSource>,
+    admission: SourceAdmission,
+}
 
-impl PluginSource for DiskPluginSource {
+impl PolicyPluginSource {
+    /// 显式严格：artifact 必须过这份 allow-list，全局开发标志不得放宽它。
+    pub fn strict(
+        inner: Arc<dyn PluginSource>,
+        policy: impl Into<Arc<PluginSourcePolicy>>,
+    ) -> Self {
+        Self {
+            inner,
+            admission: SourceAdmission::strict(policy),
+        }
+    }
+
+    /// 显式开发放行：只对这个来源跳过校验，不碰进程级标志。
+    pub fn dev_unverified(inner: Arc<dyn PluginSource>) -> Self {
+        Self {
+            inner,
+            admission: SourceAdmission::dev_unverified(),
+        }
+    }
+}
+
+impl PluginSource for PolicyPluginSource {
     fn load(
         &self,
         entry: &Entry,
         search: &[PathBuf],
         revision: u64,
     ) -> std::result::Result<LoadedFile, String> {
+        self.load_admitted(entry, search, revision, &self.admission)
+    }
+
+    fn load_admitted(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        revision: u64,
+        admission: &SourceAdmission,
+    ) -> std::result::Result<LoadedFile, String> {
+        // 谁发起这次调用、谁的结论说了算：`load` 传的是自己的，外层包装转发的是
+        // 外层的。这一层不再拿自己的覆盖它——嵌套包装时最外层的显式声明有效。
+        self.inner.load_admitted(entry, search, revision, admission)
+    }
+
+    fn plan_entry(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+    ) -> std::result::Result<Option<PlanEntrySpec>, String> {
+        self.plan_entry_admitted(entry, search, &self.admission)
+    }
+
+    fn plan_entry_admitted(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        admission: &SourceAdmission,
+    ) -> std::result::Result<Option<PlanEntrySpec>, String> {
+        self.inner.plan_entry_admitted(entry, search, admission)
+    }
+
+    fn admission(&self) -> SourceAdmission {
+        self.admission.clone()
+    }
+}
+
+/// 真实实现：磁盘上的动态库。预检（ABI 版本、结构尺寸、入口可调用性）全在
+/// 动到正在跑的实例之前完成。来源带策略（缺省回落到进程级
+/// [`crate::source::active_policy`]）时，artifact 还要先通过 sidecar manifest +
+/// allow-list 校验才会被暂存。
+pub struct DiskPluginSource;
+
+impl DiskPluginSource {
+    /// 装载流水线：准入结论由调用方给定。
+    ///
+    /// 单独抽出来是因为包装层（[`PolicyPluginSource`]）必须能把**自己的**结论交给
+    /// 它——`PluginSource::load` 里的 `self` 在内层对象上，读不到外层的策略。
+    fn load_with(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        revision: u64,
+        admission: &SourceAdmission,
+    ) -> std::result::Result<LoadedFile, String> {
         let path = resolve_plugin_path(&entry.name, search).map_err(|err| err.to_string())?;
-        // P0-1a：配置了进程级来源策略时，**暂存之前**先验 sidecar manifest 与
+        // P0-1a：有生效的来源策略时，**暂存之前**先验 sidecar manifest 与
         // allow-list。这样未登记 / 被篡改的 artifact 不会产生暂存副本，更不会
         // 走到 `LoadLibrary`/`dlopen`。
-        let active_policy = crate::source::admission()?;
+        //
+        // O9：结论来自来源对象本身（裸源 ⇒ fallback ⇒ 读进程级全局，行为不变）；
+        // 包在 `PolicyPluginSource` 里时则是**这个来源**自己的策略，且只读这一次
+        // ——暂存与二次校验共用同一份快照。
+        let active_policy = admission.resolve()?;
         if let Some(policy) = &active_policy {
             policy.verify(&path)?;
         }
         let source_fingerprint = fingerprint(&path);
         let staged = stage_plugin(&path, revision).map_err(|err| err.to_string())?;
-        let plugin = match &active_policy {
-            // 二次校验 + 暂存副本 hash：防的是 verify 与 stage 之间的替换窗口。
-            Some(policy) => LoadedPlugin::open_staged_verified(&path, &staged, policy)
-                .map_err(|err| err.to_string())?,
-            None => LoadedPlugin::open_staged(&staged).map_err(|err| err.to_string())?,
+        // 二次校验 + 暂存副本 hash：防的是 verify 与 stage 之间的替换窗口。
+        let opened = match &active_policy {
+            Some(policy) => LoadedPlugin::open_staged_verified(&path, &staged, policy),
+            None => LoadedPlugin::open_staged(&staged),
+        };
+        let plugin = match opened {
+            Ok(plugin) => plugin,
+            Err(err) => {
+                // 打不开的副本永远不会被认领（与 `reload_one` 的预检失败分支同口径）：
+                // 立刻销账并删除，否则每次坏 artifact 都在泄漏台账里留下一个 `.rN`
+                // （`stagedLeaked` 只增不减）——预检失败必须零副作用。
+                drop(StagedFile::new(&staged));
+                return Err(err.to_string());
+            }
         };
         // 预检：ABI 版本、结构尺寸、插件入口可调用性，全在动到正在跑的实例之前完成。
         // （探活失败时 `plugin` 在此 drop：先 FreeLibrary、后删暂存文件——不会泄漏。）
@@ -2252,15 +3436,18 @@ impl PluginSource for DiskPluginSource {
         })
     }
 
+    /// 依赖声明的准入版本（见 [`Self::load_with`]）。
+    ///
     /// 与 [`PluginSource::load`] 共用 [`crate::resolve_plugin_path`]，只读 sidecar
     /// manifest，不暂存、不打开动态库。
     ///
     /// 找不到 artifact 时返回 `Ok(None)`：没有 artifact 就不可能有 sidecar，
     /// 这里不该替换 `load` 的逐行错误（`strict=false` 的降级语义保持不变）。
-    fn plan_entry(
+    fn plan_entry_with(
         &self,
         entry: &Entry,
         search: &[PathBuf],
+        admission: &SourceAdmission,
     ) -> std::result::Result<Option<PlanEntrySpec>, String> {
         let Ok(path) = resolve_plugin_path(&entry.name, search) else {
             return Ok(None);
@@ -2269,6 +3456,13 @@ impl PluginSource for DiskPluginSource {
         if !manifest_path.is_file() {
             return Ok(None);
         }
+        // O9：**先解析准入结论，再读 sidecar**。同一条配置在两个环境里必须给出同一个
+        // 首错——"未配置策略 / 被策略拒绝"优先于"manifest 无效"，否则运维看到的
+        // 究竟是"准入没配"还是"发布方写坏了清单"，会随机器漂移。
+        //
+        // 与 [`Self::load_with`] 共用**同一个读口**（同一份 `SourceAdmission`），
+        // 否则"依赖预检按一种准入、真正装载按另一种"会让结论互相矛盾。
+        let active_policy = admission.resolve()?;
         let manifest = crate::source::read_manifest(&path).map_err(|err| {
             format!(
                 "插件 {} (id={}) 的 sidecar manifest {} 无效: {err}",
@@ -2286,7 +3480,7 @@ impl PluginSource for DiskPluginSource {
         })?;
         // 有生效来源策略时，依赖声明也必须先过 artifact/manifest 准入，
         // 不能从未验证的 sidecar 直接做依赖决策。
-        if let Some(policy) = crate::source::active_policy() {
+        if let Some(policy) = &active_policy {
             policy.verify(&path).map_err(|err| {
                 format!(
                     "插件 {} (id={}) 的 sidecar manifest 未通过来源准入: {err}",
@@ -2304,6 +3498,217 @@ impl PluginSource for DiskPluginSource {
     }
 }
 
+impl PluginSource for DiskPluginSource {
+    fn load(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        revision: u64,
+    ) -> std::result::Result<LoadedFile, String> {
+        self.load_with(entry, search, revision, &self.admission())
+    }
+
+    fn load_admitted(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        revision: u64,
+        admission: &SourceAdmission,
+    ) -> std::result::Result<LoadedFile, String> {
+        self.load_with(entry, search, revision, admission)
+    }
+
+    fn plan_entry(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+    ) -> std::result::Result<Option<PlanEntrySpec>, String> {
+        self.plan_entry_with(entry, search, &self.admission())
+    }
+
+    fn plan_entry_admitted(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        admission: &SourceAdmission,
+    ) -> std::result::Result<Option<PlanEntrySpec>, String> {
+        self.plan_entry_with(entry, search, admission)
+    }
+}
+
+/// 一次声明预检的**分类结论**（O7）。
+///
+/// [ADR 0007]：这是**声明**的结论，不是运行时事实——`Checked` 不代表绑定成功、
+/// 不代表插件 Active、也不代表服务在目标 realm 里可见。报告只做诊断：任何分类都
+/// **不改变**预检的门禁结果（Ok/Err 与 O7 之前逐字一致）。
+///
+/// [ADR 0007]: ../../docs/adr/0007-version-is-diagnostic-only.md
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PreflightReport {
+    /// 本次预检不适用：显式 `dependencyPlan` 覆盖 manifest，或没有可检查的启用行。
+    NotApplicable { reason: PreflightNotApplicable },
+    /// 有行没有声明（`Ok(None)`）⇒ 整次预检保守跳过（混合来源）。
+    Incomplete { rows: Vec<PreflightRow> },
+    /// 宽松模式（`strict_sidecars=false`）下有行 `Err` ⇒ 整次预检保守跳过，
+    /// 但每一行的**原始错误文本**必须留在报告里。
+    Downgraded { rows: Vec<PreflightRow> },
+    /// 声明完整且求解通过：`providers` 是求解器的结论，**不是**运行期绑定。
+    Checked {
+        entries: usize,
+        providers: Vec<PreflightProvider>,
+    },
+}
+
+impl PreflightReport {
+    fn to_json(&self) -> serde_json::Value {
+        // 三枚适用边界标记对每一种分类都一样，写一次以免某个分支漏标。
+        // `skipped` 显式表达"整次预检被跳过"：`incomplete`/`downgraded` 两种判定
+        // 都意味着这一轮**什么都没检查**，读报告的人不必从 verdict 名去推。
+        let mut value = json!({
+            "scope": "declaration",
+            "runtimeVerified": false,
+            "realmModel": "notModeled",
+        });
+        let object = value.as_object_mut().expect("json! 造的是对象");
+        match self {
+            Self::NotApplicable { reason } => {
+                object.insert("verdict".into(), json!("notApplicable"));
+                object.insert("declaration".into(), json!(reason.declaration_kind()));
+                object.insert("reason".into(), json!(reason.as_str()));
+                object.insert("skipped".into(), json!(false));
+            }
+            Self::Incomplete { rows } => {
+                object.insert("verdict".into(), json!("incomplete"));
+                object.insert("declaration".into(), json!("sidecarManifest"));
+                object.insert("rows".into(), json!(rows_json(rows)));
+                object.insert("skipped".into(), json!(true));
+            }
+            Self::Downgraded { rows } => {
+                object.insert("verdict".into(), json!("downgraded"));
+                object.insert("declaration".into(), json!("sidecarManifest"));
+                object.insert("rows".into(), json!(rows_json(rows)));
+                object.insert("skipped".into(), json!(true));
+            }
+            Self::Checked { entries, providers } => {
+                object.insert("verdict".into(), json!("checked"));
+                object.insert("declaration".into(), json!("sidecarManifest"));
+                object.insert("entries".into(), json!(entries));
+                // `declaredProviders`：求解器按**声明**选出的提供者，不是运行期绑定。
+                object.insert(
+                    "declaredProviders".into(),
+                    json!(providers
+                        .iter()
+                        .map(PreflightProvider::to_json)
+                        .collect::<Vec<_>>()),
+                );
+                object.insert("skipped".into(), json!(false));
+            }
+        }
+        value
+    }
+}
+
+fn rows_json(rows: &[PreflightRow]) -> Vec<serde_json::Value> {
+    rows.iter().map(PreflightRow::to_json).collect()
+}
+
+/// `NotApplicable` 的两种原因。名字是报告的一部分，测试与运维都按它取值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreflightNotApplicable {
+    /// 显式 `LoaderConfig.dependencyPlan` 覆盖 manifest ⇒ `plan_entry` 根本不会被调用。
+    ExplicitPlan,
+    /// 没有任何可检查的启用行（全静态 `disabled` / 只有 group 行）。
+    NoEnabledRows,
+}
+
+impl PreflightNotApplicable {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitPlan => "explicitPlan",
+            Self::NoEnabledRows => "noEnabledRows",
+        }
+    }
+
+    /// 报告里的 `declaration` 字段：这次结论的声明来源。
+    ///
+    /// `NoEnabledRows` 是 `none`：没有可检查的启用行，这一轮**根本没读** sidecar
+    /// manifest，报 `sidecarManifest` 会让人以为读过它。
+    fn declaration_kind(self) -> &'static str {
+        match self {
+            Self::ExplicitPlan => "explicitPlan",
+            Self::NoEnabledRows => "none",
+        }
+    }
+}
+
+/// 预检里的一行（non-group 且静态启用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreflightRow {
+    /// 非 group 行的遍历序号（与 `CollectedPlanEntry::index` 同一套编号）。
+    index: usize,
+    label: String,
+    plugin: String,
+    verdict: PreflightRowVerdict,
+}
+
+impl PreflightRow {
+    fn to_json(&self) -> serde_json::Value {
+        let mut value = json!({
+            "index": self.index,
+            "label": self.label,
+            "plugin": self.plugin,
+        });
+        let object = value.as_object_mut().expect("json! 造的是对象");
+        match &self.verdict {
+            PreflightRowVerdict::Declared => object.insert("verdict".into(), json!("declared")),
+            PreflightRowVerdict::NoDeclaration => {
+                object.insert("verdict".into(), json!("noDeclaration"))
+            }
+            PreflightRowVerdict::Downgraded { reason } => {
+                object.insert("verdict".into(), json!("downgraded"));
+                object.insert("reason".into(), json!(reason))
+            }
+        };
+        value
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PreflightRowVerdict {
+    /// 有 sidecar manifest 计划。
+    Declared,
+    /// `Ok(None)`：这一行没有声明。
+    NoDeclaration,
+    /// 宽松模式下的 `Err`：保留原始错误文本（降级不等于放行，见 `LoaderConfig::strict_sidecars`）。
+    Downgraded { reason: String },
+}
+
+/// 求解器选出的一个服务键提供者（声明版本，不是运行期绑定的证据）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreflightProvider {
+    key: String,
+    plugin: String,
+    version: String,
+}
+
+impl PreflightProvider {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "key": self.key,
+            "plugin": self.plugin,
+            "version": self.version,
+        })
+    }
+}
+
+/// 收集阶段的记账：既喂求解器（`entries`），也喂报告（`collection`）。
+#[derive(Default)]
+struct PreflightCollection {
+    rows: Vec<PreflightRow>,
+    missing_plan: bool,
+    downgraded: bool,
+}
+
 /// P1-1：从来源清单收集依赖计划，并在**任何 `source.load` / 挂载之前**求解。
 ///
 /// 只遍历非 group 行：
@@ -2316,31 +3721,37 @@ impl PluginSource for DiskPluginSource {
 /// 有生效来源策略时，读取 sidecar 前会先过 admission；版本/范围解析失败或
 /// [`crate::plan::resolve`] 报错都会让本次装载整体失败。`strict_sidecars` 只决定
 /// [`PluginSource::plan_entry`] 报错时是整体失败，还是当作"该行没有计划"并跳过整次预检。
+///
+/// 返回值是**分类报告**：`Err` 仍是同一个门禁失败（错误文本不变），`Ok` 则说明这次
+/// 预检走到了哪一步（[`PreflightReport`]）。
 fn preflight_source_dependency_plan(
     entries: &[Entry],
     search: &[PathBuf],
     source: &dyn PluginSource,
     strict_sidecars: bool,
-) -> std::result::Result<(), String> {
-    let mut collected = Vec::new();
-    let mut next_row = 0;
-    let missing_plan = collect_source_plan_entries(
-        entries,
-        false,
-        search,
-        source,
-        strict_sidecars,
-        &mut next_row,
-        &mut collected,
-    )?;
+) -> std::result::Result<PreflightReport, String> {
+    let mut collector = PlanCollector::new(search, source, strict_sidecars);
+    collector.walk(entries, false)?;
+    if collector.collection.rows.is_empty() {
+        // 一行可检查的都没有：没有声明可谈（全部静态 disabled / 只有组行）。
+        return Ok(PreflightReport::NotApplicable {
+            reason: PreflightNotApplicable::NoEnabledRows,
+        });
+    }
     // 混合来源（部分插件没有 sidecar）下 manifest 计划不完整；不能把
     // “没声明”误判成“没有提供者”。此时跳过预检，保留既有运行时语义。
-    if collected.is_empty() || missing_plan {
-        return Ok(());
+    if collector.collection.missing_plan {
+        let downgraded = collector.collection.downgraded;
+        let rows = std::mem::take(&mut collector.collection.rows);
+        return Ok(if downgraded {
+            PreflightReport::Downgraded { rows }
+        } else {
+            PreflightReport::Incomplete { rows }
+        });
     }
 
-    let mut plan = Vec::with_capacity(collected.len());
-    for row in collected {
+    let mut plan = Vec::with_capacity(collector.entries.len());
+    for row in collector.entries {
         let plugin_id = row.spec.id.clone();
         let entry = row.spec.into_entry().map_err(|err| {
             format!(
@@ -2356,14 +3767,28 @@ fn preflight_source_dependency_plan(
         }
         plan.push(entry);
     }
-    if let Err(findings) = crate::plan::resolve(&plan) {
-        return Err(format!(
-            "依赖计划预检失败（来源 sidecar manifest；{} 个问题）:\n  - {}",
+    let resolved = crate::plan::resolve(&plan).map_err(|findings| {
+        format!(
+            "依赖计划预检失败（来源 sidecar manifest；{} 个问题）:\n  - {}\n（声明预检不建模 realm：跨私有域的同键同版本会被判为歧义）",
             findings.len(),
             findings.join("\n  - ")
-        ));
-    }
-    Ok(())
+        )
+    })?;
+    // 求解器**只**按声明选提供者：它不知道 realm（报告里 `realmModel=notModeled`），
+    // 也不知道运行期到底谁注册成功（ADR 0007）。
+    let providers = resolved
+        .providers
+        .into_iter()
+        .map(|(key, provider)| PreflightProvider {
+            key,
+            plugin: provider.plugin,
+            version: provider.version.to_string(),
+        })
+        .collect();
+    Ok(PreflightReport::Checked {
+        entries: plan.len(),
+        providers,
+    })
 }
 
 struct CollectedPlanEntry {
@@ -2373,59 +3798,88 @@ struct CollectedPlanEntry {
     spec: PlanEntrySpec,
 }
 
-fn collect_source_plan_entries(
-    entries: &[Entry],
-    disabled_by_ancestor: bool,
-    search: &[PathBuf],
-    source: &dyn PluginSource,
+/// 遍历一棵条目树的收集器：把"查 source、记账、编号行号"三个输入收进一个对象，
+/// 于是递归只是 `walk(children, disabled)`。
+struct PlanCollector<'a> {
+    search: &'a [PathBuf],
+    source: &'a dyn PluginSource,
     strict_sidecars: bool,
-    next_row: &mut usize,
-    out: &mut Vec<CollectedPlanEntry>,
-) -> std::result::Result<bool, String> {
-    let mut missing_plan = false;
-    for entry in entries {
-        // 静态 disabled 可确定跳过；`disabled: !!js` 的求值需要上下文，
-        // 预检阶段保守地把它纳入计划，避免把运行时 false 的提供者误判为缺失。
-        let disabled = disabled_by_ancestor || entry.disabled;
-        if entry.group {
-            missing_plan |= collect_source_plan_entries(
-                &entry.children,
-                disabled,
-                search,
-                source,
-                strict_sidecars,
-                next_row,
-                out,
-            )?;
-            continue;
-        }
-        let index = *next_row;
-        *next_row += 1;
-        if disabled {
-            continue;
-        }
-        let label = entry.id.clone().unwrap_or_else(|| entry.name.clone());
-        let spec = match source.plan_entry(entry, search) {
-            Ok(spec) => spec,
-            Err(err) if strict_sidecars => {
-                return Err(format!(
-                    "第 {index} 行 {label}（插件 {}）的依赖声明不可用: {err}",
-                    entry.name
-                ));
-            }
-            // 非严格：把损坏/不可用的 sidecar 当成"没有计划"，整次预检保守跳过。
-            Err(_) => {
-                missing_plan = true;
-                continue;
-            }
-        };
-        if let Some(spec) = spec {
-            out.push(CollectedPlanEntry { index, label, spec });
-        } else {
-            missing_plan = true;
+    /// 非 group 行的遍历序号（与跳过/收集无关，便于错误定位）。
+    next_row: usize,
+    /// 收集到的计划条目（喂 [`crate::plan::resolve`]）。
+    entries: Vec<CollectedPlanEntry>,
+    /// 逐行判定与"整次跳过"的原因（喂 [`PreflightReport`]）。
+    collection: PreflightCollection,
+}
+
+impl<'a> PlanCollector<'a> {
+    fn new(search: &'a [PathBuf], source: &'a dyn PluginSource, strict_sidecars: bool) -> Self {
+        Self {
+            search,
+            source,
+            strict_sidecars,
+            next_row: 0,
+            entries: Vec::new(),
+            collection: PreflightCollection::default(),
         }
     }
-    Ok(missing_plan)
+
+    fn walk(
+        &mut self,
+        entries: &[Entry],
+        disabled_by_ancestor: bool,
+    ) -> std::result::Result<(), String> {
+        for entry in entries {
+            // 静态 disabled 可确定跳过；`disabled: !!js` 的求值需要上下文，
+            // 预检阶段保守地把它纳入计划，避免把运行时 false 的提供者误判为缺失。
+            let disabled = disabled_by_ancestor || entry.disabled;
+            if entry.group {
+                self.walk(&entry.children, disabled)?;
+                continue;
+            }
+            let index = self.next_row;
+            self.next_row += 1;
+            if disabled {
+                continue;
+            }
+            let label = entry.id.clone().unwrap_or_else(|| entry.name.clone());
+            let verdict = match self.source.plan_entry(entry, self.search) {
+                Ok(Some(spec)) => {
+                    self.entries.push(CollectedPlanEntry {
+                        index,
+                        label: label.clone(),
+                        spec,
+                    });
+                    PreflightRowVerdict::Declared
+                }
+                Ok(None) => {
+                    self.collection.missing_plan = true;
+                    PreflightRowVerdict::NoDeclaration
+                }
+                Err(err) if self.strict_sidecars => {
+                    return Err(format!(
+                        "第 {index} 行 {label}（插件 {}）的依赖声明不可用: {err}",
+                        entry.name
+                    ));
+                }
+                // 非严格：把损坏/不可用的 sidecar 当成"没有计划"，整次预检保守跳过。
+                // 门禁结论与严格模式不同，但**原始错误**必须进报告——否则用户只能从
+                // 日志里猜"为什么这次预检什么都没检查"。
+                Err(err) => {
+                    self.collection.missing_plan = true;
+                    self.collection.downgraded = true;
+                    PreflightRowVerdict::Downgraded { reason: err }
+                }
+            };
+            self.collection.rows.push(PreflightRow {
+                index,
+                label,
+                plugin: entry.name.clone(),
+                verdict,
+            });
+        }
+        Ok(())
+    }
 }
 
 async fn load(ctx: Ctx, config: LoaderConfig) -> Result<()> {
@@ -2526,14 +3980,19 @@ pub async fn load_with_source(
     // P1-1：没有显式 dependencyPlan 时，从每个静态启用行的 sidecar manifest 收集
     // provides / requires，并在创建 LoaderState、调用 source.load 之前求解。
     // 显式计划是**覆盖**：非空时上面的预检已经跑过，这里既不合并也不读 manifest。
-    if config.dependency_plan.is_empty() {
+    // 结论进 `LoaderState`（O7 报告）：首轮预检的分类与对账/重载时同一套口径。
+    let preflight = if config.dependency_plan.is_empty() {
         preflight_source_dependency_plan(
             &entries,
             &search,
             source.as_ref(),
             config.strict_sidecars,
-        )?;
-    }
+        )?
+    } else {
+        PreflightReport::NotApplicable {
+            reason: PreflightNotApplicable::ExplicitPlan,
+        }
+    };
     // 稳读窗口取轮询周期的四分之一（下限 10ms）：编辑器的"写临时文件再 rename"
     // 通常比这快得多，于是既不会误采纳半截文件，也不会让人等一个完整周期。
     let settle = config
@@ -2582,6 +4041,8 @@ pub async fn load_with_source(
     ));
     // 初装预检已经跑过：第一次 reconcile 不重复访问 source。
     state.skip_next_preflight.store(true, Ordering::SeqCst);
+    // O7：首轮预检的分类结论在 state 建好之后、出版报告之前落位。
+    state.record_preflight(preflight);
 
     // 4) `!!js` 的插值挂上 `internal/config` 链（M4-4b）——**必须在第一次对账之前**：
     //    首挂那一行的配置解析就要走它，否则原始标记会流进插件。
@@ -2854,6 +4315,12 @@ fn attach_interpolation(ctx: &Ctx, state: Arc<LoaderState>) {
 /// M3-1：`internal/commit` **总是**发出，`no_save` 作为载荷到达——
 /// 无论哪种情况都先推进内存记录（`mounted` 表 + 条目树），
 /// 只有 `no_save == false` 才落盘（上游是干脆不发 commit，见附录 A）。
+///
+/// # 锁序（与 [`LoaderState::adopt`] 互斥的那一半）
+/// `mounted`（先取先放）→ `config_gate` → `owners` / `tree` / `main_only` /
+/// `main_baseline`。"改树 + 推进回写版本 + 写主树 + 落盘"整段在**同一个**
+/// `config_gate` 临界区里：否则采纳的"校验通过 → 整份写树"会被一次并发回写覆盖，
+/// 内存树退回旧内容而记录与磁盘是新值（watcher 指纹已对齐，不会补偿）。
 fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
     ctx.store
         .clone()
@@ -2866,53 +4333,74 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
                     .map(|record| (record.label.clone(), record.origin))
             };
             let Some((label, origin)) = found else { return };
+            // 测试报到点：这一行确实有一次提交进了观察者，**还没**取 `config_gate`。
+            // 只报到、不停（观察者没有可以停住的 `.await` 点，也不该阻塞 worker）。
+            #[cfg(test)]
+            state.hooks.pass_commit_entered();
             if let Some(record) = state.mounted.lock().unwrap().get_mut(&label) {
                 record.config = config.clone();
             }
-            let tree_entry = {
-                let mut tree = state.tree.lock().unwrap();
-                match find_by_label(&mut tree, &label) {
-                    Some(entry) => {
-                        entry.config = Some(config.clone());
-                        Some(entry.clone())
+            // 闸门在**改树之前**取：采纳的"校验 + 写树"与这里的"改树 + 推进版本"
+            // 必须互斥，否则校验通过之后仍可能被这次回写盖回去。
+            //
+            // 闸门内**不跑用户代码**：`ctx.log` 是宿主/应用注入的 sink（可能 panic），
+            // 在锁里调它会让 std `Mutex` 中毒。日志放到块外（`result` 攒着原因）。
+            let result = {
+                let gate = state.config_gate.lock().unwrap();
+                let tree_entry = {
+                    let mut tree = state.tree.lock().unwrap();
+                    match find_by_label(&mut tree, &label) {
+                        Some(entry) => {
+                            entry.config = Some(config.clone());
+                            Some(entry.clone())
+                        }
+                        None => None,
                     }
-                    None => None,
+                };
+                // 记录与树都被这次提交改了：在飞/排队的旧候选基于旧树，必须失效
+                // （no_save 的纯内存提交同样要算——它照样改了已采纳目标）。
+                state.bump_writeback();
+                if no_save {
+                    // 只推进记录，不落盘（文件驱动的更新是这条路：文件已经是真相）。
+                    return;
                 }
-            };
-            if no_save {
-                // 只推进记录，不落盘（文件驱动的更新是这条路：文件已经是真相）。
-                return;
-            }
-            let Some(tree_entry) = tree_entry else { return };
-            // 字段级归属优先：主配置行若被 patch 覆盖 config，必须写回那一层，
-            // 否则下一次 reload 会被 patch 再覆盖回去。
-            let owner_layer = tree_entry
-                .id
-                .as_deref()
-                .and_then(|id| state.owners.lock().unwrap().config_layer(id));
-            let result = match owner_layer {
-                Some(layer) => {
-                    state.persist_overlay(layer, &label, &tree_entry, Some(config), None)
-                }
-                None => match origin {
-                    RowOrigin::Main => {
-                        let mut main = state.main_only.lock().unwrap();
-                        match find_by_label(&mut main, &label) {
-                            Some(entry) => {
-                                entry.config = Some(config.clone());
-                                drop(main);
+                let Some(tree_entry) = tree_entry else { return };
+                // 字段级归属优先：主配置行若被 patch 覆盖 config，必须写回那一层，
+                // 否则下一次 reload 会被 patch 再覆盖回去。
+                let owner_layer = tree_entry
+                    .id
+                    .as_deref()
+                    .and_then(|id| state.owners.lock().unwrap().config_layer(id));
+                match owner_layer {
+                    Some(layer) => {
+                        drop(gate);
+                        state.persist_overlay(layer, &label, &tree_entry, Some(config), None)
+                    }
+                    None => match origin {
+                        RowOrigin::Main => {
+                            // `main_only` 的读改写 + 落盘落在上面取的同一个 `config_gate` 里
+                            // （`persist` 要求调用方已持闸门，这里**不再**重复取锁）。
+                            let found =
+                                state.with_main_only(|main| match find_by_label(main, &label) {
+                                    Some(entry) => {
+                                        entry.config = Some(config.clone());
+                                        true
+                                    }
+                                    None => false,
+                                });
+                            if found {
                                 state.persist()
-                            }
-                            None => {
-                                drop(main);
+                            } else {
+                                drop(gate);
                                 state.persist_overlay_last(&label, &tree_entry, Some(config), None)
                             }
                         }
-                    }
-                    RowOrigin::Patch => {
-                        state.persist_overlay_last(&label, &tree_entry, Some(config), None)
-                    }
-                },
+                        RowOrigin::Patch => {
+                            drop(gate);
+                            state.persist_overlay_last(&label, &tree_entry, Some(config), None)
+                        }
+                    },
+                }
             };
             if let Err(err) = result {
                 state
@@ -3188,31 +4676,80 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
 ///
 /// HMR 监听器在"插件文件指纹变了"时调它；**外部的确定性驱动**（acceptance spike、
 /// 集成测试）也用它——于是"重载"这件事不必等墙钟轮询，而是"触碰文件 + 调一次"。
+///
+/// 依赖预检（连同它的报告落点）与换实例**同一个 `mutation` 临界区**：否则并发对账
+/// 可以在预检与挂载之间 `adopt` 新树，让一份报告里 `preflight` 与 `mounted` 描述两棵树。
+/// 预检失败也写 `last` + 刷新 `loader.report`，与对账路径同构。
 pub async fn reload_one(
     ctx: &Ctx,
     state: &Arc<LoaderState>,
     label: &str,
 ) -> std::result::Result<(), String> {
-    // P1-1：插件文件变化也可能改变 sidecar 依赖，先按当前树重跑预检。
-    if let Err(err) = state.preflight_dependencies(&state.tree_snapshot()) {
-        return Err(format!("依赖预检失败（reload 未执行）: {err}"));
-    }
     // 预检 → 换实例 → 改记录 → 发布报告：整个变更序列与对账/启停互斥。
     // 不互斥时，一次在飞的对账会把这里刚卸下的行按旧目标重新挂回去（或挂成两份）。
+    // 更隐蔽的一种在**快照**上：对账可以在"取快照"与"写报告"之间 `adopt` 一棵新树，
+    // 于是报告里的 `preflight` 描述旧树、`mounted` 描述新树——一份报告混着两棵树。
+    // 所以**先取锁、再快照**：报告始终描述当前树。预检是同步的，持锁期间不 await、
+    // 不调用户代码（与 `reconcile_attempt` 里那次预检同一做法）。
     let guard = state.mutation.lock().await;
+    // P1-1：插件文件变化也可能改变 sidecar 依赖，先按当前树重跑预检。
+    // 这棵树**就是**当前树（不是候选），所以结论可以直接落报告。
+    match state.preflight_dependencies(&state.tree_snapshot()) {
+        Ok(report) => state.record_preflight(report),
+        Err(err) => {
+            // 与下面的准入/校验拒绝分支同构：**推进指纹 + 记录失败 + 刷新报告**再返回。
+            // 早退的后果是只坏一半：指纹没动 ⇒ 这一行永远 stale ⇒ watcher 每 500ms
+            // 重跑整树预检与逐行 SHA-256，并且每轮再打一条同样的 Error。
+            //
+            // 也**不能**用 `ReconcileOutcome::default()` 覆盖 `last`：那会把上一轮
+            // 真正执行过的对账计数（`report.reconcile.*`）一起清零。
+            let failure = format!("依赖预检失败（reload 未执行）: {err}");
+            advance_fingerprint(state, label);
+            record_reload_failure(state, label, &failure);
+            state.publish_report();
+            ctx.log(
+                Level::Error,
+                &format!("热重载 {label}: {failure}（保留当前实例）"),
+            );
+            drop(guard);
+            return Err(failure);
+        }
+    }
     let Some(mut record) = state.mounted.lock().unwrap().get(label).cloned() else {
         return Ok(());
     };
 
     // ① 预检：新库先落到新文件名、打开、ABI 探活。**全部通过才动正在跑的实例**
     //    ——这是比"先卸后装"更好的地方：坏构建不会让你先失去能力再发现它坏了。
-    //    配置了来源策略时，和 `DiskPluginSource` 一样先验原始 artifact，再验
-    //    暂存副本的 hash；不通过就不产生/不保留暂存副本。
-    let active_policy = crate::source::admission()?;
+    //    有来源策略时，和 `DiskPluginSource` 一样先验原始 artifact，再验暂存副本的
+    //    hash；不通过就不产生/不保留暂存副本。
+    //
+    //    O9：准入结论来自**这个装载器的来源对象**（`state.source`），不是进程级全局
+    //    ——`PolicyPluginSource` 包一层就能让显式严格不被别人的 dev 开关放宽。
+    //    下面的 verify 与 `open_staged_verified` 共用这**一个** `active_policy`：
+    //    两次各读一次全局会读到两份不同的快照。
+    //
+    //    拒绝（含"默认拒绝"）都走同一条路：推进指纹 + 刷新报告 + 记日志再返回，
+    //    与下面的开失败分支同构。曾经的 `?` 早退只做了一半——watcher 的指纹没动，
+    //    每 500ms 重打同一条日志，`loader.report` 也不刷新。
+    let active_policy = match state.source.admission().resolve() {
+        Ok(policy) => policy,
+        Err(err) => {
+            advance_fingerprint(state, label);
+            record_reload_failure(state, label, &err);
+            state.publish_report();
+            ctx.log(
+                Level::Error,
+                &format!("热重载 {label}: 来源准入被拒绝（保留当前实例）: {err}"),
+            );
+            return Err(err);
+        }
+    };
     if let Some(policy) = &active_policy {
         if let Err(err) = policy.verify(&record.source) {
             // 坏版本也要推进指纹，否则 HMR 会按 500ms 周期反复重试。
             advance_fingerprint(state, label);
+            record_reload_failure(state, label, &err);
             state.publish_report();
             ctx.log(
                 Level::Error,
@@ -3234,6 +4771,10 @@ pub async fn reload_one(
             return Err(err.to_string());
         }
     };
+    // 测试停点（O9）：暂存副本已落地、还没被校验/打开。用它把
+    // "verify 与 open_staged_verified 之间副本被换掉"钉成确定性的一刻。
+    #[cfg(test)]
+    state.hooks.pass_before_staged_open(&staged);
     let plugin = match &active_policy {
         Some(policy) => LoadedPlugin::open_staged_verified(&record.source, &staged, policy),
         None => LoadedPlugin::open_staged(&staged),
@@ -3246,6 +4787,7 @@ pub async fn reload_one(
             drop(StagedFile::new(&staged));
             // 预检失败也要推进指纹：HMR 否则会每 500ms 重试同一个坏库（重试风暴）。
             advance_fingerprint(state, label);
+            record_reload_failure(state, label, &err.to_string());
             state.publish_report();
             ctx.log(
                 Level::Error,
@@ -3258,6 +4800,7 @@ pub async fn reload_one(
         // `plugin` 在此 drop：先卸库、后删暂存副本（`LoadedPlugin` 的字段声明序）。
         drop(plugin);
         advance_fingerprint(state, label);
+        record_reload_failure(state, label, "ABI 探活失败（保留当前实例）");
         state.publish_report();
         ctx.log(
             Level::Error,
@@ -3337,6 +4880,20 @@ pub async fn reload_one(
 fn advance_fingerprint(state: &Arc<LoaderState>, label: &str) {
     if let Some(record) = state.mounted.lock().unwrap().get_mut(label) {
         record.fingerprint = fingerprint(&record.source);
+    }
+}
+
+/// 把一次**没有执行**的热重载失败并进对账产物，让 `loader.report.failed` 看得见它。
+///
+/// 只追加 `failures`，**不动**上一轮真正执行过的对账计数（`report.reconcile`
+/// 的 `applied`/`skipped`/`lagging` 描述的是"最近一次对账"，不该被一次未执行的重载
+/// 抹掉）。同一条失败重复出现只记一次：HMR 会按文件变化反复尝试，日志里已经够多了。
+fn record_reload_failure(state: &Arc<LoaderState>, label: &str, failure: &str) {
+    let mut last = state.last.lock().unwrap();
+    let outcome = last.get_or_insert_with(ReconcileOutcome::default);
+    let line = format!("{label}: {failure}");
+    if !outcome.failures.contains(&line) {
+        outcome.failures.push(line);
     }
 }
 
@@ -3562,6 +5119,12 @@ pub fn labeled_entries(entries: &[Entry]) -> Vec<LabeledEntry> {
     visit(entries, &mut ordinals, &mut rows);
     rows
 }
+
+#[cfg(test)]
+mod loader_adopt_tests;
+
+#[cfg(test)]
+mod source_admission_tests;
 
 #[cfg(test)]
 mod tests {

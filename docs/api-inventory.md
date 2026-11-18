@@ -124,6 +124,8 @@
 | `PluginManifest` | struct | `crates/host/src/source.rs` |
 | `AllowedPlugin` | struct | `crates/host/src/source.rs` |
 | `VerifiedPluginSource` | struct | `crates/host/src/source.rs` |
+| `SourceAdmission` | struct | `crates/host/src/source.rs` |
+| `SourceAdmission::strict` | fn | `crates/host/src/source.rs` |
 | `PluginSourcePolicy::verify` | fn | `crates/host/src/source.rs` |
 | `set_active_policy` | fn | `crates/host/src/source.rs` |
 | `active_policy` | fn | `crates/host/src/source.rs` |
@@ -156,6 +158,11 @@
 | `LoaderState::pending_report` | fn | `crates/host/src/loader.rs` |
 | `DiskPluginSource` | struct | `crates/host/src/loader.rs` |
 | `PluginSource` | trait | `crates/host/src/loader.rs` |
+| `PluginSource::admission` | method | `crates/host/src/loader.rs` |
+| `PluginSource::load_admitted` | method | `crates/host/src/loader.rs` |
+| `PluginSource::plan_entry_admitted` | method | `crates/host/src/loader.rs` |
+| `PolicyPluginSource` | struct | `crates/host/src/loader.rs` |
+| `PolicyPluginSource::strict` | fn | `crates/host/src/loader.rs` |
 | `LoadedFile` | struct | `crates/host/src/loader.rs` |
 | `load_with_source` | fn | `crates/host/src/loader.rs` |
 | `LoaderConfig::new` | fn | `crates/host/src/loader.rs` |

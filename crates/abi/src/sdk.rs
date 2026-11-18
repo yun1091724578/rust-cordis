@@ -1,17 +1,26 @@
 //! 插件侧 SDK：把 C ABI 的样板全部藏起来，让插件作者写的是普通 Rust。
 //!
-//! 用法（插件 crate 的 `lib.rs`）：
-//! ```ignore
+//! 用法（插件 crate 的 `lib.rs`）。下面这段是**真编译**的 doctest（`cordis_plugin!`
+//! 生成模块级 `static` 与 `#[no_mangle]` 入口，所以用 `# fn main() {}` 阻止 rustdoc 把
+//! 整段塞进 `fn main` 里）：
+//! ```rust
+//! # fn main() {}
+//! use serde_json::{json, Value};
+//! use std::sync::Arc;
+//!
 //! cordis_abi::cordis_plugin! {
 //!     name: "hello",
 //!     inject: ["greeting"],
-//!     apply: |ctx, config| {
-//!         ctx.provide_iface("hello.gate", 1, vec![("greet", |args, meta| {
+//!     apply: |ctx, _config| {
+//!         // 接口方法体是**同步**函数（`Arc<dyn Fn(Json, Option<Json>) -> …>`），
+//!         // 所以要 `Arc::new` 并写清参数类型。
+//!         let gate: cordis_abi::sdk::IfaceFn = Arc::new(|args: Value, meta: Option<Value>| {
 //!             // `meta` = 调用点上的 `d(k) ⊕ ι(k)`（M3，右偏）；没有元数据时是 `None`。
 //!             let _ = (args, meta);
-//!             Ok(serde_json::json!({ "message": "hi" }))
-//!         })])?;
-//!         ctx.call_iface("greeting", 1, "text", serde_json::json!({}), |result| {
+//!             Ok(json!({ "message": "hi" }))
+//!         });
+//!         ctx.provide_iface("hello.gate", 1, vec![("greet", gate)])?;
+//!         ctx.call_iface("greeting", 1, "text", json!({}), |result| {
 //!             eprintln!("结果是 {result:?}");
 //!         })?;
 //!         ctx.effect(|| { /* 释放资源 */ })?;
@@ -57,6 +66,33 @@ pub type PluginResult = Result<(), String>;
 enum Retry {
     Safe,
     Never,
+}
+
+/// 下一次重试的缓冲大小（等价于原来的 `out.len.max(cap * 2)`）：只防越界。
+///
+/// `needed` 来自宿主回填的 `out.len`，**不可信**：这里只挡住超过 `isize::MAX`
+/// 的长度（那一类既分配不了，`vec![0u8; n]` 还会直接 panic），
+/// **不设业务载荷上限**——业务值由宿主侧写入，大小不受这一层约束。
+/// 真的大值交给 [`response_buffer`] 的可失败分配收场：分配不到是一条可读错误，
+/// 不是 abort。翻倍用饱和乘法并夹到 `isize::MAX`：允许的长度可以接近上界，不能溢出。
+fn retry_cap(needed: usize, current: usize) -> Result<usize, String> {
+    if needed > isize::MAX as usize {
+        return Err(format!(
+            "宿主声明响应需要 {needed} 字节，超过地址空间上限（isize::MAX）；拒绝分配"
+        ));
+    }
+    // 翻倍不能溢出（长度可以接近 isize::MAX）：结果仍落在可分配的上界之内。
+    Ok(needed.max(current.saturating_mul(2).min(isize::MAX as usize)))
+}
+
+/// 一次响应的缓冲：**可失败**分配（重试长度来自宿主回填的 `usize`）。
+fn response_buffer(cap: usize) -> Result<Vec<u8>, String> {
+    let mut buffer: Vec<u8> = Vec::new();
+    buffer
+        .try_reserve_exact(cap)
+        .map_err(|_| format!("插件无法为 {cap} 字节的宿主响应分配缓冲（分配器拒绝）"))?;
+    buffer.resize(cap, 0);
+    Ok(buffer)
 }
 
 /// 事件监听器 / 接口方法 / 派发续延的统一形态。
@@ -282,8 +318,12 @@ impl Ctx {
         api!(self.host, ctx_stream_fail, CtxStreamFailFn)
     }
 
-    /// 读服务。`None` 表示不存在或提供者未就绪——**不是错误**
-    /// （对应 `ctx.get(name)` 的可选探测语义）。
+    /// 读服务（`ctx.get(name)` 的可选探测语义）。
+    ///
+    /// `None` 表示"不可用"，**不是错误**：服务不存在、提供者未就绪，但也可能来自
+    /// **读取本身失败**（例如宿主申报的长度越界、插件侧缓冲分配失败）。需要可诊断的
+    /// 原因（`code` / `category` / `certainty`）时用 [`Ctx::require`] 或
+    /// [`Ctx::require_detailed`]。
     pub fn get(&self, name: &str) -> Option<Json> {
         let api = self.get_fn()?;
         let raw = self
@@ -474,6 +514,10 @@ impl Ctx {
     /// 窗口满时返回 [`StreamPush::Pending`]：**块没有被接受**，提供者要等
     /// `on_credit` 里给出的额度再重推这一块（额度一次一个位置）。
     /// 返回其它结局时 `on_credit` 不被使用——登记的那条回调会被撤销，不会漏。
+    ///
+    /// 同一次派发最多挂 N 条等待推送（N 是宿主侧的上限，由宿主决定、超过即拒绝）：
+    /// 超出时**立即 `Err`**，这一块既不会进流，也不会进等待集合——换一个新的
+    /// `on_credit` id 重推并不能绕过它。
     pub fn stream_push<F>(
         &self,
         dispatch_id: u64,
@@ -711,17 +755,25 @@ impl Ctx {
     /// 注册一个**带方法的服务**，且方法体**可以挂起**（ADR 0001 §4）。
     ///
     /// 与 [`Ctx::provide_iface`] 逐条同构（同一个宿主 op、同一条线上形状：接口只占一个
-    /// 回调 id、方法名是契约），区别只在方法体的形态：
+    /// 回调 id、方法名是契约），区别只在方法体的形态。
     ///
-    /// ```ignore
-    /// ctx.provide_iface_async("llm", 1, vec![(
-    ///     "generate",
-    ///     Arc::new(|args: Json, _meta: Option<Json>, dispatch_id: u64| {
-    ///         // 记下 dispatch_id（比如塞进请求队列），稍后：
-    ///         //   ctx.fulfill(dispatch_id, answer)
-    ///         Ok(sdk::AsyncReply::Pending)
-    ///     }),
-    /// )])?;
+    /// 下面这段是**真编译**的 doctest（只声明 `register_llm`、不调用：`Ctx` 只能由
+    /// 宿主函数表构造；签名与 `apply` 里的用法逐字一致）：
+    ///
+    /// ```rust
+    /// # fn main() {}
+    /// use cordis_abi::sdk::{self, Ctx, Json};
+    /// use std::sync::Arc;
+    ///
+    /// fn register_llm(ctx: &Ctx) -> Result<(), String> {
+    ///     let generate: sdk::AsyncIfaceFn =
+    ///         Arc::new(|_args: Json, _meta: Option<Json>, _dispatch_id: u64| {
+    ///             // 记下 dispatch_id（比如塞进请求队列），稍后：
+    ///             //   ctx.fulfill(dispatch_id, answer)
+    ///             Ok(sdk::AsyncReply::Pending)
+    ///         });
+    ///     ctx.provide_iface_async("llm", 1, vec![("generate", generate)])
+    /// }
     /// ```
     ///
     /// 于是 harness 的模型适配器 / 工具 / 会话日志都能写成**服务**（它们天然是异步的），
@@ -1128,7 +1180,10 @@ impl Ctx {
         // 16 KiB 起步，尽量让大返回值走正常路径；超过时写操作宁可报错也不重放。
         let mut cap = 16 * 1024usize;
         for _ in 0..8 {
-            let mut buffer = vec![0u8; cap];
+            let mut buffer = match response_buffer(cap) {
+                Ok(buffer) => buffer,
+                Err(message) => return Err(protocol_error(message, "host_too_small")),
+            };
             let mut out = Out {
                 ptr: buffer.as_mut_ptr(),
                 cap,
@@ -1159,7 +1214,10 @@ impl Ctx {
                             "host_too_small",
                         ));
                     }
-                    cap = out.len.max(cap * 2);
+                    cap = match retry_cap(out.len, cap) {
+                        Ok(cap) => cap,
+                        Err(message) => return Err(protocol_error(message, "host_too_small")),
+                    };
                     continue;
                 }
                 STATUS_ERR => {
@@ -1222,7 +1280,7 @@ impl Ctx {
     {
         let mut cap = 16 * 1024usize;
         for _ in 0..8 {
-            let mut buffer = vec![0u8; cap];
+            let mut buffer = response_buffer(cap)?;
             let mut out = Out {
                 ptr: buffer.as_mut_ptr(),
                 cap,
@@ -1237,7 +1295,7 @@ impl Ctx {
                             out.len
                         ));
                     }
-                    cap = out.len.max(cap * 2);
+                    cap = retry_cap(out.len, cap)?;
                     continue;
                 }
                 STATUS_ERR => {
@@ -2982,6 +3040,140 @@ mod tests {
         TOO_SMALL_WRITE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (*out).len = 32 * 1024;
         STATUS_TOO_SMALL
+    }
+
+    static TOO_SMALL_HUGE_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// 宿主申报一个荒唐的长度并永远报 TOO_SMALL（插件侧的镜像边界）。
+    unsafe extern "C" fn too_small_huge(_: u64, _: Blob, out: *mut Out) -> i32 {
+        TOO_SMALL_HUGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (*out).len = usize::MAX;
+        STATUS_TOO_SMALL
+    }
+
+    /// 1.5 MiB 的业务载荷：**不是**协议错误，必须扩容读回。
+    const LARGE_RESPONSE: usize = 3 * 512 * 1024;
+
+    static LARGE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// 第一次申报 1.5 MiB（16 KiB 缓冲放不下），第二次真的写出来。
+    unsafe extern "C" fn large_require(_: u64, _: Blob, out: *mut Out) -> i32 {
+        let call = LARGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 0 {
+            (*out).len = LARGE_RESPONSE;
+            return STATUS_TOO_SMALL;
+        }
+        let body = "a".repeat(LARGE_RESPONSE - 12);
+        (*out).write(format!("{{\"value\":\"{body}\"}}").as_bytes())
+    }
+
+    #[test]
+    fn retry_cap_only_rejects_out_of_range_lengths() {
+        // 与原来的 `out.len.max(cap * 2)` 逐字对齐：申报比"翻倍"小时取翻倍。
+        assert_eq!(retry_cap(0, 16 * 1024), Ok(32 * 1024));
+        assert_eq!(retry_cap(32 * 1024, 16 * 1024), Ok(32 * 1024));
+        // 业务载荷没有 1 MiB 之类的上限：大值照常给长度，由可失败分配收场。
+        assert_eq!(retry_cap(LARGE_RESPONSE, 16 * 1024), Ok(LARGE_RESPONSE));
+        assert_eq!(retry_cap(8 * 1024 * 1024, 16 * 1024), Ok(8 * 1024 * 1024));
+        // 翻倍不能溢出（长度可以接近 isize::MAX）。
+        assert_eq!(
+            retry_cap(isize::MAX as usize, isize::MAX as usize),
+            Ok(isize::MAX as usize)
+        );
+        assert!(
+            retry_cap(isize::MAX as usize + 1, 16 * 1024).is_err(),
+            "isize::MAX 之上也要被拒（真实 OOM 会 abort）"
+        );
+        assert!(
+            retry_cap(usize::MAX, 16 * 1024).is_err(),
+            "usize::MAX 必须被拒"
+        );
+    }
+
+    #[test]
+    fn absurd_retry_claims_are_rejected_before_allocating() {
+        use std::sync::atomic::Ordering;
+
+        TOO_SMALL_HUGE_CALLS.store(0, Ordering::SeqCst);
+        let host = host_with(
+            std::mem::size_of::<HostApi>() as u32,
+            Some(too_small_huge),
+            None,
+        );
+        let ctx = Ctx { host, handle: 0 };
+        let err = ctx.require_detailed("svc").unwrap_err();
+        assert_eq!(err.code, "host_too_small");
+        assert!(
+            err.error.contains("isize::MAX"),
+            "越界申报必须说清原因：{}",
+            err.error
+        );
+        assert_eq!(
+            TOO_SMALL_HUGE_CALLS.load(Ordering::SeqCst),
+            1,
+            "越界时不得再调一次（不分配）"
+        );
+    }
+
+    /// >1 MiB 的响应（业务服务值就是这么来的）必须扩容读回，而不是被判成超限。
+    #[test]
+    fn a_response_over_one_mib_is_retried_and_returned_whole() {
+        use std::sync::atomic::Ordering;
+
+        LARGE_CALLS.store(0, Ordering::SeqCst);
+        let host = host_with(
+            std::mem::size_of::<HostApi>() as u32,
+            Some(large_require),
+            None,
+        );
+        let ctx = Ctx { host, handle: 0 };
+        let value = ctx.require("svc").expect("大响应必须读回");
+        assert_eq!(
+            value.as_str().map(str::len),
+            Some(LARGE_RESPONSE - 12),
+            "必须拿回完整内容，而不是被截断/拒读"
+        );
+        assert_eq!(
+            LARGE_CALLS.load(Ordering::SeqCst),
+            2,
+            "扩容后应恰好重试一次"
+        );
+    }
+
+    unsafe extern "C" fn reject_stream_push(_: u64, _: u64, _: Blob, _: u64, out: *mut Out) -> i32 {
+        (*out).write("宿主容量上限：maxOutstandingCreditsPerStream".as_bytes());
+        STATUS_ERR
+    }
+
+    /// 宿主拒绝一次流式推送（容量上限 / 协议错误）时，`on_credit` 永远不会被调用：
+    /// 刚登记进全局回调表的续延必须撤销，否则"每次重推换一个新 id"会让回调表
+    /// 无限增长——与 `failed_registrations_release_the_callbacks_they_registered`
+    /// 同一条纪律。
+    #[test]
+    fn a_rejected_stream_push_releases_the_credit_callback() {
+        let host = Box::leak(Box::new(HostApi {
+            abi_version: crate::ABI_VERSION,
+            size: std::mem::size_of::<HostApi>() as u32,
+            ctx_stream_push: Some(reject_stream_push),
+            ..HostApi::default()
+        }));
+        let ctx = Ctx::from_host(host, 0xBEEF);
+
+        let retained = Arc::new(());
+        let weak = Arc::downgrade(&retained);
+        for _ in 0..16 {
+            let captured = retained.clone();
+            let result = ctx.stream_push(1, Json::Null, move |_credit| {
+                let _ = &captured;
+            });
+            assert!(result.is_err(), "宿主拒绝时必须报错");
+        }
+        drop(retained);
+        assert!(
+            weak.upgrade().is_none(),
+            "被拒的 stream_push 保留了 on_credit 闭包（每次重推都会多留一份）"
+        );
     }
 
     #[test]

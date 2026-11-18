@@ -13,4 +13,6 @@ publish = false
 cordis-core = { package = "rust-cordis-core", path = "../../crates/core" }
 cordis-host = { package = "rust-cordis-host", path = "../../crates/host" }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+# `sync` 是测试夹具里 `tokio::sync::Mutex`（进程级串行闸门，跨 await 持有）的
+# 显式依赖：外部消费者样例必须自己声明用到的特性，不能指望宿主或默认特性兜底。
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }

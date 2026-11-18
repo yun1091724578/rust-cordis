@@ -86,6 +86,103 @@ pub fn admission() -> Result<Option<Arc<PluginSourcePolicy>>, String> {
     Err("未配置插件来源策略；请传 --source-policy，或显式启用开发模式（set_allow_unverified/--allow-unverified）".to_string())
 }
 
+/// 一个**来源对象**自带的准入结论（O9）。
+///
+/// # 为什么它跟着来源走
+/// 进程级 [`set_active_policy`] / [`set_allow_unverified`] 是"后写覆盖先写"的全局量：
+/// 同一进程里两个宿主（或两个 App）策略不同时，后配置的那个会把先配置的悄悄放宽。
+/// 把结论放到**来源对象**上，`PluginSource` 的实现（含 [`crate::loader::PolicyPluginSource`]
+/// 这层包装）就能各自决定自己的准入，互不影响。
+///
+/// 三条语义是行为契约，不能合并成一个开关：
+/// - [`Self::strict`]：显式严格——**忽略**进程级开发标志，永不被全局放宽；
+/// - [`Self::dev_unverified`]：只对**这个来源**放行，且**不写**进程级标志；
+/// - [`Self::fallback`]：逐字等于 [`admission`]（进程级策略优先，其次是显式开发模式），
+///   它也是 [`crate::loader::PluginSource::admission`] 的缺省值——所以没换来源的宿主
+///   行为完全不变。
+///
+/// # 谁说了算
+/// `strict` 只免疫**进程级开关**。把另一个 `SourceAdmission` 显式传给
+/// [`crate::loader::PluginSource::load_admitted`] /
+/// [`crate::loader::PluginSource::plan_entry_admitted`] 是**调用方自己的选择**，
+/// 不是远端输入——嵌套包装时最外层的显式声明生效。
+#[derive(Clone, Debug)]
+pub struct SourceAdmission {
+    kind: AdmissionKind,
+}
+
+/// [`SourceAdmission`] 的私有判别：`kind` 不对外，外部只能通过三个构造器表达意图。
+#[derive(Clone, Debug)]
+enum AdmissionKind {
+    Strict(Arc<PluginSourcePolicy>),
+    DevUnverified,
+    Fallback,
+}
+
+impl Default for SourceAdmission {
+    fn default() -> Self {
+        Self::fallback()
+    }
+}
+
+impl SourceAdmission {
+    /// **显式严格**：artifact 必须过这份 allow-list。
+    ///
+    /// 它与全局开发标志无关——即使同进程另一个 App 调用了
+    /// [`set_allow_unverified(true)`]，这个来源仍然校验。这是"局部策略"存在的
+    /// 全部意义：严格是显式声明的，不能被别人的便利开关放大。
+    ///
+    /// 免疫范围仅限**进程级开关**：调用方显式把自己的 `SourceAdmission` 传给
+    /// `load_admitted` / `plan_entry_admitted` 时，那是调用方的决定（不是远端输入），
+    /// 嵌套包装时最外层声明生效。
+    pub fn strict(policy: impl Into<Arc<PluginSourcePolicy>>) -> Self {
+        Self {
+            kind: AdmissionKind::Strict(policy.into()),
+        }
+    }
+
+    /// **显式开发放行**：只对本来源跳过校验，且**不**写进程级标志。
+    ///
+    /// 与 [`set_allow_unverified(true)`] 的区别正是范围：后者会顺手放行同进程里
+    /// 所有还没换来源的宿主。
+    pub fn dev_unverified() -> Self {
+        Self {
+            kind: AdmissionKind::DevUnverified,
+        }
+    }
+
+    /// **兼容回落**：逐字等于 [`admission`]（读进程级策略与开发标志）。
+    pub fn fallback() -> Self {
+        Self {
+            kind: AdmissionKind::Fallback,
+        }
+    }
+
+    /// 解析成本次装载真正要执行的结论：`Some(policy)` = 强制校验；`None` = 放行未校验。
+    ///
+    /// 只有 `Fallback` 会读全局量；`Strict` / `DevUnverified` 的答案是**常量**，
+    /// 所以"caller 之间互相放宽策略"在类型上就不可能发生。
+    pub fn resolve(&self) -> Result<Option<Arc<PluginSourcePolicy>>, String> {
+        match &self.kind {
+            AdmissionKind::Strict(policy) => Ok(Some(policy.clone())),
+            AdmissionKind::DevUnverified => Ok(None),
+            AdmissionKind::Fallback => admission(),
+        }
+    }
+
+    /// 诊断字面量：`"enforced"` / `"dev-unverified"` / `"fallback"`。
+    ///
+    /// 第三个值故意不复用 [`admission_mode`] 的 `"denied"`：`fallback` 说的是
+    /// **这个来源没有自己的结论**，此刻进程级是什么结论由 [`Self::resolve`] 回答。
+    pub fn mode(&self) -> &'static str {
+        match &self.kind {
+            AdmissionKind::Strict(_) => "enforced",
+            AdmissionKind::DevUnverified => "dev-unverified",
+            AdmissionKind::Fallback => "fallback",
+        }
+    }
+}
+
 /// 设置进程级生效的来源策略。`None` = 没有策略；此时默认拒绝，除非显式
 /// [`set_allow_unverified(true)`]。
 ///

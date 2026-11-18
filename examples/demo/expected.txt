@@ -6,7 +6,7 @@
   [INFO ] hello: hello: 激活 #1，greeting.text = "hello, cordis-rs"，times = 7，note = "patch 里的 note"
   [INFO ] cordis:include: hello: 已挂载
   [rust-side] 我从 ABI 插件那里读到了：hello, cordis-rs × 7
-  装载报告: {"capabilities":[{"inject":[],"js":{"env":[],"host":[],"services":[]},"label":"greet","plugin":"greeting","provision":[],"volatile":[]},{"inject":["greeting"],"js":{"env":[],"host":[],"services":[]},"label":"hello","plugin":"hello","provision":[],"volatile":["note"]}],"cycles":[],"disabled":["extra"],"failed":[],"interpolation":{"failed":0,"mode":"builtin"},"mounted":2,"pending":[],"realms":{"default":4,"named":0},"reconcile":{"applied":2,"lagging":0,"skipped":0},"stagedLeaked":0,"volatile":{"declared":1,"supported":1}}
+  装载报告: {"capabilities":[{"inject":[],"js":{"env":[],"host":[],"services":[]},"label":"greet","plugin":"greeting","provision":[],"volatile":[]},{"inject":["greeting"],"js":{"env":[],"host":[],"services":[]},"label":"hello","plugin":"hello","provision":[],"volatile":["note"]}],"cycles":[],"disabled":["extra"],"failed":[],"interpolation":{"failed":0,"mode":"builtin"},"mounted":2,"pending":[],"preflight":{"declaration":"sidecarManifest","realmModel":"notModeled","rows":[{"index":0,"label":"greet","plugin":"greeting","verdict":"noDeclaration"},{"index":1,"label":"hello","plugin":"hello","verdict":"noDeclaration"}],"runtimeVerified":false,"scope":"declaration","skipped":true,"verdict":"incomplete"},"realms":{"default":4,"named":0},"reconcile":{"applied":2,"lagging":0,"skipped":0},"stagedLeaked":0,"volatile":{"declared":1,"supported":1}}
 === 3. 依赖链条被自动拉起 ===
   runtime rust-side × 1  (rust-side#1)
   runtime cordis:include × 1  (cordis:include#2)

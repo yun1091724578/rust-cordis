@@ -1,0 +1,115 @@
+//! `cargo xtask package-check` 的隔离消费者：只用**打包产物**里的公开 API
+//! 装载一个插件，完成一次跨 ABI 的服务调用，然后断言关闭后实例归零。
+//!
+//! 插件是"不经动态库的 ABI 形状插件"：`cordis_abi::sdk::build_plugin` 造描述表，
+//! 宿主侧的 `apply_via_with_error_format` 走真实装载路径。SDK 的 `attach` 收到的是
+//! **真实宿主函数表**，因此 `ctx.require` / `ctx.provide` 都是跨 C-ABI 的真实调用，
+//! 不是进程内的旁路——宿主侧任何一个可观测行为被改坏（服务值读不回来、返回值被改写、
+//! 实例不注销），下面的断言就会红。
+//!
+//! 只依赖公开 API：`cordis_core`（内核）、`cordis_abi::sdk`（插件侧 SDK）、
+//! `cordis_host`（宿主装载入口与诊断口）。任何内部测试辅助都没有引用。
+
+use cordis_abi::sdk;
+use cordis_core::{unique_key, App, Config, Dyn, ExternValue, FnPlugin, FiberState, Inject, Plugin};
+use cordis_host::{apply_via_with_error_format, host_api, loaded_instances, CallFn};
+use serde_json::json;
+use std::sync::Arc;
+
+/// 消费者自己注入的探针值。插件必须把它读回去再派生——写死的默认文案会立刻红。
+const PROBE_TEXT: &str = "package-check-probe";
+const PROBE_TIMES: u64 = 7;
+
+#[tokio::main]
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("PACKAGE-CHECK FAILED: {err}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), String> {
+    // 插件侧 SDK 与宿主函数表对接（copy-on-attach）。必须在造插件之前。
+    unsafe { sdk::attach(host_api()) };
+
+    let desc = sdk::build_plugin("package-check", &[], |ctx: &sdk::Ctx, _config| {
+        // 跨 ABI 读：走宿主的 ctx_require。
+        let input = ctx.require("probe.input")?;
+        let text = input
+            .get("text")
+            .and_then(|value| value.as_str())
+            .ok_or("probe.input.text 必须是字符串")?;
+        let times = input
+            .get("times")
+            .and_then(|value| value.as_u64())
+            .ok_or("probe.input.times 必须是整数")?;
+        // 跨 ABI 写：走宿主的 ctx_provide。
+        ctx.provide(
+            "probe.reply",
+            json!({
+                "text": text.to_uppercase(),
+                "times": times,
+                "repeat": format!("{text} x {times}"),
+            }),
+        )?;
+        Ok(())
+    });
+    let error_format = unsafe { cordis_abi::PluginDesc::error_format_at(desc) };
+    let call: CallFn = unsafe { (*desc).call };
+
+    let app = App::new();
+    app.root
+        .provide(
+            "probe.input",
+            Dyn::new(ExternValue(
+                json!({ "text": PROBE_TEXT, "times": PROBE_TIMES }),
+            )),
+        )
+        .map_err(|err| format!("注册探针服务失败: {err}"))?;
+
+    let plugin: Arc<dyn Plugin> = Arc::new(FnPlugin {
+        name: "package-check",
+        key: unique_key("package-check"),
+        inject: Inject::default(),
+        validator: None,
+        f: Arc::new(move |ctx, config| {
+            apply_via_with_error_format(call, ctx, config, "package-check", error_format)
+        }),
+    });
+    let fiber = app.root.plugin(plugin, Config::Null);
+    fiber.settle().await;
+    if !matches!(fiber.state(), FiberState::Active) {
+        return Err(format!("插件未激活: {:?}", fiber.state()));
+    }
+
+    let reply = app
+        .root
+        .require_as::<ExternValue>("probe.reply")
+        .map_err(|err| format!("读跨 ABI 服务 probe.reply 失败: {err}"))?
+        .0
+        .clone();
+    let expected = json!({
+        "text": PROBE_TEXT.to_uppercase(),
+        "times": PROBE_TIMES,
+        "repeat": format!("{PROBE_TEXT} x {PROBE_TIMES}"),
+    });
+    if reply != expected {
+        return Err(format!("probe.reply 不符: 实际 {reply}，期望 {expected}"));
+    }
+    if loaded_instances() != 1 {
+        return Err(format!(
+            "装载后应有 1 个 ABI 实例，实际 {}",
+            loaded_instances()
+        ));
+    }
+    // 判据行（xtask 侧按文本再核一遍）：服务调用的返回值。
+    println!("service call ok: {reply}");
+
+    app.close().await;
+    if loaded_instances() != 0 {
+        return Err(format!("关闭后实例未归零: {}", loaded_instances()));
+    }
+    // 判据行（xtask 侧按文本再核一遍）：关闭后实例归零。
+    println!("instances after close: 0");
+    Ok(())
+}

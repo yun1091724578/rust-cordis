@@ -9,6 +9,7 @@ use std::process::{Command, ExitCode};
 mod contract;
 mod inventory;
 mod matrix;
+mod package_check;
 mod seal;
 
 const USAGE: &str = "\
@@ -16,13 +17,15 @@ cargo xtask <命令>
 
 命令:
   fmt              cargo fmt --all -- --check
-  clippy           cargo clippy --workspace --all-targets --locked -- -D warnings
+  clippy           cargo clippy --workspace --all-targets --all-features --locked
+                   -- -D warnings
   test             cargo test --workspace --all-targets --locked
   consumer         测试独立服务消费者（只使用公开 path 依赖）
   build-plugins    构建 greeting / hello / harness-tool 三个 cdylib
   demo             构建插件并运行 demo
   e2e              构建插件并运行 harness-spike
-  ci               fmt + inventory + docs + matrix + clippy + test + consumer + demo + e2e
+  ci               fmt + inventory + docs + matrix + clippy(--all-features)
+                   + check(--all-features) + test + doctest + consumer + demo + e2e
   docs [path]      检查支持契约的保证索引（默认 docs/support-contract.md）
   inventory [--write|--check] [path]
                    检查/写入公开 API 清单（默认 docs/api-inventory.md）
@@ -37,7 +40,27 @@ cargo xtask <命令>
                    --require-v2 拒绝把 /2 伪装成 /1 绕过 provenance
   seal-consume <dir>
                    用正式封存的 allow-list 跑独立消费者（发布门禁，不进入 ci）
+  package-check [--keep] [--offline|--online] [--reuse-dir] [--dir <绝对路径>]
+                   打包 core/abi/macros/host 四个 .crate → 解包到 ASCII 临时目录
+                   → 用**产物**（不是仓库源码 path）构建一个隔离消费者 → 跑一次
+                   跨 ABI 服务调用（断言返回值与关闭后实例归零）；失败保留目录
+                   并打印路径。反后门判据：消费者清单里不得出现仓库源码 path
+                   （文本 + cargo metadata 双向核对）。默认 --locked --offline，
+                   --online 才联网（`--offline` 与默认等价，保留它只为在默认将来
+                   改成联网时仍能显式钉住离线）；
+                   --keep 或 CORDIS_PACKAGE_KEEP=1 保留目录；
+                   CORDIS_PACKAGE_CONSUMER_DIR 指定临时根目录（不进入 ci）
+                   --dir 必须是绝对路径、不含 `..`、不是驱动器根、且在仓库之外
+                   （canonicalize 后比较）；打包前会删掉目标 .crate 并断言产物是
+                   本次新写的
+                   --reuse-dir（仅调试）跳过准备/打包/解包，复用现有临时目录
+                   （须带 package-check 标记）只做 resolve/build/run；用于证明
+                   改坏解包产物必然变红（成功行明写“不作为发布证据”，不是门禁结果）
   soak [cycles]    运行被忽略的宿主资源 soak（默认 1000 轮；不进入 ci）
+                   位置参数只影响主 soak（CORDIS_SOAK_CYCLES）；真 DLL 的
+                   open_staged soak 由 CORDIS_STAGED_SOAK_CYCLES 控制（默认 200）
+                   运行前逐 target 做 `--ignored --list` 注册检查
+  dhat             跑 dhat 堆剖析（--features dhat-heap + --list 守卫 + stats；不进入 ci）
   doctor           打印本机构建环境诊断
 ";
 
@@ -51,6 +74,7 @@ fn main() -> ExitCode {
             "clippy",
             "--workspace",
             "--all-targets",
+            "--all-features",
             "--locked",
             "--",
             "-D",
@@ -67,7 +91,9 @@ fn main() -> ExitCode {
         "matrix" => matrix_command(std::env::args().skip(2).collect()),
         "seal" => seal::command(std::env::args().skip(2).collect()),
         "seal-consume" => seal_consume(std::env::args().skip(2).collect()),
+        "package-check" => package_check::command(std::env::args().skip(2).collect()),
         "soak" => soak_command(std::env::args().skip(2).collect()),
+        "dhat" => dhat_command(std::env::args().skip(2).collect()),
         "doctor" => {
             doctor();
             0
@@ -126,12 +152,26 @@ fn ci() -> i32 {
             "clippy",
             "--workspace",
             "--all-targets",
+            // `--all-features`：历史上 `dhat-heap` 这类只在 feature 下出现的代码
+            // 曾带着 unused import / 死代码合进来，默认 feature 的 clippy 看不见。
+            "--all-features",
             "--locked",
             "--",
             "-D",
             "warnings",
         ][..],
+        // 只编译不运行：`dhat-heap` 这类 feature 不开时测试会被 `#![cfg]` 整块裁掉，
+        // 缺编译验证就会在发布前才炸。
+        &[
+            "check",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--locked",
+        ][..],
         &["test", "--workspace", "--all-targets", "--locked"][..],
+        // `--all-targets` 不含 doctest：文档示例必须单独跑，否则 `ignore`/改坏都无声。
+        &["test", "--workspace", "--doc", "--locked"][..],
     ] {
         let code = run(args);
         if code != 0 {
@@ -311,6 +351,106 @@ fn build_then(args: &[&str]) -> i32 {
     }
 }
 
+/// 一个必须存在的 `#[ignore]` 集成测试目标。
+///
+/// `cargo test … -- --ignored` 在 0 个 ignored 测试时**仍然退出 0**，所以测试被删、
+/// 改名、或去掉 `#[ignore]` 之后整条命令会变成假绿。运行前先按 target 逐个 `--list`。
+struct IgnoredTarget {
+    package: &'static str,
+    target: &'static str,
+    test: &'static str,
+    /// 该测试只在开启这个 feature 时才被编译（`dhat_profile` 要 dhat 全局分配器，
+    /// 不开 feature 时 `#![cfg(feature = "dhat-heap")]` 会把整个 target 裁成空壳）。
+    feature: Option<&'static str>,
+}
+
+const SOAK_TARGET: IgnoredTarget = IgnoredTarget {
+    package: "rust-cordis-host",
+    target: "soak",
+    test: "repeated_soak_cycles_leave_no_residue",
+    feature: None,
+};
+
+const STAGED_SOAK_TARGET: IgnoredTarget = IgnoredTarget {
+    package: "rust-cordis-host",
+    target: "open_staged_soak",
+    test: "real_open_staged_cycles_return_to_baseline",
+    feature: None,
+};
+
+const DHAT_TARGET: IgnoredTarget = IgnoredTarget {
+    package: "rust-cordis-host",
+    target: "dhat_profile",
+    test: "real_open_staged_path_keeps_live_heap_bounded",
+    feature: Some("dhat-heap"),
+};
+
+/// 目标测试必须注册为 `#[ignore]` 测试；否则拒绝运行（避免空跑被当成通过）。
+fn require_ignored_test(spec: &IgnoredTarget) -> Result<(), i32> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut args = vec![
+        "test",
+        "-p",
+        spec.package,
+        "--test",
+        spec.target,
+        "--locked",
+    ];
+    if let Some(feature) = spec.feature {
+        args.extend(["--features", feature]);
+    }
+    args.extend(["--", "--ignored", "--list"]);
+    match Command::new(&cargo)
+        .args(&args)
+        .current_dir(workspace_root())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // 行级等值：`foo_x: test` 这种后缀同名不该被当成 `foo: test`。
+            let expected = format!("{}: test", spec.test);
+            if stdout.lines().any(|line| line.trim_end() == expected) {
+                Ok(())
+            } else {
+                eprintln!(
+                    "{} 目标里的 {} 未注册为 #[ignore] 测试；拒绝运行空的 {} 测试\n{}",
+                    spec.target,
+                    spec.test,
+                    spec.target,
+                    stdout.trim_end()
+                );
+                Err(1)
+            }
+        }
+        Ok(output) => {
+            eprintln!(
+                "列出 {} 目标测试失败（exit {:?}）\n{}",
+                spec.target,
+                output.status.code().unwrap_or(1),
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            );
+            Err(output.status.code().unwrap_or(1))
+        }
+        Err(err) => {
+            eprintln!("执行 {cargo} 失败: {err}");
+            Err(1)
+        }
+    }
+}
+
+/// 从环境变量读一个正整数轮次；未设置时用默认值。`0` / 非法值一律拒绝，
+/// 否则"0 轮"会让 soak 静默通过。
+fn positive_cycles(var: &str, default: u64) -> Result<u64, String> {
+    match std::env::var(var) {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|cycles| *cycles > 0)
+            .ok_or_else(|| format!("{var} 必须是正整数，实际 \"{raw}\"")),
+        Err(_) => Ok(default),
+    }
+}
+
 fn soak_command(args: Vec<String>) -> i32 {
     if matches!(args.as_slice(), [flag] if flag == "-h" || flag == "--help") {
         print!("{USAGE}");
@@ -332,60 +472,31 @@ fn soak_command(args: Vec<String>) -> i32 {
                 return 2;
             }
         },
-        None => match std::env::var("CORDIS_SOAK_CYCLES") {
-            Ok(raw) => match raw.parse::<u64>() {
-                Ok(cycles) if cycles > 0 => cycles,
-                _ => {
-                    eprintln!("CORDIS_SOAK_CYCLES 必须是正整数，实际 \"{raw}\"\n\n{USAGE}");
-                    return 2;
-                }
-            },
-            Err(_) => 1000,
+        None => match positive_cycles("CORDIS_SOAK_CYCLES", 1000) {
+            Ok(cycles) => cycles,
+            Err(message) => {
+                eprintln!("{message}\n\n{USAGE}");
+                return 2;
+            }
         },
     };
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let test_name = "repeated_soak_cycles_leave_no_residue";
-    // `cargo test -- --ignored` 在 0 个 ignored 测试时也退出 0。先列出目标测试，
-    // 防止测试被删/改名/去掉 #[ignore] 后 nightly 变成假绿。
-    let listed = Command::new(&cargo)
-        .args([
-            "test",
-            "-p",
-            "rust-cordis-host",
-            "--test",
-            "soak",
-            "--locked",
-            "--",
-            "--ignored",
-            "--list",
-        ])
-        .current_dir(workspace_root())
-        .output();
-    match listed {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.contains(&format!("{test_name}: test")) {
-                eprintln!(
-                    "soak 测试 {test_name} 未注册为 #[ignore] 测试；拒绝运行空 soak\n{}",
-                    stdout.trim_end()
-                );
-                return 1;
-            }
+    // 真 DLL 的 `open_staged` soak 读的是**另一个**环境变量。这里必须显式读取并打印，
+    // 否则 1M 轮的 nightly 里真 DLL 只跑默认的 200 轮，而且没人看得出来。
+    let staged_cycles = match positive_cycles("CORDIS_STAGED_SOAK_CYCLES", 200) {
+        Ok(cycles) => cycles,
+        Err(message) => {
+            eprintln!("{message}\n\n{USAGE}");
+            return 2;
         }
-        Ok(output) => {
-            eprintln!(
-                "列出 soak 测试失败（exit {:?}）",
-                output.status.code().unwrap_or(1)
-            );
-            return output.status.code().unwrap_or(1);
-        }
-        Err(err) => {
-            eprintln!("执行 {cargo} 失败: {err}");
-            return 1;
+    };
+    for spec in [&SOAK_TARGET, &STAGED_SOAK_TARGET] {
+        if let Err(code) = require_ignored_test(spec) {
+            return code;
         }
     }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     println!(
-        "+ {cargo} test -p rust-cordis-host --test soak --test open_staged_soak --locked -- --ignored --nocapture (cycles={cycles})"
+        "+ {cargo} test -p rust-cordis-host --test soak --test open_staged_soak --locked -- --ignored --nocapture (CORDIS_SOAK_CYCLES={cycles}, CORDIS_STAGED_SOAK_CYCLES={staged_cycles})"
     );
     match Command::new(&cargo)
         .args([
@@ -402,6 +513,49 @@ fn soak_command(args: Vec<String>) -> i32 {
             "--nocapture",
         ])
         .env("CORDIS_SOAK_CYCLES", cycles.to_string())
+        .env("CORDIS_STAGED_SOAK_CYCLES", staged_cycles.to_string())
+        .current_dir(workspace_root())
+        .status()
+    {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(err) => {
+            eprintln!("执行 {cargo} 失败: {err}");
+            1
+        }
+    }
+}
+
+/// dhat 堆剖析：开 feature → `--list` 守卫 → 执行（stats 由测试自己打印，需 --nocapture）。
+fn dhat_command(args: Vec<String>) -> i32 {
+    if matches!(args.as_slice(), [flag] if flag == "-h" || flag == "--help") {
+        print!("{USAGE}");
+        return 0;
+    }
+    if let Some(unknown) = args.first() {
+        eprintln!("dhat 不接受参数，实际 \"{unknown}\"\n\n{USAGE}");
+        return 2;
+    }
+    if let Err(code) = require_ignored_test(&DHAT_TARGET) {
+        return code;
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    println!(
+        "+ {cargo} test -p rust-cordis-host --test dhat_profile --locked --features dhat-heap -- --ignored --nocapture（stats 见 dhat: 行）"
+    );
+    match Command::new(&cargo)
+        .args([
+            "test",
+            "-p",
+            "rust-cordis-host",
+            "--test",
+            "dhat_profile",
+            "--locked",
+            "--features",
+            "dhat-heap",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ])
         .current_dir(workspace_root())
         .status()
     {

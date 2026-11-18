@@ -134,11 +134,18 @@ impl Default for App {
 
 /// 便捷构造一个函数式插件。
 ///
-/// ```ignore
-/// let hello = plugin_fn("hello", Inject::of(&["tools"]), |ctx: Ctx, _cfg| Box::pin(async move {
-///     ctx.on("x", |call| Box::pin(async move { None }))?;
-///     Ok(())
-/// }));
+/// ```rust
+/// use cordis_core::{plugin_fn, Ctx, Inject, Plugin};
+///
+/// let hello = plugin_fn("hello", Inject::of(&["tools"]), |ctx: Ctx, _cfg| {
+///     Box::pin(async move {
+///         // 注册由调用者 fiber 拥有（卸载即摘除），所以 `on` 返回的是
+///         // `Disposable` 而不是 `Result`——这里故意不写 `?`。
+///         let _ = ctx.on("x", |_call| Box::pin(async move { None }));
+///         Ok(())
+///     })
+/// });
+/// assert_eq!(hello.name(), "hello");
 /// ```
 pub fn plugin_fn<F>(name: &'static str, inject: Inject, apply: F) -> Arc<dyn Plugin>
 where

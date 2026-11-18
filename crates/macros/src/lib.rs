@@ -34,7 +34,11 @@ fn finish(result: syn::Result<proc_macro2::TokenStream>) -> TokenStream {
 
 /// 声明一个 **T1 typed 服务**（D2）。
 ///
-/// ```ignore
+/// 示例（`text`：本 crate 是 proc-macro crate，展开代码一律写 `::cordis::…`，
+/// 而 proc-macro crate 的文档测试里没有 `cordis` 这个 extern crate，所以不能编译）。
+/// 可编译的等价示例见 `crates/sdk/src/lib.rs` 的「五分钟速览」doctest。
+///
+/// ```text
 /// #[cordis::service(name = "greeter", version = 1)]
 /// pub trait Greeter {
 ///     async fn greet(&self, who: String) -> Result<String, String>;
@@ -59,7 +63,11 @@ pub fn service(args: TokenStream, input: TokenStream) -> TokenStream {
 
 /// 实现一个 `#[cordis::service]` 声明过的 trait：作者照旧写 `async fn`。
 ///
-/// ```ignore
+/// 示例（`text`：同 [`macro@service`]——proc-macro crate 的文档里没有 `cordis` 这个
+/// extern crate，引用 `::cordis::…` 的展开代码无法编译）。
+/// 可编译的等价示例见 `crates/sdk/src/lib.rs` 的「五分钟速览」doctest。
+///
+/// ```text
 /// #[cordis::service_impl]
 /// impl Greeter for GreeterImpl {
 ///     async fn greet(&self, who: String) -> Result<String, String> {
@@ -77,7 +85,11 @@ pub fn service_impl(args: TokenStream, input: TokenStream) -> TokenStream {
 
 /// 声明一组 **typed 事件**（G12）。
 ///
-/// ```ignore
+/// 示例（`text`：proc-macro crate 的文档里没有 `cordis` 这个 extern crate）。
+/// 可编译的等价示例见 `crates/sdk/tests/events_macro.rs`
+/// （`#[cordis::events]` + 逐字事件名 + typed 监听器的完整往返）。
+///
+/// ```text
 /// #[cordis::events]
 /// pub enum AgentEvents {
 ///     #[event("agent/pre-step")]
@@ -103,13 +115,17 @@ pub fn events(args: TokenStream, input: TokenStream) -> TokenStream {
 
 /// 声明一个插件：生成 `impl Plugin`，`apply` 由作者写成普通 `async fn`。
 ///
-/// ```ignore
+/// 示例（`text`：proc-macro crate 的文档里没有 `cordis` 这个 extern crate）。
+/// 可编译的等价示例见 `crates/sdk/src/lib.rs` 的「五分钟速览」doctest 与
+/// `crates/sdk/tests/plugin_macro.rs`（含 `config` / `volatile` / `schema` 全量参数）。
+///
+/// ```text
 /// #[cordis::plugin(version = "1.2.3", inject("greeter@1"), provision("agentLoop@1"), volatile("cache.dir"), config(LoopConfig))]
 /// #[derive(Clone)]
 /// pub struct AgentLoop { /* … */ }
 ///
 /// impl AgentLoop {
-///     async fn apply(&self, ctx: Cordis Ctx, config: Config) -> Result<()> { … }
+///     async fn apply(&self, ctx: Ctx, config: Config) -> Result<()> { … }
 /// }
 /// ```
 ///
@@ -132,7 +148,11 @@ pub fn plugin(args: TokenStream, input: TokenStream) -> TokenStream {
 
 /// 声明一个 **typed 配置**：serde 派生 + `parse` / `to_config`。
 ///
-/// ```ignore
+/// 示例（`text`：proc-macro crate 的文档里没有 `cordis` 这个 extern crate）。
+/// 可编译的等价示例见 `crates/sdk/tests/plugin_macro.rs`
+/// （`LoopConfig::parse` 的成功/失败两条路径）。
+///
+/// ```text
 /// #[cordis::config]
 /// #[derive(Clone, Debug)]
 /// pub struct LoopConfig { pub concurrency: u32, pub prompt: String }

@@ -21,7 +21,7 @@ const IFACE: u64 = 31;
 unsafe extern "C" fn hanging_stream_call(
     handle: u64,
     op: u32,
-    _: Blob,
+    payload: Blob,
     _: Blob,
     out: *mut Out,
 ) -> i32 {
@@ -41,14 +41,27 @@ unsafe extern "C" fn hanging_stream_call(
                 handle,
                 Blob::new(b"s@1"),
                 1,
-                Blob::new(br#"["hang"]"#),
+                Blob::new(br#"["hang","fulfill","close"]"#),
                 IFACE,
                 &mut iface_out,
             );
             (*out).write(b"")
         }
-        // 挂起后既不推块也不收尾：只能由宿主看门狗收回。
-        OP_CALLBACK => STATUS_PENDING,
+        OP_CALLBACK => {
+            let payload: serde_json::Value = serde_json::from_slice(payload.as_bytes()).unwrap();
+            let dispatch = payload["dispatch_id"].as_u64().unwrap();
+            match payload["method"].as_str() {
+                Some("fulfill") => {
+                    host_api().ctx_fulfill.unwrap()(handle, dispatch, Blob::new(b"42"), out);
+                }
+                Some("close") => {
+                    host_api().ctx_stream_push.unwrap()(handle, dispatch, Blob::new(b"42"), 0, out);
+                    host_api().ctx_stream_close.unwrap()(handle, dispatch, out);
+                }
+                _ => {}
+            }
+            STATUS_PENDING
+        }
         OP_DISPOSE => (*out).write(b""),
         _ => STATUS_UNSUPPORTED,
     }
@@ -76,6 +89,16 @@ async fn stream_dispatch_policy_timeout_fails_the_stream_and_removes_the_record(
     assert_eq!(fiber.state(), FiberState::Active);
     let handle = HANDLE.load(Ordering::SeqCst);
     assert_ne!(handle, 0);
+
+    for method in ["fulfill", "close"] {
+        let mut completed = app
+            .root
+            .call_iface_stream("s@1", 1, method, json!([]))
+            .expect("同步收尾后返回 PENDING 必须保留成功流");
+        assert_eq!(completed.next().await.unwrap(), Some(json!(42)));
+        assert_eq!(completed.next().await.unwrap(), None);
+        assert_eq!(dispatches_len(handle), 0);
+    }
 
     let mut stream = app
         .root

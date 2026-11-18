@@ -448,7 +448,9 @@ fn abi_constants(root: &Path) -> Result<(u32, u32), String> {
     Ok((read("ABI_VERSION")?, read("ERROR_FORMAT_V1")?))
 }
 
-fn workspace_version(root: &Path) -> Result<String, String> {
+/// 读 workspace 版本（`[workspace.package] version = "…"` 是根清单里第一条
+/// `version = "`）。`seal` 与 `package-check` 共用，避免两处解析漂移。
+pub(crate) fn workspace_version(root: &Path) -> Result<String, String> {
     let text = fs::read_to_string(root.join("Cargo.toml"))
         .map_err(|err| format!("读取 {} 失败：{err}", root.join("Cargo.toml").display()))?;
     text.lines()

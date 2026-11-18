@@ -82,6 +82,9 @@ pub type CallFn = unsafe extern "C" fn(u64, u32, Blob, Blob, *mut Out) -> i32;
 /// （反之亦然），不存在"旧句柄复活成另一个上下文"的串线面。
 pub const DERIVED_HANDLE_TAG: u64 = 1 << 63;
 
+#[cfg(test)]
+type ObserverGate = Arc<(std::sync::Barrier, std::sync::Barrier)>;
+
 #[derive(Clone)]
 struct Instance {
     ctx: Ctx,
@@ -95,21 +98,39 @@ struct Instance {
     /// 条目即生命周期：摘表 = 挂起续延/waterfall 帧/取消树一起释放
     /// （D3 的四条清理路径都落在这一张表上）。
     dispatches: Arc<Mutex<HashMap<u64, DispatchRecord>>>,
-    /// **库生命周期保活**（弱引用）：只有事件监听器闭包会 `upgrade()` 并持有
+    /// **库生命周期保活**（弱引用）：事件快照和实际调用会 `upgrade()` 并持有
     /// 强引用。`Instance` 的普通克隆（服务句柄、续延等）不应拖住整个动态库——
     /// 否则一次未完成的 `PluginIface` 就会让暂存副本永远删不掉。
+    ///
+    /// **注册期内的强 owner** 是实例表槽位里的那一份（`Slab::slots` 的第三项），
+    /// 随 `unregister_instance` 释放；`Instance` 克隆不延长它。
+    ///
+    /// 但"注册期内 `upgrade()` 必成功、注销后即失效"**只**在没有第三方持有该
+    /// `Arc` 时成立。标准装载路径里 `LoadedPlugin` 自己还拿着一份
+    /// `Arc<DynLib>`（`_library`），它可能比实例活得久：注销之后 `upgrade()`
+    /// 仍可能成功。真正拦住对已注销实例的 FFI 的是 `closed` 与**句柄重查**
+    /// （`with_instance` / `Slab::get` 查不到、或查到的是另一代实例），不是这条
+    /// 弱引用失效——别把它当"注销后必 dead"的保证。
+    /// `#[cfg(test)]` 的 `force_dead_weak` 会**故意**打破"注册期内 upgrade 必成功"，
+    /// 只用于覆盖"dead Weak 时绝不碰裸 `CallFn`"那条纪律。
     keepalive: Option<Weak<dyn Any + Send + Sync>>,
     /// 实例是否已经进入关闭流程（不再接受新的入站回调）。
     closed: Arc<AtomicBool>,
-    /// 关闭与在飞回调的闸门：`call_inbound`/`call_live` 持读锁，
-    /// `apply_via` 的清理持写锁，确保 `OP_DISPOSE` 之后不再进入插件代码。
-    lifecycle: Arc<RwLock<()>>,
-    /// 已被取消、但尚未结束的宿主任务完成信号。
-    ///
-    /// 取消路径（`ctx_abort` / 超时）会先从派发表里摘掉记录；如果就地丢掉
-    /// `done`，随后 `App::close` 就再也找不到这个任务。这里留到实例级，
-    /// 关闭时统一等待；插入时顺手清掉已经完成的接收端。
-    reclaiming: Arc<Mutex<Vec<tokio::sync::oneshot::Receiver<()>>>>,
+    /// 短锁登记调用，不跨 FFI 持锁；关闭与准入共用 dispatches 锁。
+    lifecycle: Arc<Mutex<usize>>,
+    calls_changed: Arc<tokio::sync::Notify>,
+    /// Pending 推送按次数记债，不依赖业务记录是否已经摘除。
+    credits: Arc<Mutex<HashMap<(u64, u64), usize>>>,
+    #[cfg(test)]
+    observer_gate: Arc<Mutex<Option<ObserverGate>>>,
+    #[cfg(test)]
+    outbound_gate: Arc<Mutex<Option<ObserverGate>>>,
+    #[cfg(test)]
+    cancel_gate: Arc<Mutex<Option<ObserverGate>>>,
+    #[cfg(test)]
+    close_drained: Arc<tokio::sync::Notify>,
+    /// 独立于业务记录的任务退出凭证；锁序为 dispatches → tasks。
+    tasks: Arc<Mutex<HashMap<u64, DispatchTask>>>,
     /// 注册时从所属 App 的 per-App 策略（或进程级回落）取下的**快照**。
     ///
     /// 快照而不是每次读注册表：已注册实例的策略不因后来调用
@@ -166,47 +187,83 @@ struct DispatchRecord {
     /// 挂在记录上而不是另立一张表，是为了让"条目即生命周期"这条既有纪律继续成立：
     /// 卸载排水 / 取消 / 超时 / 消费者离场这四条**同一条**摘表路径。
     stream: Option<StreamSink>,
-    /// 宿主为这次派发创建的后台任务（`complete_or_defer` 的异步兜底、纯 emit）。
-    ///
-    /// 关闭流程不能只撤记录、送 abort：任务里的 future 还在跑。`cancel` 丢弃它，
-    /// `done` 让 `apply_via` 的清理真正**等到**它结束再 `OP_DISPOSE`。
-    task: Option<DispatchTask>,
 }
 
-/// 一条宿主后台任务的取消/完成控制。
+/// 业务记录摘除之后，取消与退出凭证仍由实例持有。
 struct DispatchTask {
+    dispatch_id: u64,
     cancel: CancelToken,
     done: tokio::sync::oneshot::Receiver<()>,
 }
 
-/// 成对造出记录侧（`DispatchTask`）与任务侧（cancel + done sender）。
-fn dispatch_task() -> (DispatchTask, CancelToken, tokio::sync::oneshot::Sender<()>) {
+struct TaskExit {
+    registry: Weak<Mutex<HashMap<u64, DispatchTask>>>,
+    id: u64,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for TaskExit {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            let mut tasks = registry.lock().unwrap();
+            // 与 close 取走凭证互斥；close 已摘走时也必须发布退出。
+            if let Some(done) = self.done.take() {
+                let _ = done.send(());
+            }
+            tasks.remove(&self.id);
+        }
+    }
+}
+
+/// 调用者持有 dispatches 锁，且已确认 closed 与业务记录准入。
+fn dispatch_task(instance: &Instance, dispatch_id: u64) -> (CancelToken, TaskExit) {
+    static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
+    let id = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
     let cancel = CancelToken::new();
-    let (done, done_rx) = tokio::sync::oneshot::channel();
-    (
+    let (done, rx) = tokio::sync::oneshot::channel();
+    instance.tasks.lock().unwrap().insert(
+        id,
         DispatchTask {
+            dispatch_id,
             cancel: cancel.clone(),
-            done: done_rx,
+            done: rx,
         },
+    );
+    (
         cancel,
-        done,
+        TaskExit {
+            registry: Arc::downgrade(&instance.tasks),
+            id,
+            done: Some(done),
+        },
     )
 }
 
-/// 把已取消任务的完成信号放进实例级待回收集合。
-///
-/// 调用方必须**仍持有派发表锁**：这样关闭流程要么在表里看到记录，要么在
-/// `reclaiming` 里看到完成信号，不存在“两边都空、任务却还活着”的窗口。
-/// 先清掉已经结束的接收端：`Closed` 表示任务已经 drop 了 sender（完成/取消/
-/// panic），不必再占着槽位。这样集合只保留**仍在运行**的任务。
-fn stash_reclaiming(instance: &Instance, done: Vec<tokio::sync::oneshot::Receiver<()>>) {
-    use tokio::sync::oneshot::error::TryRecvError;
-    let mut pending = instance.reclaiming.lock().unwrap();
-    pending.retain_mut(|rx| match rx.try_recv() {
-        Ok(()) | Err(TryRecvError::Closed) => false,
-        Err(TryRecvError::Empty) => true,
-    });
-    pending.extend(done);
+#[cfg(test)]
+#[allow(clippy::result_large_err)]
+fn register_dispatch_task(
+    instance: &Instance,
+    dispatch_id: u64,
+) -> std::result::Result<(CancelToken, TaskExit), ErrorPayload> {
+    let table = instance.dispatches.lock().unwrap();
+    if instance.closed.load(Ordering::SeqCst) {
+        return Err(closed_admission_payload());
+    }
+    if !table.contains_key(&dispatch_id) {
+        return Err(ErrorPayload::new("派发已结算：不再启动后台任务")
+            .with_code("host_lifecycle")
+            .with_category("lifecycle")
+            .with_certainty("unknown"));
+    }
+    Ok(dispatch_task(instance, dispatch_id))
+}
+
+// 字段析构顺序是协议的一部分：即使首 poll panic 或任务从未被 poll，
+// future 与交付闭包的捕获物也必须先于退出信号释放。
+struct TaskWork<T, C> {
+    future: BoxFuture<T>,
+    on_done: Option<C>,
+    _exit: TaskExit,
 }
 
 /// 句柄表：**槽位号 + 代际号**。
@@ -220,22 +277,30 @@ fn stash_reclaiming(instance: &Instance, done: Vec<tokio::sync::oneshot::Receive
 /// 把代际号编进句柄，陈旧句柄自然失效：`get` 会代际不匹配而拒绝。
 #[derive(Default)]
 struct Slab {
-    slots: Vec<Option<(u32, Instance)>>,
+    /// `(代际号, 实例, 库保活强 owner)`。
+    ///
+    /// 保活强 owner 是**唯一**一份：`Instance::keepalive` 只是它的弱引用。
+    /// 保存在这里（而不是 `Instance` 里）既让 `Instance` 保持廉价 `Clone`，
+    /// 又让库的生命周期正好等于"注册期"——`unregister_instance` 是唯一释放点。
+    slots: Vec<Option<(u32, Instance, Option<KeepaliveOwner>)>>,
     free: Vec<usize>,
     generation: u32,
 }
 
+/// 槽位里的库保活强 owner（真实装载路径下是 `Arc<DynLib>`，Drop 即 `FreeLibrary`）。
+type KeepaliveOwner = Arc<dyn Any + Send + Sync>;
+
 impl Slab {
-    fn insert(&mut self, instance: Instance) -> u64 {
+    fn insert(&mut self, instance: Instance, owner: Option<KeepaliveOwner>) -> u64 {
         self.generation = self.generation.wrapping_add(1).max(1);
         let generation = self.generation;
         let index = match self.free.pop() {
             Some(index) => {
-                self.slots[index] = Some((generation, instance));
+                self.slots[index] = Some((generation, instance, owner));
                 index
             }
             None => {
-                self.slots.push(Some((generation, instance)));
+                self.slots.push(Some((generation, instance, owner)));
                 self.slots.len() - 1
             }
         };
@@ -256,24 +321,41 @@ impl Slab {
             return None;
         }
         let (index, generation) = Self::split(handle);
-        let (slot_generation, instance) = self.slots.get(index)?.as_ref()?;
+        let (slot_generation, instance, _) = self.slots.get(index)?.as_ref()?;
         (*slot_generation == generation).then(|| instance.clone())
     }
 
-    fn remove(&mut self, handle: u64) -> Option<Instance> {
+    /// 取走槽位：`Instance` 与库保活强 owner 一起交给调用方在**锁外**析构。
+    fn remove(&mut self, handle: u64) -> Option<(Instance, Option<KeepaliveOwner>)> {
         if handle & DERIVED_HANDLE_TAG != 0 {
             return None;
         }
         let (index, generation) = Self::split(handle);
-        let (slot_generation, _) = self.slots.get(index)?.as_ref()?;
+        let (slot_generation, _, _) = self.slots.get(index)?.as_ref()?;
         if *slot_generation != generation {
             return None;
         }
-        let taken = self.slots[index].take().map(|(_, instance)| instance);
+        let taken = self.slots[index]
+            .take()
+            .map(|(_, instance, owner)| (instance, owner));
         if taken.is_some() {
             self.free.push(index);
         }
         taken
+    }
+
+    /// 测试探针用：拿到槽位里的实例与强 owner（仅 `#[cfg(test)]` 路径使用）。
+    #[cfg(test)]
+    fn slot_mut(&mut self, handle: u64) -> Option<(&mut Instance, &mut Option<KeepaliveOwner>)> {
+        if handle & DERIVED_HANDLE_TAG != 0 {
+            return None;
+        }
+        let (index, generation) = Self::split(handle);
+        let (slot_generation, instance, owner) = self.slots.get_mut(index)?.as_mut()?;
+        if *slot_generation != generation {
+            return None;
+        }
+        Some((instance, owner))
     }
 
     fn live(&self) -> usize {
@@ -315,7 +397,7 @@ fn register_instance_with_keepalive(
         .slots
         .iter()
         .filter_map(|slot| slot.as_ref())
-        .filter(|(_, instance)| Arc::ptr_eq(&instance.ctx.store, &ctx.store))
+        .filter(|(_, instance, _)| Arc::ptr_eq(&instance.ctx.store, &ctx.store))
         .count();
     if used >= host_limits.max_instances_per_app {
         return Err(format!(
@@ -323,30 +405,99 @@ fn register_instance_with_keepalive(
             host_limits.max_instances_per_app
         ));
     }
-    Ok(slab.insert(Instance {
+    // 强 owner 随注册**移入槽位**，实例里只留弱引用：注册期内 `upgrade()` 必成功，
+    // `unregister_instance` 取走 owner 之后即失效。`apply_via`（keepalive=None）
+    // 语义不变——none 仍然表示"没有库需要保活"。
+    let weak = keepalive.as_ref().map(Arc::downgrade);
+    let instance = Instance {
         ctx,
         call,
         error_format,
         dispatches: Arc::new(Mutex::new(HashMap::new())),
-        keepalive: keepalive.as_ref().map(Arc::downgrade),
+        keepalive: weak,
         closed: Arc::new(AtomicBool::new(false)),
-        lifecycle: Arc::new(RwLock::new(())),
-        reclaiming: Arc::new(Mutex::new(Vec::new())),
+        lifecycle: Arc::new(Mutex::new(0)),
+        calls_changed: Arc::new(tokio::sync::Notify::new()),
+        credits: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(test)]
+        close_drained: Arc::new(tokio::sync::Notify::new()),
+        #[cfg(test)]
+        observer_gate: Arc::new(Mutex::new(None)),
+        #[cfg(test)]
+        outbound_gate: Arc::new(Mutex::new(None)),
+        #[cfg(test)]
+        cancel_gate: Arc::new(Mutex::new(None)),
+        tasks: Arc::new(Mutex::new(HashMap::new())),
         dispatch_policy,
         host_limits,
-    }))
+    };
+    Ok(slab.insert(instance, keepalive))
 }
 
 fn unregister_instance(handle: u64) {
-    instances().lock().unwrap().remove(handle);
+    let removed = instances().lock().unwrap().remove(handle);
     // 排水：`owner == root` 的派生句柄全部撤销。只撤句柄——不给派生句柄发
     // OP_DISPOSE（派生 ctx 没有自己的插件入口），子 fiber 的拆除由父 fiber 的
     // effect 链负责（`Fiber::new` 已把子 dispose 注册成父的 effect，且先于本
     // 函数跑完）。
-    derived_table()
-        .lock()
-        .unwrap()
-        .retain(|_, entry| entry.owner != handle);
+    let entries = {
+        let mut table = derived_table().lock().unwrap();
+        let handles: Vec<_> = table
+            .iter()
+            .filter_map(|(&key, entry)| (entry.owner == handle).then_some(key))
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|key| table.remove(&key))
+            .collect::<Vec<_>>()
+    };
+    // 最后强引用的析构可能重入宿主，两个表锁都必须已释放。
+    drop(entries);
+    // 槽位里取出的两样东西在这里才 drop：`Instance` 的析构可能重入宿主；
+    // 库 owner 的析构就是 `FreeLibrary`（第三方二进制代码），同样不能带表锁跑。
+    if let Some((instance, owner)) = removed {
+        drop(instance);
+        drop(owner);
+    }
+}
+
+/// 测试探针：把实例的库保活强 owner 摘掉，并装进一个**已释放**的 `Weak`。
+///
+/// 前提随所有权模型改变：强 owner 现在住在实例表槽位里，注册期内弱引用不可能
+/// 自然失效。想覆盖"dead Weak 时绝不碰裸 `CallFn`"这条既有纪律，只能显式构造。
+/// 返回那个 dead Weak，供调用方同步到自己手里的 `Instance` 克隆（克隆不共享槽位）。
+///
+/// 摘下来的 owner 在锁外 drop：它就是"库"的析构。
+#[cfg(test)]
+fn force_dead_weak(handle: u64) -> Option<Weak<dyn Any + Send + Sync>> {
+    let dead: Arc<dyn Any + Send + Sync> = Arc::new(());
+    let weak = Arc::downgrade(&dead);
+    drop(dead);
+    let owner = {
+        let mut slab = instances().lock().unwrap();
+        let (instance, owner) = slab.slot_mut(handle)?;
+        instance.keepalive = Some(weak.clone());
+        owner.take()
+    };
+    drop(owner);
+    Some(weak)
+}
+
+/// 测试探针：把槽位里的库保活强 owner **摘走并交给调用方**（实例仍登记，
+/// `Instance::keepalive` 的弱引用仍指向它——这里**不**装 dead weak）。
+///
+/// 用途：让测试重新模拟"强引用只由外部（测试侧）持有"的旧所有权模型。O4 把
+/// owner 移进槽位之后，槽位那份强引用会替测试一直兜住库，于是"call lease /
+/// close lease 是否真的生效"这类断言（`DropProbe` 的 `alive`）变成恒真。
+/// 取出后由测试在指定时刻 drop，`alive` 才重新只由 lease 决定。
+///
+/// 与 [`force_dead_weak`] 同族，区别只在弱引用是否还有效。它同样会（仅在测试中）
+/// 打破"注册期内 `upgrade()` 必成功"的不变量：owner 被摘到测试手里，槽位不再替它兜着。
+#[cfg(test)]
+fn take_slot_owner(handle: u64) -> Option<KeepaliveOwner> {
+    let mut slab = instances().lock().unwrap();
+    let (_, owner) = slab.slot_mut(handle)?;
+    owner.take()
 }
 
 /// 按**上下文身份**找回实例句柄（M4-5 的 volatile 推送要用它）。
@@ -357,7 +508,9 @@ fn unregister_instance(handle: u64) {
 fn instance_handle_of(ctx: &Ctx) -> Option<u64> {
     let slab = instances().lock().unwrap();
     for index in 0..slab.slots.len() {
-        if let Some((generation, instance)) = slab.slots.get(index).and_then(|slot| slot.as_ref()) {
+        if let Some((generation, instance, _)) =
+            slab.slots.get(index).and_then(|slot| slot.as_ref())
+        {
             if Arc::ptr_eq(&instance.ctx, ctx) {
                 return Some(Slab::handle(index, *generation));
             }
@@ -581,12 +734,14 @@ impl StreamObserver for HostStreamObserver {
             deliver_stream_credit_gone(self.handle, self.dispatch_id, on_credit, outcome);
         }
         // ② 流结束 ⇒ 这次派发结束（`remove` 幂等：宿主自己收回的路径早已摘过）。
-        if let Some(instance) = instances().lock().unwrap().get(self.handle) {
-            instance
+        let instance = instances().lock().unwrap().get(self.handle);
+        if let Some(instance) = instance {
+            let removed = instance
                 .dispatches
                 .lock()
                 .unwrap()
                 .remove(&self.dispatch_id);
+            drop(removed);
         }
     }
 }
@@ -604,19 +759,38 @@ fn stream_outcome_message(outcome: &StreamOutcome) -> String {
 ///
 /// 与 `deliver_next` 同一套纪律：把这次派发留在作用域里（插件在回调里再发派发时
 /// 父节点仍是它）；**先取 call、放锁、后调用**（插件会重入宿主：推块、再登记额度）。
-fn deliver_to_plugin(handle: u64, dispatch_id: u64, payload: &str, what: &str) {
+fn deliver_to_plugin(handle: u64, dispatch_id: u64, on_credit: u64, payload: &str, what: &str) {
     let _scope = scope_push(handle, dispatch_id);
-    let call = instances()
-        .lock()
-        .unwrap()
-        .get(handle)
-        .map(|instance| (instance.call, instance.error_format));
-    if let Some((call, error_format)) = call {
-        if let Err(message) =
-            unsafe { call_plugin(call, handle, OP_CALLBACK, payload, error_format) }
-        {
-            eprintln!("[cordis] {what} 投递失败: {message}");
+    let target = instances().lock().unwrap().get(handle);
+    #[cfg(test)]
+    if let Some(instance) = &target {
+        let gate = instance.observer_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.0.wait();
+            gate.1.wait();
         }
+    }
+    let Some(instance) = target else { return };
+    let Some(_active) = admit_call(&instance) else {
+        return;
+    };
+    {
+        let mut credits = instance.credits.lock().unwrap();
+        // 这张票不存在 ⇒ 这条续延已经被结算过（或从来没登记），不再投递。
+        if !release_credit(&mut credits, dispatch_id, on_credit) {
+            return;
+        }
+    }
+    if let Err(message) = unsafe {
+        call_plugin(
+            instance.call,
+            handle,
+            OP_CALLBACK,
+            payload,
+            instance.error_format,
+        )
+    } {
+        eprintln!("[cordis] {what} 投递失败: {message}");
     }
 }
 
@@ -628,7 +802,7 @@ fn deliver_stream_credit(handle: u64, dispatch_id: u64, on_credit: u64, window: 
         "args": [{ "result": { "window": window, "dispatch_id": dispatch_id } }],
     })
     .to_string();
-    deliver_to_plugin(handle, dispatch_id, &payload, "流额度");
+    deliver_to_plugin(handle, dispatch_id, on_credit, &payload, "流额度");
 }
 
 /// "这条流已经不在了"：同一个续延 id，载荷里是 `error`（插件侧会走
@@ -645,17 +819,27 @@ fn deliver_stream_credit_gone(
         "args": [{ "error": stream_outcome_message(outcome) }],
     })
     .to_string();
-    deliver_to_plugin(handle, dispatch_id, &payload, "流驳回");
+    deliver_to_plugin(handle, dispatch_id, on_credit, &payload, "流驳回");
 }
 
 /// 流式 op 的统一外壳：与 [`with_instance`] 同一套纪律（克隆后执行、panic 截在
 /// ABI 边界内），但**状态码由这次调用自己决定**——推块有三态
 /// （`STATUS_OK` / `STATUS_PENDING` / `STATUS_STREAM_GONE`），把它们压成
 /// "成功/失败"会丢掉提供者必须区分的信息。
+///
+/// 错误走**载荷**通道（与 [`with_instance_payload`] 同一条）：宿主在这里写的是
+/// 一个完整的 `ErrorPayload`（`code` / `category` / `certainty` / `detail`），
+/// 而不是一句压平的话。
+///
+/// 但**结构化字段当前并不透出到插件侧**：`ctx.stream_push` 走
+/// `invoke_statused`，它只保留 `ErrorPayload.error` 这段文本（`StreamPush`
+/// 没有错误面）。所以插件今天看到的是文本；要按 `certainty` 决定重试，
+/// 得等 SDK 把它暴露成结果类型里的字段。
+#[allow(clippy::result_large_err)]
 unsafe fn with_stream_instance(
     handle: u64,
     out: *mut Out,
-    f: impl FnOnce(&Instance) -> std::result::Result<i32, String>,
+    f: impl FnOnce(&Instance) -> std::result::Result<i32, ErrorPayload>,
 ) -> i32 {
     let instance = instances().lock().unwrap().get(handle);
     match instance {
@@ -666,13 +850,7 @@ unsafe fn with_stream_instance(
         Some(instance) => {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&instance))) {
                 Ok(Ok(status)) => status,
-                Ok(Err(message)) => fail_to(
-                    out,
-                    instance.error_format,
-                    &message,
-                    "host_call",
-                    "protocol",
-                ),
+                Ok(Err(payload)) => fail_payload(out, instance.error_format, &payload),
                 Err(payload) => fail_to(
                     out,
                     instance.error_format,
@@ -686,6 +864,13 @@ unsafe fn with_stream_instance(
             }
         }
     }
+}
+
+/// 流式 op 的协议错误：与 `fail_to(host_call/protocol)` 同形，只是走载荷通道。
+fn stream_protocol_error(message: String) -> ErrorPayload {
+    ErrorPayload::new(message)
+        .with_code("host_call")
+        .with_category("protocol")
 }
 
 /// 取一条派发记录上的流。三种结局都要能区分：
@@ -703,7 +888,88 @@ fn stream_of(instance: &Instance, dispatch_id: u64) -> Option<Option<StreamSink>
         .map(|record| record.stream.clone())
 }
 
+/// 每条流最多挂多少条**等待窗口的推送**（credit 债）。
+///
+/// 它不是窗口大小（`STREAM_WINDOW` 是 core 的缓冲块数），也不是派发/流的数量
+/// （那些在 `HostLimits` 里）。它挡的是"窗口满之后不断换 `on_credit` id 重推"：
+/// 每推一次，core 的 `waiting` 队列、宿主的 `credits` 表与 SDK 的 continuation
+/// 表各长一条，三处都按**推送次数**增长，`maxDispatchesPerInstance` /
+/// `maxStreamsPerInstance` 一个都盖不住。
+///
+/// 64 的取法：正常背压只需要"每个窗口位置一个等待者"（窗口默认 4），64 留了一个
+/// 数量级余量；再多就只可能是坏插件在循环。私有常量而不是 `HostLimits` 字段：
+/// 这是宿主对**自己内存**的硬边界，不该变成可配置项，也不该改公开结构形状。
+///
+/// 为什么 64 是**结构性**上界而不只是"经验值"：真正保证它的是**检查与记账同在一个
+/// `credits` 临界区**——`reserve_credit` 一次持锁做"看余额 + 记账"，两者之间没有
+/// 别的推送插进来的窗口。`dispatches` 锁只让**同一实例的推送串行**，因此并发维度
+/// 没有额外风险；上界本身不来自那把锁。也正因为如此，这里不写"多 producer 并发"
+/// 用例：那样的用例只能证明锁存在，测不到上限（上限是临界区决定的，不是并发压出来的）。
+///
+/// 正常路径不漏票：`reserve_credit` 之后紧跟 `push_awaiting`，`Sent` 与 `Gone` 都
+/// 当场回滚，只有 `Pending` 兑现。一旦 `push_awaiting` **内部** panic（记账之后唯一
+/// 可能 panic 的位置），`credits` 与 `dispatches` 两把 std `Mutex` 都在作用域内，
+/// 于是**两把锁都会中毒**：本实例此后的推送与卸载都会在 `.lock().unwrap()` 上 panic。
+/// 这是既有的 fail-loud 形态（不承诺恢复），不是"随那次卸载一起消失"的可恢复泄漏。
+const MAX_OUTSTANDING_CREDITS_PER_STREAM: usize = 64;
+
+/// 一条流当前记了几张 credit 票（**按次数**求和：重复 id 不去重）。
+fn outstanding_credits(credits: &HashMap<(u64, u64), usize>, dispatch_id: u64) -> usize {
+    credits
+        .iter()
+        .filter(|((dispatch, _), _)| *dispatch == dispatch_id)
+        .map(|(_, count)| *count)
+        .sum()
+}
+
+/// 给这次挂起**预留**一张票：上限检查与记账在同一把 `credits` 锁里完成，
+/// 因此"检查通过"与"记债"之间不存在第二个推送插进来的窗口（无 TOCTOU）。
+///
+/// 调用方必须先预留、再 `push_awaiting`：`Sent` 与 `Gone` 都回滚，只有 `Pending`
+/// 兑现。拒绝时**不记账**，返回与容量准入同形的载荷（同 code / category /
+/// certainty / detail），文案则说清被拒的是**这一块**而不是一次派发。
+#[allow(clippy::result_large_err)]
+fn reserve_credit(
+    credits: &mut HashMap<(u64, u64), usize>,
+    dispatch_id: u64,
+    on_credit: u64,
+) -> std::result::Result<(), ErrorPayload> {
+    let outstanding = outstanding_credits(credits, dispatch_id);
+    if outstanding >= MAX_OUTSTANDING_CREDITS_PER_STREAM {
+        // 文案只针对**这一块**：派发本身没有问题，插件代码也正在执行。
+        return Err(capacity_payload_with(
+            format!(
+                "宿主容量上限：超出每流挂起推送上限 maxOutstandingCreditsPerStream 已用 \
+                 {outstanding}/{MAX_OUTSTANDING_CREDITS_PER_STREAM}，这块未被接受"
+            ),
+            "maxOutstandingCreditsPerStream",
+            outstanding,
+            MAX_OUTSTANDING_CREDITS_PER_STREAM,
+        ));
+    }
+    *credits.entry((dispatch_id, on_credit)).or_default() += 1;
+    Ok(())
+}
+
+/// 还一张票。返回 `false` = 这张票根本不存在（调用方据此决定"还要不要投递"）。
+fn release_credit(
+    credits: &mut HashMap<(u64, u64), usize>,
+    dispatch_id: u64,
+    on_credit: u64,
+) -> bool {
+    let key = (dispatch_id, on_credit);
+    let Some(count) = credits.get_mut(&key) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        credits.remove(&key);
+    }
+    true
+}
+
 /// #20（ADR 0001 §5）：往这次派发对应的流里推一块。
+#[allow(clippy::result_large_err)]
 unsafe extern "C" fn host_stream_push(
     handle: u64,
     dispatch_id: u64,
@@ -716,29 +982,47 @@ unsafe extern "C" fn host_stream_push(
         Err(err) => return fail(out, &format!("流数据块不是合法 JSON: {err}")),
     };
     with_stream_instance(handle, out, move |instance| {
-        match stream_of(instance, dispatch_id) {
+        let table = instance.dispatches.lock().unwrap();
+        if instance.closed.load(Ordering::SeqCst) {
+            return Ok(STATUS_STREAM_GONE);
+        }
+        match table.get(&dispatch_id).map(|record| record.stream.as_ref()) {
             None => Ok(STATUS_STREAM_GONE),
-            Some(None) => Err(format!(
+            Some(None) => Err(stream_protocol_error(format!(
                 "dispatch {dispatch_id} 不是流：这次调用走的是值路径（ctx_call_iface）。\
              要按流调用请用 ctx.call_iface_stream"
-            )),
-            Some(Some(sink)) => Ok(match sink.push_awaiting(value, on_credit) {
-                PushOutcome::Sent => STATUS_OK,
-                PushOutcome::Pending => STATUS_PENDING,
-                PushOutcome::Gone => STATUS_STREAM_GONE,
-            }),
+            ))),
+            Some(Some(sink)) => {
+                // push_awaiting 不调用 observer；finish/credit 会先放 core 锁。
+                // 先预留一张票再推：`Sent`（块直接被接受）与 `Gone`（流已不在）
+                // 都回滚，只有 `Pending`（真的挂起了）兑现——拒绝路径绝不会 +1。
+                let mut credits = instance.credits.lock().unwrap();
+                reserve_credit(&mut credits, dispatch_id, on_credit)?;
+                Ok(match sink.push_awaiting(value, on_credit) {
+                    PushOutcome::Pending => STATUS_PENDING,
+                    PushOutcome::Sent => {
+                        release_credit(&mut credits, dispatch_id, on_credit);
+                        STATUS_OK
+                    }
+                    PushOutcome::Gone => {
+                        release_credit(&mut credits, dispatch_id, on_credit);
+                        STATUS_STREAM_GONE
+                    }
+                })
+            }
         }
     })
 }
 
 /// #21（ADR 0001 §5）：正常收尾——消费者读完已缓冲的块之后拿到 `Ok(None)`。
+#[allow(clippy::result_large_err)]
 unsafe extern "C" fn host_stream_close(handle: u64, dispatch_id: u64, out: *mut Out) -> i32 {
     with_stream_instance(handle, out, move |instance| {
         match stream_of(instance, dispatch_id) {
             None => Ok(STATUS_STREAM_GONE),
-            Some(None) => Err(format!(
+            Some(None) => Err(stream_protocol_error(format!(
                 "dispatch {dispatch_id} 不是流：收尾只对 ctx.call_iface_stream 开的流有意义"
-            )),
+            ))),
             Some(Some(sink)) => Ok(match sink.close() {
                 PushOutcome::Sent => STATUS_OK,
                 _ => STATUS_STREAM_GONE,
@@ -748,6 +1032,7 @@ unsafe extern "C" fn host_stream_close(handle: u64, dispatch_id: u64, out: *mut 
 }
 
 /// #22（ADR 0001 §5）：失败收尾——`reason` 直达消费者（缓冲丢弃）。
+#[allow(clippy::result_large_err)]
 unsafe extern "C" fn host_stream_fail(
     handle: u64,
     dispatch_id: u64,
@@ -758,9 +1043,9 @@ unsafe extern "C" fn host_stream_fail(
     with_stream_instance(handle, out, move |instance| {
         match stream_of(instance, dispatch_id) {
             None => Ok(STATUS_STREAM_GONE),
-            Some(None) => Err(format!(
+            Some(None) => Err(stream_protocol_error(format!(
                 "dispatch {dispatch_id} 不是流：失败收尾只对 ctx.call_iface_stream 开的流有意义"
-            )),
+            ))),
             Some(Some(sink)) => Ok(match sink.fail(reason) {
                 PushOutcome::Sent => STATUS_OK,
                 _ => STATUS_STREAM_GONE,
@@ -782,13 +1067,24 @@ fn revoke_dispatch(instance: &Instance, dispatch_id: u64, payload: &ErrorPayload
 /// 摘除 `root` 及其全部后代，并按统一的收尾顺序结算：
 /// 流以失败结束、挂起续延收到错误、出站续延收到 abort。
 ///
-/// 返回 `None` 表示 `root` 不在表里（已经被取消/结算）。
+/// 返回 `None` 表示 `root` 已终态，或关闭已认领余下记录。
 fn drain_dispatch_tree(instance: &Instance, root: u64, payload: &ErrorPayload) -> Option<usize> {
-    let victims = {
-        let table = instance.dispatches.lock().unwrap();
-        if !table.contains_key(&root) {
+    let _active;
+    let mut removed = Vec::new();
+    {
+        let mut table = instance.dispatches.lock().unwrap();
+        if instance.closed.load(Ordering::SeqCst) || !table.contains_key(&root) {
             return None;
         }
+        // Host 撤销与 FFI 准入分离：dead Weak 仍须排水并让 close 等待，
+        // 但 Err 明确禁止调用裸函数指针（不同于 fake target 的 Ok(None)）。
+        let lease = call_lease(instance);
+        *instance.lifecycle.lock().unwrap() += 1;
+        _active = ActiveCall {
+            active: instance.lifecycle.clone(),
+            changed: instance.calls_changed.clone(),
+            lease,
+        };
         let mut victims = vec![root];
         let mut index = 0;
         while index < victims.len() {
@@ -800,26 +1096,37 @@ fn drain_dispatch_tree(instance: &Instance, root: u64, payload: &ErrorPayload) -
             }
             index += 1;
         }
-        victims
-    };
-    let mut removed = Vec::new();
-    {
-        let mut table = instance.dispatches.lock().unwrap();
-        let mut done = Vec::new();
+        let cancellations: Vec<_> = instance
+            .tasks
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|task| victims.contains(&task.dispatch_id))
+            .map(|task| task.cancel.clone())
+            .collect();
+        if _active.lease.is_err() {
+            instance
+                .credits
+                .lock()
+                .unwrap()
+                .retain(|(dispatch_id, _), _| !victims.contains(dispatch_id));
+        }
         for id in victims {
-            if let Some(mut record) = table.remove(&id) {
-                if let Some(task) = record.task.take() {
-                    task.cancel.cancel();
-                    done.push(task.done);
-                }
+            if let Some(record) = table.remove(&id) {
                 removed.push(record);
             }
         }
-        // **在释放派发表锁之前**完成回收登记：并发关闭要么在表里看到记录，
-        // 要么在 reclaiming 里看到完成信号；不会出现两边都空、任务却仍活着
-        // 的窗口。插件回调（下面的 sink/abort 交付）仍在锁外执行。
-        if !done.is_empty() {
-            stash_reclaiming(instance, done);
+        drop(table);
+        for cancel in cancellations {
+            cancel.cancel();
+        }
+    }
+    #[cfg(test)]
+    {
+        let gate = instance.cancel_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.0.wait();
+            gate.1.wait();
         }
     }
     let count = removed.len();
@@ -830,8 +1137,10 @@ fn drain_dispatch_tree(instance: &Instance, root: u64, payload: &ErrorPayload) -
         if let Some(tx) = record.sink.take() {
             let _ = tx.send(Err(payload.clone()));
         }
-        if let Some(outbound) = record.outbound {
-            deliver_abort(outbound, payload);
+        if _active.lease.is_ok() {
+            if let Some(outbound) = record.outbound {
+                deliver_abort_direct(instance, outbound, payload);
+            }
         }
         // `record.frame` 随记录一起被丢：剩余链的 future 在这里释放。
     }
@@ -1110,18 +1419,40 @@ fn host_limits_for_ctx(ctx: &Ctx) -> HostLimits {
         .unwrap_or_else(default_host_limits)
 }
 
-/// 一条容量拒绝的结构化载荷：`host_capacity` / `capacity` / `not_executed`。
-fn capacity_payload(scope: &str, used: usize, limit: usize) -> ErrorPayload {
-    ErrorPayload::new(format!(
-        "宿主容量上限：{scope} 已用 {used}/{limit}，拒绝这次派发（插件代码未执行）"
-    ))
-    .with_code("host_capacity")
-    .with_category("capacity")
-    .with_certainty("not_executed")
-    .with_detail(json!({ "scope": scope, "used": used, "limit": limit }))
+/// 一条容量拒绝的结构化骨架：`host_capacity` / `capacity` / `not_executed`。
+///
+/// 文案由调用方给：派发准入拒的是**一次派发**，每流推送上限拒的是**一块数据**。
+/// 复用同一句话会让插件读到"拒绝这次派发（插件代码未执行）"——对推送它不成立。
+///
+/// `not_executed` 的读法随 `scope` 走：派发准入是"插件代码不会执行"，而 credit 拒绝
+/// （[`reserve_credit`]）是"**这块数据未入队**"——插件代码当前正在执行。别把它读成
+/// "插件未执行"。
+fn capacity_payload_with(message: String, scope: &str, used: usize, limit: usize) -> ErrorPayload {
+    ErrorPayload::new(message)
+        .with_code("host_capacity")
+        .with_category("capacity")
+        .with_certainty("not_executed")
+        .with_detail(json!({ "scope": scope, "used": used, "limit": limit }))
 }
 
-/// 派发记录的唯一插入口（P0-3）：容量检查与插入在同一把表锁内完成。
+/// 派发准入的容量拒绝（`maxDispatchesPerInstance` 等）。
+fn capacity_payload(scope: &str, used: usize, limit: usize) -> ErrorPayload {
+    capacity_payload_with(
+        format!("宿主容量上限：{scope} 已用 {used}/{limit}，拒绝这次派发（插件代码未执行）"),
+        scope,
+        used,
+        limit,
+    )
+}
+
+fn closed_admission_payload() -> ErrorPayload {
+    ErrorPayload::new("插件正在卸载：不再接受新工作")
+        .with_code("host_lifecycle")
+        .with_category("lifecycle")
+        .with_certainty("not_executed")
+}
+
+/// 派发记录的唯一插入口：关闭、容量检查与插入在同一把表锁内完成。
 ///
 /// 拒绝时返回可读的结构化载荷，**不插入**任何记录；调用方必须在这之后直接
 /// 返回错误，绝不能继续调用插件代码。
@@ -1131,8 +1462,32 @@ fn insert_dispatch(
     dispatch_id: u64,
     record: DispatchRecord,
 ) -> std::result::Result<(), (ErrorPayload, DispatchRecord)> {
-    let limits = instance.host_limits;
     let mut table = instance.dispatches.lock().unwrap();
+    insert_dispatch_locked(instance, &mut table, dispatch_id, record)
+}
+
+#[allow(clippy::result_large_err)]
+fn insert_dispatch_task(
+    instance: &Instance,
+    dispatch_id: u64,
+    record: DispatchRecord,
+) -> std::result::Result<(CancelToken, TaskExit), (ErrorPayload, DispatchRecord)> {
+    let mut table = instance.dispatches.lock().unwrap();
+    insert_dispatch_locked(instance, &mut table, dispatch_id, record)?;
+    Ok(dispatch_task(instance, dispatch_id))
+}
+
+#[allow(clippy::result_large_err)]
+fn insert_dispatch_locked(
+    instance: &Instance,
+    table: &mut HashMap<u64, DispatchRecord>,
+    dispatch_id: u64,
+    record: DispatchRecord,
+) -> std::result::Result<(), (ErrorPayload, DispatchRecord)> {
+    let limits = instance.host_limits;
+    if instance.closed.load(Ordering::SeqCst) {
+        return Err((closed_admission_payload(), record));
+    }
     if table.len() >= limits.max_dispatches_per_instance {
         return Err((
             capacity_payload(
@@ -1179,31 +1534,50 @@ fn insert_dispatch(
     Ok(())
 }
 
-/// 等所有同步插件回调退出，拿到 lifecycle 写锁后立即释放。
-///
-/// 有 tokio runtime 时用 blocking pool，避免把 async worker 一起阻塞；没有
-/// runtime 时退回同步等待（调用方不在 tokio 上，不会饿死 worker）。blocking
-/// 任务被取消或 panic 时同样退回同步等待，**绝不跳过闸门继续卸载**。
-async fn wait_lifecycle_exclusive(instance: &Instance) {
-    let lifecycle = instance.lifecycle.clone();
-    if tokio::runtime::Handle::try_current().is_err() {
-        let _wait = lifecycle
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        return;
+struct ActiveCall {
+    active: Arc<Mutex<usize>>,
+    changed: Arc<tokio::sync::Notify>,
+    // Err = host-only cleanup, never FFI; Ok(None) = explicit fake target.
+    lease: std::result::Result<Option<Arc<dyn Any + Send + Sync>>, ()>,
+}
+
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        // 最后强引用在锁外释放，退出通知必须晚于调用保护期。
+        drop(std::mem::replace(&mut self.lease, Err(())));
+        *self.active.lock().unwrap() -= 1;
+        self.changed.notify_one();
     }
-    let blocking = lifecycle.clone();
-    if tokio::task::spawn_blocking(move || {
-        let _wait = blocking
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+}
+
+fn call_lease(instance: &Instance) -> std::result::Result<Option<Arc<dyn Any + Send + Sync>>, ()> {
+    match &instance.keepalive {
+        None => Ok(None),
+        Some(owner) => owner.upgrade().map(Some).ok_or(()),
+    }
+}
+
+fn admit_call(instance: &Instance) -> Option<ActiveCall> {
+    let _table = instance.dispatches.lock().unwrap();
+    if instance.closed.load(Ordering::SeqCst) {
+        return None;
+    }
+    let lease = call_lease(instance).ok()?;
+    *instance.lifecycle.lock().unwrap() += 1;
+    Some(ActiveCall {
+        active: instance.lifecycle.clone(),
+        changed: instance.calls_changed.clone(),
+        lease: Ok(lease),
     })
-    .await
-    .is_err()
-    {
-        let _wait = lifecycle
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+}
+
+async fn wait_lifecycle_exclusive(instance: &Instance) {
+    loop {
+        let changed = instance.calls_changed.notified();
+        if *instance.lifecycle.lock().unwrap() == 0 {
+            return;
+        }
+        changed.await;
     }
 }
 
@@ -1433,18 +1807,14 @@ unsafe fn call_inbound(
     frame: Option<Next>,
     stream: Option<StreamSink>,
 ) -> std::result::Result<Inbound, CallFailure> {
-    // 快照/延迟回调可能在实例注销后才到达：先确认实例仍在表里，并持有
-    // 生命周期读锁。`keepalive` 保证库不会被卸载，`closed` 保证 OP_DISPOSE
-    // 之后不再进入插件代码。
-    let _lifecycle = instance.lifecycle.read().unwrap();
-    if instance.closed.load(Ordering::SeqCst) {
-        return Err(CallFailure::new(
-            format!("ctx 句柄 {handle} 已失效（插件正在卸载）"),
+    let _lifecycle = admit_call(instance).ok_or_else(|| {
+        CallFailure::new(
+            format!("ctx 句柄 {handle} 已失效（插件正在卸载或库已释放）"),
             "host_lifecycle",
             "lifecycle",
             "unknown",
-        ));
-    }
+        )
+    })?;
     {
         let live = instances().lock().unwrap().get(handle);
         if !live
@@ -1483,7 +1853,6 @@ unsafe fn call_inbound(
             parent,
             outbound: None,
             stream,
-            task: None,
         },
     ) {
         return Err(CallFailure::from_payload(payload).with_frame(rejected.frame));
@@ -1496,7 +1865,8 @@ unsafe fn call_inbound(
     };
     match status {
         STATUS_OK => {
-            instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            drop(removed);
             if text.is_empty() {
                 return Ok(Inbound::Ready(Value::Null));
             }
@@ -1523,14 +1893,16 @@ unsafe fn call_inbound(
             },
         }))),
         STATUS_ERR => {
-            instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            drop(removed);
             Err(CallFailure::from_payload(decode_plugin_error(
                 instance.error_format,
                 &text,
             )))
         }
         STATUS_UNSUPPORTED => {
-            instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            drop(removed);
             Err(CallFailure::new(
                 format!("插件不支持 op {op}（它可能是为更老的宿主编译的）"),
                 "plugin_unsupported",
@@ -1539,7 +1911,8 @@ unsafe fn call_inbound(
             ))
         }
         other => {
-            instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            drop(removed);
             Err(CallFailure::new(
                 if text.is_empty() {
                     format!("插件回调返回了意料之外的状态码 {other}")
@@ -1630,42 +2003,201 @@ fn with_next_timeout(
     })
 }
 
+/// 一次 poll 边界 panic 的归档坐标：日志、测试登记与错误消息共用同一套口径。
+#[derive(Clone, Copy)]
+struct PanicScope {
+    /// 场景名（`iface` / `dispatch` / `next` / `emit` / `on_done`）。
+    scene: &'static str,
+    handle: u64,
+    dispatch_id: u64,
+}
+
+/// [`complete_or_defer`] 的失败形态：调用点**必须**能区分这两件事。
+enum DeferFailure {
+    /// 操作尚未就绪，但当前线程没有 tokio 运行时：结果无法交付。
+    NoRuntime(String),
+    /// **首 poll 就 panic**：调用方同步返回这条错误，绝不调用 `on_done`。
+    Panic(ErrorPayload),
+}
+
+/// 一次 poll 边界 panic 的结构化载荷：`host_panic`，分类/认知/重试保持默认 `unknown`。
+///
+/// 绝不写 `not_executed`：宿主**无法**证明插件的副作用没有发生——那条字段是
+/// 调用方据此决定"能不能重试"的事实，猜错了就是重复副作用。
+fn panic_payload(scene: &str, payload: &(dyn Any + Send)) -> ErrorPayload {
+    ErrorPayload::new(format!(
+        "宿主在驱动异步操作时 panic（{scene}，已在 poll 边界截获）：{}",
+        cordis_core::panic_message(payload)
+    ))
+    .with_code("host_panic")
+}
+
+/// 一条宿主 poll 边界 panic 的诊断记录（仅测试构建；按 handle/dispatch 过滤，
+/// 避免并行测试互相串扰）。
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct PanicNote {
+    pub(crate) scene: &'static str,
+    pub(crate) handle: u64,
+    pub(crate) dispatch_id: u64,
+    pub(crate) message: String,
+}
+
+#[cfg(test)]
+pub(crate) fn panic_notes() -> &'static Mutex<Vec<PanicNote>> {
+    static NOTES: OnceLock<Mutex<Vec<PanicNote>>> = OnceLock::new();
+    NOTES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 记录一次**宿主自己**在 poll 边界截获的 panic。
+///
+/// 范围只有"宿主进程内、future 被 poll 时的 Rust unwind"（`panic=unwind`）：
+/// `extern "C"` 边界、OOM/abort、`panic=abort`、panic-in-Drop 都不在这里的承诺里。
+/// 生产构建只打印既有风格的诊断；测试构建另外登记一条供断言。
+fn record_async_panic(
+    scene: &'static str,
+    handle: u64,
+    dispatch_id: u64,
+    payload: &(dyn Any + Send),
+) {
+    let message = cordis_core::panic_message(payload);
+    eprintln!(
+        "[cordis] 宿主 poll 边界截获 panic（{scene}；handle {handle}；dispatch {dispatch_id}）：{message}"
+    );
+    #[cfg(test)]
+    panic_notes().lock().unwrap().push(PanicNote {
+        scene,
+        handle,
+        dispatch_id,
+        message,
+    });
+}
+
+/// 借用式适配器：只把 `poll` 的 unwind 收敛成 `Err`，**不动** future 的所有权。
+///
+/// 为什么不换掉 `TaskWork.future` 的类型：`future → on_done → _exit` 的字段析构序
+/// 是 O1 的协议（首 poll panic 时捕获物也必须先于退出信号释放）。把 `&mut` 借出来
+/// 包一层，析构序原样保留。
+struct CatchUnwind<'a, T> {
+    future: &'a mut BoxFuture<T>,
+}
+
+impl<'a, T> CatchUnwind<'a, T> {
+    fn new(future: &'a mut BoxFuture<T>) -> Self {
+        Self { future }
+    }
+
+    fn get_mut(&mut self) -> &mut BoxFuture<T> {
+        self.future
+    }
+}
+
+impl<T> std::future::Future for CatchUnwind<'_, T> {
+    type Output = std::result::Result<T, Box<dyn Any + Send>>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        // 适配器本身 Unpin：先解开 Pin，再借出内层 future 的 `&mut`。
+        let this = std::pin::Pin::get_mut(self);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::future::Future::poll(this.get_mut().as_mut(), cx)
+        }));
+        match caught {
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    }
+}
+
 /// 先同步试跑一次；不就绪就交给运行时，完成时调 `on_done`。
 ///
 /// 用 `Waker::noop()` 轮询是安全的：若返回 `Pending`，我们把**同一个** future
 /// 交给真实任务继续跑（届时会重新注册真实 waker），所以不会丢唤醒。
 /// 若返回 `Ready`，调用方拿到值，插件侧就是普通的一次函数调用——
 /// 这就是"同步 ABI 不为异步内核付出代价"的来源。
+///
+/// # panic 结算（O3）
+/// - **首 poll** 就 panic：返回 [`DeferFailure::Panic`]，`on_done` / `on_panic`
+///   一律不调用（调用方同步返回错误，记录由调用点摘）；
+/// - **后台 poll** 才 panic：与正常完成走**同一条**交付路径，调 `on_panic(payload)`——
+///   插件在等的是一条回调，而不是"永远没有下文"。
+#[allow(clippy::result_large_err)]
 fn complete_or_defer<T: Send + 'static>(
     future: BoxFuture<T>,
     on_done: impl FnOnce(T) + Send + 'static,
-    task: (CancelToken, tokio::sync::oneshot::Sender<()>),
-) -> std::result::Result<Option<T>, String> {
-    let mut future = future;
+    on_panic: impl FnOnce(ErrorPayload) + Send + 'static,
+    task: (CancelToken, TaskExit),
+    scope: PanicScope,
+) -> std::result::Result<Option<T>, DeferFailure> {
+    let (cancel, exit) = task;
+    let mut work = TaskWork {
+        future,
+        on_done: Some(on_done),
+        _exit: exit,
+    };
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
-    match future.as_mut().poll(&mut cx) {
-        Poll::Ready(value) => Ok(Some(value)),
+    let polled = {
+        let mut caught = CatchUnwind::new(&mut work.future);
+        std::future::Future::poll(std::pin::Pin::new(&mut caught), &mut cx)
+    };
+    match polled {
+        Poll::Ready(Ok(value)) => Ok(Some(value)),
+        Poll::Ready(Err(payload)) => {
+            record_async_panic(scope.scene, scope.handle, scope.dispatch_id, &*payload);
+            // `work` 在这里析构：future → on_done → 退出信号（O1 的析构序）。
+            Err(DeferFailure::Panic(panic_payload(scope.scene, &*payload)))
+        }
         Poll::Pending => {
             // 没有运行时说明调用发生在同步上下文里：既不能阻塞（会死锁），
             // 也无法驱动未来。必须把错误交还调用方，不能假装"稍后会有回调"。
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
-                    let (cancel, done) = task;
                     handle.spawn(async move {
-                        // sender 随任务结束（完成 / 取消 / panic / 运行时关闭）一起
-                        // drop；记录侧的 receiver 因此能作为"任务真的结束了"的信号。
-                        let _done = done;
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => {}
-                            value = future => on_done(value),
+                        let settled = {
+                            let mut caught = CatchUnwind::new(&mut work.future);
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => None,
+                                value = &mut caught => Some(value),
+                            }
+                        };
+                        match settled {
+                            // 取消：交付属于取消/排水路径（"恰好一次"的既有纪律）。
+                            None => {}
+                            Some(Ok(value)) => {
+                                if let Some(on_done) = work.on_done.take() {
+                                    // `on_done` 跑在宿主派生的任务里：它自己的 panic 也要
+                                    // 截获，否则就是一条无人观察的 panic（插件既等不到
+                                    // 回调，也得不到任何诊断）。
+                                    if let Err(payload) = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(move || on_done(value)),
+                                    ) {
+                                        record_async_panic(
+                                            "on_done",
+                                            scope.handle,
+                                            scope.dispatch_id,
+                                            &*payload,
+                                        );
+                                    }
+                                }
+                            }
+                            Some(Err(payload)) => {
+                                record_async_panic(
+                                    scope.scene,
+                                    scope.handle,
+                                    scope.dispatch_id,
+                                    &*payload,
+                                );
+                                on_panic(panic_payload(scope.scene, &*payload));
+                            }
                         }
+                        drop(work);
                     });
                     Ok(None)
                 }
-                Err(_) => Err("操作尚未就绪，但当前没有异步运行时；结果无法交付（请在有 tokio runtime 的线程调用）"
-                    .to_string()),
+                Err(_) => Err(DeferFailure::NoRuntime("操作尚未就绪，但当前没有异步运行时；结果无法交付（请在有 tokio runtime 的线程调用）"
+                    .to_string())),
             }
         }
     }
@@ -1737,6 +2269,8 @@ unsafe fn fail_to(
 ///
 /// 容量拒绝（`host_capacity`）必须让插件看到 `certainty = not_executed`：
 /// “插件代码没有执行”是调用方可以据此决定是否重试的事实，不能被压成 unknown。
+/// 对 credit 拒绝（[`reserve_credit`]）而言，`not_executed` 指的是**这块数据未入队**
+/// ——插件代码当前正在执行；它不表示"插件未执行"。
 unsafe fn fail_payload(out: *mut Out, error_format: u32, payload: &ErrorPayload) -> i32 {
     if error_format >= cordis_abi::ERROR_FORMAT_V1 {
         let text = payload.to_json();
@@ -1967,7 +2501,15 @@ unsafe fn invoke_raw(call: CallFn, handle: u64, op: u32, payload: &str) -> (i32,
 }
 
 /// 只读/幂等 op 的原始调用：允许 `STATUS_TOO_SMALL` 扩容重试。
+///
+/// **只给 `OP_VOLATILE_PATHS` 用**：它的输出是插件自述的元数据，不是业务载荷。
+/// 将来若要给别的只读 op 也开这条路，先确认它同样不受"业务值可以任意大"的约束。
 unsafe fn invoke_raw_read(call: CallFn, handle: u64, op: u32, payload: &str) -> (i32, String) {
+    debug_assert_eq!(
+        op,
+        cordis_abi::OP_VOLATILE_PATHS,
+        "只读扩容重试只服务于插件自述元数据；业务只读 op 不得静默继承这条路径"
+    );
     invoke_raw_with(call, handle, op, payload, true)
 }
 
@@ -1993,12 +2535,18 @@ impl CallBuffer {
         Self(buffer)
     }
 
-    fn with_capacity(cap: usize) -> Self {
+    fn try_with_capacity(cap: usize) -> std::result::Result<Self, String> {
         if cap == 16 * 1024 {
-            Self::take()
-        } else {
-            Self(vec![0u8; cap])
+            return Ok(Self::take());
         }
+        // 长度来自插件回填的 `usize`：分配必须**可失败**，不能靠 `vec![0u8; n]`
+        // 在 OOM 时 abort。
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes
+            .try_reserve_exact(cap)
+            .map_err(|_| format!("宿主无法为 {cap} 字节的插件输出分配缓冲（分配器拒绝）"))?;
+        bytes.resize(cap, 0);
+        Ok(Self(bytes))
     }
 
     fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -2025,6 +2573,32 @@ impl Drop for CallBuffer {
             CALL_BUFFER_POOL.with(|pool| pool.borrow_mut().push(buffer));
         }
     }
+}
+
+/// 只读 op 扩容重试的输出上限（1 MiB）。
+///
+/// 与 `cordis_abi::MAX_CONFIG_SCHEMA_BYTES` 同口径：只读 op（`OP_VOLATILE_PATHS`
+/// 之类）的输出是**声明**，不是业务载荷——声明大到 1 MiB 以上已经不是声明，
+/// 而是坏插件把宿主回填的 `usize` 当分配指令。上限之外的申报一律拒绝，
+/// 且拒绝发生在分配之前。
+const MAX_READ_RETRY_BYTES: usize = 1024 * 1024;
+
+/// 只读扩容重试要分配的缓冲大小：先拒越界与超限，再给出长度。
+///
+/// `needed` 来自插件回填的 `out.len`，**不可信**：`vec![0u8; n]` 在
+/// `n > isize::MAX` 时 panic，真实 OOM 时 abort——两种都不该由插件的一行数字触发。
+fn read_retry_cap(needed: usize) -> std::result::Result<usize, String> {
+    if needed > isize::MAX as usize {
+        return Err(format!(
+            "插件声明输出需要 {needed} 字节，超过地址空间上限（isize::MAX）；拒绝分配"
+        ));
+    }
+    if needed > MAX_READ_RETRY_BYTES {
+        return Err(format!(
+            "插件声明输出需要 {needed} 字节，超过宿主只读扩容上限 {MAX_READ_RETRY_BYTES} 字节；拒绝分配"
+        ));
+    }
+    Ok(needed.max(16 * 1024))
 }
 
 unsafe fn invoke_raw_with(
@@ -2057,7 +2631,13 @@ unsafe fn invoke_raw_with(
                 ),
             );
         }
-        buffer = CallBuffer::with_capacity(out.len.max(16 * 1024));
+        buffer = match read_retry_cap(out.len) {
+            Ok(cap) => match CallBuffer::try_with_capacity(cap) {
+                Ok(buffer) => buffer,
+                Err(message) => return (STATUS_TOO_SMALL, message),
+            },
+            Err(message) => return (STATUS_TOO_SMALL, message),
+        };
         out = Out {
             ptr: buffer.as_mut_ptr(),
             cap: buffer.len(),
@@ -2070,6 +2650,18 @@ unsafe fn invoke_raw_with(
             Blob::EMPTY,
             &mut out,
         );
+        if retried == STATUS_TOO_SMALL {
+            // 第二次仍然不够：插件这一轮往往一个字节都没写，缓冲则是刚清零的；
+            // 按 `out.len` 读出来就是一串 NUL。给一条说清"扩过容了"的诊断。
+            return (
+                retried,
+                format!(
+                    "插件回调在扩容到 {} 字节后仍然报输出不足（声称需要 {} 字节）；不再扩大缓冲",
+                    buffer.len(),
+                    out.len
+                ),
+            );
+        }
         if out.len > buffer.len() {
             return (
                 retried,
@@ -2113,6 +2705,9 @@ unsafe fn call_op(
 }
 
 /// 只读 op（`OP_VOLATILE_PATHS`）专用：允许 TOO_SMALL 重试。
+///
+/// op 由 [`invoke_raw_read`] 断言；这里再钉一次，是为了让"业务只读 op 静默继承
+/// 1 MiB 上限"这件事在调用点就现形，而不是等某条大响应被判成协议错误。
 unsafe fn call_op_read(
     call: CallFn,
     handle: u64,
@@ -2120,6 +2715,11 @@ unsafe fn call_op_read(
     payload: &str,
     error_format: u32,
 ) -> std::result::Result<CallOutcome, String> {
+    debug_assert_eq!(
+        op,
+        cordis_abi::OP_VOLATILE_PATHS,
+        "只读扩容重试只服务于插件自述元数据；业务只读 op 不得静默继承这条路径"
+    );
     call_op_with(call, handle, op, payload, true, error_format)
 }
 
@@ -2196,19 +2796,17 @@ pub unsafe fn call_plugin_detailed(
     }
 }
 
-/// 只向**仍然存活**的实例投递回调：取实例（保活库）→ 读锁 → closed 检查。
+/// 只向**仍然存活**的实例投递回调：短锁准入、取得调用 lease，锁外执行。
 ///
-/// 所有异步/延迟路径（iface 完成、waterfall next、取消交付、dispatch 完成）
-/// 都必须经过它；直接使用快照里的裸 `CallFn` 会在 HMR/自卸载后打进已释放的库。
+/// waterfall next 和取消交付经此准入；普通出站完成由 `deliver_outbound`
+/// 将摘表与准入合并。直接使用快照里的裸 `CallFn` 会打进已释放的库。
 unsafe fn call_live(handle: u64, op: u32, payload: &str) -> std::result::Result<Value, String> {
     let instance =
         instances().lock().unwrap().get(handle).ok_or_else(|| {
             format!("ctx 句柄 {handle} 已失效（插件已卸载，或句柄来自上一代实例）")
         })?;
-    let _lifecycle = instance.lifecycle.read().unwrap();
-    if instance.closed.load(Ordering::SeqCst) {
-        return Err(format!("ctx 句柄 {handle} 已失效（插件正在卸载）"));
-    }
+    let _lifecycle = admit_call(&instance)
+        .ok_or_else(|| format!("ctx 句柄 {handle} 已失效（插件正在卸载或库已释放）"))?;
     call_plugin(instance.call, handle, op, payload, instance.error_format)
 }
 
@@ -2386,45 +2984,38 @@ unsafe extern "C" fn host_ctx_dispose(handle: u64, target: Blob, out: *mut Out) 
     with_resolved(handle, out, move |resolved| {
         // 调用者只能回收**自己根实例**的派生句柄；派生句柄的 seq 可枚举，
         // 不加归属检查就能销毁别的插件的子 fiber。
-        let owner = derived_table()
-            .lock()
-            .unwrap()
+        let mut table = derived_table().lock().unwrap();
+        let entry = table
             .get(&raw)
-            .map(|entry| entry.owner);
-        match owner {
-            None => {
-                return Err(format!(
-                    "派生句柄 {raw} 已失效（已回收，或根实例已注销排水）"
-                ));
-            }
-            Some(owner) if owner != resolved.owner => {
-                return Err(format!(
-                    "派生句柄 {raw} 不属于调用方根实例 {handle}，拒绝回收"
-                ));
-            }
-            Some(_) => {}
+            .ok_or_else(|| format!("派生句柄 {raw} 已失效（已回收，或根实例已注销排水）"))?;
+        if entry.owner != resolved.owner {
+            return Err(format!(
+                "派生句柄 {raw} 不属于调用方根实例 {handle}，拒绝回收"
+            ));
         }
+        let live_fiber = entry.fiber.as_ref().and_then(Weak::upgrade);
         // 先在摘表前确认运行时：否则 remove 之后才发现无法 dispose，句柄就丢了。
-        let live_fiber = derived_table()
-            .lock()
-            .unwrap()
-            .get(&raw)
-            .and_then(|entry| entry.fiber.as_ref())
-            .and_then(|weak| weak.upgrade());
-        if live_fiber.is_some() && tokio::runtime::Handle::try_current().is_err() {
-            return Err("子 fiber 的卸载需要异步运行时（当前在同步上下文里）".into());
+        let runtime = if live_fiber.is_some() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => Some(runtime),
+                Err(_) => {
+                    // upgrade 可能取得最后强引用，失败分支也必须先放锁再析构。
+                    drop(table);
+                    drop(live_fiber);
+                    return Err("子 fiber 的卸载需要异步运行时（当前在同步上下文里）".into());
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(test)]
+        derived_dispose_tests::before_remove(raw);
+        let entry = table.remove(&raw).expect("validated under the same lock");
+        drop(table);
+        if let (Some(fiber), Some(runtime)) = (live_fiber, runtime) {
+            runtime.spawn(async move { fiber.dispose().await });
         }
-        let entry = derived_table()
-            .lock()
-            .unwrap()
-            .remove(&raw)
-            .expect("owner checked above");
-        if let Some(fiber) = live_fiber {
-            tokio::runtime::Handle::try_current()
-                .expect("checked above")
-                .spawn(async move { fiber.dispose().await });
-        }
-        let _ = entry;
+        drop(entry);
         Ok(String::new())
     })
 }
@@ -2669,12 +3260,11 @@ impl ExternService for PluginIface {
                 // 流式挂起：记录归流观察者所有（流收尾时摘除）。若配了派发看门狗，
                 // 派生一个 settle 任务执行超时策略；超时会 revoke 记录并以错误收流。
                 Ok(Inbound::Pending(pending)) => {
-                    if provider.dispatch_policy.timeout_ms.is_some() {
-                        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                            runtime.spawn(async move {
-                                let _ = (*pending).settle("流式调用").await;
-                            });
-                        }
+                    if provider.dispatch_policy.timeout_ms.is_some()
+                        && tokio::runtime::Handle::try_current().is_ok()
+                    {
+                        spawn_stream_settle(&provider, pending)
+                            .map_err(|payload| Error::from(CallFailure::from_payload(payload)))?;
                     }
                     Ok(())
                 }
@@ -2685,6 +3275,40 @@ impl ExternService for PluginIface {
             }
         })
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn spawn_stream_settle(
+    instance: &Instance,
+    pending: Box<PendingContinuation>,
+) -> std::result::Result<(), ErrorPayload> {
+    let (cancel, exit) = {
+        let table = instance.dispatches.lock().unwrap();
+        if instance.closed.load(Ordering::SeqCst) {
+            return Err(closed_admission_payload());
+        }
+        // 流可在 OP_CALLBACK 内正常收尾后仍返回 PENDING；此时无需看门狗。
+        if !table.contains_key(&pending.dispatch_id) {
+            return Ok(());
+        }
+        dispatch_task(instance, pending.dispatch_id)
+    };
+    let mut work = TaskWork {
+        future: Box::pin(async move {
+            let _ = (*pending).settle("流式调用").await;
+        }),
+        on_done: None::<fn(())>,
+        _exit: exit,
+    };
+    tokio::runtime::Handle::current().spawn(async move {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {}
+            _ = &mut work.future => {}
+        }
+        drop(work);
+    });
+    Ok(())
 }
 
 unsafe extern "C" fn host_ctx_provide_iface(
@@ -2763,8 +3387,7 @@ unsafe extern "C" fn host_ctx_call_iface(
         // 容量拒绝时直接返回：future 还没有被 poll，提供者代码不会执行。
         let iface_id = next_dispatch_id();
         let parent = scope_top().map(|(_, id)| id);
-        let (task, cancel, done) = dispatch_task();
-        insert_dispatch(
+        let (cancel, done) = insert_dispatch_task(
             &resolved.instance,
             iface_id,
             DispatchRecord {
@@ -2777,32 +3400,36 @@ unsafe extern "C" fn host_ctx_call_iface(
                     kind: ContinuationKind::Iface,
                 }),
                 stream: None,
-                task: Some(task),
             },
         )
         .map_err(|(payload, _)| payload)?;
-        let deferred = complete_or_defer(
-            future,
-            move |result| {
-                // 记录已被卸载/取消路径摘走 ⇒ 不再交付（"恰好一次"）。
-                if !unregister_dispatch_node(consumer, iface_id) {
-                    return;
-                }
-                let payload = json!({
-                    "kind": KIND_IFACE,
-                    "id": continuation,
-                    "args": [match &result {
-                        Ok(value) => json!({ "result": value }),
-                        Err(err) => error_arg(error_format, &payload_of(err.as_ref())),
-                    }],
-                })
-                .to_string();
-                unsafe {
-                    let _ = call_live(consumer, OP_CALLBACK, &payload);
-                }
-            },
-            (cancel, done),
-        );
+        let deliver: Arc<dyn Fn(Result<Config>) + Send + Sync> = Arc::new(move |result| {
+            let payload = json!({
+                "kind": KIND_IFACE,
+                "id": continuation,
+                "args": [match &result {
+                    Ok(value) => json!({ "result": value }),
+                    Err(err) => error_arg(error_format, &payload_of(err.as_ref())),
+                }],
+            })
+            .to_string();
+            deliver_outbound(consumer, iface_id, &payload);
+        });
+        let deferred = {
+            let on_done = deliver.clone();
+            let on_panic = deliver.clone();
+            complete_or_defer(
+                future,
+                move |result| on_done(result),
+                move |payload| on_panic(Err(Box::new(CallFailure::from_payload(payload)))),
+                (cancel, done),
+                PanicScope {
+                    scene: "iface",
+                    handle: consumer,
+                    dispatch_id: iface_id,
+                },
+            )
+        };
         match deferred {
             // 内联完成：把结果直接带回，插件侧自己消费掉它的续延（零额外跨边界往返）。
             Ok(Some(result)) => {
@@ -2824,11 +3451,17 @@ unsafe extern "C" fn host_ctx_call_iface(
             }
             // 未就绪：结果会通过 `OP_CALLBACK` 送到同一个续延 id 上。
             Ok(None) => Ok(json!({ "pending": true }).to_string()),
-            Err(message) => {
+            Err(DeferFailure::NoRuntime(message)) => {
                 unregister_dispatch_node(consumer, iface_id);
                 Err(ErrorPayload::new(message)
                     .with_code("host_call")
                     .with_category("protocol"))
+            }
+            // 首 poll panic：调用方同步拿到错误 ⇒ **先摘表再返回**，
+            // 否则关闭路径会为同一次调用补发一条 abort（双交付）。
+            Err(DeferFailure::Panic(payload)) => {
+                unregister_dispatch_node(consumer, iface_id);
+                Err(payload)
             }
         }
     })
@@ -2920,22 +3553,8 @@ fn abort_payload(outbound: &Outbound, error_format: u32, error: &ErrorPayload) -
     .to_string()
 }
 
-fn deliver_abort(outbound: Outbound, error: &ErrorPayload) {
-    let error_format = instances()
-        .lock()
-        .unwrap()
-        .get(outbound.owner)
-        .map(|instance| instance.error_format)
-        .unwrap_or(0);
-    let payload = abort_payload(&outbound, error_format, error);
-    // 只向仍然存活的实例交付；插件会在回调里重入宿主，`call_live` 内部不持锁执行。
-    if let Err(message) = unsafe { call_live(outbound.owner, OP_CALLBACK, &payload) } {
-        eprintln!("[cordis] 取消交付失败: {message}");
-    }
-}
-
-/// 卸载清理专用：实例已经 `closed`，但仍要在 `OP_DISPOSE` 前把 abort 送达
-/// 正在等结果的出站续延。`Instance` 克隆持有库保活，因此可以直接调用。
+/// 向已认领的出站续延交付取消：即使 `closed` 已跨入，也必须先于 `OP_DISPOSE`。
+/// 调用方必须持有 FFI 准入成功的 ActiveCall 或关闭 lease，并在锁外调用。
 fn deliver_abort_direct(instance: &Instance, outbound: Outbound, error: &ErrorPayload) {
     let payload = abort_payload(&outbound, instance.error_format, error);
     if let Err(message) = unsafe {
@@ -2957,6 +3576,7 @@ fn deliver_abort_direct(instance: &Instance, outbound: Outbound, error: &ErrorPa
 /// 剩余链先**同步试跑**（D6 的同步快速路径）：就地完成时就地投递 `on_done`
 /// （于是"回调内 next、回调内结算"一次往返搞定）；未就绪则交给运行时。
 /// 帧**取出即消费**：第二次 `ctx_next` 是可读错误。
+#[allow(clippy::result_large_err)]
 unsafe extern "C" fn host_ctx_next(
     handle: u64,
     dispatch_id: u64,
@@ -2974,26 +3594,30 @@ unsafe extern "C" fn host_ctx_next(
             .cloned()
             .unwrap_or_else(|| parsed.clone()),
     );
-    with_instance_as(handle, out, "host_next", "lifecycle", move |instance| {
+    with_instance_payload(handle, out, move |instance| {
+        let next_error = |message| {
+            ErrorPayload::new(message)
+                .with_code("host_next")
+                .with_category("lifecycle")
+        };
         let error_format = instance.error_format;
-        let (task, cancel, done) = dispatch_task();
         let frame = {
             let mut table = instance.dispatches.lock().unwrap();
+            if instance.closed.load(Ordering::SeqCst) {
+                return Err(closed_admission_payload());
+            }
             match table.get_mut(&dispatch_id) {
-                Some(record) => match record.frame.take() {
-                    Some(frame) => {
-                        record.task = Some(task);
-                        Some(frame)
-                    }
-                    None => None,
-                },
+                Some(record) => record
+                    .frame
+                    .take()
+                    .map(|frame| (frame, dispatch_task(instance, dispatch_id))),
                 None => None,
             }
         };
-        let Some(next) = frame else {
-            return Err(format!(
+        let Some((next, (cancel, done))) = frame else {
+            return Err(next_error(format!(
                 "dispatch {dispatch_id} 没有可续跑的 waterfall 帧（不是 waterfall 派发，或已经 next 过）"
-            ));
+            )));
         };
         let future: BoxFuture<Ret> = Box::pin(next.call(new_args));
         // 剩余链的 future 打上作用域：它交付给插件的回调能记下父节点。
@@ -3008,12 +3632,25 @@ unsafe extern "C" fn host_ctx_next(
             });
         let deferred = {
             let deliver = deliver.clone();
-            complete_or_defer(scoped, move |result| deliver(result), (cancel, done))
+            let deliver_panic = deliver.clone();
+            complete_or_defer(
+                scoped,
+                move |result| deliver(result),
+                move |payload| deliver_panic(Err(payload)),
+                (cancel, done),
+                PanicScope {
+                    scene: "next",
+                    handle,
+                    dispatch_id,
+                },
+            )
         };
         match deferred {
             Ok(Some(result)) => deliver(result),
             Ok(None) => {}
-            Err(err) => return Err(err),
+            Err(DeferFailure::NoRuntime(message)) => return Err(next_error(message)),
+            // 首 poll panic：**不摘入站记录**（它由事件派发/取消路径收尾），只返回错误。
+            Err(DeferFailure::Panic(payload)) => return Err(payload),
         }
         Ok(String::new())
     })
@@ -3039,7 +3676,7 @@ fn deliver_next(
     .to_string();
     // 交付期间让"这次派发"留在作用域里：插件在 on_done 里再发派发时父节点仍是它。
     let _scope = scope_push(handle, dispatch_id);
-    // `call_live` 取实例、持读锁、放锁后调用；插件会重入宿主（fulfill / 再 next）。
+    // `call_live` 短锁登记后调用；插件可重入宿主（fulfill / 再 next）。
     if let Err(message) = unsafe { call_live(handle, OP_CALLBACK, &payload) } {
         eprintln!("[cordis] waterfall 的 on_done 交付失败: {message}");
     }
@@ -3229,9 +3866,8 @@ unsafe fn dispatch_impl(
         // 父节点 = 当前正在执行的那次派发（插件在自己的回调里发派发时，
         // 作用域栈顶就是它；不在派发里时为 None）。
         let parent = scope_top().map(|(_, id)| id);
-        let (task, cancel, done) = dispatch_task();
         // 容量拒绝时直接返回：future 还没有被创建/驱动，订阅者不会收到派发。
-        insert_dispatch(
+        let (cancel, done) = insert_dispatch_task(
             instance,
             dispatch_id,
             DispatchRecord {
@@ -3244,7 +3880,6 @@ unsafe fn dispatch_impl(
                     kind: ContinuationKind::Dispatch,
                 }),
                 stream: None,
-                task: Some(task),
             },
         )
         .map_err(|(payload, _)| payload)?;
@@ -3266,15 +3901,26 @@ unsafe fn dispatch_impl(
                 .with_code("host_call")
                 .with_category("protocol"));
             };
+            let mut work = TaskWork {
+                future,
+                on_done: None::<fn(std::result::Result<Ret, ErrorPayload>)>,
+                _exit: done,
+            };
             runtime.spawn(async move {
-                let _done = done;
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {}
-                    _ = future => {}
+                let panic = {
+                    let mut caught = CatchUnwind::new(&mut work.future);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => None,
+                        outcome = &mut caught => outcome.err(),
+                    }
+                };
+                if let Some(payload) = panic {
+                    // 纯 emit 没有续延可交付：只摘表 + 诊断，绝不为它伪造一条回调。
+                    record_async_panic("emit", handle, dispatch_id, &*payload);
                 }
-                // 派发结束：摘除出站节点（被取消时已经被取消路径摘走了）。
                 unregister_dispatch_node(handle, dispatch_id);
+                drop(work);
             });
             return Ok(json!({ "dispatch_id": dispatch_id }).to_string());
         }
@@ -3286,29 +3932,34 @@ unsafe fn dispatch_impl(
             Arc::new(move || unregister_dispatch_node(handle, dispatch_id))
         };
         let deliver = {
-            let finished = finished.clone();
             Arc::new(move |result: std::result::Result<Ret, ErrorPayload>| {
-                if finished() {
-                    let args = match result {
-                        Ok(ret) => json!({ "result": ret_to_json(ret) }),
-                        Err(err) => error_arg(error_format, &err),
-                    };
-                    let payload = json!({
-                        "kind": KIND_DISPATCH,
-                        "id": continuation,
-                        "args": [args],
-                    })
-                    .to_string();
-                    unsafe {
-                        // 消费者可能已经卸载：`call_live` 取不到句柄就不投递。
-                        let _ = call_live(consumer, OP_CALLBACK, &payload);
-                    }
-                }
+                let args = match result {
+                    Ok(ret) => json!({ "result": ret_to_json(ret) }),
+                    Err(err) => error_arg(error_format, &err),
+                };
+                let payload = json!({
+                    "kind": KIND_DISPATCH,
+                    "id": continuation,
+                    "args": [args],
+                })
+                .to_string();
+                deliver_outbound(consumer, dispatch_id, &payload);
             })
         };
         let deferred = {
             let deliver = deliver.clone();
-            complete_or_defer(future, move |result| deliver(result), (cancel, done))
+            let deliver_panic = deliver.clone();
+            complete_or_defer(
+                future,
+                move |result| deliver(result),
+                move |payload| deliver_panic(Err(payload)),
+                (cancel, done),
+                PanicScope {
+                    scene: "dispatch",
+                    handle,
+                    dispatch_id,
+                },
+            )
         };
         Ok(match deferred {
             Ok(Some(Ok(ret))) => {
@@ -3332,13 +3983,18 @@ unsafe fn dispatch_impl(
                 payload.to_string()
             }
             Ok(None) => json!({ "pending": true, "dispatch_id": dispatch_id }).to_string(),
-            Err(message) => {
+            Err(DeferFailure::NoRuntime(message)) => {
                 // 没有运行时，future 已被丢弃：必须把登记节点也摘掉，
                 // 否则取消/排水会看到一条永远不会结算的记录。
                 finished();
                 return Err(ErrorPayload::new(message)
                     .with_code("host_call")
                     .with_category("protocol"));
+            }
+            // 首 poll panic：同样必须**先摘表再返回错误**（否则关闭时补发 abort）。
+            Err(DeferFailure::Panic(payload)) => {
+                finished();
+                return Err(payload);
             }
         })
     })
@@ -3347,19 +4003,60 @@ unsafe fn dispatch_impl(
 /// 摘除一条**出站派发**的登记节点。返回 `true` 表示"它还在表里"——
 /// 即这次派发仍由正常路径收尾；被取消（或已注销）时返回 `false`。
 fn unregister_dispatch_node(handle: u64, dispatch_id: u64) -> bool {
-    instances()
-        .lock()
-        .unwrap()
-        .get(handle)
-        .map(|instance| {
-            instance
-                .dispatches
-                .lock()
-                .unwrap()
-                .remove(&dispatch_id)
-                .is_some()
-        })
-        .unwrap_or(false)
+    let instance = instances().lock().unwrap().get(handle);
+    let removed =
+        instance.and_then(|instance| instance.dispatches.lock().unwrap().remove(&dispatch_id));
+    removed.is_some()
+}
+
+// 普通出站的终态认领与调用准入必须在同一表锁内；关闭先赢则留给排水 abort。
+// next 的入站记录可能早已终态，不能复用这个依赖记录存在的认领路径。
+fn deliver_outbound(handle: u64, dispatch_id: u64, payload: &str) {
+    let Some(instance) = instances().lock().unwrap().get(handle) else {
+        return;
+    };
+    let (removed, _active) = {
+        let mut table = instance.dispatches.lock().unwrap();
+        if instance.closed.load(Ordering::SeqCst) || !table.contains_key(&dispatch_id) {
+            return;
+        }
+        let Ok(lease) = call_lease(&instance) else {
+            return;
+        };
+        let record = table.remove(&dispatch_id).unwrap();
+        *instance.lifecycle.lock().unwrap() += 1;
+        (
+            record,
+            ActiveCall {
+                active: instance.lifecycle.clone(),
+                changed: instance.calls_changed.clone(),
+                lease: Ok(lease),
+            },
+        )
+    };
+    drop(removed);
+    #[cfg(test)]
+    {
+        let gate = instance.outbound_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.0.wait();
+            gate.1.wait();
+        }
+    }
+    unsafe {
+        if let Err(message) = call_plugin(
+            instance.call,
+            handle,
+            OP_CALLBACK,
+            payload,
+            instance.error_format,
+        ) {
+            // 回调投递失败过去是静默的：插件等不到回调，宿主也没有任何线索。
+            eprintln!(
+                "[cordis] 出站续延交付失败（handle {handle}；dispatch {dispatch_id}）：{message}"
+            );
+        }
+    }
 }
 
 fn ret_to_json(ret: Option<Dyn>) -> Value {
@@ -3684,8 +4381,8 @@ impl Plugin for LoadedPlugin {
     }
 
     fn apply(&self, ctx: Ctx, config: Config) -> BoxFuture<Result<()>> {
-        // 把动态库句柄作为实例保活：事件快照/延迟续延可能比 fiber 活得更久，
-        // 只要还有 `Instance` 引用，`FreeLibrary` 就必须等它。
+        // 动态库句柄以**弱引用**登记为实例保活：`Instance` 克隆不延长 owner——
+        // owner 由实例表槽位持有到注销，最后 drop 在表锁之外（那一下才是 `FreeLibrary`）。
         let keepalive: Arc<dyn Any + Send + Sync> = self._library.clone();
         apply_via_with_keepalive_and_format(
             self.call,
@@ -3808,8 +4505,10 @@ pub fn apply_via_with_keepalive_and_error_format(
     apply_via_with_keepalive_and_format(call, ctx, config, name, keepalive, error_format)
 }
 
-/// [`apply_via`] 的带库保活版本：`LoadedPlugin::apply` 传入 `Arc<DynLib>`，
-/// 保证实例注销后仍被事件快照/延迟续延持有的 `Instance` 不会指向已释放的库。
+/// [`apply_via`] 的带库保活版本：`LoadedPlugin::apply` 传入 `Arc<DynLib>`。
+///
+/// 保活窗口 = 注册期（槽位强 owner）+ 在飞调用 lease + 关闭交付 lease；
+/// 注销后由 `closed`、句柄重查、lease 失效共同保证不进入 FFI。
 pub fn apply_via_with_keepalive(
     call: CallFn,
     ctx: Ctx,
@@ -3845,32 +4544,31 @@ fn apply_via_with_keepalive_and_format(
         let registered = fiber.try_effect(move |_| {
             Disposable::new(move || {
                 Box::pin(async move {
-                    // 关闭闸门：先置 closed，再等所有在飞读锁退出；之后的
-                    // call_inbound/call_live 一律拒绝，OP_DISPOSE 不会与用户代码并发。
+                    // 先关闭准入，再异步等待已经登记的同步调用退出。
                     let instance = instances().lock().unwrap().get(handle);
                     let mut outbound = Vec::new();
                     if let Some(instance) = &instance {
-                        instance.closed.store(true, Ordering::SeqCst);
+                        let close_lease = {
+                            let _table = instance.dispatches.lock().unwrap();
+                            instance.closed.store(true, Ordering::SeqCst);
+                            call_lease(instance)
+                        };
                         wait_lifecycle_exclusive(instance).await;
-                        // M2/M2b/M2c：反复排水，直到派发表与“已取消待回收”
-                        // 集合都为空。取快照时必须**同时持有派发表锁**：取消
-                        // 路径在同一把锁内完成“摘记录 + 登记 done”，否则关闭
-                        // 可能落在两者之间、看到两张空表后提前返回。
+                        // closed 与登记共用 dispatches 锁；任务凭证不随业务摘表消失。
                         loop {
-                            let (drained, reclaiming) = {
+                            let (drained, tasks) = {
                                 let mut table = instance.dispatches.lock().unwrap();
                                 let drained: Vec<DispatchRecord> =
                                     table.drain().map(|(_, record)| record).collect();
-                                let reclaiming: Vec<_> = {
-                                    let mut pending = instance.reclaiming.lock().unwrap();
-                                    std::mem::take(&mut *pending)
-                                };
-                                (drained, reclaiming)
+                                let tasks: Vec<_> = instance.tasks.lock().unwrap().drain()
+                                    .map(|(_, task)| task).collect();
+                                (drained, tasks)
                             };
-                            if drained.is_empty() && reclaiming.is_empty() {
+                            #[cfg(test)]
+                            instance.close_drained.notify_one();
+                            if drained.is_empty() && tasks.is_empty() {
                                 break;
                             }
-                            let mut tasks = Vec::new();
                             for mut record in drained {
                                 // 流（ADR 0001 §5）：先排水——没收尾的流以错误结束，且
                                 // **等待中的 credit 回调在这里被驳回**（跨 ABI 的提供者
@@ -3889,18 +4587,13 @@ fn apply_via_with_keepalive_and_format(
                                 if let Some(entry) = record.outbound {
                                     outbound.push(entry);
                                 }
-                                if let Some(task) = record.task.take() {
-                                    tasks.push(task);
-                                }
                             }
                             // 关闭不能只送 abort：宿主创建的任务必须**终止并等待**，
                             // 否则 `App::close` 返回后工具/副作用仍可能继续执行。
                             for task in &tasks {
                                 task.cancel.cancel();
                             }
-                            let mut done = reclaiming;
-                            done.extend(tasks.into_iter().map(|task| task.done));
-                            for rx in done {
+                            for rx in tasks.into_iter().map(|task| task.done) {
                                 let _ = rx.await;
                             }
                         }
@@ -3910,10 +4603,26 @@ fn apply_via_with_keepalive_and_format(
                             .with_code("host_lifecycle")
                             .with_category("lifecycle")
                             .with_certainty("unknown");
-                        for outbound in outbound {
-                            deliver_abort_direct(instance, outbound, &unload_error);
+                        let credits = std::mem::take(&mut *instance.credits.lock().unwrap());
+                        if close_lease.is_ok() {
+                            for ((dispatch_id, id), count) in credits {
+                                let payload = json!({
+                                    "kind": KIND_STREAM_CREDIT,
+                                    "id": id,
+                                    "args": [{ "error": "插件已卸载：这条流已被收回" }],
+                                }).to_string();
+                                for _ in 0..count {
+                                    let _scope = scope_push(handle, dispatch_id);
+                                    let _ = unsafe { call_plugin(instance.call, handle, OP_CALLBACK, &payload, instance.error_format) };
+                                }
+                            }
                         }
-                        if applied_flag.load(Ordering::SeqCst) {
+                        for outbound in outbound {
+                            if close_lease.is_ok() {
+                                deliver_abort_direct(instance, outbound, &unload_error);
+                            }
+                        }
+                        if applied_flag.load(Ordering::SeqCst) && close_lease.is_ok() {
                             let mut buffer = vec![0u8; 16 * 1024];
                             let mut out = Out {
                                 ptr: buffer.as_mut_ptr(),
@@ -4260,18 +4969,36 @@ pub fn probe_capabilities(path: &std::path::Path) -> Result<Capabilities> {
 
 /// [`probe_capabilities`] 的显式搜索目录版本（CLI 的 `--plugin-dir` 用）。
 pub fn probe_capabilities_in(path: &std::path::Path, search: &[PathBuf]) -> Result<Capabilities> {
+    probe_capabilities_with(plugin_source(), path, search)
+}
+
+/// 探测的**来源版本**（私有）：准入与装载用**同一个**来源对象、**同一份**结论。
+///
+/// O9：以前这里读进程级 [`crate::source::admission`]，而 `load` 可能走的是另一个
+/// 带局部策略的来源——同一次探测里"准入按全局、打开按局部"是两份快照。把来源
+/// 显式传进来之后，结论只来自一个地方。
+fn probe_capabilities_with(
+    source: Arc<dyn loader::PluginSource>,
+    path: &std::path::Path,
+    search: &[PathBuf],
+) -> Result<Capabilities> {
     let entry = patch::Entry {
         name: path.to_string_lossy().into_owned(),
         ..patch::Entry::default()
     };
-    // P0-1a：配置了来源策略时，inspect 也必须在打开动态库**之前**验证原始 artifact。
+    // P0-1a：有生效来源策略时，inspect 也必须在打开动态库**之前**验证原始 artifact。
     // 先解析到真实路径（`entry.name` 可能只是裸插件名）；没有策略时保持原有顺序，
     // 这样测试注入的假 `PluginSource` 仍能在没有磁盘文件的情况下工作。
-    if let Some(policy) = crate::source::admission()? {
+    //
+    // O9：结论只取**一次**，并原样交给 `load_admitted`。以前的写法是"自己校验一次，
+    // 再让 `source.load` 去读第二次准入"：两步之间全局被改，打开就走了另一份结论
+    // （甚至走未校验分支），暂存副本也不再与已验证的 hash 绑定。
+    let admission = source.admission();
+    if let Some(policy) = admission.resolve()? {
         let resolved = resolve_plugin_path(&entry.name, search)?;
         policy.verify(&resolved)?;
     }
-    let loaded = plugin_source().load(&entry, search, next_use_revision())?;
+    let loaded = source.load_admitted(&entry, search, next_use_revision(), &admission)?;
     // `loaded` 在这一句之后 drop：先 FreeLibrary、后删暂存副本（M0b 的字段序保证）。
     Ok(Capabilities::of_plugin(&*loaded.plugin))
 }
@@ -4448,8 +5175,517 @@ pub fn describe(error: &Error) -> String {
 }
 
 #[cfg(test)]
+mod credits_limit_tests;
+
+#[cfg(test)]
+mod derived_dispose_tests;
+
+#[cfg(test)]
+mod observer_close_tests;
+
+#[cfg(test)]
+mod panic_close_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+
+    thread_local! {
+        static TASK_TEST_HANDLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe extern "C" fn task_test_call(
+        handle: u64,
+        op: u32,
+        _: Blob,
+        _: Blob,
+        _: *mut Out,
+    ) -> i32 {
+        if op == OP_APPLY {
+            TASK_TEST_HANDLE.set(handle);
+        }
+        STATUS_OK
+    }
+
+    #[tokio::test]
+    async fn o1_task_survives_normal_record_removal() {
+        let app = cordis_core::App::new();
+        apply_via(task_test_call, app.root.clone(), Value::Null, "task-owner")
+            .await
+            .unwrap();
+        let handle = TASK_TEST_HANDLE.get();
+        let instance = instances().lock().unwrap().get(handle).unwrap();
+        insert_dispatch(
+            &instance,
+            91,
+            DispatchRecord {
+                sink: None,
+                frame: None,
+                parent: None,
+                outbound: None,
+                stream: None,
+            },
+        )
+        .unwrap_or_else(|_| panic!("admission"));
+        let (_cancel, done) = register_dispatch_task(&instance, 91).unwrap();
+        assert!(unregister_dispatch_node(handle, 91));
+        // A task in its synchronous delivery tail cannot observe cancellation yet.
+        // No lifecycle read lock is held: only task ownership can keep close pending.
+        let mut close = Box::pin(app.close());
+        let mut drained = Box::pin(instance.close_drained.notified());
+        std::future::poll_fn(|cx| {
+            assert!(
+                close.as_mut().poll(cx).is_pending(),
+                "close lost the task after normal record removal"
+            );
+            drained.as_mut().poll(cx)
+        })
+        .await;
+        drop(done);
+        close.await;
+    }
+
+    #[tokio::test]
+    async fn o1_fulfill_keeps_pending_task_cancellable() {
+        let app = cordis_core::App::new();
+        apply_via(
+            task_test_call,
+            app.root.clone(),
+            Value::Null,
+            "task-fulfill",
+        )
+        .await
+        .unwrap();
+        let handle = TASK_TEST_HANDLE.get();
+        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        insert_dispatch(
+            &instance,
+            92,
+            DispatchRecord {
+                sink: Some(tx),
+                frame: None,
+                parent: None,
+                outbound: None,
+                stream: None,
+            },
+        )
+        .unwrap_or_else(|_| panic!("admission"));
+        let (cancel, done) = register_dispatch_task(&instance, 92).unwrap();
+        let mut output = Out {
+            ptr: std::ptr::null_mut(),
+            cap: 0,
+            len: 0,
+        };
+        assert_eq!(
+            unsafe { host_ctx_fulfill(handle, 92, Blob::EMPTY, &mut output) },
+            STATUS_OK
+        );
+        let mut close = Box::pin(app.close());
+        let mut drained = Box::pin(instance.close_drained.notified());
+        std::future::poll_fn(|cx| {
+            assert!(
+                close.as_mut().poll(cx).is_pending(),
+                "close lost the pending next task"
+            );
+            drained.as_mut().poll(cx)
+        })
+        .await;
+        assert!(
+            matches!(
+                std::future::poll_fn(|cx| Poll::Ready(
+                    Box::pin(cancel.cancelled()).as_mut().poll(cx)
+                ))
+                .await,
+                Poll::Ready(())
+            ),
+            "fulfill must not discard task cancellation"
+        );
+        drop(done);
+        close.await;
+    }
+
+    thread_local! {
+        static NEXT_RETURN_STATUS: std::cell::Cell<i32> = const { std::cell::Cell::new(STATUS_OK) };
+        static NEXT_CALL_STATUS: std::cell::Cell<i32> = const { std::cell::Cell::new(STATUS_ERR) };
+        static NEXT_DROP_MARKER: std::cell::RefCell<Option<Arc<AtomicBool>>> = const { std::cell::RefCell::new(None) };
+        static NEXT_DISPOSE_AFTER_DROP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static NEXT_COMPLETIONS: std::cell::RefCell<Vec<Value>> = const { std::cell::RefCell::new(Vec::new()) };
+        static NEXT_COMPLETED: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    unsafe extern "C" fn next_then_terminal(
+        handle: u64,
+        op: u32,
+        payload: Blob,
+        _: Blob,
+        _: *mut Out,
+    ) -> i32 {
+        if op == OP_APPLY {
+            TASK_TEST_HANDLE.set(handle);
+        }
+        if op == OP_CALLBACK {
+            let Ok(value) = serde_json::from_slice::<Value>(payload.as_bytes()) else {
+                return STATUS_ERR;
+            };
+            if value["kind"] == KIND_NEXT {
+                NEXT_COMPLETIONS.with_borrow_mut(|completions| completions.push(value));
+                NEXT_COMPLETED.with_borrow(|completed| {
+                    if let Some(completed) = completed {
+                        completed.notify_one();
+                    }
+                });
+                return STATUS_OK;
+            }
+            let Some(id) = value["dispatch_id"].as_u64() else {
+                return STATUS_ERR;
+            };
+            let mut output = Out {
+                ptr: std::ptr::null_mut(),
+                cap: 0,
+                len: 0,
+            };
+            NEXT_CALL_STATUS.set(host_ctx_next(handle, id, Blob::new(b"[]"), 1, &mut output));
+            return NEXT_RETURN_STATUS.get();
+        }
+        if op == OP_DISPOSE {
+            NEXT_DISPOSE_AFTER_DROP.set(NEXT_DROP_MARKER.with_borrow(|marker| {
+                marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.load(Ordering::SeqCst))
+            }));
+        }
+        STATUS_OK
+    }
+
+    #[tokio::test]
+    async fn o1_real_next_survives_all_inbound_terminal_states() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for status in [
+            STATUS_OK,
+            STATUS_ERR,
+            STATUS_UNSUPPORTED,
+            12345,
+            STATUS_PENDING,
+        ] {
+            NEXT_RETURN_STATUS.set(status);
+            NEXT_CALL_STATUS.set(STATUS_ERR);
+            let app = cordis_core::App::new();
+            apply_via(
+                next_then_terminal,
+                app.root.clone(),
+                Value::Null,
+                "next-terminal",
+            )
+            .await
+            .unwrap();
+            let handle = TASK_TEST_HANDLE.get();
+            let instance = instances().lock().unwrap().get(handle).unwrap();
+            let dropped = Arc::new(AtomicBool::new(false));
+            NEXT_DROP_MARKER.with_borrow_mut(|marker| *marker = Some(dropped.clone()));
+            NEXT_DISPOSE_AFTER_DROP.set(false);
+            let marker = dropped.clone();
+            let frame = Next::some(move |_| {
+                let guard = Dropped(marker.clone());
+                Box::pin(async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                    None
+                })
+            });
+            let result = unsafe {
+                call_inbound(
+                    &instance,
+                    handle,
+                    OP_CALLBACK,
+                    json!({}),
+                    None,
+                    None,
+                    Some(frame),
+                    None,
+                )
+            };
+            assert_eq!(NEXT_CALL_STATUS.get(), STATUS_OK);
+            if let Ok(Inbound::Pending(pending)) = result {
+                let mut output = Out {
+                    ptr: std::ptr::null_mut(),
+                    cap: 0,
+                    len: 0,
+                };
+                assert_eq!(
+                    unsafe {
+                        host_ctx_fulfill(handle, pending.dispatch_id, Blob::EMPTY, &mut output)
+                    },
+                    STATUS_OK
+                );
+                assert_eq!(
+                    unsafe { host_ctx_abort(handle, pending.dispatch_id, &mut output) },
+                    STATUS_ERR,
+                    "已结算 id 不再是可 abort 的在飞派发"
+                );
+                assert_eq!(instance.tasks.lock().unwrap().len(), 1);
+                drop(pending);
+            }
+            assert!(instance.dispatches.lock().unwrap().is_empty());
+            assert_eq!(instance.tasks.lock().unwrap().len(), 1);
+            assert!(!dropped.load(Ordering::SeqCst));
+            tokio::time::timeout(std::time::Duration::from_secs(3), app.close())
+                .await
+                .unwrap();
+            assert!(
+                NEXT_DISPOSE_AFTER_DROP.get(),
+                "OP_DISPOSE 必须晚于 next future drop"
+            );
+            NEXT_DROP_MARKER.with_borrow_mut(|marker| *marker = None);
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "close returned before next Drop for {status}"
+            );
+            assert!(instance.tasks.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn o1_real_next_completes_after_inbound_record_removal() {
+        for status in [STATUS_OK, STATUS_PENDING] {
+            NEXT_RETURN_STATUS.set(status);
+            NEXT_CALL_STATUS.set(STATUS_ERR);
+            NEXT_COMPLETIONS.with_borrow_mut(Vec::clear);
+            let completed = Arc::new(tokio::sync::Notify::new());
+            NEXT_COMPLETED.with_borrow_mut(|slot| *slot = Some(completed.clone()));
+            let app = cordis_core::App::new();
+            apply_via(
+                next_then_terminal,
+                app.root.clone(),
+                Value::Null,
+                "next-normal-completion",
+            )
+            .await
+            .unwrap();
+            let handle = TASK_TEST_HANDLE.get();
+            let instance = instances().lock().unwrap().get(handle).unwrap();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let started = Arc::new(AtomicBool::new(false));
+            let frame = Next::some({
+                let release = release.clone();
+                let started = started.clone();
+                move |_| {
+                    let release = release.clone();
+                    let started = started.clone();
+                    Box::pin(async move {
+                        started.store(true, Ordering::SeqCst);
+                        release.notified().await;
+                        Some(Dyn::new(ExternValue(json!({ "tail": 42 }))))
+                    })
+                }
+            });
+            let result = unsafe {
+                call_inbound(
+                    &instance,
+                    handle,
+                    OP_CALLBACK,
+                    json!({}),
+                    None,
+                    None,
+                    Some(frame),
+                    None,
+                )
+            };
+            assert_eq!(NEXT_CALL_STATUS.get(), STATUS_OK);
+            assert!(
+                started.load(Ordering::SeqCst),
+                "next must first poll pending"
+            );
+            match result.unwrap() {
+                Inbound::Ready(value) => {
+                    assert_eq!(status, STATUS_OK);
+                    assert_eq!(value, Value::Null);
+                }
+                Inbound::Pending(pending) => {
+                    assert_eq!(status, STATUS_PENDING);
+                    let mut output = Out {
+                        ptr: std::ptr::null_mut(),
+                        cap: 0,
+                        len: 0,
+                    };
+                    assert_eq!(
+                        unsafe {
+                            host_ctx_fulfill(handle, pending.dispatch_id, Blob::EMPTY, &mut output)
+                        },
+                        STATUS_OK
+                    );
+                    drop(pending);
+                }
+            }
+            assert!(instance.dispatches.lock().unwrap().is_empty());
+            assert_eq!(instance.tasks.lock().unwrap().len(), 1);
+            NEXT_COMPLETIONS.with_borrow(|completions| assert!(completions.is_empty()));
+
+            release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(3), completed.notified())
+                .await
+                .unwrap();
+            // The current-thread task finishes its synchronous delivery tail before we resume.
+            assert!(!instance.closed.load(Ordering::SeqCst));
+            assert!(instance.dispatches.lock().unwrap().is_empty());
+            assert!(instance.tasks.lock().unwrap().is_empty());
+            NEXT_COMPLETIONS.with_borrow(|completions| {
+                assert_eq!(
+                    completions.as_slice(),
+                    &[json!({ "kind": "next", "id": 1, "args": [{ "result": { "tail": 42 } }] })]
+                );
+            });
+            app.close().await;
+            NEXT_COMPLETED.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    #[tokio::test]
+    async fn o1_multiple_tasks_reclaim_without_new_work() {
+        let instance = dummy_instance("multi-task");
+        insert_dispatch(
+            &instance,
+            93,
+            DispatchRecord {
+                sink: None,
+                frame: None,
+                parent: None,
+                outbound: None,
+                stream: None,
+            },
+        )
+        .unwrap_or_else(|_| panic!("admission"));
+        let (cancel_a, exit_a) = register_dispatch_task(&instance, 93).unwrap();
+        let (_cancel_b, exit_b) = register_dispatch_task(&instance, 93).unwrap();
+        assert_eq!(instance.tasks.lock().unwrap().len(), 2);
+        drop(exit_a);
+        assert_eq!(instance.tasks.lock().unwrap().len(), 1);
+        assert!(std::future::poll_fn(|cx| Poll::Ready(
+            Box::pin(cancel_a.cancelled()).as_mut().poll(cx)
+        ))
+        .await
+        .is_pending());
+        drop(exit_b);
+        assert!(instance.tasks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn o1_task_work_drops_captures_before_exit_on_panic() {
+        struct CheckDrop(Arc<Mutex<HashMap<u64, DispatchTask>>>);
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert_eq!(self.0.lock().unwrap().len(), 1);
+            }
+        }
+        let instance = dummy_instance("panic-exit");
+        insert_dispatch(
+            &instance,
+            94,
+            DispatchRecord {
+                sink: None,
+                frame: None,
+                parent: None,
+                outbound: None,
+                stream: None,
+            },
+        )
+        .unwrap_or_else(|_| panic!("admission"));
+        let task = register_dispatch_task(&instance, 94).unwrap();
+        let future_guard = CheckDrop(instance.tasks.clone());
+        let callback_guard = CheckDrop(instance.tasks.clone());
+        // O3 起首 poll panic 不再向外 unwind：它收敛成 `DeferFailure::Panic`。
+        // 这里钉住的仍是 O1 的析构序——future 与交付闭包的捕获物都必须在
+        // 退出信号（`TaskExit`）之前释放（`CheckDrop` 断言 tasks 里还有 1 条）。
+        let outcome = complete_or_defer::<()>(
+            Box::pin(async move {
+                let _guard = future_guard;
+                panic!("Rust future panic");
+            }),
+            move |_| drop(callback_guard),
+            |_| panic!("首 poll panic 时不得调用 on_panic"),
+            task,
+            PanicScope {
+                scene: "test",
+                handle: 0,
+                dispatch_id: 94,
+            },
+        );
+        assert!(
+            matches!(outcome, Err(DeferFailure::Panic(_))),
+            "首 poll panic 必须收敛成可区分的失败"
+        );
+        assert!(instance.tasks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn o1_stream_settle_registers_and_reclaims() {
+        let instance = dummy_instance("stream-settle");
+        instance.closed.store(true, Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let pending = PendingContinuation {
+            instance: instance.clone(),
+            dispatch_id: 95,
+            rx,
+            cancel: None,
+            _abandon: PendingDropGuard {
+                instance: instance.clone(),
+                dispatch_id: 95,
+            },
+        };
+        assert!(spawn_stream_settle(&instance, Box::new(pending)).is_err());
+        assert!(instance.tasks.lock().unwrap().is_empty());
+        drop(tx);
+        instance.closed.store(false, Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        insert_dispatch(
+            &instance,
+            96,
+            DispatchRecord {
+                sink: Some(tx),
+                frame: None,
+                parent: None,
+                outbound: None,
+                stream: None,
+            },
+        )
+        .unwrap_or_else(|_| panic!("admission"));
+        let pending = PendingContinuation {
+            instance: instance.clone(),
+            dispatch_id: 96,
+            rx,
+            cancel: None,
+            _abandon: PendingDropGuard {
+                instance: instance.clone(),
+                dispatch_id: 96,
+            },
+        };
+        spawn_stream_settle(&instance, Box::new(pending)).unwrap();
+        assert_eq!(instance.tasks.lock().unwrap().len(), 1);
+        instance
+            .dispatches
+            .lock()
+            .unwrap()
+            .remove(&96)
+            .unwrap()
+            .sink
+            .unwrap()
+            .send(Ok(Value::Null))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !instance.tasks.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("真实 settle 任务完成后必须自行摘除 registry");
+        assert!(instance.tasks.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn schema_blob_rejects_null_and_impossible_lengths() {
@@ -4583,8 +5819,18 @@ mod tests {
             dispatches: Arc::new(Mutex::new(HashMap::new())),
             keepalive: None,
             closed: Arc::new(AtomicBool::new(false)),
-            lifecycle: Arc::new(RwLock::new(())),
-            reclaiming: Arc::new(Mutex::new(Vec::new())),
+            lifecycle: Arc::new(Mutex::new(0)),
+            calls_changed: Arc::new(tokio::sync::Notify::new()),
+            credits: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            close_drained: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            observer_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            outbound_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            cancel_gate: Arc::new(Mutex::new(None)),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
             error_format: 0,
             dispatch_policy: DispatchPolicy::default(),
             host_limits: HostLimits::default(),
@@ -4639,7 +5885,7 @@ mod tests {
     #[test]
     fn stale_handles_are_rejected_after_slot_reuse() {
         let mut slab = Slab::default();
-        let first = slab.insert(dummy_instance("first"));
+        let first = slab.insert(dummy_instance("first"), None);
         assert!(slab.get(first).is_some());
 
         // 卸载 → 槽位进入空闲表。
@@ -4647,7 +5893,7 @@ mod tests {
         assert!(slab.get(first).is_none(), "卸载后句柄立刻失效");
 
         // 新实例复用同一个槽位。
-        let second = slab.insert(dummy_instance("second"));
+        let second = slab.insert(dummy_instance("second"), None);
         assert_eq!(
             Slab::split(first).0,
             Slab::split(second).0,
@@ -4663,7 +5909,7 @@ mod tests {
     fn handle_zero_is_reserved() {
         let mut slab = Slab::default();
         assert!(slab.get(0).is_none());
-        let handle = slab.insert(dummy_instance("x"));
+        let handle = slab.insert(dummy_instance("x"), None);
         assert_ne!(handle, 0);
         assert!(slab.get(handle).is_some());
     }
@@ -4673,7 +5919,7 @@ mod tests {
     fn slots_are_recycled_not_leaked() {
         let mut slab = Slab::default();
         let handles: Vec<u64> = (0..8)
-            .map(|i| slab.insert(dummy_instance(&format!("p{i}"))))
+            .map(|i| slab.insert(dummy_instance(&format!("p{i}")), None))
             .collect();
         assert_eq!(slab.live(), 8);
         for handle in &handles {
@@ -4682,7 +5928,7 @@ mod tests {
         assert_eq!(slab.live(), 0);
         // 再插入 8 个：槽位应当被复用，容量不增长。
         for i in 0..8 {
-            slab.insert(dummy_instance(&format!("q{i}")));
+            slab.insert(dummy_instance(&format!("q{i}")), None);
         }
         assert_eq!(slab.slots.len(), 8, "槽位应被复用而不是无限增长");
     }
@@ -4962,6 +6208,290 @@ mod tests {
         );
     }
 
+    /// 与实现里的私有上限对齐（crate 内用例才读得到它）。
+    const READ_CAP: usize = MAX_READ_RETRY_BYTES;
+
+    thread_local! {
+        static READ_CLAIM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static READ_CLAIM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static WRITE_CLAIM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn read_claim(claim: usize) {
+        READ_CLAIM.set(claim);
+        READ_CLAIM_CALLS.set(0);
+    }
+
+    /// `{"ret":"xxx…"}`，总长度恰好 `total` 字节（前缀 8 + 后缀 2）。
+    fn big_ret_json(total: usize) -> String {
+        format!(r#"{{"ret":"{}"}}"#, "x".repeat(total - 10))
+    }
+
+    /// 第一次申报 `claim` 字节；第二次回填**恰好 claim 字节**的合法 JSON。
+    unsafe extern "C" fn read_claim_call(_: u64, _: u32, _: Blob, _: Blob, out: *mut Out) -> i32 {
+        let calls = READ_CLAIM_CALLS.get() + 1;
+        READ_CLAIM_CALLS.set(calls);
+        let claim = READ_CLAIM.get();
+        if calls == 1 {
+            (*out).len = claim;
+            return STATUS_TOO_SMALL;
+        }
+        (*out).write(big_ret_json(claim).as_bytes())
+    }
+
+    /// 永远申报同一个 `claim` 并报 TOO_SMALL：坏插件的"我就是不够"。
+    unsafe extern "C" fn read_claim_forever_call(
+        _: u64,
+        _: u32,
+        _: Blob,
+        _: Blob,
+        out: *mut Out,
+    ) -> i32 {
+        READ_CLAIM_CALLS.set(READ_CLAIM_CALLS.get() + 1);
+        (*out).len = READ_CLAIM.get();
+        STATUS_TOO_SMALL
+    }
+
+    /// 写 op 的坏申报：一次就是 usize::MAX。
+    unsafe extern "C" fn write_huge_claim_call(
+        _: u64,
+        _: u32,
+        _: Blob,
+        _: Blob,
+        out: *mut Out,
+    ) -> i32 {
+        WRITE_CLAIM_CALLS.set(WRITE_CLAIM_CALLS.get() + 1);
+        (*out).len = usize::MAX;
+        STATUS_TOO_SMALL
+    }
+
+    /// O8b-1 的上限取数与边界（与 `READ_CAP`/`read_retry_cap` 一对一）。
+    #[test]
+    fn read_retry_cap_rejects_out_of_range_and_oversize_lengths() {
+        assert_eq!(
+            read_retry_cap(0),
+            Ok(16 * 1024),
+            "申报小于初始缓冲时仍按 16 KiB 起步"
+        );
+        assert_eq!(read_retry_cap(200 * 1024), Ok(200 * 1024));
+        assert_eq!(read_retry_cap(READ_CAP), Ok(READ_CAP), "上限本身可用");
+        assert!(read_retry_cap(READ_CAP + 1).is_err(), "上限 +1 必须被拒");
+        assert!(
+            read_retry_cap(isize::MAX as usize).is_err(),
+            "isize::MAX 也要被拒（真实 OOM 会 abort）"
+        );
+        assert!(read_retry_cap(usize::MAX).is_err(), "usize::MAX 必须被拒");
+    }
+
+    /// O8b-1 a. 上限内的扩容重试照常工作，并拿回**完整**内容。
+    #[test]
+    fn read_retry_within_the_cap_returns_the_full_payload() {
+        read_claim(200 * 1024);
+        let value =
+            unsafe { call_op_read(read_claim_call, 0, cordis_abi::OP_VOLATILE_PATHS, "", 0) }
+                .expect("上限内的只读扩容应成功");
+        match value {
+            CallOutcome::Ok(value) => assert_eq!(
+                value.as_str().map(str::len),
+                Some(200 * 1024 - 10),
+                "必须拿回完整内容，而不是被截断/补零的缓冲"
+            ),
+            _ => panic!("只读路径应返回解析后的值"),
+        }
+        assert_eq!(READ_CLAIM_CALLS.get(), 2, "只读路径应重试一次");
+    }
+
+    /// O8b-1 b. 上限 +1 被拒：拒绝发生在**分配之前**，文案点名上限。
+    #[test]
+    fn read_retry_past_the_cap_is_rejected_before_allocating() {
+        read_claim(READ_CAP + 1);
+        let error = match unsafe {
+            call_op_read(
+                read_claim_forever_call,
+                0,
+                cordis_abi::OP_VOLATILE_PATHS,
+                "",
+                0,
+            )
+        } {
+            Err(error) => error,
+            Ok(_) => panic!("超过只读扩容上限必须拒绝"),
+        };
+        assert!(
+            error.contains("扩容上限"),
+            "必须点名上限；得到 {} 字节的诊断",
+            error.len()
+        );
+        assert!(!error.contains('\0'));
+        assert_eq!(READ_CLAIM_CALLS.get(), 1, "超限时不得再调一次（不扩容）");
+    }
+
+    /// O8b-1 c. `usize::MAX` / `isize::MAX` 被拒且不 panic（也不真去分配）。
+    #[test]
+    fn absurd_read_claims_are_rejected_instead_of_panicking() {
+        for claim in [usize::MAX, isize::MAX as usize] {
+            read_claim(claim);
+            let error = match unsafe {
+                call_op_read(
+                    read_claim_forever_call,
+                    0,
+                    cordis_abi::OP_VOLATILE_PATHS,
+                    "",
+                    0,
+                )
+            } {
+                Err(error) => error,
+                Ok(_) => panic!("{claim} 字节的申报必须被拒绝"),
+            };
+            assert!(
+                error.contains("拒绝分配"),
+                "{claim} 字节的申报必须被明确拒绝；得到 {} 字节的诊断",
+                error.len()
+            );
+            assert!(!error.contains('\0'));
+            assert_eq!(READ_CLAIM_CALLS.get(), 1);
+        }
+    }
+
+    /// O8b-1 d. 第二次仍是 TOO_SMALL 时给出可读原因，而不是全零缓冲的 NUL 串。
+    #[test]
+    fn a_second_too_small_reports_a_readable_reason() {
+        read_claim(2 * 1024);
+        let error = match unsafe {
+            call_op_read(
+                read_claim_forever_call,
+                0,
+                cordis_abi::OP_VOLATILE_PATHS,
+                "",
+                0,
+            )
+        } {
+            Err(error) => error,
+            Ok(_) => panic!("二次 TOO_SMALL 必须报错"),
+        };
+        assert!(
+            !error.contains('\0'),
+            "错误消息不得是 NUL 填充串（{} 字节）",
+            error.len()
+        );
+        assert!(!error.is_empty(), "必须给出原因");
+        assert!(error.contains("仍"), "必须说清扩容之后仍然不够：{error}");
+    }
+
+    /// O8b-1 e. 写 op 遇到巨量申报仍然只调用一次（不重放、不分配）。
+    #[test]
+    fn huge_write_claims_still_call_the_plugin_exactly_once() {
+        WRITE_CLAIM_CALLS.set(0);
+        let error = match unsafe { call_op(write_huge_claim_call, 0, OP_CALLBACK, "", 0) } {
+            Err(error) => error,
+            Ok(_) => panic!("写路径不得重放"),
+        };
+        assert!(error.contains("不可重试"), "{error}");
+        assert!(!error.contains('\0'));
+        assert_eq!(WRITE_CLAIM_CALLS.get(), 1, "写路径只能调用一次");
+    }
+
+    #[test]
+    fn closed_next_preserves_frame_and_task_before_drain() {
+        let app = cordis_core::App::new();
+        let handle = register_instance_with_keepalive(
+            app.root.clone(),
+            stream_unused_call,
+            None,
+            cordis_abi::ERROR_FORMAT_V1,
+        )
+        .unwrap();
+        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tail_calls = calls.clone();
+        let frame = Next::some(move |_| {
+            tail_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        });
+        assert!(insert_dispatch(
+            &instance,
+            1,
+            DispatchRecord {
+                sink: None,
+                frame: Some(frame),
+                parent: None,
+                outbound: None,
+                stream: None,
+            }
+        )
+        .is_ok());
+        {
+            let _table = instance.dispatches.lock().unwrap();
+            instance.closed.store(true, Ordering::SeqCst);
+        }
+        let mut buffer = [0u8; 4096];
+        let mut out = Out {
+            ptr: buffer.as_mut_ptr(),
+            cap: buffer.len(),
+            len: 0,
+        };
+        let status = unsafe { host_ctx_next(handle, 1, Blob::new(b"[]"), 9, &mut out) };
+        let payload: Value = serde_json::from_slice(&buffer[..out.len]).unwrap_or(Value::Null);
+        let (frame_preserved, task_absent) = {
+            let table = instance.dispatches.lock().unwrap();
+            let record = table.get(&1).unwrap();
+            (
+                record.frame.is_some(),
+                instance.tasks.lock().unwrap().is_empty(),
+            )
+        };
+        unregister_instance(handle);
+        assert_eq!(status, STATUS_ERR, "closed next admitted work: {payload}");
+        assert_eq!(payload["code"], "host_lifecycle");
+        assert_eq!(payload["category"], "lifecycle");
+        assert_eq!(payload["certainty"], "not_executed");
+        assert!(frame_preserved, "拒绝不得消费有效 Next frame");
+        assert!(task_absent, "拒绝不得赋值 task");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "拒绝不得执行尾链");
+    }
+
+    #[test]
+    fn closed_dispatch_admission_precedes_capacity() {
+        let app = cordis_core::App::new();
+        set_host_limits_for(
+            &app.root,
+            HostLimits {
+                max_dispatches_per_instance: 1,
+                ..HostLimits::default()
+            },
+        )
+        .unwrap();
+        let handle = register_instance_with_keepalive(
+            app.root.clone(),
+            stream_unused_call,
+            None,
+            cordis_abi::ERROR_FORMAT_V1,
+        )
+        .unwrap();
+        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let record = || DispatchRecord {
+            sink: None,
+            frame: Some(Next::none()),
+            parent: None,
+            outbound: None,
+            stream: None,
+        };
+        assert!(insert_dispatch(&instance, 1, record()).is_ok());
+        {
+            let _table = instance.dispatches.lock().unwrap();
+            instance.closed.store(true, Ordering::SeqCst);
+        }
+        let result = insert_dispatch(&instance, 2, record());
+        let count = instance.dispatches.lock().unwrap().len();
+        unregister_instance(handle);
+        let (payload, rejected) = result.expect_err("closed 必须拒绝记录");
+        assert_eq!(payload.code, "host_lifecycle", "关闭优先于容量");
+        assert_eq!(payload.category, "lifecycle");
+        assert_eq!(payload.certainty, "not_executed");
+        assert_eq!(count, 1);
+        assert!(rejected.frame.is_some(), "拒绝必须归还 waterfall frame");
+    }
+
     /// 流式宿主函数的业务错误也必须按插件能力位写结构化载荷。
     #[test]
     fn stream_host_errors_are_structured_for_capable_plugins() {
@@ -4986,7 +6516,6 @@ mod tests {
                         parent: None,
                         outbound: None,
                         stream: None,
-                        task: None,
                     },
                 )
                 .is_ok(),

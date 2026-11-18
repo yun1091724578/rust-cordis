@@ -610,6 +610,68 @@ fn soak_rejects_invalid_or_extra_arguments() {
 }
 
 #[test]
+fn soak_rejects_invalid_staged_cycles_env() {
+    // `soak` 无位置参数时只读环境变量：非法值必须在拉起 cargo 之前就被拒。
+    for raw in ["0", "-1", "abc"] {
+        let output = Command::new(bin())
+            .env("CORDIS_STAGED_SOAK_CYCLES", raw)
+            .arg("soak")
+            .output()
+            .expect("spawn xtask");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "CORDIS_STAGED_SOAK_CYCLES={raw}: stdout={} stderr={stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("CORDIS_STAGED_SOAK_CYCLES") && stderr.contains("正整数"),
+            "CORDIS_STAGED_SOAK_CYCLES={raw} 的错误必须点名变量与取值要求：stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn dhat_rejects_an_unknown_argument() {
+    let output = Command::new(bin())
+        .args(["dhat", "--bogus"])
+        .output()
+        .expect("spawn xtask");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("dhat 不接受参数"),
+        "未知参数必须可读：stderr={stderr}"
+    );
+}
+
+#[test]
+fn dhat_help_exits_zero_and_names_dhat() {
+    let output = Command::new(bin())
+        .args(["dhat", "--help"])
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("dhat"),
+        "stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn docs_explicit_path_is_repo_relative() {
     let output = Command::new(bin())
         .current_dir(std::env::temp_dir())
@@ -623,5 +685,391 @@ fn docs_explicit_path_is_repo_relative() {
         "stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn package_check_help_lists_the_new_command() {
+    let output = Command::new(bin())
+        .args(["package-check", "--help"])
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("package-check"), "stdout={stdout}");
+    // 三个旋钮必须在用法里看得见，否则"失败保留目录"就没人知道。
+    // `--reuse-dir` 是调试口，同样写进用法（否则"改坏产物必红"的证据没人能复现）。
+    for needle in [
+        "--keep",
+        "--online",
+        "CORDIS_PACKAGE_CONSUMER_DIR",
+        "--reuse-dir",
+    ] {
+        assert!(stdout.contains(needle), "用法缺少 {needle}: {stdout}");
+    }
+}
+
+#[test]
+fn package_check_rejects_bad_arguments_before_packaging() {
+    // 参数错误必须是 usage 错误（2）：此时一行 cargo 命令都还没跑。
+    for args in [
+        vec!["package-check", "--bogus"],
+        vec!["package-check", "positional"],
+        vec!["package-check", "--dir"],
+        vec!["package-check", "--dir", "relative/path"],
+        vec!["package-check", "--dir", "/a", "--dir", "/b"],
+    ] {
+        let output = Command::new(bin())
+            .args(&args)
+            .output()
+            .expect("spawn xtask");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn package_check_refuses_a_root_inside_the_repo_or_a_non_ascii_root() {
+    // 两个前置判据在拉起 cargo 之前就要拦住：目录必须 ASCII 且在仓库之外。
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask 位于仓库根目录下")
+        .to_path_buf();
+    let inside = repo.join("target").join("package-check-should-not-exist");
+    let output = Command::new(bin())
+        .args(["package-check", "--dir"])
+        .arg(&inside)
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("不能位于仓库内"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!inside.exists(), "被拒绝的目录不该被创建");
+}
+
+#[test]
+#[cfg(windows)]
+fn package_check_refuses_a_non_ascii_root() {
+    let output = Command::new(bin())
+        .args(["package-check", "--dir", "C:/科迪斯/包检查"])
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("ASCII"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !Path::new("C:/科迪斯/包检查").exists(),
+        "被拒绝的目录不该被创建"
+    );
+}
+
+#[test]
+fn package_check_refuses_to_wipe_a_foreign_directory() {
+    // `--dir` 打错一个字符就是递归删除：非空且没有归属标记的目录必须拒绝清空。
+    let dir = std::env::temp_dir().join(format!(
+        "cordis-package-check-foreign-{}",
+        std::process::id()
+    ));
+    if !dir.to_string_lossy().is_ascii() {
+        return; // 非 ASCII 临时目录会先被 ASCII 判据拦下，这个用例无从验证。
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("keep.txt"), b"keep").unwrap();
+
+    let output = Command::new(bin())
+        .args(["package-check", "--dir"])
+        .arg(&dir)
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("拒绝清空"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.join("keep.txt").exists(), "拒绝清空的目录必须原样保留");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn package_check_rejects_a_dir_with_a_parent_component() {
+    // `..` 在 canonicalize 之前无法判定落点，必须在拉起任何 cargo 之前就拒。
+    let sneaky = std::env::temp_dir()
+        .join("cordis-package-check-sneaky")
+        .join("..")
+        .join("elsewhere");
+    let output = Command::new(bin())
+        .args(["package-check", "--dir"])
+        .arg(&sneaky)
+        .output()
+        .expect("spawn xtask");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "含 `..` 的 --dir 是用法错误：stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(stderr.contains("不能含 `..`"), "stderr={stderr}");
+    assert!(
+        !std::env::temp_dir()
+            .join("cordis-package-check-sneaky")
+            .join("..")
+            .join("elsewhere")
+            .exists(),
+        "被拒绝的目录不该被创建"
+    );
+}
+
+#[test]
+fn package_check_rejects_a_drive_root() {
+    // 驱动器根没有父目录，而 `remove_owned_dir` 允许删"空目录"：一旦放过就是整盘
+    // `remove_dir_all`。这个形状永远不是临时目录，必须在解析阶段拒（连目录都不碰）。
+    let drive_root = if cfg!(windows) { "C:\\" } else { "/" };
+    let output = Command::new(bin())
+        .args(["package-check", "--dir", drive_root])
+        .output()
+        .expect("spawn xtask");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "驱动器根是用法错误：stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(stderr.contains("驱动器根"), "stderr={stderr}");
+}
+
+#[test]
+#[cfg(windows)]
+fn package_check_refuses_a_case_variant_of_the_repo_path() {
+    // 盘符/目录大小写不同仍是同一个目录：canonicalize 之后必须认出它在仓库里。
+    // 否则消费者会继承仓库的 .cargo/config.toml，cleanup 还会递归删仓库内目录。
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask 位于仓库根目录下")
+        .to_path_buf();
+    let dir = PathBuf::from(repo.to_string_lossy().to_uppercase())
+        .join("target")
+        .join("package-check-case-variant");
+    let output = Command::new(bin())
+        .args(["package-check", "--dir"])
+        .arg(&dir)
+        .output()
+        .expect("spawn xtask");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(stderr.contains("不能位于仓库内"), "stderr={stderr}");
+    assert!(!dir.exists(), "被拒绝的目录不该被创建");
+}
+
+#[test]
+fn package_check_reuse_dir_requires_an_existing_marked_root() {
+    // `--reuse-dir` 只复用带自己标记的目录：既不能凭空造，也不能指向别人的目录。
+    let missing = std::env::temp_dir().join(format!(
+        "cordis-package-reuse-missing-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&missing);
+    let output = Command::new(bin())
+        .args(["package-check", "--reuse-dir", "--dir"])
+        .arg(&missing)
+        .output()
+        .expect("spawn xtask");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("--reuse-dir 要求目录已存在"),
+        "stderr={stderr}"
+    );
+    assert!(!missing.exists(), "被拒绝的目录不该被创建");
+
+    let foreign = std::env::temp_dir().join(format!(
+        "cordis-package-reuse-foreign-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&foreign);
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(foreign.join("keep.txt"), b"keep").unwrap();
+    let output = Command::new(bin())
+        .args(["package-check", "--reuse-dir", "--dir"])
+        .arg(&foreign)
+        .output()
+        .expect("spawn xtask");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(
+        stderr.contains("只复用 package-check 自己的目录"),
+        "stderr={stderr}"
+    );
+    assert!(
+        foreign.join("keep.txt").exists(),
+        "复用被拒时不能动别人的目录"
+    );
+    let _ = std::fs::remove_dir_all(&foreign);
+}
+
+/// 解包目录里 host 的源码文件（`unpacked/rust-cordis-host-<版本>/src/lib.rs`）。
+fn unpacked_host_source(root: &Path) -> PathBuf {
+    let unpacked = root.join("unpacked");
+    let dir = std::fs::read_dir(&unpacked)
+        .unwrap_or_else(|err| panic!("读取 {} 失败：{err}", unpacked.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().starts_with("rust-cordis-host-"))
+                    .unwrap_or(false)
+        })
+        .unwrap_or_else(|| panic!("{} 里没有 rust-cordis-host 的解包目录", unpacked.display()));
+    dir.join("src").join("lib.rs")
+}
+
+/// `--reuse-dir` 的负向证据：改坏**解包产物**之后，检查必须变红。
+///
+/// 为什么要标 `#[ignore]`：第一次运行要先跑一次完整的 `package-check --keep`
+/// （四个 crate 打包 + 隔离消费者构建，分钟级），放进 `cargo test -p xtask`
+/// 会把秒级套件变成分钟级；而证据本身仍然可重复——
+/// `cargo test -p xtask --test cli -- --ignored reuse_dir_flags`。
+///
+/// 复用的目录：`CORDIS_PACKAGE_CONSUMER_DIR`（与 package-check 共用），否则
+/// `<temp>/cordis-package-reuse`。目录里已有 package-check 标记就跳过准备阶段。
+///
+/// 恢复文件用"仓库外备份 + SHA256 双校验"：备份放在 root（仓库之外）里，
+/// 恢复后再核一次 SHA256，任何一步对不上就直接红，不留半截改动。
+#[test]
+#[ignore = "慢：需要先跑一次 package-check --keep；用 --ignored 手动执行"]
+fn reuse_dir_flags_a_broken_unpacked_artifact() {
+    let root = match std::env::var_os("CORDIS_PACKAGE_CONSUMER_DIR") {
+        Some(value) => PathBuf::from(value),
+        None => std::env::temp_dir().join("cordis-package-reuse"),
+    };
+    if !root.to_string_lossy().is_ascii() {
+        eprintln!(
+            "跳过：目录不是纯 ASCII（{}），package-check 会先拒绝它",
+            root.display()
+        );
+        return;
+    }
+    if !root.join("package-check-root.marker").exists() {
+        let output = Command::new(bin())
+            .args(["package-check", "--keep", "--dir"])
+            .arg(&root)
+            .output()
+            .expect("spawn xtask");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "准备阶段（package-check --keep）必须通过：stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let source = unpacked_host_source(&root);
+    let original = std::fs::read(&source).unwrap();
+    let digest = sha256_hex(&original);
+    let backup = root.join("reuse-backup-host-lib.rs");
+    std::fs::write(&backup, &original).unwrap();
+    assert_eq!(
+        sha256_hex(&std::fs::read(&backup).unwrap()),
+        digest,
+        "备份必须与原始文件逐字节一致"
+    );
+
+    // 一处**沉默**的语义改动：实例计数多算一个。编译照过，只有判据能抓住。
+    const NEEDLE: &str = "instances().lock().unwrap().live()";
+    let text = String::from_utf8(original.clone()).expect("解包产物里的 host 源码应是 UTF-8");
+    assert_eq!(
+        text.matches(NEEDLE).count(),
+        1,
+        "解包产物里应恰好有一处 `{NEEDLE}`；源码结构变了就更新这个用例"
+    );
+    let mutated = text.replacen(NEEDLE, "instances().lock().unwrap().live() + 1", 1);
+    std::fs::write(&source, mutated.as_bytes()).unwrap();
+
+    let output = Command::new(bin())
+        .args(["package-check", "--reuse-dir", "--dir"])
+        .arg(&root)
+        .output()
+        .expect("spawn xtask");
+
+    // 先恢复，再断言：无论检查结果如何，仓库外的解包产物都要回到原状。
+    std::fs::write(&source, &original).unwrap();
+    let restored = std::fs::read(&source).unwrap();
+    assert_eq!(
+        sha256_hex(&restored),
+        digest,
+        "恢复后的 SHA256 必须等于原始值"
+    );
+    assert_eq!(restored, original, "恢复后必须逐字节等于原始文件");
+    let _ = std::fs::remove_file(&backup);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "改坏解包产物必须判红：stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("[package-check] --- package"),
+        "`--reuse-dir` 必须跳过打包阶段（否则红可能只是重新打包造成的）：stdout={stdout}"
+    );
+    assert!(
+        stderr.contains("失败于阶段 \"run\""),
+        "失败必须落在 run 阶段：stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("装载后应有 1 个 ABI 实例，实际 2"),
+        "失败原因必须可读（来自产物侧断言的原文）：stderr={stderr}"
     );
 }

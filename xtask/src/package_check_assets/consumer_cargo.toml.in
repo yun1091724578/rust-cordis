@@ -1,0 +1,29 @@
+# `cargo xtask package-check` 生成的临时消费者工程。
+#
+# 依赖**只**来自解包后的 .crate 产物：host 用 path 指向解包目录，core/abi 由
+# `[patch.crates-io]` 把 registry 依赖重定向到解包目录。这里**不得**出现任何指向
+# 仓库源码目录的 path —— 生成之后 package-check 会逐条断言（文本判据 +
+# `cargo metadata` 溯源判据），所以下面三个占位符之外的路径都不该被写进来。
+
+[package]
+name = "cordis-package-consumer"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+# 独立 workspace：不吃仓库的 workspace 与成员列表。
+[workspace]
+
+[dependencies]
+cordis-abi = { package = "rust-cordis-abi", version = "{{VERSION}}" }
+cordis-core = { package = "rust-cordis-core", version = "{{VERSION}}" }
+cordis-host = { package = "rust-cordis-host", path = "{{HOST}}" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+# host 的打包清单把 core/abi 写成 registry 的 `^<version>`（crates.io 上并没有这个
+# 版本），patch 把这些要求重定向到解包目录——这正是"用产物构建"的关键一步。
+[patch.crates-io]
+rust-cordis-abi = { path = "{{ABI}}" }
+rust-cordis-core = { path = "{{CORE}}" }

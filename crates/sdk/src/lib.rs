@@ -11,7 +11,12 @@
 //!
 //! # 五分钟速览
 //!
-//! ```ignore
+//! 下面这段是**真编译**的 doctest（`cargo test -p rust-cordis-sdk --doc`）。
+//! 片段里的类型都是模块级 item（`#[cordis::plugin]` 会生成 `mod …{ use super::… }`），
+//! 所以用 `# fn main() {}` 阻止 rustdoc 把整段塞进 `fn main` 里。
+//!
+//! ```rust
+//! # fn main() {}
 //! #[cordis::service(name = "greeter", version = 1)]
 //! pub trait Greeter {
 //!     async fn greet(&self, who: String) -> Result<String, String>;

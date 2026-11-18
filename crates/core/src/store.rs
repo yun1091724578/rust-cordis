@@ -214,8 +214,15 @@ pub trait Plugin: Send + Sync + 'static {
 /// 给任意插件**加上 provision 声明**（M5）。
 ///
 /// 原生插件没有 ABI 的 `PluginDesc` 字段，声明走这个包装器：
-/// ```ignore
-/// let plugin = with_provision(plugin_fn("tools", Inject::default(), apply), vec!["tools".into()]);
+/// ```rust
+/// use cordis_core::{plugin_fn, with_provision, BoxFuture, Config, Ctx, Inject, Plugin, Result};
+///
+/// let apply = |_ctx: Ctx, _cfg: Config| -> BoxFuture<Result<()>> { Box::pin(async { Ok(()) }) };
+/// let plugin = with_provision(
+///     plugin_fn("tools", Inject::default(), apply),
+///     vec!["tools".into()],
+/// );
+/// assert_eq!(plugin.provision(), vec!["tools".to_string()]);
 /// ```
 /// ABI 插件不需要它——声明在 desc 里，宿主读进 [`Plugin::provision`]。
 pub fn with_provision(plugin: Arc<dyn Plugin>, provision: Vec<String>) -> Arc<dyn Plugin> {

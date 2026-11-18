@@ -23,8 +23,8 @@
 
 use cordis_core::{App, Config, Ctx, Disposable, Dyn, Fiber, FiberState, Inject, Plugin};
 use cordis_host::loader::{
-    declare_volatile, load_with_source, Action, HmrConfig, JsEvaluator, LoadedFile, LoaderConfig,
-    LoaderState, PluginSource, ReconcileOutcome, ReloadOutcome,
+    declare_volatile, load_with_source, Action, DiskPluginSource, HmrConfig, JsEvaluator,
+    LoadedFile, LoaderConfig, LoaderState, PluginSource, ReconcileOutcome, ReloadOutcome,
 };
 use cordis_host::patch::{parse_entries, Entry};
 use serde_json::{json, Value};
@@ -44,11 +44,15 @@ use tokio::sync::Semaphore;
 ///   模拟"插件自己把自己卸载了"（上游 `loader/src/index.ts:137-145` 的 case 7）；
 /// - `gate`：可选闸门。打开之后每一次挂载都要先拿到一个许可证，于是"对账进行到一半"
 ///   这一刻可以被钉成确定性的（`no_tearing` / `coalesces` 两条测试靠它）；
-/// - `trace`：生命周期轨迹（apply / cleanup 的先后顺序就是"先卸后装"的证据）。
+/// - `trace`：生命周期轨迹（`load` / apply / cleanup 的先后顺序就是"先卸后装"、
+///   以及"预检前移到拆卸之前"的证据）。
 struct FakeSource {
     gate: Arc<Mutex<Option<Arc<Semaphore>>>>,
     stashed: Arc<Mutex<Vec<Arc<Fiber>>>>,
     trace: Arc<Mutex<Vec<String>>>,
+    /// 已 **drop** 的 artifact（插件名，按 drop 先后）。`load` 交出去的
+    /// `LoadedFile.plugin` 无人持有时才会走到这里——"丢弃"与"被永久持有"由此可区分。
+    drops: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeSource {
@@ -57,7 +61,21 @@ impl FakeSource {
             gate: Arc::new(Mutex::new(None)),
             stashed: Arc::new(Mutex::new(Vec::new())),
             trace: Arc::new(Mutex::new(Vec::new())),
+            drops: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// artifact 回收探针：随插件对象（`Arc<dyn Plugin>`）一起 drop 时记一行。
+    fn probe(&self, name: &str) -> DropProbe {
+        DropProbe {
+            name: name.to_string(),
+            drops: self.drops.clone(),
+        }
+    }
+
+    /// 已 drop 的 artifact 名（按 drop 顺序）。
+    fn dropped(&self) -> Vec<String> {
+        self.drops.lock().unwrap().clone()
     }
 
     /// 打开闸门：此后每次挂载都要先拿许可证（测试用 `add_permits` 放行）。
@@ -76,12 +94,36 @@ impl FakeSource {
         self.trace.lock().unwrap().clone()
     }
 
+    /// `load` 轨迹（`<行身份>:<插件名>:load`）：次数与先后顺序就是
+    /// "预检发生过几次、发生在拆卸之前还是之后"的证据（O5b-2）。
+    fn loads(&self) -> Vec<String> {
+        self.trace()
+            .into_iter()
+            .filter(|line| line.ends_with(":load"))
+            .collect()
+    }
+
     fn stashed_fiber(&self) -> Arc<Fiber> {
         self.stashed
             .lock()
             .unwrap()
             .pop()
             .expect("`self-removing` 插件应当把 fiber 交出来")
+    }
+}
+
+/// artifact 回收探针：跟着插件对象走（`FnPlugin` 持有它的闭包，闭包捕获这个探针），
+/// 于是"最后一个 `Arc<dyn Plugin>` 被 drop"这一刻会记一行——正是"丢弃回收"的证据。
+///
+/// 纯测试夹具：不改 `LoadedFile` / `Plugin` 的形状。
+struct DropProbe {
+    name: String,
+    drops: Arc<Mutex<Vec<String>>>,
+}
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.drops.lock().unwrap().push(self.name.clone());
     }
 }
 
@@ -99,6 +141,8 @@ impl PluginSource for FakeSource {
             entry.id.clone().unwrap_or_else(|| entry.name.clone()),
             entry.name
         );
+        // 每次 `load` 都留痕（含失败的那些）：换实例的"预检前移"要靠次数与先后顺序验证。
+        self.trace.lock().unwrap().push(format!("{tag}:load"));
         let config = entry.config.clone().unwrap_or(Config::Null);
         let service = config
             .get("service")
@@ -118,13 +162,17 @@ impl PluginSource for FakeSource {
                 };
                 // 「插件自我卸载」的模拟：这一行的插件把自己的 fiber 交给测试。
                 let stash_self = entry.name == "self-removing";
+                let probe = self.probe(name);
                 cordis_core::plugin_fn(name, Inject::default(), move |ctx: Ctx, cfg: Config| {
                     let gate = gate.clone();
                     let trace = trace.clone();
                     let stashed = stashed.clone();
                     let service = service.clone();
                     let tag = tag.clone();
+                    // 探针只为"这份 artifact 何时被回收"存在：闭包被 `FnPlugin` 持有到头。
+                    let probe = &probe;
                     Box::pin(async move {
+                        let _ = probe;
                         // 配置在**每一次** apply 时重新读：`update`（不重挂）就是靠这一点被观察到的。
                         let value = cfg.get("value").and_then(Value::as_u64).unwrap_or(0) as u32;
                         trace.lock().unwrap().push(format!("{tag}:apply"));
@@ -159,13 +207,16 @@ impl PluginSource for FakeSource {
                     .and_then(Value::as_str)
                     .unwrap_or("svc")
                     .to_string();
+                let probe = self.probe("declares");
                 let plugin = declare_volatile(
                     cordis_core::plugin_fn(
                         "declares",
                         Inject::default(),
                         move |ctx: Ctx, cfg: Config| {
                             let service = service.clone();
+                            let probe = &probe;
                             Box::pin(async move {
+                                let _ = probe;
                                 let value =
                                     cfg.get("value").and_then(Value::as_u64).unwrap_or(0) as u32;
                                 ctx.provide(&service, Dyn::new(value))?;
@@ -182,10 +233,13 @@ impl PluginSource for FakeSource {
             "fails" => {
                 let trace = self.trace.clone();
                 let tag = tag.clone();
+                let probe = self.probe("fails");
                 cordis_core::plugin_fn("fails", Inject::default(), move |ctx: Ctx, _cfg: Config| {
                     let trace = trace.clone();
                     let tag = tag.clone();
+                    let probe = &probe;
                     Box::pin(async move {
+                        let _ = probe;
                         trace.lock().unwrap().push(format!("{tag}:apply"));
                         let cleaned = trace.clone();
                         let cleaned_tag = tag.clone();
@@ -1550,6 +1604,8 @@ async fn self_dispose_of_a_patch_inserted_row_writes_the_patch_layer_not_main() 
 /// ② 暂存副本必须销账并删除，否则每个坏构建漏一个 `.rN`（`stagedLeaked` 只增不减）。
 #[tokio::test]
 async fn failed_reload_precheck_advances_fingerprint_and_cleans_the_staged_copy() {
+    let _serial = staged_ledger_serial().await;
+    let _globals = GlobalsGuard::new();
     cordis_host::source::set_allow_unverified(true);
     let app = App::new();
     let dir = TempDir::new("reload-bad-precheck");
@@ -1603,6 +1659,87 @@ async fn failed_reload_precheck_advances_fingerprint_and_cleans_the_staged_copy(
         state.mounted_liveness().iter().all(|(_, alive)| *alive),
         "记录必须仍指向活着的实例：{:?}",
         state.mounted_liveness()
+    );
+}
+
+/// `staged_leaked()` 是**进程级**台账：凡是真的走 `stage_plugin` 的用例都必须串行，
+/// 否则并行的「取基线 → 断言回基线」窗口会互相污染（同一个测试二进制里并发跑）。
+///
+/// 用 `tokio::sync::Mutex` 而不是 `std::sync::Mutex`：这些用例都要跨 `await` 持锁，
+/// 而 `std::sync::MutexGuard` 跨 await 是 clippy 的 `await_holding_lock` 违例
+/// （它同时也确实会在 current-thread 运行时里卡住同线程的其他任务）。
+async fn staged_ledger_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
+}
+
+/// 进程级准入是全局量：进用例先复位，出用例（含 panic 路径）再复位。
+///
+/// 没有它，`set_allow_unverified(true)` 会**常驻**这个测试二进制——后续用例即便
+/// 自己从没声明过开发模式，也会在准入上被悄悄放行，把"默认拒绝"的回归掩盖掉。
+struct GlobalsGuard;
+
+impl GlobalsGuard {
+    fn new() -> Self {
+        reset_globals();
+        Self
+    }
+}
+
+impl Drop for GlobalsGuard {
+    fn drop(&mut self) {
+        reset_globals();
+    }
+}
+
+fn reset_globals() {
+    cordis_host::source::set_active_policy(None);
+    cordis_host::source::set_allow_unverified(false);
+}
+
+/// 首次装载的**开失败**分支必须与 `reload_one` 同口径：暂存副本当场认领并删除。
+///
+/// 否则每一个"复制成功但打不开"的 artifact 都会在泄漏台账里留下一个 `.rN`
+/// （`stagedLeaked` 只增不减、`staged_unadopted` 永久 +1），与"预检失败零副作用"冲突。
+///
+/// 构造是确定性的：一个**存在但不是动态库**的文件（普通文本）。`stage_plugin` 必然
+/// 成功（就是文件复制），`LoadLibrary`/`dlopen` 必然失败——不需要 ABI 夹具，也不依赖
+/// 平台未定义行为。文件名用无扩展名的 `plug`，这样 `resolve_plugin_path` 在
+/// Windows/Linux/macOS 上都按同一个候选命中。
+#[tokio::test]
+async fn failed_disk_load_reclaims_its_staged_copy() {
+    let _serial = staged_ledger_serial().await;
+    let _globals = GlobalsGuard::new();
+    cordis_host::source::set_allow_unverified(true);
+    let dir = TempDir::new("disk-load-bad-artifact");
+    dir.write("plug", "definitely not a dynamic library");
+    let entry = Entry {
+        name: "plug".into(),
+        ..Entry::default()
+    };
+    let leaked = cordis_host::staged_leaked();
+
+    let error = match DiskPluginSource.load(&entry, &[dir.path().to_path_buf()], 1) {
+        Ok(loaded) => panic!("坏 artifact 不得打开：{}", loaded.source.display()),
+        Err(error) => error,
+    };
+    assert!(!error.is_empty(), "失败必须带原因：{error}");
+
+    assert_eq!(
+        cordis_host::staged_leaked(),
+        leaked,
+        "开失败分支必须销账：暂存台账不得永久 +1（基线 {leaked}）"
+    );
+    let mut leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("读临时目录")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("plug."))
+        .collect();
+    leftovers.sort();
+    assert!(
+        leftovers.is_empty(),
+        "开失败后暂存副本必须从磁盘消失，实际残留：{leftovers:?}"
     );
 }
 
@@ -1882,4 +2019,642 @@ async fn runtime_config_update_writes_the_patch_owner_layer() {
         Some(3),
         "reload 后不能被旧 patch 覆盖回 2"
     );
+}
+
+// ---------------------------------------------------------------------------
+// O5b：`Replace` 的**拆卸语义**（先卸后装 ⇒ 失败时旧实例如今真的没了）
+// ---------------------------------------------------------------------------
+
+/// 事件的载荷（装载器的事件都是单实参 JSON）。
+fn payload_of(call: &cordis_core::Call) -> Value {
+    call.args
+        .first()
+        .and_then(|arg| arg.downcast::<cordis_core::ExternValue>())
+        .map(|value| value.0.clone())
+        .unwrap_or(Value::Null)
+}
+
+/// O5b-a：`Replace` 失败必须**说出拆卸事实**，且整棵树保持自洽。
+///
+/// `Replace` 是"先卸后装"（`mount_row` 里才 `source.load`）：卸下之后才去装，
+/// 装不上就**没有回滚**。所以报告里既不能写"卸 0"（`disposed` 记的是"不再期望挂载"
+/// 的移除，这里不适用），也不能只说一句和 HMR 路径同款、含义相反的错误文案
+/// ——HMR 上那句话意味着"保留当前实例"，这里实际是"实例已丢"。
+///
+/// 目标不回滚是**有意**的（文件是真相；下一轮对账会带着同一份目标重试），
+/// 因此这里要钉住的三件事是：光秃秃的装载表、说清拆卸的失败文案、仍是新目标的树。
+#[tokio::test]
+async fn replace_failure_reports_the_teardown_and_stays_consistent() {
+    let app = App::new();
+    let dir = TempDir::new("replace-failure");
+    let source = FakeSource::new();
+    let logs = capture_logs(&app);
+    let state = load(
+        &app,
+        &dir,
+        "cordis.yml",
+        &yaml_row("provider", "provides", "svc", 1),
+        &[],
+        source.clone(),
+        None,
+    )
+    .await
+    .expect("装载");
+    assert_eq!(service_of(&app, "svc"), Some(1));
+
+    // 换成一个 apply 必然失败的插件 ⇒ Replace 先卸后装，装不上。
+    dir.write("cordis.yml", &yaml_row("provider", "fails", "svc", 2));
+    let outcome = reload_now(&state).await;
+
+    // ① 旧实例真的没了，表里也没有幽灵记录。
+    assert!(
+        state.mounted_labels().is_empty(),
+        "失败的换实例不得在装载表里留记录：{outcome:?}"
+    );
+    assert!(
+        state.mounted_liveness().is_empty(),
+        "记录不得指向已拆的实例：{:?}",
+        state.mounted_liveness()
+    );
+    assert!(
+        service_of(&app, "svc").is_none(),
+        "旧实例已经被卸下，服务不该还解析得到"
+    );
+
+    // ② `disposed`/`replaced` 的内容不动（这条路径既不"移除"也没"换成功"）。
+    assert!(outcome.replaced.is_empty(), "{outcome:?}");
+    assert!(
+        outcome.disposed.is_empty(),
+        "换实例不是移除路径，`disposed` 记的是不再期望挂载的行：{outcome:?}"
+    );
+
+    // ③ 失败文案必须写明拆卸事实（否则和 HMR 的"保留当前实例"读起来一样）。
+    assert_eq!(outcome.failures.len(), 1, "{outcome:?}");
+    assert!(
+        outcome.failures[0].contains("旧实例已卸下、未恢复"),
+        "失败文案必须写明拆卸事实：{:?}",
+        outcome.failures
+    );
+    assert!(
+        outcome.failures[0].contains("故意让 apply 失败"),
+        "原始错误不得被吞掉：{:?}",
+        outcome.failures
+    );
+    assert!(
+        logs.lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("Error") && line.contains("旧实例已卸下、未恢复")),
+        "Error 日志必须保留且同样写明拆卸：{:?}",
+        logs.lock().unwrap()
+    );
+    assert!(
+        report(&app)["failed"][0]
+            .as_str()
+            .is_some_and(|message| message.contains("旧实例已卸下、未恢复")),
+        "报告里也必须看得见拆卸事实：{}",
+        report(&app)
+    );
+    assert_eq!(
+        report(&app)["mounted"],
+        json!(0),
+        "报告不得声称这一行还挂着：{}",
+        report(&app)
+    );
+
+    // ④ 目标不回滚：树已经是新目标（下一轮对账会按它重试）。
+    let adopted = state.tree_snapshot();
+    let provider = adopted
+        .iter()
+        .find(|entry| entry.id.as_deref() == Some("provider"))
+        .expect("目标里必须有这一行");
+    assert_eq!(
+        provider.name, "fails",
+        "树必须停在新目标（不回滚）：{adopted:?}"
+    );
+
+    // ⑤ 可诊断性：失败一轮之后，「目标要求挂载、当前没有实例」仍然看得见
+    //    （既有字段组合，不需要新的公开字段）：装载表空 + `plan` 给出 Mount + `failed` 有话说。
+    assert_eq!(
+        state.plan(&adopted),
+        vec![Action::Mount("provider".to_string())],
+        "下一轮计划必须是 Mount（实例没了、目标还在）"
+    );
+
+    // ⑥ 磁盘不能被写成 disabled（换实例失败不是"插件自我卸载"）。
+    let disk = std::fs::read_to_string(dir.path().join("cordis.yml")).expect("读主配置");
+    assert!(
+        !disk.contains("disabled"),
+        "换实例失败不得改写磁盘：\n{disk}"
+    );
+}
+
+/// O5b-b：`Replace` 失败**可以在下一轮对账恢复**——这也是"目标不回滚"的理由。
+///
+/// 失败的挂载不写进装载表，所以下一轮 `diff` 看到的是 `Mount`（不是残缺的 `Replace`），
+/// 配置改回可用之后一次对账就能重新挂上，并且单飞位（`reconciling`）已复位。
+#[tokio::test]
+async fn replace_failure_is_recoverable_on_the_next_reconcile() {
+    let app = App::new();
+    let dir = TempDir::new("replace-recover");
+    let source = FakeSource::new();
+    let state = load(
+        &app,
+        &dir,
+        "cordis.yml",
+        &yaml_row("provider", "provides", "svc", 1),
+        &[],
+        source.clone(),
+        None,
+    )
+    .await
+    .expect("装载");
+
+    dir.write("cordis.yml", &yaml_row("provider", "fails", "svc", 2));
+    let failed = reload_now(&state).await;
+    assert!(
+        !failed.failures.is_empty(),
+        "前提：这一轮必须失败：{failed:?}"
+    );
+    assert_eq!(service_of(&app, "svc"), None);
+
+    // 改回可用配置 ⇒ 下一轮对账把它挂回来。
+    dir.write(
+        "cordis.yml",
+        &yaml_row("provider", "provides-next", "svc", 7),
+    );
+    let recovered = reload_now(&state).await;
+    assert_eq!(recovered.mounted, ["provider"], "{recovered:?}");
+    assert!(
+        recovered.failures.is_empty(),
+        "恢复那一轮不该再有失败：{recovered:?}"
+    );
+    assert_eq!(service_of(&app, "svc"), Some(7), "必须由新实例提供服务");
+    assert_eq!(state.mounted_labels(), ["provider"]);
+    assert!(
+        state.mounted_liveness().iter().all(|(_, alive)| *alive),
+        "恢复后记录必须指向活实例：{:?}",
+        state.mounted_liveness()
+    );
+    let target = tree(&yaml_row("provider", "provides-next", "svc", 7));
+    assert!(
+        state.plan(&target).is_empty(),
+        "恢复之后计划必须是空的：{:?}",
+        state.plan(&target)
+    );
+
+    // `reconciling` 已复位：同一份配置再来一轮仍然能被本次调用驱动完成（否则是 Coalesced）。
+    let idle = reload_now(&state).await;
+    assert!(idle.is_noop(), "空闲一轮必须是对账无动作：{idle:?}");
+}
+
+/// O5b-c：失败的换实例**不留残骸**：没有残留 fiber、没有暂存泄漏、旧实例恰好清理一次。
+///
+/// 这条覆盖两层清理：`dispose_row`（旧实例）与 `mount_row` 的失败自清理（半成品 fiber）。
+/// 少了后者，每次失败的换实例都会在 runtime 表里留一条没人认领的 fiber。
+#[tokio::test]
+async fn replace_failure_does_not_leave_artifacts() {
+    let _serial = staged_ledger_serial().await;
+    let app = App::new();
+    let dir = TempDir::new("replace-artifacts");
+    let source = FakeSource::new();
+    let leaked_before = cordis_host::staged_leaked();
+    let state = load(
+        &app,
+        &dir,
+        "cordis.yml",
+        &yaml_row("provider", "provides", "svc", 1),
+        &[],
+        source.clone(),
+        None,
+    )
+    .await
+    .expect("装载");
+    assert_eq!(service_of(&app, "svc"), Some(1));
+
+    dir.write("cordis.yml", &yaml_row("provider", "fails", "svc", 2));
+    let outcome = reload_now(&state).await;
+    assert!(
+        !outcome.failures.is_empty(),
+        "前提：这一轮必须失败：{outcome:?}"
+    );
+
+    // 没有残留 fiber：旧实例半成品都不在 runtime 表里。
+    assert!(
+        app.store.fibers_by_plugin_name("provides").is_empty(),
+        "旧实例必须已经拆干净：{:?}",
+        app.store.inventory()
+    );
+    assert!(
+        app.store.fibers_by_plugin_name("fails").is_empty(),
+        "失败挂载留下的半成品 fiber 必须被 dispose：{:?}",
+        app.store.inventory()
+    );
+    assert!(state.fiber_of("provider").is_none(), "装载表里没有可用实例");
+
+    // 旧实例的清理恰好一次；半成品的 effect 也恰好清理一次。
+    let trace = source.trace();
+    let count = |suffix: &str| trace.iter().filter(|line| line.ends_with(suffix)).count();
+    assert_eq!(
+        count(":provides:cleanup"),
+        1,
+        "旧实例必须恰好清理一次：{trace:?}"
+    );
+    assert_eq!(
+        count(":fails:cleanup"),
+        1,
+        "半成品 fiber 也必须清理一次：{trace:?}"
+    );
+    assert_eq!(
+        count(":provides-next:apply"),
+        0,
+        "根本没走到新实例的成功挂载：{trace:?}"
+    );
+
+    // 暂存台账不回退（假源不暂存 ⇒ 基线不动；真源里失败挂载同样要销账）。
+    assert_eq!(
+        cordis_host::staged_leaked(),
+        leaked_before,
+        "失败的换实例不得新增暂存泄漏（基线 {leaked_before}）"
+    );
+}
+
+/// O5b-d：被 `loader/patch-context` 短路的换实例**不能声称旧实例还在服务**。
+///
+/// 短路（监听者不调 `next`）在 `Mount` 上意味着"什么都没挂"——记 `skipped` 是对的；
+/// 但在 `Replace` 上，`emit_partial_dispose` + `dispose_row` **已经跑过**，
+/// 短路只挡住了"装"，于是"跳过"这个词会掩盖"实例已丢"。这里钉住新语义：
+/// 记 Warn + 进 `failures`，且任何文案都不得出现"保留/仍在服务/已回滚"。
+#[tokio::test]
+async fn a_vetoed_replace_does_not_claim_the_old_instance_is_still_serving() {
+    let app = App::new();
+    let dir = TempDir::new("replace-veto");
+    let source = FakeSource::new();
+    let logs = capture_logs(&app);
+    let state = load(
+        &app,
+        &dir,
+        "cordis.yml",
+        &yaml_row("provider", "provides", "svc", 1),
+        &[],
+        source.clone(),
+        None,
+    )
+    .await
+    .expect("装载");
+    assert_eq!(service_of(&app, "svc"), Some(1));
+
+    // 只拦"这一行的挂载动作"：直接不调 next ⇒ 尾链（真正的挂载）不执行。
+    let vetoed = Arc::new(AtomicUsize::new(0));
+    let calls = vetoed.clone();
+    let veto = app
+        .root
+        .on("loader/patch-context", move |call: cordis_core::Call| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                let payload = payload_of(&call);
+                if payload["action"] == "mount" && payload["label"] == "provider" {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    return None;
+                }
+                let args = call.args.clone();
+                call.next.call(args).await
+            })
+        });
+
+    dir.write(
+        "cordis.yml",
+        &yaml_row("provider", "provides-next", "svc", 2),
+    );
+    let outcome = reload_now(&state).await;
+
+    assert_eq!(
+        vetoed.load(Ordering::SeqCst),
+        1,
+        "前提：监听者必须真的收到了这次挂载动作"
+    );
+
+    // 拆卸已经发生：实例与记录都不在。
+    assert!(
+        state.mounted_labels().is_empty(),
+        "短路挡住的只是'装'，记录不该还在：{outcome:?}"
+    );
+    assert!(
+        service_of(&app, "svc").is_none(),
+        "旧实例已经被卸下，服务不该还解析得到"
+    );
+
+    // 不得再记成 skipped（那会让人以为"什么都没发生"）。
+    assert!(
+        outcome.skipped.is_empty(),
+        "Replace 的短路不是'跳过'——拆卸已经发生：{outcome:?}"
+    );
+    assert_eq!(outcome.failures.len(), 1, "{outcome:?}");
+    assert!(
+        outcome.failures[0].contains("已卸下"),
+        "失败文案必须写明拆卸：{:?}",
+        outcome.failures
+    );
+
+    // 日志：Warn 一条，且写明拆卸。
+    let lines = logs.lock().unwrap().clone();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("Warn") && line.contains("已卸下")),
+        "必须留下一条 Warn：{lines:?}"
+    );
+
+    // 任何文案都不得声称旧实例还在服务（含义与 HMR 路径相反，措辞必须区分开）。
+    let mut everything = String::new();
+    everything.push_str(&outcome.failures.join("\n"));
+    everything.push('\n');
+    everything.push_str(&lines.join("\n"));
+    everything.push('\n');
+    everything.push_str(&report(&app).to_string());
+    for wording in ["保留", "仍在服务", "已回滚", "回滚到"] {
+        assert!(
+            !everything.contains(wording),
+            "不得出现「{wording}」这种把旧实例说成还在的措辞：\n{everything}"
+        );
+    }
+
+    drop(veto);
+}
+
+// ---------------------------------------------------------------------------
+// O5b-2：换实例的 artifact 预检**前移**到拆卸之前（先决策、再前移）
+// ---------------------------------------------------------------------------
+
+/// 轨迹里某一条的**下标**（"这件事在第几步发生"）。
+fn position_of(trace: &[String], needle: &str) -> usize {
+    trace
+        .iter()
+        .position(|line| line == needle)
+        .unwrap_or_else(|| panic!("轨迹里没有 {needle}：{trace:?}"))
+}
+
+/// O5b-2-a：换实例的 artifact 预检**先于拆卸** ⇒ 预检失败时旧实例仍在服务。
+///
+/// 写错 `name`（或 artifact 缺失）时 `source.load` 直接报错。旧实现把它放在
+/// `mount_row` 的尾链里（`dispose_row` 之后），于是"配置里写错一个字"的代价是
+/// 整条服务消失。这里钉住新语义的四个面：实例/记录原样保留、失败文案写明
+/// **保留当前实例**、磁盘不被改成 `disabled`、目标**不回滚**（下一轮仍是 `Replace`）。
+#[tokio::test]
+async fn replace_preflight_failure_keeps_the_old_instance_serving() {
+    let app = App::new();
+    let dir = TempDir::new("replace-preflight");
+    let source = FakeSource::new();
+    let logs = capture_logs(&app);
+    let state = load(
+        &app,
+        &dir,
+        "cordis.yml",
+        &yaml_row("provider", "provides", "svc", 1),
+        &[],
+        source.clone(),
+        None,
+    )
+    .await
+    .expect("装载");
+    assert_eq!(service_of(&app, "svc"), Some(1));
+    let before = state.fiber_of("provider").expect("旧实例已挂载");
+
+    // 改成假源**不认识**的插件名 ⇒ Replace 的 `load` 直接失败（artifact 缺失/写错 name 的同一档）。
+    let broken = yaml_row("provider", "missing", "svc", 2);
+    dir.write("cordis.yml", &broken);
+    let outcome = reload_now(&state).await;
+
+    // ① 服务没被打断：同一个实例还在、值还是旧的、记录还在、记录指向活实例。
+    assert_eq!(
+        service_of(&app, "svc"),
+        Some(1),
+        "预检失败不得让旧实例消失：{outcome:?}"
+    );
+    let after = state.fiber_of("provider").expect("旧实例必须还在装载表里");
+    assert!(
+        Arc::ptr_eq(&before, &after) && before.uid() == after.uid(),
+        "必须是**同一个**实例（不重建、不重挂）：{outcome:?}"
+    );
+    assert_eq!(
+        state.mounted_labels(),
+        ["provider"],
+        "mounted 记录必须原样保留：{outcome:?}"
+    );
+    assert!(
+        state.mounted_liveness().iter().all(|(_, alive)| *alive),
+        "记录不得指向已拆的实例：{:?}",
+        state.mounted_liveness()
+    );
+
+    // ② 失败文案写明"保留当前实例"，且不得声称拆卸；旧实例的清理一次都没跑。
+    assert_eq!(outcome.failures.len(), 1, "{outcome:?}");
+    assert!(
+        outcome.failures[0].contains("保留当前实例"),
+        "失败文案必须写明保留：{:?}",
+        outcome.failures
+    );
+    assert!(
+        outcome.failures[0].contains("missing"),
+        "原始错误不得被吞掉：{:?}",
+        outcome.failures
+    );
+    assert!(
+        !outcome.failures[0].contains("已卸下"),
+        "预检失败时没有拆卸这回事：{:?}",
+        outcome.failures
+    );
+    assert!(
+        logs.lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.starts_with("Error") && line.contains("保留当前实例")),
+        "必须留下一条 Error 日志：{:?}",
+        logs.lock().unwrap()
+    );
+    assert!(
+        outcome.replaced.is_empty() && outcome.disposed.is_empty(),
+        "预检失败既没换成功也没移除：{outcome:?}"
+    );
+    let trace = source.trace();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|line| line.ends_with(":provides:cleanup"))
+            .count(),
+        0,
+        "旧实例的 cleanup 一次都不该跑（根本没拆）：{trace:?}"
+    );
+
+    // ③ 磁盘不得被写成 disabled（换实例预检失败不是"插件自我卸载"）。
+    let disk = std::fs::read_to_string(dir.path().join("cordis.yml")).expect("读主配置");
+    assert!(!disk.contains("disabled"), "预检失败不得改写磁盘：\n{disk}");
+
+    // ④ 目标不回滚：树停在新目标，下一轮计划仍是 Replace（下一轮会重试）。
+    let adopted = state.tree_snapshot();
+    assert_eq!(
+        state.plan(&tree(&broken)),
+        vec![Action::Replace("provider".to_string())],
+        "目标必须仍是新目标（不回滚）：{adopted:?}"
+    );
+}
+
+/// O5b-2-b：换实例的**成功**路径只 `load` 一次，而且发生在 `dispose` 之前。
+///
+/// 两半都是要求：预检前移（`load` 早于拆卸）与"复用已加载的 artifact"
+/// （尾链绝不二次 `load`——二次 load 等于多一次 stage/open/ping，预检前移的收益全没了）。
+#[tokio::test]
+async fn replace_preloads_artifact_before_dispose() {
+    let app = App::new();
+    let dir = TempDir::new("replace-preload-order");
+    let source = FakeSource::new();
+    let state = load(
+        &app,
+        &dir,
+        "cordis.yml",
+        &yaml_row("provider", "provides", "svc", 1),
+        &[],
+        source.clone(),
+        None,
+    )
+    .await
+    .expect("装载");
+    assert_eq!(
+        source.loads(),
+        ["provider:provides:load"],
+        "首次挂载自己 load"
+    );
+
+    dir.write(
+        "cordis.yml",
+        &yaml_row("provider", "provides-next", "svc", 2),
+    );
+    let outcome = reload_now(&state).await;
+    assert_eq!(outcome.replaced, ["provider"], "{outcome:?}");
+    assert_eq!(service_of(&app, "svc"), Some(2));
+
+    // 同一次换实例只 load 一次（前移预检拿到的 LoadedFile 必须被尾链复用）。
+    let trace = source.trace();
+    assert_eq!(
+        source.loads(),
+        ["provider:provides:load", "provider:provides-next:load"],
+        "换实例只 load 一次（前移 + 复用，不得二次 load）：{trace:?}"
+    );
+
+    // 顺序：新 artifact 的预检在旧实例的拆卸之前。
+    let preload = position_of(&trace, "provider:provides-next:load");
+    let cleanup = position_of(&trace, "provider:provides:cleanup");
+    assert!(
+        preload < cleanup,
+        "artifact 预检必须前移到拆卸之前：{trace:?}"
+    );
+    // 拆卸仍然发生在挂载之前（先卸后装的内核不变量没被破坏）。
+    let apply = position_of(&trace, "provider:provides-next:apply");
+    assert!(cleanup < apply, "仍然是先卸后装：{trace:?}");
+}
+
+/// O5b-2-c：`loader/patch-context` 短路时，**已前移的 artifact** 必须被丢弃回收。
+///
+/// 短路时尾链一行都不跑（`run_waterfall` 的惰性下游），所以那份 `LoadedFile`
+/// 既不会被挂上、也不会自己消失：谁拿的谁还——暂存副本必须回收、次数仍是恰好一次
+/// （短路之后不得再 load 一次把它"补上"）。
+///
+/// 假源不暂存文件，`staged_leaked()` 恒等于基线、fiber 空断言只证明"没挂上"，
+/// 两者都无法区分"已丢弃"和"被永久持有"；因此这里另外用 `FakeSource` 的 artifact
+/// **drop 探针**（[`DropProbe`]）作为回收的直接证据。
+#[tokio::test]
+async fn vetoed_replace_discards_the_preloaded_artifact() {
+    let _serial = staged_ledger_serial().await;
+    let app = App::new();
+    let dir = TempDir::new("replace-veto-discard");
+    let source = FakeSource::new();
+    let leaked_before = cordis_host::staged_leaked();
+    let state = load(
+        &app,
+        &dir,
+        "cordis.yml",
+        &yaml_row("provider", "provides", "svc", 1),
+        &[],
+        source.clone(),
+        None,
+    )
+    .await
+    .expect("装载");
+    assert_eq!(service_of(&app, "svc"), Some(1));
+
+    // 只拦"这一行的挂载动作"：直接不调 next ⇒ 尾链（真正的挂载）不执行。
+    let vetoed = Arc::new(AtomicUsize::new(0));
+    let calls = vetoed.clone();
+    let veto = app
+        .root
+        .on("loader/patch-context", move |call: cordis_core::Call| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                let payload = payload_of(&call);
+                if payload["action"] == "mount" && payload["label"] == "provider" {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    return None;
+                }
+                let args = call.args.clone();
+                call.next.call(args).await
+            })
+        });
+
+    dir.write(
+        "cordis.yml",
+        &yaml_row("provider", "provides-next", "svc", 2),
+    );
+    let outcome = reload_now(&state).await;
+    assert_eq!(vetoed.load(Ordering::SeqCst), 1, "前提：尾链被真的短路了");
+
+    // 前移的 artifact 只 load 一次：短路之后不得再补一次。
+    let trace = source.trace();
+    assert_eq!(
+        source.loads(),
+        ["provider:provides:load", "provider:provides-next:load"],
+        "前移的预检恰好一次：{trace:?}"
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|line| line.ends_with(":provides-next:apply"))
+            .count(),
+        0,
+        "短路 ⇒ 新实例根本没挂：{trace:?}"
+    );
+
+    // 回收：没有残留 fiber、暂存台账回到基线（前移的副本不得泄漏）。
+    assert!(
+        app.store.fibers_by_plugin_name("provides-next").is_empty(),
+        "短路后不得留下实例：{:?}",
+        app.store.inventory()
+    );
+    // 回收的真实证据（drop 探针）：前移的 artifact 必须真的被 drop，而不是被谁留着。
+    // 按插件名统计——被换下的旧实例（`provides`）也会正常 drop，那不是本用例的判据；
+    // 判据是 `provides-next` 在这条短路路径上恰好 drop 一次。
+    let dropped = source.dropped();
+    assert_eq!(
+        dropped
+            .iter()
+            .filter(|name| name.as_str() == "provides-next")
+            .count(),
+        1,
+        "短路后前移的 artifact 必须恰好 drop 一次（0 = 被永久持有）：{dropped:?}"
+    );
+    assert_eq!(
+        cordis_host::staged_leaked(),
+        leaked_before,
+        "前移的暂存副本必须被回收（基线 {leaked_before}）"
+    );
+
+    // 既有语义不变：旧实例已经卸下 ⇒ 不记 skipped、失败文案写明拆卸。
+    assert!(outcome.skipped.is_empty(), "{outcome:?}");
+    assert_eq!(outcome.failures.len(), 1, "{outcome:?}");
+    assert!(
+        outcome.failures[0].contains("已卸下"),
+        "失败文案必须写明拆卸：{:?}",
+        outcome.failures
+    );
+
+    drop(veto);
 }

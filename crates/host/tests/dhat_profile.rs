@@ -3,7 +3,9 @@
 //! Optional dhat heap profile for the real staged-load path.
 //!
 //! Run manually:
-//! `cargo test -p rust-cordis-host --test dhat_profile -- --ignored --nocapture`
+//! `cargo xtask dhat`（等价于
+//! `cargo test -p rust-cordis-host --test dhat_profile --locked --features dhat-heap -- --ignored --nocapture`）。
+//! 不开 `dhat-heap` 时整个 target 被 `#![cfg]` 裁空 ⇒ 必须带 feature，否则"0 个测试"也退出 0。
 //!
 //! The test uses the frozen v1 cdylib, performs 100 real stage/open/drop cycles,
 //! and asserts that the final live heap stays bounded. dhat is a dev-only
@@ -11,7 +13,6 @@
 
 mod fixture_support;
 
-use cordis_core::Plugin;
 use cordis_host::{loaded_instances, stage_plugin, staged_leaked, LoadedPlugin};
 use fixture_support::{build_fixture, TempDir};
 

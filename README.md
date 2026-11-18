@@ -12,13 +12,17 @@ Cordis 的 Rust 实现：服务容器 + epoch 驱动的 fiber 生命周期 + 可
 
 插件来源按 [ADR 0005](docs/adr/0005-trust-model-and-plugin-source-boundary.md)：
 只承载第一方、可审查、固定 revision 构建的 T1/T2 插件；第三方、运行时下载或
-模型生成且未经人工审查的可执行插件不进入当前运行时。来源 allow-list 是准入，
+既未经人工审查也未经受审流水线签发的模型生成可执行插件不进入当前运行时
+（演化产物的签发条件见该 ADR §2.3）。来源 allow-list 是准入，
 不是执行隔离：`cordis inspect/validate/status/run/service --source-policy
 <allow-list.json>` 会在 `dlopen` 之前检查 sidecar manifest 与 SHA256。**没有策略
-默认拒绝**；只有显式传 `--allow-unverified`（或嵌入方调用
-`set_allow_unverified(true)`）才进入本地开发模式。生产宿主必须传
-`--source-policy`。T2 同步 `apply`/回调不可抢占；`DispatchPolicy` 只覆盖等待
-挂起结算，不能中断正在执行的调用。
+默认拒绝**；进程级开发放行只由显式传 `--allow-unverified`（或嵌入方调用
+`set_allow_unverified(true)`）开启。来源对象还能携带**自己的**准入结论
+（`PolicyPluginSource::strict` / `::dev_unverified`），与全局开关的区别是作用域：
+严格来源不被别人的 dev 开关放宽，dev 来源只放行自己、不写进程级标志
+（见 [ADR 0008](docs/adr/0008-source-admission-scope.md)）。生产宿主必须传
+`--source-policy`。T2 同步 `apply`/回调不可抢占；
+`DispatchPolicy` 只覆盖等待挂起结算，不能中断正在执行的调用。
 
 派发策略可按 **App / 装载器子树** 配置：`LoaderConfig.dispatchPolicy`
 （camelCase，如 `{ timeoutMs: 50, outboundTimeoutMs: 20 }`）在挂载前按
@@ -48,6 +52,8 @@ maxPendingPerInstance: 64, maxStreamsPerInstance: 8 }`），嵌入方也可调�
   （服务键 → 该插件提供的 semver 版本）与 `requires`（服务键 → semver range）。
   显式 `dependencyPlan` 为空时，`DiskPluginSource::plan_entry` 读取每个静态启用行
   旁的 `<artifact>.manifest.json`，由装载器汇总后调用 `host::plan::resolve`。
+  **准入判定先于清单结论**：既没有来源策略、也没开开发模式时，预检会以
+  「未配置插件来源策略」失败（不再跳过校验），manifest 无效/不合法都轮不到报。
   混合来源下只要有一行没有 sidecar/manifest 计划，整次 manifest 预检会保守跳过，
   避免把“未声明”误判成“无提供者”。`LoaderConfig.strictSidecars`（默认 false）
   控制坏 sidecar：false 跳过预检并保留历史行为，true 在装载前硬失败。manifest
@@ -91,6 +97,7 @@ cargo run -p harness-spike
 ```text
 cargo xtask test
 cargo xtask consumer
+cargo xtask package-check
 cargo xtask seal-consume dist/cordis-0.1.1-formal
 cargo xtask demo
 cargo xtask e2e
@@ -101,15 +108,16 @@ cargo xtask matrix
 cargo xtask seal
 cargo xtask seal --verify <dir>
 cargo xtask soak [cycles]
+cargo xtask dhat
 cargo xtask doctor
 ```
 
-`cargo xtask ci` 依次执行格式检查、inventory/docs/平台矩阵检查、clippy（`-D warnings`）、workspace 测试、独立服务消费者测试、demo 快照比较与真 DLL harness；三平台 GitHub CI 也直接运行 `cargo xtask consumer` 和 consumer 的 fmt 检查。`cargo xtask consumer` 会先构建 `greeting` / `hello` cdylib，再在独立 workspace 中验证真实 ABI 服务组合、`PluginSourcePolicy` + sidecar 准入和关闭。正式封存消费者演练（本地/发布证据，不在 PR CI）：
+`cargo xtask ci` 依次执行格式检查、inventory/docs/平台矩阵检查、clippy（`-D warnings`、`--all-features`）、全 target 的 `--all-features` 编译检查、workspace 测试、doctest（`cargo test --workspace --doc`）、独立服务消费者测试、demo 快照比较与真 DLL harness；三平台 GitHub CI 也直接运行 `cargo xtask consumer` 和 consumer 的 fmt 检查。`cargo xtask consumer` 会先构建 `greeting` / `hello` cdylib，再在独立 workspace 中验证真实 ABI 服务组合、`PluginSourcePolicy` + sidecar 准入和关闭。正式封存消费者演练（本地/发布证据，不在 PR CI）：
 ```text
 cargo xtask seal-consume dist/cordis-0.1.1-formal
 ```
 
-`cargo xtask fmt` 可单独检查格式；格式基线已建立，是阻塞门禁。`cargo xtask matrix` 只检查矩阵结构，不验证真实平台结果；实际结果记录在 [`docs/platform-matrix.md`](docs/platform-matrix.md)，是一次三平台 CI 的快照。`cargo xtask seal` 是发布时入口：构建三个宿主目标示例插件，写 sidecar manifest、`allow-list.json`、SHA256/源码树/工具链清单，用同版本 `inspect --source-policy` 逐插件核对身份，并保存 `smoke/inspect.txt`；它不在 `ci` 内，边界见 [`docs/release-seal.md`](docs/release-seal.md)。`cargo xtask soak [cycles]` 运行默认被忽略的宿主资源 soak（默认 1000 轮）和 200 轮真实 `open_staged` soak，同样不进入 `ci`；`scripts/version-matrix.ps1` 运行本地相邻版本矩阵。
+`cargo xtask fmt` 可单独检查格式；格式基线已建立，是阻塞门禁。`cargo xtask matrix` 只检查矩阵结构，不验证真实平台结果；实际结果记录在 [`docs/platform-matrix.md`](docs/platform-matrix.md)，是一次三平台 CI 的快照。`cargo xtask seal` 是发布时入口：构建三个宿主目标示例插件，写 sidecar manifest、`allow-list.json`、SHA256/源码树/工具链清单，用同版本 `inspect --source-policy` 逐插件核对身份，并保存 `smoke/inspect.txt`；它不在 `ci` 内，边界见 [`docs/release-seal.md`](docs/release-seal.md)。`cargo xtask soak [cycles]` 运行默认被忽略的宿主资源 soak（默认 1000 轮）和 200 轮真实 `open_staged` soak，同样不进入 `ci`；位置参数只影响主 soak，真 DLL 的 `open_staged` soak 由 `CORDIS_STAGED_SOAK_CYCLES` 控制（默认 200）。`cargo xtask dhat` 单独跑 `dhat-heap` 下的真实 `open_staged` 堆剖析（带 feature 守卫并打印 stats），也不进入 `ci`；`cargo xtask package-check` 用打包产物在隔离目录构建消费者并跑一次跨 ABI 服务调用，防止源码 path 后门，同样不在 `ci` 里、按需运行；`scripts/version-matrix.ps1` 运行本地相邻版本矩阵。
 
 ### Windows GNU / 非 ASCII 路径
 

@@ -301,6 +301,18 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub struct VerifiedPluginSource",
     },
     PublicItem {
+        item: "SourceAdmission",
+        kind: "struct",
+        source: "crates/host/src/source.rs",
+        marker: "pub struct SourceAdmission",
+    },
+    PublicItem {
+        item: "SourceAdmission::strict",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn strict(policy: impl Into<Arc<PluginSourcePolicy>>) -> Self",
+    },
+    PublicItem {
         item: "PluginSourcePolicy::verify",
         kind: "fn",
         source: "crates/host/src/source.rs",
@@ -491,6 +503,36 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         kind: "trait",
         source: "crates/host/src/loader.rs",
         marker: "pub trait PluginSource",
+    },
+    PublicItem {
+        item: "PluginSource::admission",
+        kind: "method",
+        source: "crates/host/src/loader.rs",
+        marker: "fn admission(&self) -> SourceAdmission {\n        SourceAdmission::fallback()",
+    },
+    PublicItem {
+        item: "PluginSource::load_admitted",
+        kind: "method",
+        source: "crates/host/src/loader.rs",
+        marker: "fn load_admitted(\n        &self,\n        entry: &Entry,\n        search: &[PathBuf],\n        revision: u64,\n        _admission: &SourceAdmission,",
+    },
+    PublicItem {
+        item: "PluginSource::plan_entry_admitted",
+        kind: "method",
+        source: "crates/host/src/loader.rs",
+        marker: "fn plan_entry_admitted(\n        &self,\n        entry: &Entry,\n        search: &[PathBuf],\n        _admission: &SourceAdmission,",
+    },
+    PublicItem {
+        item: "PolicyPluginSource",
+        kind: "struct",
+        source: "crates/host/src/loader.rs",
+        marker: "pub struct PolicyPluginSource",
+    },
+    PublicItem {
+        item: "PolicyPluginSource::strict",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub fn strict(\n        inner: Arc<dyn PluginSource>,\n        policy: impl Into<Arc<PluginSourcePolicy>>,",
     },
     PublicItem {
         item: "LoadedFile",
@@ -1136,7 +1178,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 80, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 87, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 
