@@ -34,7 +34,8 @@ ADR 0005 的信任模型冲突：循环产物是模型生成代码，逐个人�
 
 - **外部循环负责**：变体生成、评估执行、选择规则、归档库、每变体的隔离。
 - **本仓负责**：装载已签发变体（ADR 0005 §2.3）、失败回滚、调用级归因、
-  契约导出与冻结。
+  契约导出与冻结。**签发材料不在运行时校验**：`verify` 只比对
+  id/semver/revision/hash/ABI，attestation 由部署准入台账核对。
 - **交界是文件**：变体产物 + sidecar manifest + 配置行；宿主经 HMR 轮询拾取，
   观测结果由宿主自己落盘。本 ADR 不引入 RPC 控制面。
 
@@ -46,9 +47,9 @@ ADR 0005 的信任模型冲突：循环产物是模型生成代码，逐个人�
   同进程顺序热换 v1→v2→v3 会让前一代的状态污染后一代的分数。每变体一进程
   由外部循环负责；本仓的热换只用于部署已选中变体与金丝雀回滚。
 
-### 2.2 归因：`call_iface` 单点，iface-only
+### 2.2 归因：服务调用，iface-only
 
-新增 `TraceSink`（core 侧，宿主嵌入方可安装），每次服务接口调用产出一条记录：
+新增 `TraceSink`（由宿主嵌入方安装），每次服务接口调用产出一条记录：
 `ts_ms`（**完成时刻**）/ `name` / `caller_uid` / `callee_uid`（**发起时快照**）/
 `callee_plugin` / `elapsed` / `outcome`。
 
@@ -61,11 +62,15 @@ ADR 0005 的信任模型冲突：循环产物是模型生成代码，逐个人�
   （运行时名）跨热换稳定，用来兜住“记录写出时实例已不在”的情况；
 - 记录由**宿主**写，插件无法经公开 API 写入或删除记录（恶意插件仍可篡改宿主
   内存，见 ADR 0005 §1.1 第 1 条）；
-- **丢弃路径不止一条**：超时（`with_iface_timeout` 丢弃 future）、取消
-  （排水/`complete_or_defer` 的 `None` 分支）、panic。实现用一个共享 outcome
-  cell：包装层在超时/取消时写入 `host_timeout` / `host_cancel`，Drop guard
-  只在 cell 仍为空时兜底 `host_drop`，且只发一条。panic 不新增第四种码
-  （判 `std::thread::panicking()` 也只能在 guard 里），阶段 1 记 `host_drop`；
+- **记录点有两处，按“谁先知道结果”分工**：
+  1. 正常完成：`Context::call_iface` 出口（`Ok`/`Err`）；
+  2. 异常终止：宿主调用包装层。超时（`with_iface_timeout`）、取消
+     （排水/`complete_or_defer` 的 `None` 分支）、panic 都在这一层可知，
+     分别记 `host_timeout` / `host_cancel` / `host_panic`（已有码，不新增）。
+  future 在超时时被丢弃，core 侧的收尾不会执行，所以**不能**把三条异常路径
+  都塞进 core 的 Drop guard（也判不出原因）；两处各自只发一条，正常完成与
+  异常终止互斥，不会重复。仅当 future 被丢弃且宿主未能分类时，兜底记
+  `host_drop`；
 - **安装入口在 `App`，不在 `Context::store`**：`Context.store` 是公开字段，
   任何进程内插件都能触达；sink 若挂在 `Store` 上，插件可替换或摘除记录，
   “宿主写、插件不可改”的论证就不成立；
@@ -90,6 +95,7 @@ ADR 0005 的信任模型冲突：循环产物是模型生成代码，逐个人�
 - 不再另立 `mounts` 数组、`config_digest` 或 per-label `epoch`：前者与
   `capabilities` 重复，后者没有消费者；
 - HMR 指纹是 `(mtime, len)`，不是内容哈希，不得当 `sha256` 用；
+- `report` 载荷**只增不改**：新字段只追加，既有字段不重命名、语义不变；
 - `uid` 是 **per-Store 计数器**，只在同一 Store 生命周期内有意义；实例卸载后
   `uid` 被置为 `u64::MAX`。变体级对齐靠 trace 的 `callee_plugin` +
   消费方在每次 `report` 变化时切时间窗；本 ADR 不提供 `mount_gen`，
@@ -117,11 +123,13 @@ ADR 0005 的信任模型冲突：循环产物是模型生成代码，逐个人�
 
 导出面目前**不存在**：`StatusReport` 没有 capabilities/services，
 `status_with_source` 在取完诊断后就 shutdown。阶段 1 需要两处加法——
-`Store::services_of(&Arc<Fiber>)`（按 fiber 枚举服务与方法名，接收 fiber 而非
-裸 uid；`uid` 只作行内字段，`UID_DISPOSED` 返回空并标记 disposed）与
-`StatusReport.capabilities`（typed row，仿 `RowProvenance`；`StatusReport`
-派生了 `Eq`，不能塞 `serde_json::Value`）。方法名必须在 shutdown 之前抓取。
-两项都是加法，按 ADR 0006 登记 `api-inventory`，归“待验证”面。
+`Store::services_of(&Arc<Fiber>)`（**薄封装**已有的
+`impls_owned_by` / `impls_owned_by_with_realm`（store.rs:986/:1006），补上
+version 与 `Dyn::adapter` 里的方法名，避免第二套枚举语义；接收 fiber 而非裸
+uid，`UID_DISPOSED` 返回空并标记）与 `StatusReport.capabilities`（typed row，
+仿 `RowProvenance`；`StatusReport` 派生了 `Eq`，不能塞 `serde_json::Value`）。
+方法名必须在 shutdown 之前抓取。两项都是加法，按 ADR 0006 登记
+`api-inventory`，归“待验证”面：**0.2 前可改可删，不入兼容面**。
 
 契约比对由演化脚本或测试对两次导出做 diff，**不加** `validate --interface-lock`
 一类 CLI flag。`attestation`（ADR 0005 §2.3）属于准入材料，不属于契约。
@@ -129,15 +137,20 @@ ADR 0005 的信任模型冲突：循环产物是模型生成代码，逐个人�
 ## 3. 不承诺
 
 - **不承诺跨变体隔离**：T2 同进程、同地址空间；评估期隔离是外部循环的事。
+- **不承诺回滚等价于“状态复位”**：两种回滚路径的静态语义不同——apply 失败时
+  回滚是重挂旧 `Arc<dyn Plugin>`（同一个已加载模块，`static` 保留）；改 YAML
+  重投会走新的暂存文件（新模块，`static` 全新）。用例必须幂等或自行复位，
+  否则预热过的静态状态会造成假绿、v2 遗留的线程/文件/端口会造成假红。
 - **不承诺金丝雀分数与容器评估分数可比**：同进程顺序热换仍受 dylib static
   污染（ADR 0005 §1.1 第 5 条）。基线定义为“同一 App、热换前、同一用例集”；
   硬判据不是分数，而是“同一用例由 Ok 变 Err”或“出现
   `callee_plugin=<变体名>` 的新 Err”，回滚后要求同一用例回到 Ok；
   跨容器/跨进程的分数不做比较。
 - **不承诺记录自带用例粒度**：`TraceRecord` 没有 case id。对齐靠两条约定：
-  宿主在 `report` 每次变化时落一份 mounts 快照（`label` / `uid` /
-  `sha256` / UTC 毫秒），evaluator 落每个用例的起止时间戳；两者一起才能把
-  记录归到“哪一代、哪个用例”。
+  宿主在 `report` 变化后落一份 mounts 快照（`plugin` / `label` / `uid` /
+  `sha256` / 递增 `seq` / UTC 毫秒，取 swap 完成之后的值），evaluator 落每个
+  用例的起止时间戳（同一时钟）；`report` 是拉取式、没有变更通知，快照由
+  **消费方**轮询写入，窗口误差至少是轮询间隔（HMR 默认 500ms）。
 - **不承诺事件级归因**：事件派发不在 trace 覆盖面内。
 - **不承诺 typed 直调与流式接口的归因**：见 §2.2 盲区。
 - **不承诺运行中宿主的 RPC 控制**：交界是文件（§2.1）。
@@ -185,9 +198,9 @@ ADR 0005 的信任模型冲突：循环产物是模型生成代码，逐个人�
 - 调用链归因：A→B→C 中 C 失败时产出两条 Err 记录，且按 `callee_uid` 聚合
   能把失败归到 C；
 - 挂起结算：PENDING 50ms 后 `elapsed ≥ 50ms`；
-- 丢弃路径：超时 → 恰好一条 `host_timeout`；取消 → `host_cancel`；panic →
-  一条 `host_drop`；未接 outcome cell 时前两条用例必须红（防止“任何 drop
-  都记超时”）；
+- 异常终止：超时 → 恰好一条 `host_timeout`；取消 → `host_cancel`；panic →
+  `host_panic`；三者都不得记成同一种码（写死成 `host_timeout` 时前两条红）。
+  宿主无法分类的丢弃才记 `host_drop`；
 - callee panic：宿主仍产出 `Err` 记录（“记录由宿主写”的硬证据）；
 - 在飞热换：PENDING 期间换实例，记录仍带发起时的 `callee_uid` 与稳定的
   `callee_plugin`，`callee_uid != u64::MAX`；

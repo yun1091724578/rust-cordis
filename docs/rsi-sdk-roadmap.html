@@ -52,7 +52,7 @@
 ③ 归因埋点必须用共享 outcome cell + Drop guard：超时/取消/panic 三条丢弃路径不能都记成 timeout；
 ④ 新增"callee panic 仍产出 Err 记录"断言（宿主写记录 vs 插件自报的硬证据）；
 ⑤ <code>callee_uid</code> 在<b>发起时快照</b>（卸载后是 <code>u64::MAX</code>），并加稳定的 <code>callee_plugin</code>；不引入 <code>mount_gen</code>，在飞热换不承诺归到正确那一代；
-⑥ 导出面目前不存在：WP2b 需新增 <code>Store::services_of(&amp;Arc&lt;Fiber&gt;)</code> 与 <code>StatusReport.capabilities</code>（typed row），方法名在 shutdown 前抓取；
+⑥ 导出面目前不存在：WP2b 需新增 <code>Store::services_of(&amp;Arc&lt;Fiber&gt;)</code>（薄封装 <code>impls_owned_by</code>）与 <code>StatusReport.capabilities</code>（typed row），方法名在 shutdown 前抓取；
 ⑦ attestation 摘要<b>不写进 policy JSON</b>（未知字段会被静默丢弃），放准入台账；准入合并须与签发流水线职责分离；
 ⑧ "变体不得用 <code>dev_unverified</code>"只是部署纪律，loader 不区分变体，无法强制——已在 ADR 里如实说明；
 ⑨ trace sink 的安装入口挂 <code>App</code>，不挂公开可达的 <code>Context::store</code>，否则同进程插件可以替换或摘除记录。
@@ -140,12 +140,12 @@
 <!-- ============================================================ -->
 <h2 id="s3">3. 方案：阶段 1 工作包</h2>
 
-<p>五个工作包，总计约 <b>14 人日</b>（1 + 4.5 + 1 + 1.5 + 5 + 缓冲 1）。本机所有命令用 <code>.\cargo.cmd</code>（仓库路径含中文，GNU ld 无法处理；见 <code>cargo.cmd</code> 注释）；下文验证清单里的 <code>cargo ...</code> 一律指 <code>.\cargo.cmd ...</code>。每个 WP 给出<b>最小实现</b>与<b>可执行验证</b>，验证不过不算完成。包名以 <code>rust-cordis-core</code> / <code>rust-cordis-host</code> / <code>cordis-cli</code> 为准。</p>
+<p>五个工作包，总计约 <b>14 人日</b>（1 + 4.5 + 1 + 1.5 + 5 + 缓冲 1）。本机所有命令用 <code>.\cargo.cmd</code>（仓库路径含中文，GNU ld 无法处理；见 <code>cargo.cmd</code> 注释）；下文验证清单里的 <code>cargo ...</code> / <code>xtask ...</code> 一律指 <code>.\cargo.cmd ...</code>。每个 WP 给出<b>最小实现</b>与<b>可执行验证</b>，验证不过不算完成。包名以 <code>rust-cordis-core</code> / <code>rust-cordis-host</code> / <code>cordis-cli</code> 为准。</p>
 
 <h3>WP0 · 定位 ADR 与 ADR 0005 修订 <span class="tag">1 人日</span></h3>
 <table>
 <tr><th style="width:90px">改动</th><td>
-<p><b>1–3.</b> 新增 <code>docs/adr/0009-rsi-deployment-substrate.md</code>（一页）：§0 的 A1–A6、§1 站位图、§5 非目标，以及三条必须写明的约束：</p>
+<p><b>1–3.</b> 新增 <code>docs/adr/0009-rsi-deployment-substrate.md</code>（一页）：定位与站位、三条决定（归因/变体身份/契约）、不承诺清单、与 0001/0005/0006/0007/0008 的关系、验收与复评条件，以及两条必须写明的约束：</p>
 <ol>
 <li>typed 直调 <code>ctx.iface::&lt;dyn T&gt;()</code>（context.rs:395）不经 <code>call_iface</code>，<b>不可追踪</b>；要归因的调用必须走 <code>call_iface</code>。</li>
 <li><code>loader.report</code> 载荷与 <code>status --json</code> 新字段<b>只增不改</b>。</li>
@@ -176,14 +176,14 @@ pub struct TraceRecord {
     pub callee_uid: u64,     // 发起时快照（drop 时读会得到 u64::MAX）
     pub callee_plugin: Box&lt;str&gt;, // 运行时名，跨热换稳定
     pub elapsed: Duration,   // 含 PENDING 等待期（PluginIface::call 内部已 await settle）
-    pub outcome: Outcome,    // Ok | Err(code)：host_timeout / host_cancel / host_drop
+    pub outcome: Outcome,    // Ok | Err(code)：host_timeout / host_cancel / host_panic / host_drop
 }
 pub trait TraceSink: Send + Sync { fn record(&amp;self, r: TraceRecord); }
-impl Store { pub fn set_trace_sink(&amp;self, sink: Arc&lt;dyn TraceSink&gt;); }   // 仿 log_sink/set_log_sink（store.rs:413, 462）
+impl App { pub fn set_trace_sink(&amp;self, sink: Arc&lt;dyn TraceSink&gt;); }  // 挂 App，不挂公开的 Store
 </code></pre>
 <ul>
-<li><b>埋点 1 处，带共享 outcome cell</b>：<code>Context::call_iface</code>（context.rs:468-486）计时。T1→T2 与 T2→T2 都汇合于此（host <code>ctx_call_iface</code> 调它，lib.rs:3377）；<b>不碰</b> <code>call_inbound</code>/<code>settle</code>。</li>
-<li><b>丢弃路径不止一条</b>：超时（<code>with_iface_timeout</code> 在 lib.rs:1936，注释明写"超时后 future 被丢弃"）、取消（排水/<code>complete_or_defer</code> 的 <code>None</code> 分支）、panic。包装层在超时/取消时把 <code>host_timeout</code>/<code>host_cancel</code> 写进共享 cell，Drop guard 只在 cell 为空时兜底 <code>host_drop</code> 且只发一条；panic 也记 <code>host_drop</code>（阶段 1 不新增第四种码）。</li>
+<li><b>两个记录点，按"谁先知道结果"分工</b>：正常完成在 <code>Context::call_iface</code>（context.rs:468-486，T1→T2 与 T2→T2 的汇合点，host 的 <code>ctx_call_iface</code> 也调它）；异常终止在宿主调用包装层——超时（<code>with_iface_timeout</code>，lib.rs:1936）、取消（<code>complete_or_defer</code> 的 <code>None</code> 分支）、panic 都只有那一层知道。两处互斥，各发一条。</li>
+<li><b>不要把三条异常路径塞进 core 的 Drop guard</b>：future 被超时丢弃时 core 的收尾不执行，且 guard 判不出原因（panic 已被 <code>catch_unwind</code> 截断，future 是正常析构的）。异常码用宿主已有的 <code>host_timeout</code>/<code>host_cancel</code>/<code>host_panic</code>；只有宿主未分类的丢弃才记 <code>host_drop</code>。</li>
 <li><b>安装入口挂 <code>App</code></b>，不挂 <code>Store</code>：<code>Context.store</code> 是公开字段，插件能触达；挂 Store 上等于让插件可以替换/摘除记录。</li>
 <li><b>callee 身份</b>：补 <code>Store::resolve_impl</code> 返回 <code>Arc&lt;Impl&gt;</code>（现 <code>resolve</code> 丢掉 <code>Impl.fiber</code>），在<b>发起时</b>取 <code>provider_uid()</code>（store.rs:86）与运行时名。约 20 行。</li>
 <li><b>零开销</b>：sink 槽用 <code>OnceLock&lt;Arc&lt;dyn TraceSink&gt;&gt;</code>，未安装时一次原子读早返回，不取 Mutex。</li>
@@ -196,7 +196,7 @@ impl Store { pub fn set_trace_sink(&amp;self, sink: Arc&lt;dyn TraceSink&gt;); }
 <ol>
 <li><code>cargo test -p rust-cordis-core trace_iface_chain</code>：A 经 <code>call_iface</code> 调 B，B 调 C，C 返回 Err → 2 条记录：(A→B, Err)、(B→C, Err)，uid 与 name 正确。</li>
 <li><code>cargo test -p rust-cordis-host trace_iface_pending</code>：T2 插件返回 PENDING，50ms 后 fulfill → 1 条记录 outcome=Ok、<code>elapsed ≥ 50ms</code>。</li>
-<li><code>cargo test -p rust-cordis-host trace_iface_drop_paths</code>：超时 → 恰好 1 条 <code>host_timeout</code>；取消 → 1 条 <code>host_cancel</code>；未接 cell 时两条都红。</li>
+<li><code>cargo test -p rust-cordis-host trace_iface_abort_paths</code>：超时 → 恰好 1 条 <code>host_timeout</code>；取消 → 1 条 <code>host_cancel</code>；panic → 1 条 <code>host_panic</code>；三者写成同一个码时前两条红。</li>
 <li><code>cargo test -p rust-cordis-host trace_iface_inflight_swap</code>：PENDING 期间热换，记录带发起时 uid 且 <code>callee_uid != u64::MAX</code>。</li>
 <li><code>cargo test -p rust-cordis-host trace_iface_panic</code>：callee apply/回调 panic → 仍产出 1 条 <code>Err</code>（"宿主写记录"的硬证据）。</li>
 <li>未装 sink：代码评审确认 <code>call_iface</code> 路径只多一次 <code>OnceLock::get</code>；不写性能测试。</li>
@@ -257,7 +257,7 @@ examples/rsi-substrate/
 <li>v1：score 5/5；trace 中 evaluator→pipeline 5 条 Ok、pipeline→solver 5 条 Ok。</li>
 <li>投 v2：热换成功、solver uid 变、sha256 变；trace 中 pipeline→solver 2 条 Err 且 evaluator→pipeline 对应 2 条 Err —— <b>按 <code>callee_plugin</code>/<code>callee_uid</code> 聚合，solver 行 40%、pipeline 行 0%（自身无失败，仅透传）</b>；改回 YAML → uid 再变，<b>同一用例回到 Ok</b>。<b>金丝雀的硬判据是"同一用例 Ok→Err"或"出现 callee_plugin=solver 的新 Err"，不是分数</b>（同进程 static 污染使跨代分数不可比，ADR 0009 §3）。<b>这一步证明归因可定位到链中一跳。</b></li>
 <li>投 v3 前做契约 diff：<code>services[solver].methods</code> 少了/改名了，或 <code>iface_spec_sha256</code> 与 manifest 不符 → 拒绝投放；宿主无感知。</li>
-<li>投 solver-panic：<code>SwapOutcome::RolledBack</code>；<code>report.failed</code> 含 solver；旧实例 uid 不变、evaluator 仍 5/5。</li>
+<li>投 solver-panic：<code>SwapOutcome::RolledBack</code>；<code>report.failed</code> 含 solver；<b>uid 变为新值</b>（回滚会重建 fiber），<code>sha256</code> 回到 v1 的值，evaluator 仍 5/5。用例本身必须幂等：apply 失败回滚复用同一模块（static 保留），改 YAML 重投是新模块（static 全新）。</li>
 <li>投 solver-crash：solve 回调 panic → 恰好一条 <code>Err</code> 记录且 <code>callee_plugin</code> = solver；宿主不退出。<b>这是"记录由宿主写、插件无法自报"的硬证据。</b></li>
 <li>在飞热换：让 pipeline 的调用在 PENDING 期间触发 solver 热换 → 该记录仍带发起时 uid（<code>!= u64::MAX</code>）与 <code>callee_plugin=solver</code>，不因 drop 读已释放实例而丢归属。</li>
 <li>全程同一 App 实例（不重启）；Windows + Linux 均通过（CI <code>--workspace</code> 自动覆盖）。</li>
@@ -317,8 +317,8 @@ examples/rsi-substrate/
 </table>
 
 <!-- ============================================================ -->
-<h2 id="s8">8. 三轮评审记录与处置</h2>
-<p class="mute">三位评审独立阅读 v1 与仓库代码，原始记录见 <code>docs/review-r1.md</code>、<code>review-r2.md</code>、<code>review-r3.md</code>。下表为发现 → 处置 → 落点。</p>
+<h2 id="s8">8. 评审记录与处置</h2>
+<p class="mute">三轮不同角度的独立评审（R1 简化 / R2 RSI 契合 / R3 维护者），随后对 WP0 又跑了四轮验收（A1 一致性 / A2 安全 / A3 研究者）。原始记录见 <code>docs/review-r1.md</code>、<code>review-r2.md</code>、<code>review-r3.md</code>；WP0 的验收轮次与修复项记在 <code>docs/roadmap.md</code> 的 RSI-WP0 条目。工作包编号沿用早期草案：WP3 是预留位（loader 控制面），本阶段不单列，对应阶段 2 的 S2-3。</p>
 
 <h3>R1 · 简化与范围（Karpathy 视角）—— 结论：v1 未通过，v2 采纳全部 P0/P1</h3>
 <table class="small">

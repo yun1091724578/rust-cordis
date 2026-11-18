@@ -111,8 +111,10 @@ allow-list**。如果产品要求更严，可以升级为“必须同仓库”�
   被签发）、签发逻辑三者都经人工 PR 修改；单个变体不审。只有已审的
   `pipeline_revision` 可以签发，集合由人工 PR 维护（**本仓不校验该集合**，
   由流水线入口与 PR 纪律强制）；签发入口不得有“评估失败仍签发”的 override；
-- **固定 revision**：变体源进归档仓库并记 revision；manifest 同时记
-  variant revision 与 pipeline revision；
+- **固定 revision**：变体源进归档仓库并记 revision；准入台账记录 variant
+  revision 与 pipeline revision。sidecar 的 `PluginManifest` 目前没有这两个
+  字段，且它同样未开 `deny_unknown_fields`——写进 sidecar 会被静默丢弃，
+  阶段 1 不依赖 sidecar 承载它们；
 - **受控构建**：产物由受信任 CI 从该 revision 构建；归档仓库**禁止提交二进制
   产物**，否则“从该 revision 构建”退化为“取回已提交的二进制”；
 - **产物 hash 与来源记录**：artifact SHA256，加 `attestation` 三元组
@@ -123,9 +125,10 @@ allow-list**。如果产品要求更严，可以升级为“必须同仓库”�
   `xtask seal` 只覆盖随宿主发布的插件，变体走归档仓库 + allow-list；
 - **allow-list 在来源解析出策略时生效**：条目按
   `(plugin id, semver, source revision, artifact SHA256, abi version)` 匹配。
-  strict 恒生效；fallback 在进程级策略存在时生效（此时它仍是 allow-list
-  门禁）；`dev_unverified` 从不生效（ADR 0008 §3）。所以“唯一门禁”只在
-  strict 下无条件成立；
+  strict 恒生效（未覆写 `*_admitted` 的外部来源除外，ADR 0008 §4）；
+  fallback 在进程级策略存在时生效（此时它仍是 allow-list 门禁），无策略且
+  未开开发模式时**默认拒绝**；`dev_unverified` 从不生效（ADR 0008 §3）。
+  所以“唯一门禁”只在 strict 下无条件成立；
 - **准入台账旁挂 attestation 摘要**：摘要写入 allow-list 旁的准入记录，不写进
   `PluginSourcePolicy` 的 JSON。现行 `AllowedPlugin` 没有该字段，且
   `from_json` 未开 `deny_unknown_fields`——写进 policy 会被**静默丢弃**，
@@ -133,14 +136,14 @@ allow-list**。如果产品要求更严，可以升级为“必须同仓库”�
 - **职责分离**：准入合并（把条目写进 allow-list）必须由签发流水线**之外**的
   主体执行。同一自动化既签发又合并时，下条的交叉相等退化为自洽检查。
 
-**校验发生在准入，不在运行时。** `loader` / `PluginSourcePolicy::verify` 只比对
-id / semver / revision / hash / ABI，不认识 `attestation`；把“缺 attestation
-即由 loader 拒绝”写成运行时行为是虚报。缺任一项的材料**不得进入 allow-list**，
-这条由部署方的准入步骤（人工 PR 或受审 CI）执行：核对
-`eval_record` 的 `variant_revision` / `artifact_sha256` 与 manifest 相等，
+**校验发生在部署准入，不在运行时。** `loader` / `PluginSourcePolicy::verify`
+只比对 id / semver / revision / hash / ABI，不认识 `attestation`；把“缺
+attestation 即由 loader 拒绝”写成运行时行为是虚报。缺任一项的材料**不得进入
+allow-list**，这条由部署方的准入台账步骤（人工 PR 或受审 CI）执行：核对
+`eval_record` 的 `variant_revision` / `artifact_sha256` 与准入台账记录相等，
 `eval_record_sha256` 与 attestation 相等。
 
-**交叉相等只能防配错与重放，不能防伪造。** `eval_record` 与 manifest 由同一条
+**交叉相等只能防配错与重放，不能防伪造。** `eval_record` 与准入台账由同一条
 流水线写入，两边一致也可能两边都错或都被改；真正的独立证据是签名与构建
 provenance。没有签名时，attestation 的可信上限等于 allow-list 合并者的审查。
 需要抗伪造时，给 allow-list 与 attestation 加签名或 SLSA provenance；本 ADR
