@@ -1,13 +1,15 @@
 # ADR 0005：信任模型与插件来源边界
 
-- **状态**：已接受（2026-11-07；按“可信单租户底座 + T3 条件触发”口径）
-- **日期**：2026-11-07
+- **状态**：已接受（2026-11-07；2026-11-18 修订：新增 §2.3 受审流水线签发）
+- **日期**：2026-11-07（修订 2026-11-18）
 - **依据**：`README.md`《定位与边界》；`docs/support-contract.md` 非目标；
   `docs/adr/0001-second-carrier.md`；`docs/architecture-review.md`；
+  `docs/adr/0009-rsi-deployment-substrate.md`；
   `docs/release.md` 的 0.1.0/0.1.1 发布记录
 - **决定摘要**：本仓只承诺承载**第一方、可审查、随宿主发布**的 T1/T2 插件；
-  不承诺对不可信代码的隔离。第三方、运行时下载、模型生成且未经人工审查的
-  可执行插件，在 T3 落地前不得进入运行时。来源治理是准入，不是执行隔离。
+  不承诺对不可信代码的隔离。第三方、运行时下载、以及既未经人工审查也未经
+  §2.3 受审流水线签发的模型生成可执行插件，在 T3 落地前不得进入运行时。
+  来源治理是准入，不是执行隔离。
 
 ---
 
@@ -49,7 +51,8 @@
 - T2 可以提供**可信组件内的服务组合、生命周期、可观测性和工程安全**；
 - T2 不能提供**不可信代码隔离、多租户安全、单次同步调用抢占、per-plugin
   硬内存上限**；
-- 如果插件来源包含第三方或模型生成代码，**T3 是前置条件**，不是后续优化；
+- 如果插件来源包含第三方，或未经 §2.3 签发的模型生成代码，**T3 是前置条件**，
+  不是后续优化；
 - 任何超出上述边界的“安全”“稳定”“无泄漏”“不冲突”表述，都是契约破坏。
 
 ---
@@ -77,14 +80,17 @@ T1/T2 的 plugin、宿主、配置和宿主注入的 log sink 都在同一信任
 - 产物能对应到固定 commit / revision；
 - 由受信任 CI 从该 revision 构建；
 - 产物有 SHA256，最好有签名或 SLSA provenance；
-- 使用受支持的 ABI，并随 `xtask seal` 一起封存；
-- loader 只加载 allow-list 中的 `(plugin id, source revision, artifact hash)`。
+- 使用受支持的 ABI，并随 `xtask seal` 一起封存（变体见 §2.3 的例外）；
+- 来源解析出策略时，loader 只加载 allow-list 中的
+  `(plugin id, semver, source revision, artifact SHA256, abi version)`：
+  strict 恒生效，fallback 在进程级策略存在时生效，`dev_unverified` 从不生效
+  （ADR 0008 §3）。
 
 不允许：
 
 - 第三方二进制；
 - 运行时下载的可执行插件；
-- 模型生成且未经人工审查的代码；
+- 模型生成、且既未经人工审查也未经 §2.3 受审流水线签发的代码；
 - 无法对应到固定源码 revision 的产物；
 - 仅凭 `schema` / `provision` 自述就视为已授权。
 
@@ -92,7 +98,70 @@ T1/T2 的 plugin、宿主、配置和宿主注入的 log sink 都在同一信任
 **组织控制 + review + 固定 revision + 受控构建 + 产物 hash/来源证明 +
 allow-list**。如果产品要求更严，可以升级为“必须同仓库”。
 
-### 2.3 承诺口径
+### 2.3 受审流水线签发（演化产物）
+
+自我改进/演化循环产出的变体是模型生成代码，逐个人工审查不成立。本 ADR 允许
+一条替代路径：由**受审流水线**签发，而不是由人对每个变体签字。签发不降低
+§2.2 的最低要求，只是把审查对象从“产物”上移到“生产者”。
+
+受审流水线必须**同时**满足：
+
+- **组织控制**：流水线代码与宿主在同一组织控制的仓库，受同一 review 纪律；
+- **review 的对象是流水线**：评估器（固定用例与评分）、选择门禁（何者可以
+  被签发）、签发逻辑三者都经人工 PR 修改；单个变体不审。只有已审的
+  `pipeline_revision` 可以签发，集合由人工 PR 维护（**本仓不校验该集合**，
+  由流水线入口与 PR 纪律强制）；签发入口不得有“评估失败仍签发”的 override；
+- **固定 revision**：变体源进归档仓库并记 revision；manifest 同时记
+  variant revision 与 pipeline revision；
+- **受控构建**：产物由受信任 CI 从该 revision 构建；归档仓库**禁止提交二进制
+  产物**，否则“从该 revision 构建”退化为“取回已提交的二进制”；
+- **产物 hash 与来源记录**：artifact SHA256，加 `attestation` 三元组
+  （`pipeline_id` / `pipeline_revision` / `eval_record_sha256`）。评估记录
+  本身必须含 variant revision 与 artifact SHA256，准入时与 manifest 交叉
+  相等——否则同一份好记录可以配任意二进制（重放）；
+- **ABI 同受精确门禁**：`abi_version` 不匹配的变体在准入阶段即被拒绝；
+  `xtask seal` 只覆盖随宿主发布的插件，变体走归档仓库 + allow-list；
+- **allow-list 在来源解析出策略时生效**：条目按
+  `(plugin id, semver, source revision, artifact SHA256, abi version)` 匹配。
+  strict 恒生效；fallback 在进程级策略存在时生效（此时它仍是 allow-list
+  门禁）；`dev_unverified` 从不生效（ADR 0008 §3）。所以“唯一门禁”只在
+  strict 下无条件成立；
+- **准入台账旁挂 attestation 摘要**：摘要写入 allow-list 旁的准入记录，不写进
+  `PluginSourcePolicy` 的 JSON。现行 `AllowedPlugin` 没有该字段，且
+  `from_json` 未开 `deny_unknown_fields`——写进 policy 会被**静默丢弃**，
+  不构成任何校验；阶段 1 不依赖该字段；
+- **职责分离**：准入合并（把条目写进 allow-list）必须由签发流水线**之外**的
+  主体执行。同一自动化既签发又合并时，下条的交叉相等退化为自洽检查。
+
+**校验发生在准入，不在运行时。** `loader` / `PluginSourcePolicy::verify` 只比对
+id / semver / revision / hash / ABI，不认识 `attestation`；把“缺 attestation
+即由 loader 拒绝”写成运行时行为是虚报。缺任一项的材料**不得进入 allow-list**，
+这条由部署方的准入步骤（人工 PR 或受审 CI）执行：核对
+`eval_record` 的 `variant_revision` / `artifact_sha256` 与 manifest 相等，
+`eval_record_sha256` 与 attestation 相等。
+
+**交叉相等只能防配错与重放，不能防伪造。** `eval_record` 与 manifest 由同一条
+流水线写入，两边一致也可能两边都错或都被改；真正的独立证据是签名与构建
+provenance。没有签名时，attestation 的可信上限等于 allow-list 合并者的审查。
+需要抗伪造时，给 allow-list 与 attestation 加签名或 SLSA provenance；本 ADR
+不承诺该能力。
+
+**`dev_unverified` 禁令只能由部署纪律保证。** loader 没有“变体”概念，只读来源
+对象自带的准入结论；`PolicyPluginSource::dev_unverified` 是公开构造器，宿主
+无法区分它是给普通插件还是给变体用的。把它写成运行时门禁同样是虚报。
+
+仍然**不允许**：
+
+- 流水线自身被演化：`pipeline_revision` 的变更只能经人工 PR；
+- 跳过评估门禁的签发（例如评估失败但强制签发）；
+- 把 `attestation` 自述当成授权：它是准入材料，不是运行时信任；
+- 用 §2.3 包装第三方二进制：外部下载物不是“变体”，不得进入归档仓库。
+
+后果不变：签发方被攻破等价于 §1.1 第 6 条“信任是传递的”失效；宿主仍与插件同进程、
+同权限。签发只回答“这是哪个流水线、用哪份评估记录选出来的”，不回答
+“这段代码是安全的”。
+
+### 2.4 承诺口径
 
 | 表述 | 是否允许 | 说明 |
 |---|---|---|
@@ -106,7 +175,7 @@ allow-list**。如果产品要求更严，可以升级为“必须同仓库”�
 
 对外文档必须使用左列口径。出现右列禁用语时，应视为文档契约破坏。
 
-### 2.4 允许的失败模式
+### 2.5 允许的失败模式
 
 “接受”不等于“已解决”，也不等于“可以写成保证”。它表示产品明确知道
 T2 无法在本进程内消除该风险，并把处置责任放到了部署层或后续 T3。
@@ -138,7 +207,14 @@ T2 无法在本进程内消除该风险，并把处置责任放到了部署层�
 
 - manifest 至少记录：plugin id、semver、source revision、ABI version、
   artifact SHA256；
-- loader 有 allow-list；
+- 演化产物另记 `attestation`：pipeline id、pipeline revision、eval record
+  SHA256；评估记录须含 variant revision 与 artifact SHA256（§2.3）；
+  其他来源可选。`attestation` 落在准入台账侧；若要写进 `PluginManifest`，
+  属 ADR 0006 的加法并须登记 `api-inventory`；
+- 演化产物的 attestation 由准入步骤核对（职责分离，§2.3），`verify` 只比对
+  id / semver / revision / hash / ABI；
+- loader 有 allow-list（strict 恒生效；fallback 在进程级策略存在时生效；
+  `dev_unverified` 从不生效，ADR 0008 §3）；
 - `inspect` / `status` 能显示来源和 revision；
 - 没有来源信息的插件默认拒绝（或显式开发模式）。
 
@@ -271,6 +347,7 @@ T2 无法在本进程内消除该风险，并把处置责任放到了部署层�
 - 不提供 per-plugin 内存上限与 CPU 抢占；
 - 不提供文件/网络能力收窄；
 - 不把 `schema` / `provision` 自述升级为授权；
+- 不把 `attestation` 自述升级为运行时信任（§2.3）；
 - 不承诺多租户、远程部署或独立故障域；
 - 不承诺“不会死锁/不会泄漏/不会版本冲突”的绝对命题；
 - 不把线程池超时描述成“取消同步调用”。
@@ -281,7 +358,7 @@ T2 无法在本进程内消除该风险，并把处置责任放到了部署层�
 
 出现任一情况，必须重开本 ADR，并另立 T3 决策：
 
-- 任一第三方或模型生成插件要进入运行时；
+- 任一第三方插件，或未按 §2.3 签发的模型生成插件要进入运行时；
 - 出现多租户、不可信输入或对外托管需求；
 - 需要 per-plugin 内存上限、CPU 配额或可抢占执行；
 - 生产环境出现插件 hang 导致宿主不可用；
@@ -295,9 +372,9 @@ T3 决策至少包含：载体选型、HostApi 收窄、权限模型、性能预
 
 ## 7. 验收与证据
 
-- README / 支持契约增加“插件来源”行，状态为**声明**，并注明这是来源治理
-  不是运行时安全。该行会把保证索引从 25 行变为 26 行（保证数仍为 17）；
-  同步更新 `xtask` 中固定行数的测试与文档计数；
+- README / 支持契约已有“插件来源”行，状态为**声明**，并注明这是来源治理
+  不是运行时安全（当前保证索引 26 行 / 17 保证，`xtask/src/contract.rs` 固定；
+  §2.3 只改该行措辞，不增行）；
 - P0 每项有对应测试或故障注入记录，否则不得标记完成；
 - `cargo xtask docs` 继续只对“保证”行要求测试证据；
 - 文档不得出现“安全隔离 / 沙箱 / 不会泄漏 / 版本不冲突 / 多租户安全底座”
