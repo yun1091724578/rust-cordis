@@ -435,6 +435,7 @@ async fn cancel_close_window(close_first: bool, format: u32, kind: ContinuationK
                 owner: f.handle,
                 continuation: 99,
                 kind,
+                trace_parent: None,
             }),
         },
     )
@@ -642,6 +643,7 @@ async fn dead_weak_cleanup(timeout: bool) {
                 owner: f.handle,
                 continuation: 99,
                 kind: ContinuationKind::Iface,
+                trace_parent: None,
             }),
         },
     )
@@ -670,6 +672,12 @@ async fn dead_weak_cleanup(timeout: bool) {
                 instance,
                 dispatch_id: 71,
             },
+            trace_parent: None,
+            traced: false,
+            callee: (0, Box::from("test")),
+            caller_uid: 0,
+            name: Box::from("test"),
+            started: std::time::Instant::now(),
         };
         assert!(pending.settle("dead owner").await.is_err());
     } else {
@@ -764,6 +772,7 @@ async fn o1d_outbound_terminal_window() {
                         owner: f.handle,
                         continuation: 99,
                         kind,
+                        trace_parent: None,
                     }),
                 },
             )
@@ -856,6 +865,7 @@ async fn o1d_close_wins_keeps_outbound_for_abort() {
                     owner: f.handle,
                     continuation: 99,
                     kind,
+                    trace_parent: None,
                 }),
             },
         )
@@ -1031,6 +1041,7 @@ async fn o1c_close_lease_covers_gone_abort_dispose() {
                 owner: f.handle,
                 continuation: 10,
                 kind: ContinuationKind::Iface,
+                trace_parent: None,
             }),
         },
     )
@@ -1071,6 +1082,8 @@ async fn o1c_dead_weak_never_calls_raw_target() {
             None,
             None,
             None,
+            None,
+            false,
             None,
         )
     }
@@ -1120,6 +1133,8 @@ fn o1c_reentrant_close_child() {
                         None,
                         None,
                         None,
+                        None,
+                        false,
                         None,
                     )
                     .map(|_| ())

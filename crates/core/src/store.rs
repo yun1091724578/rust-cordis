@@ -20,10 +20,11 @@
 use crate::dyn_value::{BoxFuture, Config, Disposable, Dyn, Result};
 use crate::event::{self, Args, Filter, Handler, Hook, Mode, Ret};
 use crate::fiber::Fiber;
+use crate::trace::{TraceRecord, TraceSink};
 use crate::{Context, Ctx};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub type RealmId = u32;
 
@@ -47,6 +48,17 @@ pub type GetHook = Arc<dyn Fn(&Ctx, &str) -> Option<Dyn> + Send + Sync>;
 /// **同步写钩子**（`internal/set` 的 Rust 形态，M3-3）：实参 `(写的 ctx, 服务名, 新值)`；
 /// 返回 `Some(result)` ⇒ 接管这次写入（`Some(Err(..))` 即否决）；`None` ⇒ 走内核的 `set`。
 pub type SetHook = Arc<dyn Fn(&Ctx, &str, &Dyn) -> Option<Result<()>> + Send + Sync>;
+
+/// 一个 fiber 注册的**可调用服务**（`provide_iface` 或带 JSON 面的值）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceInfo {
+    /// 注册键（`call_iface` 解析用的名字）。
+    pub name: String,
+    /// 接口版本。
+    pub version: u32,
+    /// 方法名（排序去重；只有名字，没有参数形状）。
+    pub methods: Vec<String>,
+}
 
 pub struct Impl {
     pub name: Box<str>,
@@ -411,6 +423,8 @@ pub struct Store {
     observer_sn: AtomicU64,
     fiber_sn: AtomicU64,
     log_sink: Mutex<LogSink>,
+    /// 逐跳记录出口（ADR 0009）：只在 `App` 上安装一次；未安装时一次原子读。
+    trace_sink: OnceLock<Arc<dyn TraceSink>>,
 }
 
 impl Default for Store {
@@ -441,6 +455,7 @@ impl Store {
             log_sink: Mutex::new(Arc::new(|level, name, msg| {
                 eprintln!("[{level:?}] {name}: {msg}");
             })),
+            trace_sink: OnceLock::new(),
         };
         // 内置监听器钩子（上游 `events.ts:54-58` 的那个 `internal/listener` 监听器）：
         // 把**非全局**的 `internal/update` 注册路由进 fiber 自己的钩子链——
@@ -461,6 +476,38 @@ impl Store {
 
     pub fn set_log_sink(&self, sink: LogSink) {
         *self.log_sink.lock().unwrap() = sink;
+    }
+
+    /// 安装逐跳记录出口。只允许安装一次；返回是否安装成功。
+    ///
+    /// 入口在 `App` 上而不是 `Store` 的公开方法：`Context::store` 是公开字段，
+    /// 插件能读到它；不提供可替换/可摘除的 sink 槽。
+    pub(crate) fn install_trace_sink(&self, sink: Arc<dyn TraceSink>) -> bool {
+        self.trace_sink.set(sink).is_ok()
+    }
+
+    /// 记录出口是否已安装。宿主在没有 sink 时跳过身份快照的构造（只是多一次原子读）。
+    pub fn has_trace_sink(&self) -> bool {
+        self.trace_sink.get().is_some()
+    }
+
+    /// 写出一个逐跳记录；未安装 sink 时只做一次原子读。
+    ///
+    /// **T1 插件可以调用本方法伪造记录**（编译进宿主的受信域，见 ADR 0009 §2.2）；
+    /// T2 无法经 ABI 触达。防伪造不在 0.1 的安全承诺内。
+    ///
+    /// sink 的 panic 会被截获并丢弃这一条记录，不会打穿宿主任务（与 log sink
+    /// 同一处置：记录出口是宿主注入的第三方代码）。
+    pub fn record_trace(&self, record: TraceRecord) {
+        if let Some(sink) = self.trace_sink.get() {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sink.record(record);
+            }))
+            .is_err()
+            {
+                eprintln!("[cordis] trace sink 在记录时 panic（已截获并丢弃该条记录）");
+            }
+        }
     }
 
     pub fn log(&self, level: Level, name: &str, message: &str) {
@@ -1017,6 +1064,63 @@ impl Store {
             })
             .map(|impl_| (impl_.name.clone(), impl_.realm))
             .collect()
+    }
+
+    /// 本 fiber 注册的**可调用服务**（`provide_iface` / 带 JSON 面的值）。
+    ///
+    /// 与 [`Store::impls_owned_by`] 同一口径：只按 fiber 身份过滤，不把注册键
+    /// 当作第二套枚举语义。没有可调用面孔的值（纯数据 `Dyn`）不列出。方法名
+    /// 排序去重，契约比对得到的是稳定集合。
+    ///
+    /// fiber 已销毁（`UID_DISPOSED`）时返回空：注册条目随生命周期消失，这里
+    /// 不再去哈希表里按弱引用碰运气。调用方可用 `fiber.uid() == UID_DISPOSED`
+    /// 区分“没有服务”和“实例已经没了”。
+    pub fn services_of(&self, fiber: &Arc<Fiber>) -> Vec<ServiceInfo> {
+        if fiber.uid() == crate::fiber::UID_DISPOSED {
+            return Vec::new();
+        }
+        // 先在锁内只取适配器，再在锁外调 `methods()`：提供者的方法表实现
+        // 不属于内核，不能在持有 `impls` 锁时执行。
+        let registered: Vec<(String, Arc<dyn crate::ExternService>)> = {
+            let impls = self.impls.lock().unwrap();
+            impls
+                .values()
+                .filter(|impl_| {
+                    impl_
+                        .fiber
+                        .upgrade()
+                        .map(|own| Arc::ptr_eq(&own, fiber))
+                        .unwrap_or(false)
+                })
+                .filter_map(|impl_| {
+                    impl_
+                        .get()
+                        .adapter()
+                        .map(|adapter| (impl_.name.to_string(), adapter))
+                })
+                .collect()
+        };
+        let mut services: Vec<ServiceInfo> = registered
+            .into_iter()
+            .map(|(name, iface)| {
+                let mut methods = iface.methods();
+                methods.sort();
+                methods.dedup();
+                ServiceInfo {
+                    name,
+                    version: iface.version(),
+                    methods,
+                }
+            })
+            .collect();
+        services.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then(a.version.cmp(&b.version))
+                .then(a.methods.cmp(&b.methods))
+        });
+        services.dedup();
+        services
     }
 
     // ------------------------------------------------------------- provision（M5）

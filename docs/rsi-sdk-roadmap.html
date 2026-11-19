@@ -46,16 +46,18 @@
 </div>
 
 <div class="box warn">
-<b>WP0 验收后的修正（三轮独立评审两轮，见 docs/review-r1/r2/r3.md）</b>：
-① 签发只是准入口径，<b>不是</b> loader 能力 —— attestation 由准入步骤核对，且必须绑定 artifact SHA256 与 variant revision，否则可重放；
+<b>WP0 验收后的修正（三轮独立评审 + 多轮 A1/A2/A3 角度验收，见 docs/review-r1/r2/r3.md）</b>：
+① 签发只是准入口径，<b>不是</b> loader 能力 —— attestation 由部署准入台账核对，且必须绑定 artifact SHA256 与 variant revision，否则可重放；
 ② 契约锁只能锁方法名集合（<code>ExternService::methods()</code> 无参数形状），IO schema 级锁列为范围外；
-③ 归因埋点必须用共享 outcome cell + Drop guard：超时/取消/panic 三条丢弃路径不能都记成 timeout；
-④ 新增"callee panic 仍产出 Err 记录"断言（宿主写记录 vs 插件自报的硬证据）；
-⑤ <code>callee_uid</code> 在<b>发起时快照</b>（卸载后是 <code>u64::MAX</code>），并加稳定的 <code>callee_plugin</code>；不引入 <code>mount_gen</code>，在飞热换不承诺归到正确那一代；
-⑥ 导出面目前不存在：WP2b 需新增 <code>Store::services_of(&amp;Arc&lt;Fiber&gt;)</code>（薄封装 <code>impls_owned_by</code>）与 <code>StatusReport.capabilities</code>（typed row），方法名在 shutdown 前抓取；
+③ 归因写入点：core 在入站派发记录之前（解析/版本/方法检查失败）；host 在同步出口或 PENDING 结算（共用 dispatch_id、互斥）；host 在“入站从未结算”时有三种补写：仅出站看门狗超时（<code>call_id=0</code>、<code>HOST_TIMEOUT</code>）、poll 边界 panic（<code>call_id=0</code>、<code>host_panic</code>）、NoRuntime（<code>call_id=0</code>、<code>host_call</code>）；
+④ panic 分两种断言：宿主 poll 边界 unwind → <code>call_id=0</code>、<code>host_panic</code>；T2 插件经 ABI 收敛的 <code>STATUS_ERR</code> 走入站结算（真实 <code>call_id</code>）；
+⑤ <code>callee_uid</code> 在<b>发起时快照</b>（结算时是 <code>u64::MAX</code>），并带稳定的 <code>callee_plugin</code>；不引入 <code>mount_gen</code>；
+⑥ 导出面已落地（WP2b）：<code>Store::services_of(&amp;Arc&lt;Fiber&gt;)</code>（复用 <code>impls_owned_by</code> 的 fiber 身份判据）与 <code>StatusReport.capabilities</code>（typed row，含 <code>services</code>），方法名在 shutdown 前抓取；
 ⑦ attestation 摘要<b>不写进 policy JSON</b>（未知字段会被静默丢弃），放准入台账；准入合并须与签发流水线职责分离；
 ⑧ "变体不得用 <code>dev_unverified</code>"只是部署纪律，loader 不区分变体，无法强制——已在 ADR 里如实说明；
-⑨ trace sink 的安装入口挂 <code>App</code>，不挂公开可达的 <code>Context::store</code>，否则同进程插件可以替换或摘除记录。
+⑨ trace sink 的安装入口挂 <code>App</code>，不挂公开可达的 <code>Context::store</code>，否则同进程插件可以替换或摘除记录；
+⑩ 父链设计见 ADR 0010：`call_id` 复用入站 `dispatch_id`，host 新增私有 <code>CALL_SCOPE</code>，只在 <code>call_inbound</code> 执行窗口与 <code>deliver_outbound</code> 交付窗口压栈；不改 ABI、不加 <code>HostApi</code> 字段；
+⑪ 父链的边界已披露：T1 异步起点、事件/waterfall 起点、typed 直调与流式接口无父；T2→T1→T2 跳过 T1。事件不压 <code>CALL_SCOPE</code>，避免父指向无记录的幽灵 id。
 </div>
 
 <div class="box warn">
@@ -70,11 +72,11 @@
 <a href="#s1">1. 定位：rust-cordis 在 RSI 循环里站哪一格</a>
 <a href="#s2">2. 现状缺口（基于代码事实，评审后修正）</a>
 <a href="#s3">3. 方案：阶段 1 工作包</a>
-<a href="#s4">4. 阶段 2（决策门控）</a>
+<a href="#s4">4. 阶段 2（决策门控，不在本轮）</a>
 <a href="#s5">5. 明确的非目标</a>
 <a href="#s6">6. 验收标准总表</a>
 <a href="#s7">7. 风险与决策门</a>
-<a href="#s8">8. 三轮评审记录与处置</a>
+<a href="#s8">8. 评审与验收记录</a>
 <a href="#sA">附录 A. 引用的代码事实（已核实）</a>
 </div>
 
@@ -88,7 +90,7 @@
 <tr><td>A3</td><td><b>不升 ABI major</b>：改动全部是 T1/宿主内部，或 ADR 0004 允许的尾追加。阶段 1 实际不碰 ABI。</td><td>接受升 major 则 T2 异步化可提前。</td></tr>
 <tr><td>A4</td><td>消费者接受<b>文件驱动</b>（替换 cdylib + sidecar manifest + 改 YAML），宿主通过 HMR 轮询拾取；观测通过宿主自己落盘的 JSONL/JSON 文件。不提供 RPC。</td><td>需要 RPC 则阶段 2 的 <code>loader.control</code> 提前。</td></tr>
 <tr><td class="diff">A5′</td><td class="diff"><b>进本宿主的只有已选中变体</b>，带<b>受审演化流水线</b>签发的 sidecar manifest（sha256 + source_revision + 流水线 revision + 评估记录摘要）。宿主不运行未经评估的 LLM 产物。签发权已由 D1 决定：修 ADR 0005 承认"受审流水线"为签发方。</td><td class="diff">若要在宿主里直接跑未评估产物，必须先有子进程/Wasm 载体（阶段 2）。</td></tr>
-<tr><td class="diff">A6</td><td class="diff">评估 episode 在宿主内<b>串行</b>执行；trace 用墙钟时间戳与 episode 时间窗对齐。</td><td class="diff">并行 episode 需要 correlation 透传（阶段 2 S2-2）。</td></tr>
+<tr><td class="diff">A6</td><td class="diff">评估 episode 在宿主内<b>串行</b>执行；trace 用墙钟时间戳与 episode 时间窗对齐。</td><td class="diff">并行 episode 需要 correlation 透传（与调用链无关，另立设计）。</td></tr>
 </table>
 
 <h3>两种理解，本方案选第一种</h3>
@@ -112,12 +114,12 @@
 │ 可变层 T2（cdylib，YAML + sidecar manifest 驱动）                               │
 │   pipeline → solver(v1→v2…)  · apply 失败自动回滚旧实例 · 仅配置变更走 volatile  │
 └──────────────────────────────────────────────────────────────────────────────┘
-          ▲ 归因：trace 把回归定位到调用链中具体一跳；回归 → 改回 YAML 即回滚
+          ▲ 归因：trace 带父链，按叶子 Err 定位到链中一跳（ADR 0010）；回归 → 改回 YAML 即回滚
 </pre>
 
 <table>
 <tr><th>开放问题</th><th>外部循环现有做法</th><th>rust-cordis 可补的差异化</th><th>覆盖</th></tr>
-<tr><td>attribution</td><td>PluginRSI"一次只变一个插件"（干预式）；整 harness 一个分数</td><td><b>观察式</b>补充：宿主内多插件调用链 A→B→C 哪一跳失败/变慢；一代改多个插件后事后分解。与 TS <code>tools/result</code> 的差别不是"看不看得到嵌套"，而是三条：记录由宿主写（插件崩溃仍有）、逐跳 <code>elapsed</code>、callee 是提供方实例 uid 而非工具名</td><td class="ok">WP1 + WP4 调用链场景</td></tr>
+<tr><td>attribution</td><td>PluginRSI"一次只变一个插件"（干预式）；整 harness 一个分数</td><td><b>宿主写、带父链</b>：按叶子 Err 归到链中具体一跳（ADR 0010），并给出逐跳耗时；T2→T2 与 PENDING 续延完整，T1 异步/事件起点为根。与 TS <code>tools/result</code> 的差别：记录由宿主写（插件崩溃仍有）、逐跳 <code>elapsed</code>、callee 是提供方实例</td><td class="ok">WP1 + ADR 0010 + WP4</td></tr>
 <tr><td>transfer</td><td>插件 = YAML 接口规范 + 实现，入共享库</td><td>机器可读契约 = inject/provision/配置 schema（PluginDesc）+ <b>服务方法名集合</b>（运行时注册）；锁住契约只许改实现</td><td class="ok">WP2b</td></tr>
 <tr><td>safety / reversibility</td><td>评估期：失败丢容器</td><td><b>部署期</b>：reload 失败回滚旧实例（已有）、金丝雀回归后改 YAML 回滚、不停机</td><td class="ok">已有能力，WP4 可见化</td></tr>
 <tr><td>reliable evaluation</td><td>Docker 内跑 benchmark</td><td>不提供。T1 只保证评估器"不在 stage 写入面上"，是治理约束不是物理不可演化（见 R2）</td><td class="mute">仅文档</td></tr>
@@ -128,10 +130,10 @@
 
 <table>
 <tr><th style="width:36px">#</th><th>需要</th><th>现状</th><th class="ref">证据</th></tr>
-<tr><td>G1</td><td>每次服务调用的归因记录（caller、callee、耗时、结果）</td><td>无。<code>internal/dispatch</code> 只带 mode/label/argc 且在 handler 前发；<code>Context::call_iface</code> 是 T1→T2 / T2→T2 的单一汇合点，持有 caller 身份与 <code>Result</code>，但 <code>store.resolve</code> 丢掉 <code>Impl.fiber</code>（callee 身份）。</td><td class="ref">core/src/store.rs:1303-1316; core/src/context.rs:468-486; host/src/lib.rs:3377; store.rs:685-742, :56</td></tr>
-<tr><td>G2</td><td>uid ↔ 挂载行 ↔ 源文件摘要 的对应</td><td><del>无逐实例列表</del> → <code>report().capabilities[]</code> 已是逐行 <code>{label, plugin, inject, provision, volatile}</code>；<code>Mounted</code> 私有结构已持 <code>fiber: Weak&lt;Fiber&gt;</code>；缺 <code>uid</code> 与 <code>sha256</code> 两个字段。HMR 指纹是 <code>(mtime, len)</code> 不是内容哈希；内容哈希已有 <code>source::sha256_file</code>。</td><td class="ref">host/src/loader.rs:1615-1665, :257-297, :299-308; host/src/source.rs:355</td></tr>
-<tr><td>G3</td><td>契约可导出、可冻结比对</td><td><code>inspect --json</code> 已输出 label/plugin/version/inject/provision/schema/provenance。但 <code>PluginDesc.schema</code> 是<b>配置</b> schema；<b>服务方法名</b>在 apply 期由 <code>provide_iface</code> 注册（<code>ExternService::methods() -> Vec&lt;String&gt;</code>，<b>只有名字、没有参数形状</b>），任何 CLI 输出都不含。</td><td class="ref">cli/src/lib.rs:267-288; abi/src/lib.rs:434; core/src/context.rs:448; core/src/dyn_value.rs:143; macros/src/service.rs:324</td></tr>
-<tr><td>G4</td><td>运行中宿主的状态可被外部读取</td><td><code>cordis status --json</code> 新起 App → 挂载 → 取 report → 关闭，与 <code>cordis run</code> 进程无关；<code>cordis run</code> 硬编码 <code>hmr: None</code>。</td><td class="ref">cli/src/lib.rs:740-772, :684</td></tr>
+<tr><td>G1</td><td>每次服务调用的归因记录（caller、callee、耗时、结果）</td><td><b>（WP1 前快照）</b>无。<code>internal/dispatch</code> 只带 mode/label/argc 且在 handler 前发；<code>Context::call_iface</code> 是 T1→T2 / T2→T2 的单一汇合点，持有 caller 身份与 <code>Result</code>，但 <code>store.resolve</code> 丢掉 <code>Impl.fiber</code>（callee 身份）。<b>WP1/ADR 0010 已实现</b>逐跳记录与父链。</td><td class="ref">core/src/store.rs:1303-1316; core/src/context.rs:468-486; host/src/lib.rs:3377; store.rs:685-742, :56</td></tr>
+<tr><td>G2</td><td>uid ↔ 挂载行 ↔ 源文件摘要 的对应</td><td><b>（WP2 前快照）</b><del>无逐实例列表</del> → <code>report().capabilities[]</code> 已是逐行 <code>{label, plugin, inject, provision, volatile}</code>；<code>Mounted</code> 私有结构已持 <code>fiber: Weak&lt;Fiber&gt;</code>；当时缺 <code>uid</code> 与 <code>sha256</code> 两个字段。<b>WP2 已补齐</b>（行内九项含 <code>js</code>/<code>schema</code>/<code>uid</code>/<code>sha256</code>，sha 取暂存副本）。HMR 指纹是 <code>(mtime, len)</code> 不是内容哈希；内容哈希用 <code>source::sha256_file</code>。</td><td class="ref">host/src/loader.rs:1611-1675, :257-300, :299-308; host/src/source.rs:355</td></tr>
+<tr><td>G3</td><td>契约可导出、可冻结比对</td><td><code>inspect --json</code> 已输出 label/plugin/version/inject/provision/schema/provenance。但 <code>PluginDesc.schema</code> 是<b>配置</b> schema；<b>服务方法名</b>在 apply 期由 <code>provide_iface</code> 注册（<code>ExternService::methods() -> Vec&lt;String&gt;</code>，<b>只有名字、没有参数形状</b>）。<b>WP2b 已补齐</b>：<code>status --json capabilities[].services[].methods</code> 导出运行期方法名，<code>capabilities[].schema</code> 导出配置 schema。</td><td class="ref">cli/src/lib.rs; core/src/store.rs::services_of; abi/src/lib.rs:434; core/src/context.rs:448; core/src/dyn_value.rs:143; macros/src/service.rs:324</td></tr>
+<tr><td>G4</td><td>运行中宿主的状态可被外部读取</td><td><code>cordis status --json</code> 新起 App → 挂载 → 取 report → 关闭，与 <code>cordis run</code> 进程无关；<code>cordis run</code> 硬编码 <code>hmr: None</code>。</td><td class="ref">crates/cli/src/lib.rs:899-934, :684</td></tr>
 <tr><td>G5</td><td>端到端示例：部署→金丝雀→归因→回滚</td><td>无。<code>examples/harness-spike</code> 是 ABI 冒烟。</td><td class="ref">examples/harness-spike/src/main.rs:189-220</td></tr>
 </table>
 
@@ -145,7 +147,7 @@
 <h3>WP0 · 定位 ADR 与 ADR 0005 修订 <span class="tag">1 人日</span></h3>
 <table>
 <tr><th style="width:90px">改动</th><td>
-<p><b>1–3.</b> 新增 <code>docs/adr/0009-rsi-deployment-substrate.md</code>（一页）：定位与站位、三条决定（归因/变体身份/契约）、不承诺清单、与 0001/0005/0006/0007/0008 的关系、验收与复评条件，以及两条必须写明的约束：</p>
+<p><b>1–3.</b> 新增 <code>docs/adr/0009-rsi-deployment-substrate.md</code>（一页）：定位与站位、三条决定（归因/变体身份/契约）、不承诺清单、与 0001/0005/0006/0007/0008 的关系、验收与复评条件，以及三条必须写明的约束：</p>
 <ol>
 <li>typed 直调 <code>ctx.iface::&lt;dyn T&gt;()</code>（context.rs:395）不经 <code>call_iface</code>，<b>不可追踪</b>；要归因的调用必须走 <code>call_iface</code>。</li>
 <li><code>loader.report</code> 载荷与 <code>status --json</code> 新字段<b>只增不改</b>。</li>
@@ -164,47 +166,67 @@
 <tr><th>验证</th><td>ADR 编号 0009 连续；ADR 0005 §2.2/§2.3/§I1 三处一致（不允许项、允许条件、manifest 字段互不矛盾）；<code>xtask inventory --check</code> 通过（WP1/WP2 完成后复跑）。</td></tr>
 </table>
 
+<h3>S2-2 · 调用链关联设计（前置，已完成）<span class="tag">0 人日</span> <span class="tag ok">ADR 0010</span></h3>
+<p>父链语义与压栈点见 <code>docs/adr/0010-call-graph-correlation.md</code>：host 私有 <code>CALL_SCOPE</code>（thread-local + RAII），只在 iface 入站窗口与续延交付窗口压栈；<code>Outbound</code> 拆出 <code>trace_parent</code>，取消树的 <code>DispatchRecord.parent</code> 保持不变；<code>PendingContinuation</code> 携带 trace 父、traced、callee/发起方快照（不再重复存 call_id）。不改 ABI、不加 <code>HostApi</code> 字段。WP1 的实现包含它。</p>
+
 <h3>WP1 · 服务调用归因（trace sink，iface-only） <span class="tag">4.5 人日</span> <span class="tag p0">核心</span></h3>
 <table>
-<tr><th style="width:90px">目标</th><td>每次经 <code>call_iface</code> 的跨 fiber 服务调用产出一条记录，足以回答"调用链 A→B→C 里哪一跳失败/变慢"。</td></tr>
+<tr><th style="width:90px">目标</th><td>每次经 <code>call_iface</code> 的服务调用产出一条记录，足以按父链把失败定位到链中一跳（父子语义与压栈见 ADR 0010）。</td></tr>
 <tr><th>设计</th><td>
-<pre><code>// crates/core/src/trace.rs（新文件，约 60 行）
+<pre><code>// crates/core/src/trace.rs（新文件，约 50 行）
 pub struct TraceRecord {
     pub ts_ms: u64,          // 完成时刻，供与 episode 时间窗对齐（A6）
     pub name: Box&lt;str&gt;,      // "service.method"
+    pub call_id: u64,        // 入站 dispatch_id；解析失败/仅出站超时/poll panic/NoRuntime 为 0
+    pub parent_call_id: u64, // 发起时的 CALL_SCOPE 栈顶；0=根/未归因
     pub caller_uid: u64,     // root ctx 的 fiber_opt() 返回 UID_ROOT，不需要 Option
-    pub callee_uid: u64,     // 发起时快照（drop 时读会得到 u64::MAX）
-    pub callee_plugin: Box&lt;str&gt;, // 运行时名，跨热换稳定
-    pub elapsed: Duration,   // 含 PENDING 等待期（PluginIface::call 内部已 await settle）
-    pub outcome: Outcome,    // Ok | Err(code)：host_timeout / host_cancel / host_panic / host_drop
+    pub callee_uid: u64,     // 发起时快照（结算时读会得到 u64::MAX）；0=根或未记到
+    pub callee_plugin: Box&lt;str&gt;, // 运行时名；callee_uid=0 时填请求名（根为 "root"）
+    pub elapsed: Duration,   // 含 PENDING 等待期（入站 settle 覆盖）
+    pub outcome: Outcome,    // Ok | Err(code)：HOST_TIMEOUT / host_cancel / host_panic / host_lifecycle / host_call / 业务码
 }
 pub trait TraceSink: Send + Sync { fn record(&amp;self, r: TraceRecord); }
-impl App { pub fn set_trace_sink(&amp;self, sink: Arc&lt;dyn TraceSink&gt;); }  // 挂 App，不挂公开的 Store
+impl App { pub fn set_trace_sink(&amp;self, sink: Arc&lt;dyn TraceSink&gt;) -&gt; bool; }  // 挂 App，不挂公开的 Store
 </code></pre>
 <ul>
-<li><b>两个记录点，按"谁先知道结果"分工</b>：正常完成在 <code>Context::call_iface</code>（context.rs:468-486，T1→T2 与 T2→T2 的汇合点，host 的 <code>ctx_call_iface</code> 也调它）；异常终止在宿主调用包装层——超时（<code>with_iface_timeout</code>，lib.rs:1936）、取消（<code>complete_or_defer</code> 的 <code>None</code> 分支）、panic 都只有那一层知道。两处互斥，各发一条。</li>
-<li><b>不要把三条异常路径塞进 core 的 Drop guard</b>：future 被超时丢弃时 core 的收尾不执行，且 guard 判不出原因（panic 已被 <code>catch_unwind</code> 截断，future 是正常析构的）。异常码用宿主已有的 <code>host_timeout</code>/<code>host_cancel</code>/<code>host_panic</code>；只有宿主未分类的丢弃才记 <code>host_drop</code>。</li>
+<li><b>写入点 = 调用产生最终结果的地方，一次调用只写一条</b>：① core——<code>iface_target</code> 解析失败与随后的版本/方法检查失败（<code>call_id=0</code>）；② host——同步返回（<code>STATUS_OK</code>/<code>STATUS_ERR</code>/ABI 边界 panic）在 <code>call_inbound</code> 出口，<code>STATUS_PENDING</code> 在 <code>settle</code> 落定，两处共用同一 <code>dispatch_id</code> 且互斥；③ host——<b>仅出站看门狗单独超时</b>补写一条 <code>call_id=0</code> 的 <code>HOST_TIMEOUT</code>；④ host——出站 future 的 <b>poll 边界 panic</b>（首 poll / 后台）补写一条 <code>call_id=0</code> 的 <code>host_panic</code>；⑤ host——<b>NoRuntime</b> 补一条 <code>call_id=0</code> 的 <code>host_call</code>；③④⑤ 都与 ② 互斥。结果码：三类异常 <code>HOST_TIMEOUT</code>/<code>host_cancel</code>/<code>host_panic</code>；结算通道关闭 <code>host_lifecycle</code>，无法驱动 <code>host_call</code>；插件业务码原样透传；trace-only 内部码是 <code>resolve_failed</code>/<code>iface_check_failed</code>/<code>status_&lt;n&gt;</code>；<code>plugin_unsupported</code>/<code>plugin_protocol</code> 是既有协议码，trace 复用同名码。</li>
+<li><b>父链：新增私有 <code>CALL_SCOPE</code></b>（thread-local + RAII），只在两个窗口压栈——<code>call_inbound</code> 执行提供者代码的窗口、<code>deliver_outbound</code> 交付 <code>OP_CALLBACK</code> 的窗口；<code>PluginIface::call</code> 的 <b>trace 父</b>取 <code>call_scope_top()</code>，取消父仍取 <code>scope_top()</code>（<code>Outbound</code> 拆出 <code>trace_parent</code>）。事件/waterfall/流压的是 <code>DISPATCH_SCOPE</code>，<b>不压</b> <code>CALL_SCOPE</code>。</li>
+<li><b>出站 <code>iface_id</code> 不进父链</b>：它只做取消/结算记账；父链只用入站 <code>dispatch_id</code>，否则父会指向不存在的记录。</li>
+<li><b>PENDING 要带父与快照</b>：<code>PendingContinuation</code> 增 <code>trace_parent</code>、<code>traced</code>、callee 快照、<code>caller_uid</code>、<code>name</code>、<code>started</code>（不跨 FFI）；<code>settle</code> 只在 <code>traced</code> 为真时写记录；<code>trace_parent</code> 与取消树的 <code>parent</code> 是两个字段。</li>
+<li><b>取消只写一次</b>：取消交付与超时/panic 同在入站结算路径；<code>revoke_dispatch</code> 等早退不写。</li>
+<li><b>结果分类靠错误码</b>：<code>HOST_TIMEOUT</code>/<code>host_cancel</code>/<code>host_panic</code>。</li>
+<li><b>解析不到实现时也要记</b>：<code>callee_uid=0</code> 表示“没有记到实现方”（解析失败/仅出站超时/poll 边界 panic/NoRuntime）。根提供者的 uid <b>也</b>是 <code>UID_ROOT=0</code>，所以不能只看 uid 区分“根/未知”；未记到实现方时 <code>callee_plugin</code> 是请求的服务名，根实现时是 <code>"root"</code>，没有路径会产出空串。</li>
+<li><b>外部丢弃调用 future 时没有记录</b>：调用方任务被整体取消、或自己 <code>select!</code> 掉 future，只剩宿主侧可观测的取消结果。</li>
 <li><b>安装入口挂 <code>App</code></b>，不挂 <code>Store</code>：<code>Context.store</code> 是公开字段，插件能触达；挂 Store 上等于让插件可以替换/摘除记录。</li>
-<li><b>callee 身份</b>：补 <code>Store::resolve_impl</code> 返回 <code>Arc&lt;Impl&gt;</code>（现 <code>resolve</code> 丢掉 <code>Impl.fiber</code>），在<b>发起时</b>取 <code>provider_uid()</code>（store.rs:86）与运行时名。约 20 行。</li>
-<li><b>零开销</b>：sink 槽用 <code>OnceLock&lt;Arc&lt;dyn TraceSink&gt;&gt;</code>，未安装时一次原子读早返回，不取 Mutex。</li>
-<li><code>call_iface_stream</code>（context.rs:495）阶段 1 <b>明确排除</b>，写入 ADR。</li>
+<li><b>零开销</b>：sink 槽用 <code>OnceLock&lt;Arc&lt;dyn TraceSink&gt;&gt;</code>；未安装时每个入口一次原子读 + 一次时钟读，不取锁、不构造身份快照。</li>
+<li><code>call_iface_stream</code>（<code>Context::call_iface_stream</code>）阶段 1 <b>明确排除</b>，写入 ADR。</li>
 <li>sink 实现放示例宿主（WP4），写 JSONL；<b>不加</b> <code>cordis run --trace-out</code>，<b>不在</b> host crate 放 JsonlSink。</li>
 </ul>
 </td></tr>
-<tr><th>不做</th><td>事件派发追踪（事件 <code>Ret = Option&lt;Dyn&gt;</code> 不可失败，event.rs:12；阶段 1 无消费者。若将来要做，单点在 <code>Store::handlers()</code> store.rs:1218-1248 包每个 hook）；采样/聚合/OTel；correlation 透传。</td></tr>
+<tr><th>不做</th><td>事件派发追踪（事件 <code>Ret = Option&lt;Dyn&gt;</code> 不可失败，event.rs:12）；采样/聚合/OTel；跨进程链路拼接。</td></tr>
 <tr><th>验证</th><td>
 <ol>
-<li><code>cargo test -p rust-cordis-core trace_iface_chain</code>：A 经 <code>call_iface</code> 调 B，B 调 C，C 返回 Err → 2 条记录：(A→B, Err)、(B→C, Err)，uid 与 name 正确。</li>
-<li><code>cargo test -p rust-cordis-host trace_iface_pending</code>：T2 插件返回 PENDING，50ms 后 fulfill → 1 条记录 outcome=Ok、<code>elapsed ≥ 50ms</code>。</li>
-<li><code>cargo test -p rust-cordis-host trace_iface_abort_paths</code>：超时 → 恰好 1 条 <code>host_timeout</code>；取消 → 1 条 <code>host_cancel</code>；panic → 1 条 <code>host_panic</code>；三者写成同一个码时前两条红。</li>
-<li><code>cargo test -p rust-cordis-host trace_iface_inflight_swap</code>：PENDING 期间热换，记录带发起时 uid 且 <code>callee_uid != u64::MAX</code>。</li>
-<li><code>cargo test -p rust-cordis-host trace_iface_panic</code>：callee apply/回调 panic → 仍产出 1 条 <code>Err</code>（"宿主写记录"的硬证据）。</li>
-<li>未装 sink：代码评审确认 <code>call_iface</code> 路径只多一次 <code>OnceLock::get</code>；不写性能测试。</li>
-<li>回归：<code>cargo test --workspace --all-targets --locked</code> 全绿；<code>cargo test -p cordis-abi</code> 与 <code>baseline.txt</code> 不变。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_chain --test abi_trace_depth</code>：同步链 2/3 跳；<code>parent_call_id</code> 逐跳；三跳失败链按叶子聚合只落到 <code>deep@1</code>。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_pending</code>：PENDING 续延交付后再调 C → C 的父是 B；<code>elapsed ≥ 30ms</code>；<code>call_id</code> 等于提供者看到的 <code>dispatch_id</code>。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_scopes</code>（事件用例）：从根 ctx emit 事件，回调里发起 A→B → A 的父为 0、B 的父为 A；事件本身不写记录。若在 iface 跳内同步 emit，监听器会继承该跳的父（ADR 0010 §6）。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_t1_suspend</code>：T1 服务方法 <code>await</code> 恢复后再调 C → C 的父为 0（提供者侧断链）。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_scopes</code>（T1 用例）：T2→T1→T2 的 T1 同步段内 C 父是 A；T1 自己 <code>tokio::spawn</code> 的任务里 C 父为 0；T1 apply 起点 A 父为 0、B 父为 A。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_cancel</code>：provider 侧 <code>ctx_abort</code> → 一条 <code>host_cancel</code>；快照判别见 <code>abi_trace_unload</code>。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_timeouts --test abi_outbound_timeout</code>：入站/出站超时各一条，码同为 <code>HOST_TIMEOUT</code>，靠 <code>call_id</code>（入站非 0 / 出站 0）区分；等过另一条截止点后仍只有一条。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_timeout_parent</code>：仅出站超时的记录父取发起时栈顶（<code>parent_call_id == m@1.call_id</code>），不是写死 0；恰好两条记录。</li>
+<li><code>cargo test -p rust-cordis-host --test panic_future_iface_sync --test abi_trace_panic_async --test abi_trace_panic_status_err</code>：宿主 poll 边界 panic（首 poll / 后台）各一条 <code>call_id=0</code> 的 <code>host_panic</code>，同步路径 0 次回调、后台恰好 1 次；T2 经 ABI 收敛的 <code>STATUS_ERR</code> 走入站结算，带真实 <code>call_id</code>/<code>callee_uid</code>。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_unload</code>：调用方活过被调方时，卸载仍在飞调用写一条 <code>host_lifecycle</code>，<code>callee_uid</code> 与结算时的 <code>UID_DISPOSED</code> 不同（快照判别）。依赖者一起卸载的分支按 ADR 0009 §2.2 无记录，真实 loader 时序归 WP4。</li>
+<li><code>cargo test -p rust-cordis-core --lib trace</code>：请求不存在的服务/版本不匹配/方法不存在 → Err 记录，<code>call_id=0</code>、<code>callee_plugin</code> 是请求名；sink panic 被截获且不污染调用作用域。</li>
+<li><code>cargo test -p rust-cordis-host --test abi_trace_protocol</code>：插件回 <code>STATUS_OK</code> 但 body 非法 JSON → 一条 <code>plugin_protocol</code> 记录，带真实 <code>call_id</code>/<code>callee_uid</code>，不记成 Ok。</li>
+<li><code>cargo test -p rust-cordis-host --lib no_runtime_is_recorded_as_host_call</code>：同步上下文没有 tokio runtime → 调用方拿到 <code>host_call</code>，同时一条 <code>call_id=0</code> 的记录。</li>
+<li>一跳一条：上述用例的 <code>records.len()</code> 断言；出站补写只在“入站从未结算”时发生。</li>
+<li>事件/流不写记录：<code>inbound_pushes_call_scope_only_when_traced</code> 在装 sink 的状态下断言 <code>trace=false</code> 后记录数不变。</li>
+<li>未装 sink：<code>Store::has_trace_sink</code> 在 <code>call_iface</code> / <code>call_inbound</code> 入口做一次原子读；不构造身份快照、不取锁，不写性能测试。</li>
+<li>回归：<code>cargo test --workspace --all-targets --locked</code> 全绿；<code>cargo test -p rust-cordis-abi</code> 与 <code>baseline.txt</code> 不变。</li>
 </ol></td></tr>
 </table>
 
-<h3>WP2 · 变体身份：capabilities 行加 uid 与 sha256 <span class="tag">1 人日</span></h3>
+<h3>WP2 · 变体身份：capabilities 行加 uid 与 sha256 <span class="tag">1 人日</span> <span class="tag ok">已实现</span></h3>
 <table>
 <tr><th style="width:90px">改动</th><td>
 <p><code>LoaderState::report().capabilities[]</code>（loader.rs:1615-1665）每行追加：</p>
@@ -213,27 +235,27 @@ impl App { pub fn set_trace_sink(&amp;self, sink: Arc&lt;dyn TraceSink&gt;); }  
 <p>sha256 存入<b>私有</b> <code>Mounted</code>；<b>不改</b> <code>LoadedFile</code>（api-inventory 受控项，外部 <code>PluginSource</code> 用字面量构造，ADR 0006）。uid 是 per-Store 计数器，卸载后置 <code>u64::MAX</code>：跨热换的变体级对齐靠 trace 的 <code>callee_plugin</code> + 消费方切时间窗；不引入 <code>mount_gen</code>，也不承诺把热换瞬间的在飞调用归到正确的那一代。</p>
 <p class="mute"><del>mounts 数组、config_digest、epoch、Store::all_fibers()</del> —— 已有 capabilities 行、WP4 不改配置、进程内 e2e 直接比 uid 变化、uid↔label 用 <code>label_of_fiber</code>（loader.rs:1830）。全部砍掉。</p>
 </td></tr>
-<tr><th>验证</th><td><code>cargo test -p rust-cordis-host report_capabilities_identity</code>：① <code>capabilities.len() == 启用行数</code>；② 同一 cdylib 复制两份不同 mtime 挂载，sha256 相同；改一字节重编，sha256 不同；③ 热换后同 label 的 uid 变化且 sha256 随之变化。</td></tr>
+<tr><th>验证</th><td><code>cargo test -p rust-cordis-host --test loader_capabilities_identity</code>：① <code>capabilities.len() == 启用行数</code>（含一条非文件来源，sha256 为 <code>builtin</code>；另有一条暂存副本读不到 → <code>unavailable: read_failed</code>）；② 同内容、不同 mtime 的暂存副本重挂后 sha256 相同、uid 单调增大；③ 同长一字节差异后 sha256 变化、uid 再变；source 与 staged 内容不同，证明取 staged。<br><code>cargo test -p rust-cordis-host --lib commit_outcome_refreshes_sha256_from_the_current_staged_copy</code>：HMR 换副本后重算，回滚保持旧副本。<br><code>cargo xtask demo</code>：真实 cdylib 的 sha256 必须是 64 位小写十六进制；快照输出替换为 <code>&lt;artifact-sha256&gt;</code>，跨平台稳定。</td></tr>
 </table>
 
-<h3>WP2b · 契约锁：含服务方法名 <span class="tag">1.5 人日</span></h3>
+<h3>WP2b · 契约锁：含服务方法名 <span class="tag">1.5 人日</span> <span class="tag ok">已实现</span></h3>
 <table>
 <tr><th style="width:90px">改动</th><td>
 <ol>
-<li><code>status --json</code>（挂载后导出，cli/src/lib.rs:740-772）每行追加 <code>services: [{name, version, methods: [..]}]</code>，数据来自该 fiber 经 <code>provide_iface</code> 注册的 <code>ExternService</code>（dyn_value.rs:143）。约 40 行。</li>
-<li><b>两个导出面目前都不存在</b>，需一并做（+0.5 人日）：<code>StatusReport</code> 没有 capabilities/services（cli/lib.rs:553-564、:629-651），core 也没有按 fiber 枚举服务的 API（<code>Store.runtimes</code> 私有）。新增 <code>Store::services_of(&amp;Arc&lt;Fiber&gt;)</code>（接收 fiber 而非裸 uid；<code>UID_DISPOSED</code> 返回空并标记）与 <code>StatusReport.capabilities</code>（<b>typed row</b>，仿 <code>RowProvenance</code>；<code>StatusReport</code> 派生了 <code>Eq</code>，不能塞 <code>serde_json::Value</code>）。方法名必须在 <code>status_with_source</code> shutdown 之前抓取（:763）。</li>
-<li><b>契约 = </b> <code>{inject.required(插件声明口径), provision, schema, services, iface_spec_sha256}</code>。锁文件 = <code>cordis status --json</code> 的这一子集 + manifest 的 <code>iface_spec_sha256</code>（接口规范原文 hash）；比对 = 演化脚本/测试做 JSON diff。加 <code>iface_spec_sha256</code> 是为了让宿主侧导出与作者侧 YAML 同源——否则锁通过也不证明两边说的是同一份接口。</li>
+<li><code>status --json</code>（挂载后导出，crates/cli/src/lib.rs:899-934）每行追加 <code>services: [{name, version, methods: [..]}]</code>，数据来自该 fiber 经 <code>provide_iface</code> 注册的 <code>ExternService</code>（dyn_value.rs:143）。约 40 行。</li>
+<li><b>两个导出面已落地</b>（WP2b）：<code>Store::services_of(&amp;Arc&lt;Fiber&gt;)</code>（接收 fiber 而非裸 uid；<code>UID_DISPOSED</code> 返回空）按 <code>Dyn::adapter</code> 枚举可调用面，方法名排序去重；<code>StatusReport.capabilities</code> 是 <b>typed row</b>（仿 <code>RowProvenance</code>，<code>StatusReport</code> 仍可派生 <code>Eq</code>），每行带 <code>services: [{name, version, methods}]</code>。方法名在 <code>status_with_source</code> shutdown 之前抓取。`loader.report().capabilities[]` 同时补了插件自述的配置 <code>schema</code>，<code>status --json</code> 的契约子集可一次导出。</li>
+<li><b>契约 = </b> <code>{inject, provision, schema, services, iface_spec_sha256}</code>（<code>inject</code> 用插件声明口径，行级声明混入时须固定口径）。锁文件 = <code>cordis status --json</code> 的这一子集 + manifest 的 <code>iface_spec_sha256</code>（接口规范原文 hash，已导出到 <code>provenance</code> 与 <code>capabilities[]</code>，缺失为 <code>null</code>）；比对 = 演化脚本/测试做 JSON diff。加 <code>iface_spec_sha256</code> 是为了让宿主侧导出与作者侧 YAML 同源——否则锁通过也不证明两边说的是同一份接口。</li>
 </ol>
 <p class="mute"><del>validate --interface-lock</del> —— 不加 CLI flag，10 行 diff 即可。注意 <code>inject.required</code> 混合了 YAML 行级声明（lib.rs:196），锁比对用插件声明口径或接受"行+插件"口径，ADR 写明。</p>
 <p><b>范围限定</b>：<code>ExternService::methods()</code> 返回 <code>Vec&lt;String&gt;</code>，<b>只有方法名</b>；参数/返回值在 ABI 上是 <code>Config</code>，宿主看不到形状。所以契约锁只能发现增删改名，发现不了参数类型变化。IO schema 级锁需要给 <code>PluginDesc</code> 按方法加 args/ret schema，属独立设计决策，不在阶段 1。</p>
 </td></tr>
-<tr><th>验证</th><td><code>cargo test -p cordis-cli status_services_methods</code>：fixture 插件 provide_iface 两个方法 → <code>services[0].methods.len()==2</code>；WP4 e2e 验收 3 覆盖"删除/改名方法被拒"。</td></tr>
+<tr><th>验证</th><td><code>cargo test -p cordis-cli --test status status_services_methods</code>：fixture 插件 provide_iface 两个方法 → <code>services[0].methods.len()==2</code>；<code>cargo test -p cordis-cli --test source_policy status_with_source_policy_shows_manifest_provenance</code>：manifest 的 <code>iface_spec_sha256</code> 在 provenance 与 capabilities 两处可见；<code>cargo test -p rust-cordis-core --test services_of</code>：两条注册通道、<code>UID_DISPOSED</code> 的残留条目窗口返回空。WP4 e2e 验收 3 覆盖"删除/改名方法被拒"。</td></tr>
 </table>
 
 <h3>WP4 · 端到端示例：<code>examples/rsi-substrate</code> <span class="tag">5 人日</span> <span class="tag p0">验收载体</span></h3>
 <table>
 <tr><th style="width:90px">场景</th><td>
-<b>部署金丝雀</b>（不是评估期）：已选中变体 solver-v2 带 manifest 投放到运行中宿主；canary evaluator 跑 5 个固定用例；trace 把回归归到调用链中 <b>solver</b> 而非 <b>pipeline</b>；驱动方据此改回 YAML → 回滚。
+<b>部署金丝雀</b>（不是评估期）：已选中变体 solver-v2 带 manifest 投放到运行中宿主；canary evaluator 跑 5 个固定用例；trace 的父链把回归定位到 <b>solver</b> 那一跳（pipeline 的记录是它的父，叶子 Err 只在 solver）；驱动方据此改回 YAML → 回滚。
 <pre>
 examples/rsi-substrate/
 ├── host/src/main.rs   自定义 Rust 宿主（仿 harness-spike:189-220）：
@@ -250,16 +272,16 @@ examples/rsi-substrate/
 ├── cordis.yaml + *.manifest.json + eval-record.json
 └── tests/e2e.rs       Rust 进程内驱动：复制文件(确保 mtime 变化)、改 YAML、等 report 变化、读三份文件断言
 </pre>
-<p class="mute"><code>evolve.py</code> 不进仓库。外部驱动约定写在 ADR 0009 §3：替换 cdylib + manifest → 改 YAML → 轮询 status.json → 读 trace.jsonl/score.json；宿主在 report 每次变化时落 mounts 快照（label/uid/sha256/UTC ms），evaluator 落每用例起止 ts，二者一起才能把记录归到"哪一代、哪个用例"。</p>
+<p class="mute"><code>evolve.py</code> 不进仓库。外部驱动约定写在 ADR 0009 §3：替换 cdylib + manifest → 改 YAML → 轮询 status.json → 读 trace.jsonl/score.json；宿主在 report 每次变化时落 mounts 快照（plugin/label/uid/sha256/seq/UTC ms），evaluator 落每用例起止 ts，二者一起才能把记录归到"哪一代、哪个用例"。</p>
 </td></tr>
 <tr><th>验证（e2e 断言）</th><td>
 <ol>
 <li>v1：score 5/5；trace 中 evaluator→pipeline 5 条 Ok、pipeline→solver 5 条 Ok。</li>
-<li>投 v2：热换成功、solver uid 变、sha256 变；trace 中 pipeline→solver 2 条 Err 且 evaluator→pipeline 对应 2 条 Err —— <b>按 <code>callee_plugin</code>/<code>callee_uid</code> 聚合，solver 行 40%、pipeline 行 0%（自身无失败，仅透传）</b>；改回 YAML → uid 再变，<b>同一用例回到 Ok</b>。<b>金丝雀的硬判据是"同一用例 Ok→Err"或"出现 callee_plugin=solver 的新 Err"，不是分数</b>（同进程 static 污染使跨代分数不可比，ADR 0009 §3）。<b>这一步证明归因可定位到链中一跳。</b></li>
+<li>投 v2：热换成功、solver uid 变、sha256 变；trace 中 pipeline→solver 2 条 Err 且 evaluator→pipeline 对应 2 条 Err —— <b>按父链取叶子 Err 再按 <code>callee_plugin</code> 聚合：solver 行 40%、pipeline 行 0%（它只是透传）</b>；改回 YAML → uid 再变，<b>同一用例回到 Ok</b>。<b>金丝雀硬判据是"同一用例 Ok→Err"或"出现叶子 Err 命中 solver"，不是分数</b>（同进程 static 污染使跨代分数不可比）。<b>这一步证明归因可定位到链中一跳。</b></li>
 <li>投 v3 前做契约 diff：<code>services[solver].methods</code> 少了/改名了，或 <code>iface_spec_sha256</code> 与 manifest 不符 → 拒绝投放；宿主无感知。</li>
 <li>投 solver-panic：<code>SwapOutcome::RolledBack</code>；<code>report.failed</code> 含 solver；<b>uid 变为新值</b>（回滚会重建 fiber），<code>sha256</code> 回到 v1 的值，evaluator 仍 5/5。用例本身必须幂等：apply 失败回滚复用同一模块（static 保留），改 YAML 重投是新模块（static 全新）。</li>
-<li>投 solver-crash：solve 回调 panic → 恰好一条 <code>Err</code> 记录且 <code>callee_plugin</code> = solver；宿主不退出。<b>这是"记录由宿主写、插件无法自报"的硬证据。</b></li>
-<li>在飞热换：让 pipeline 的调用在 PENDING 期间触发 solver 热换 → 该记录仍带发起时 uid（<code>!= u64::MAX</code>）与 <code>callee_plugin=solver</code>，不因 drop 读已释放实例而丢归属。</li>
+<li>投 solver-crash：solve 回调 panic → 恰好一条 <code>Err</code> 记录且 <code>callee_plugin</code> = solver；宿主不退出。<b>这是“记录由宿主写”的硬证据</b>（T2 无法经 ABI 自报；T1 例外：<code>Store::record_trace</code> 是公开方法，见 ADR 0009 §2.2）。</li>
+<li>在飞换实例：调用方是 inject 依赖者时，换实例会把它一起卸载，出站 future 被丢弃 ⇒ 按 ADR 0009 §2.2 <b>无记录</b>；调用方活过被调方时（根 ctx/无依赖），<code>settle</code> 仍写一条 <code>host_lifecycle</code>，<code>callee_uid</code> 必须是发起时快照（判别性用例 <code>abi_trace_unload</code>）。WP4 用真实 loader 验证依赖者分支与新调用归属到新 uid。</li>
 <li>全程同一 App 实例（不重启）；Windows + Linux 均通过（CI <code>--workspace</code> 自动覆盖）。</li>
 </ol></td></tr>
 <tr><th>风险</th><td>示例 manifest 必须含 <code>attestation</code> 三项 + <code>iface_spec_sha256</code>（D1 后 sidecar 是示例要证明的东西，<b>不再</b>保留 <code>set_allow_unverified(true)</code> 退路）。<code>PluginSourcePolicy::verify</code> <b>不</b>校验 attestation：示例宿主的准入函数自己做交叉核对（eval-record 的 artifact SHA256/variant revision ↔ manifest），并遵守职责分离（合并准入者 ≠ 签发流水线）。</td></tr>
@@ -273,7 +295,6 @@ examples/rsi-substrate/
 <table>
 <tr><th>项</th><th>内容</th><th>触发条件</th><th>约束</th></tr>
 <tr><td class="diff">S2-1 子进程载体</td><td class="diff">stdio JSON-RPC 插件载体：任意语言、每变体一进程、可 kill。ADR 0005 已列为 T3 路线之一，远比 Wasm 便宜。<b>这是让 PluginRSI/AHE 式 Python 研究者接入的唯一现实路径</b>。</td><td class="diff">WP4 完成后两个月内无 Rust cdylib 消费者接入意向（§7 D2）。</td><td class="diff">另立选型 ADR；HostApi 不变，载体层做协议桥。</td></tr>
-<tr><td>S2-2 correlation 透传</td><td>TraceRecord 加 <code>correlation: Option&lt;Box&lt;str&gt;&gt;</code>，由 root 发起方经 ctx 透传，宿主不解释。</td><td>A6 不成立：需要并行 episode。</td><td>需 ctx 增一槽位，评估对 T2 ABI 的影响。</td></tr>
 <tr><td>S2-3 <code>loader.control</code></td><td>T1 侧 <code>provide_iface</code>：reload(label)、set_disabled(label, bool)（LoaderState 已有方法 loader.rs:1853, :2528）。</td><td>A4 不成立：要求 RPC。</td><td>仅 T1 / 受信任 realm 可 inject（ADR 0005、0008）。</td></tr>
 <tr><td>S2-4 T2 异步原语</td><td>HostApi 尾追加 <code>ctx_spawn</code>/<code>ctx_timer</code>（ADR 0004 size 门控）。</td><td>被部署插件需要自起后台任务。</td><td>不加新 STATUS；旧宿主 field_at None 时 SDK 降级。</td></tr>
 <tr><td>S2-5 Wasm T3</td><td>按 ADR 0001 另立 ADR。</td><td>要在宿主里直接跑未评估产物且不能接受子进程开销。</td><td>成本 ≈ 阶段 1 ×3；排在 S2-1 之后。</td></tr>
@@ -295,11 +316,11 @@ examples/rsi-substrate/
 <table>
 <tr><th>#</th><th>标准</th><th>命令 / 断言</th><th>归属</th></tr>
 <tr><td>V1</td><td>全 workspace 测试绿，四个 CI workflow 不变仍绿</td><td><code>cargo test --workspace --all-targets --locked</code></td><td>全部</td></tr>
-<tr><td>V2</td><td>ABI 形状未变</td><td><code>cargo test -p cordis-abi</code>；<code>baseline.txt</code> diff 为空</td><td>WP1</td></tr>
-<tr><td>V3</td><td>调用链归因正确、PENDING 等待期计入 elapsed</td><td>§WP1 测试 1、2</td><td>WP1</td></tr>
-<tr><td>V4</td><td>capabilities 行 uid/sha256 稳定且敏感</td><td>§WP2 测试三条</td><td>WP2</td></tr>
+<tr><td>V2</td><td>ABI 形状未变</td><td><code>cargo test -p rust-cordis-abi</code>；<code>baseline.txt</code> diff 为空</td><td>WP1</td></tr>
+<tr><td>V3</td><td>父链与逐跳事实完整（同步/PENDING/事件根/T1 跳过/T1 起点/失败路径），一跳一条，PENDING 等待期计入 elapsed</td><td>§WP1 验证清单（零开销与回归两项不计入行为判据）</td><td>WP1 + ADR 0010</td></tr>
+<tr><td>V4</td><td>capabilities 行 sha256 稳定且敏感，热重挂后 uid 变化</td><td>§WP2 两条集成用例 + 一条 HMR 换副本单测（同内容不同 mtime / 同长一字节 / 重挂 uid / 回滚）</td><td>WP2</td></tr>
 <tr><td>V5</td><td>status --json 含 <code>services[].methods</code>（方法名集合）与 capabilities</td><td>§WP2b 测试</td><td>WP2b</td></tr>
-<tr><td>V6</td><td>端到端七条断言（含在飞热换），Windows + Linux</td><td><code>cargo test -p rsi-substrate --test e2e</code></td><td>WP4</td></tr>
+<tr><td>V6</td><td>端到端七条断言（含父链与在飞换实例的两种分支），Windows + Linux</td><td><code>cargo test -p rsi-substrate --test e2e</code></td><td>WP4</td></tr>
 <tr><td>V7</td><td>新增 pub 项已登记并归"待验证"</td><td><code>xtask inventory --check</code> 通过；support-contract 用词检查</td><td>WP0</td></tr>
 </table>
 <p class="mute"><del>V8 "每行改动可追溯"</del> 不是可执行验收，已由 R1 评审承担。</p>
@@ -312,13 +333,13 @@ examples/rsi-substrate/
 <tr><td class="diff">D1 <span class="ok">已决</span></td><td class="diff">谁有权签发变体 manifest。ADR 0005 §2.2 原文禁止未人审的模型生成代码；该节末段明言"同一流水线本身不是信任证明"。</td><td class="diff">—</td><td class="diff"><b>决定：修 ADR 0005</b>，新增 §2.3"受审流水线签发"——审的是流水线（评估器 + 门禁 + 签发逻辑经人工 PR），不审单个变体；manifest 增 <code>attestation</code> 三项。落点 WP0 第 4 项。</td></tr>
 <tr><td class="diff">D2 <span class="ok">已决</span></td><td class="diff">没人会把 Python 插件改写成 Rust cdylib（两仓对 rust-cordis 零引用）。真实消费者只有"已用 rust-cordis 做线上宿主、想把演化产物部署回去"（desolate 类）。</td><td class="diff">—</td><td class="diff"><b>决定：同意两个月接入门</b>。WP4 完成日起计：有 Rust 消费者 → 继续 S2-3/S2-4；无 → 阶段 2 只做 S2-1 子进程载体，其余冻结。</td></tr>
 <tr><td>R-a</td><td>trace 开销影响被测插件耗时</td><td>归因失真</td><td>示例 sink 用 <code>std::sync::mpsc</code> + 一个写线程即可；不在 core/host 预设。</td></tr>
-<tr><td>R-b</td><td><code>resolve_impl</code> 改动触及 <code>store.resolve</code> 热路径</td><td>意外行为变化</td><td>新增函数，不改 <code>resolve</code> 签名；现有 18 个 core 测试文件回归。</td></tr>
+<tr><td>R-b</td><td><code>callee_uid</code> 取自入站结算路径已有信息</td><td>改动触及 <code>call_inbound</code> / <code>settle</code> 热路径</td><td>只读已有字段，不改 <code>store.resolve</code> 签名；现有 18 个 core 测试文件回归。</td></tr>
 <tr><td>R-c</td><td><code>PluginSourcePolicy::verify</code> 扩展 attestation 校验超预算</td><td>WP0/WP4 超期</td><td>见 WP4 风险行：示例 manifest 写全字段，校验强制化后置。</td></tr>
 </table>
 
 <!-- ============================================================ -->
-<h2 id="s8">8. 评审记录与处置</h2>
-<p class="mute">三轮不同角度的独立评审（R1 简化 / R2 RSI 契合 / R3 维护者），随后对 WP0 又跑了四轮验收（A1 一致性 / A2 安全 / A3 研究者）。原始记录见 <code>docs/review-r1.md</code>、<code>review-r2.md</code>、<code>review-r3.md</code>；WP0 的验收轮次与修复项记在 <code>docs/roadmap.md</code> 的 RSI-WP0 条目。工作包编号沿用早期草案：WP3 是预留位（loader 控制面），本阶段不单列，对应阶段 2 的 S2-3。</p>
+<h2 id="s8">8. 评审与验收记录</h2>
+<p class="mute">先有三轮不同角度的独立评审（R1 简化 / R2 RSI 契合 / R3 维护者），随后 WP0 又按 A1 一致性 / A2 安全 / A3 研究者三个角度反复验收了多轮（此处的 A1/A2/A3 是验收角度编号，与 §0 的假设 A1–A6 无关）。原始评审记录见 <code>docs/review-r1.md</code>、<code>review-r2.md</code>、<code>review-r3.md</code>；WP0 的验收轮次与修复项记在 <code>docs/roadmap.md</code> 的 RSI-WP0 条目。工作包编号沿用早期草案：WP3 是预留位（loader 控制面），本阶段不单列，对应阶段 2 的 S2-3。</p>
 
 <h3>R1 · 简化与范围（Karpathy 视角）—— 结论：v1 未通过，v2 采纳全部 P0/P1</h3>
 <table class="small">
@@ -328,7 +349,7 @@ examples/rsi-substrate/
 <tr><td class="p1">P1</td><td>evaluator 直接调 solver 证明不了内核归因</td><td>采纳。加 pipeline 间接层，断言按 callee 聚合失败率</td><td>WP4 断言 2</td></tr>
 <tr><td class="p1">P1</td><td>WP2 大半已存在；:4427 是 on_plugin 不是指纹；指纹是 (mtime,len)</td><td>采纳。WP2 缩为 capabilities 行加 uid+sha256；砍 all_fibers/config_digest/epoch；修正附录</td><td>G2, WP2</td></tr>
 <tr><td class="p1">P1</td><td>inspect --json 已齐四项，不需 CLI flag</td><td>采纳砍 flag；但接受 R2 的"方法面缺失"，锁源改为 status --json 加 services</td><td>WP2b</td></tr>
-<tr><td class="p1">P1</td><td>TraceRecord 字段过半无消费者</td><td>采纳。砍 seq/kind/started/Pending；caller_uid 去 Option；保留 uid 不保留 plugin 名；加 ts_ms（R2 对齐需求）</td><td>WP1</td></tr>
+<tr><td class="p1">P1</td><td>TraceRecord 字段过半无消费者</td><td>采纳。砍 seq/kind/started/Pending；caller_uid 去 Option；<b>后修订</b>：保留 uid 同时补 <code>callee_plugin</code>（在飞热换靠它兜住归属）；加 ts_ms（R2 对齐需求）</td><td>WP1</td></tr>
 <tr><td class="p1">P1</td><td>范围蔓延：§7 第 12 条、--trace-out、channel 写线程</td><td>采纳。全部砍</td><td>WP0, WP1, §7</td></tr>
 <tr><td class="p2">P2</td><td>G6 Windows 文件锁已由 stage_plugin 解决</td><td>采纳。G6 销，移入"不是缺口"</td><td>§2</td></tr>
 <tr><td class="p2">P2</td><td>验收模糊（手工核对、elapsed&gt;0、不分配、评审确认）</td><td>采纳。改为 len 相等、≥50ms、代码评审、删 V8</td><td>WP1/WP2/§6</td></tr>
@@ -352,7 +373,7 @@ examples/rsi-substrate/
 <tr><th>级别</th><th>发现</th><th>处置</th><th>落点</th></tr>
 <tr><td class="p0">P0</td><td>HMR 指纹是 (mtime,len)；不要改 LoadedFile（api-inventory 受控）</td><td>采纳。用 sha256_file，存私有 Mounted</td><td>WP2</td></tr>
 <tr><td class="p0">P0</td><td>status --json 不能观测运行宿主；cordis run 硬编码 hmr: None</td><td>采纳。自定义宿主设 hmr.intervalMs，evaluator 写 status.json；不加 CLI flag</td><td>WP4</td></tr>
-<tr><td class="p1">P1</td><td>事件埋点单点在 handlers()；iface 埋点单点在 call_iface，不碰 settle；需 resolve_impl；typed 直调与 call_iface_stream 是盲区</td><td>采纳。iface 路径按此实现；事件路径记录为将来方案；盲区写入 ADR 0009</td><td>WP1, WP0</td></tr>
+<tr><td class="p1">P1</td><td>事件埋点单点在 handlers()；iface 埋点单点在 call_iface，不碰 settle；需 resolve_impl；typed 直调与 call_iface_stream 是盲区</td><td>采纳盲区部分；埋点位置后修订为“结算两处 + 三种未结算补写（超时/panic/NoRuntime）”，resolve_impl 不再需要</td><td>WP1, WP0</td></tr>
 <tr><td class="p1">P1</td><td>support-contract 无"实验性"类；新 pub 项须登记 api-inventory；ci 不跑 inventory check</td><td>采纳。用"待验证"；V7 改为 xtask inventory --check；ADR 写明 report 载荷只增不改</td><td>WP0, V7</td></tr>
 <tr><td class="p1">P1</td><td>"加载即 panic"须限定为 apply/入口构造期；默认来源策略拒绝无 manifest 插件</td><td>采纳。断言 4 限定措辞；示例用 sidecar（D1 后无 allow_unverified 退路）</td><td>WP4</td></tr>
 <tr><td class="p2">P2</td><td>包名应为 rust-cordis-core/-host；sink 槽仿 log_sink 用 OnceLock；Windows 文件锁已解；覆盖文件须改 mtime（copyfile 非 copy2）；CI --workspace 自动覆盖新 example</td><td>采纳。全部写入对应 WP</td><td>WP1, WP2, WP4</td></tr>
@@ -382,7 +403,7 @@ examples/rsi-substrate/
 <tr><td><code>sha256_file</code></td><td>host/src/source.rs:355</td></tr>
 <tr><td>失败回滚 <code>SwapOutcome::RolledBack</code> / <code>record_reload_failure</code></td><td>host/src/loader.rs:4533, :4891</td></tr>
 <tr><td><code>stage_plugin</code> 复制后加载（Windows 文件锁已解）</td><td>host/src/lib.rs:5068-5096; dylib.rs:39</td></tr>
-<tr><td><code>status_with_source</code> 新起 App；<code>cordis run</code> 硬编码 <code>hmr: None</code>；<code>inspect --json</code> 字段</td><td>cli/src/lib.rs:740-772, :684, :267-288, :196</td></tr>
+<tr><td><code>status_with_source</code> 新起 App；<code>cordis run</code> 硬编码 <code>hmr: None</code>；<code>inspect --json</code> 字段</td><td>crates/cli/src/lib.rs:899-934, :684, :267-288, :196</td></tr>
 <tr><td><code>PluginDesc.schema</code> 是配置 schema；方法面在 <code>provide_iface</code>/<code>ExternService::methods</code></td><td>abi/src/lib.rs:434; core/src/context.rs:448; core/src/dyn_value.rs:143</td></tr>
 <tr><td>HostApi 尾字段与 field_at；PluginDesc 字段；PREFIX=72；形状测试</td><td>abi/src/lib.rs:388-391, :404-412, :426-454, :486; abi/tests/v1_shape.rs; baseline.txt</td></tr>
 <tr><td>support-contract 四类用词；api-inventory 受控子集</td><td>docs/support-contract.md:97-108; docs/api-inventory.md:81</td></tr>

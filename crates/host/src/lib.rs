@@ -167,6 +167,8 @@ struct Outbound {
     owner: u64,
     continuation: u64,
     kind: ContinuationKind,
+    /// trace 父（ADR 0010 §2.2）：只有 iface 出站写它；续延交付时用它压 CALL_SCOPE。
+    trace_parent: Option<u64>,
 }
 
 /// 一条在飞派发的记录（M2/M2b/M2c 共用）：
@@ -1647,6 +1649,31 @@ fn scope_push(handle: u64, dispatch_id: u64) -> ScopeGuard {
     ScopeGuard
 }
 
+// 调用作用域（ADR 0010）：**只由有记录的 iface 跳维护**，与上面的取消作用域分开。
+// 事件 / waterfall / 流只压 DISPATCH_SCOPE，不压这一条，避免父指向无记录的 id。
+thread_local! {
+    static CALL_SCOPE: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn call_scope_top() -> Option<u64> {
+    CALL_SCOPE.with(|scope| scope.borrow().last().copied())
+}
+
+struct CallScopeGuard;
+
+impl Drop for CallScopeGuard {
+    fn drop(&mut self) {
+        CALL_SCOPE.with(|scope| {
+            scope.borrow_mut().pop();
+        });
+    }
+}
+
+fn call_scope_push(call_id: u64) -> CallScopeGuard {
+    CALL_SCOPE.with(|scope| scope.borrow_mut().push(call_id));
+    CallScopeGuard
+}
+
 /// 给一条**出站派发**的 future 打上作用域：每次 poll 期间栈顶就是它，于是这次
 /// 派发**交付给插件**的入站回调能记下自己的父节点（`parent = scope_top()`）。
 struct Scoped {
@@ -1684,6 +1711,15 @@ struct PendingContinuation {
     cancel: Option<CancelToken>,
     /// 调用 Future 被丢弃（超时/取消/调用方放弃）时撤销派发记录。
     _abandon: PendingDropGuard,
+    /// trace 父（ADR 0010）：settle 时写记录用。
+    trace_parent: Option<u64>,
+    /// 这次入站是否要写记录（事件 / 流为 false）。
+    traced: bool,
+    /// 发起时快照：settle 可能晚于 provider 卸载，届时 uid 已被处置。
+    callee: (u64, Box<str>),
+    caller_uid: u64,
+    name: Box<str>,
+    started: std::time::Instant,
 }
 
 /// 挂起续延的“兜底清理”：只要 `PendingContinuation` 没有走到正常收尾就被丢弃，
@@ -1739,6 +1775,12 @@ impl PendingContinuation {
             rx,
             cancel,
             _abandon,
+            trace_parent,
+            traced,
+            callee,
+            caller_uid,
+            name,
+            started,
         } = self;
         let timeout_ms = instance.dispatch_policy.timeout_ms;
         let wait = async move {
@@ -1759,15 +1801,45 @@ impl PendingContinuation {
                 }
             }
         };
+        let emit = |outcome: cordis_core::Outcome| {
+            if !traced {
+                return;
+            }
+            instance.ctx.store.record_trace(cordis_core::TraceRecord {
+                ts_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                name: name.clone(),
+                call_id: dispatch_id,
+                parent_call_id: trace_parent.unwrap_or(0),
+                caller_uid,
+                callee_uid: callee.0,
+                callee_plugin: callee.1.clone(),
+                elapsed: started.elapsed(),
+                outcome,
+            });
+        };
         match outcome {
-            SettleOutcome::Settled(Ok(Ok(value))) => Ok(value),
-            SettleOutcome::Settled(Ok(Err(payload))) => Err(CallFailure::from_payload(payload)),
-            SettleOutcome::Settled(Err(_)) => Err(CallFailure::new(
-                format!("{what}：结算通道已关闭（插件已卸载）"),
-                "host_lifecycle",
-                "lifecycle",
-                "unknown",
-            )),
+            SettleOutcome::Settled(Ok(Ok(value))) => {
+                emit(cordis_core::Outcome::Ok);
+                Ok(value)
+            }
+            SettleOutcome::Settled(Ok(Err(payload))) => {
+                emit(cordis_core::Outcome::Err(
+                    payload.code.clone().into_boxed_str(),
+                ));
+                Err(CallFailure::from_payload(payload))
+            }
+            SettleOutcome::Settled(Err(_)) => {
+                emit(cordis_core::Outcome::Err("host_lifecycle".into()));
+                Err(CallFailure::new(
+                    format!("{what}：结算通道已关闭（插件已卸载）"),
+                    "host_lifecycle",
+                    "lifecycle",
+                    "unknown",
+                ))
+            }
             SettleOutcome::Cancelled => {
                 // 收回这条派发：记录连同它上面的流一起（流必须以**错误**结束）。
                 let payload =
@@ -1776,6 +1848,7 @@ impl PendingContinuation {
                         .with_category("cancel")
                         .with_certainty("unknown");
                 revoke_dispatch(&instance, dispatch_id, &payload);
+                emit(cordis_core::Outcome::Err("host_cancel".into()));
                 Err(CallFailure::from_payload(payload))
             }
             SettleOutcome::TimedOut(ms) => {
@@ -1784,6 +1857,7 @@ impl PendingContinuation {
                     .with_category("timeout")
                     .with_certainty("unknown");
                 revoke_dispatch(&instance, dispatch_id, &payload);
+                emit(cordis_core::Outcome::Err("HOST_TIMEOUT".into()));
                 Err(CallFailure::from_payload(payload))
             }
         }
@@ -1806,7 +1880,39 @@ unsafe fn call_inbound(
     cancel: Option<CancelToken>,
     frame: Option<Next>,
     stream: Option<StreamSink>,
+    trace: bool,
+    trace_parent: Option<u64>,
 ) -> std::result::Result<Inbound, CallFailure> {
+    let started = std::time::Instant::now();
+    // 没有安装记录出口时，连身份快照都不构造（事件/流路径最常见）。
+    let traced = trace && instance.ctx.store.has_trace_sink();
+    let (caller_uid, callee, name) = if traced {
+        let caller_uid = cordis_core::current_caller_uid();
+        let service_hint = payload
+            .get("event")
+            .or_else(|| payload.get("service"))
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let callee = instance
+            .ctx
+            .fiber_opt()
+            .map(|fiber| (fiber.uid(), fiber.name().into_boxed_str()))
+            .unwrap_or_else(|| (0, Box::from(service_hint)));
+        let name: Box<str> = match &payload {
+            Value::Object(map) if map.contains_key("event") || map.contains_key("service") => {
+                format!(
+                    "{}.{}",
+                    service_hint,
+                    map.get("method").and_then(Value::as_str).unwrap_or("?")
+                )
+                .into_boxed_str()
+            }
+            _ => format!("op:{op}").into_boxed_str(),
+        };
+        (caller_uid, callee, name)
+    } else {
+        (0, (0, Box::from("")), Box::from(""))
+    };
     let _lifecycle = admit_call(instance).ok_or_else(|| {
         CallFailure::new(
             format!("ctx 句柄 {handle} 已失效（插件正在卸载或库已释放）"),
@@ -1861,23 +1967,50 @@ unsafe fn call_inbound(
         // 调用期间把"正在执行的那次派发"压进作用域：插件在回调内部发起的
         // 出站派发因此能记下父节点（取消级联）。
         let _scope = scope_push(handle, dispatch_id);
+        // 调用作用域（ADR 0010）：只有有记录的 iface 跳压它。
+        let _call_scope = traced.then(|| call_scope_push(dispatch_id));
         invoke_raw(instance.call, handle, op, &payload.to_string())
+    };
+    let emit = |outcome: cordis_core::Outcome| {
+        if !traced {
+            return;
+        }
+        instance.ctx.store.record_trace(cordis_core::TraceRecord {
+            ts_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            name: name.clone(),
+            call_id: dispatch_id,
+            parent_call_id: trace_parent.unwrap_or(0),
+            caller_uid,
+            callee_uid: callee.0,
+            callee_plugin: callee.1.clone(),
+            elapsed: started.elapsed(),
+            outcome,
+        });
     };
     match status {
         STATUS_OK => {
             let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
             drop(removed);
             if text.is_empty() {
+                emit(cordis_core::Outcome::Ok);
                 return Ok(Inbound::Ready(Value::Null));
             }
-            let parsed: Value = serde_json::from_str(&text).map_err(|err| {
-                CallFailure::new(
-                    format!("插件回调回复不是合法 JSON: {err}"),
-                    "plugin_protocol",
-                    "protocol",
-                    "unknown",
-                )
-            })?;
+            let parsed: Value = match serde_json::from_str(&text) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    emit(cordis_core::Outcome::Err("plugin_protocol".into()));
+                    return Err(CallFailure::new(
+                        format!("插件回调回复不是合法 JSON: {err}"),
+                        "plugin_protocol",
+                        "protocol",
+                        "unknown",
+                    ));
+                }
+            };
+            emit(cordis_core::Outcome::Ok);
             Ok(Inbound::Ready(
                 parsed.get("ret").cloned().unwrap_or(Value::Null),
             ))
@@ -1891,18 +2024,26 @@ unsafe fn call_inbound(
                 instance: instance.clone(),
                 dispatch_id,
             },
+            trace_parent,
+            traced,
+            callee,
+            caller_uid,
+            name,
+            started,
         }))),
         STATUS_ERR => {
             let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
             drop(removed);
-            Err(CallFailure::from_payload(decode_plugin_error(
-                instance.error_format,
-                &text,
-            )))
+            let payload = decode_plugin_error(instance.error_format, &text);
+            emit(cordis_core::Outcome::Err(
+                payload.code.clone().into_boxed_str(),
+            ));
+            Err(CallFailure::from_payload(payload))
         }
         STATUS_UNSUPPORTED => {
             let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
             drop(removed);
+            emit(cordis_core::Outcome::Err("plugin_unsupported".into()));
             Err(CallFailure::new(
                 format!("插件不支持 op {op}（它可能是为更老的宿主编译的）"),
                 "plugin_unsupported",
@@ -1913,6 +2054,9 @@ unsafe fn call_inbound(
         other => {
             let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
             drop(removed);
+            emit(cordis_core::Outcome::Err(
+                format!("status_{other}").into_boxed_str(),
+            ));
             Err(CallFailure::new(
                 if text.is_empty() {
                     format!("插件回调返回了意料之外的状态码 {other}")
@@ -1929,15 +2073,55 @@ unsafe fn call_inbound(
 
 // ------------------------------------------------------------ 同步快速路径 + 异步兜底
 
+/// 一次出站 iface 调用的归因快照：超时与 panic 两类“入站没有结算”的
+/// 异常都用它补写记录（ADR 0009 §2.2 第 3/4 点）。
+///
+/// `call_id=0`、`callee_uid=0`：这条记录证明“入站从未结算”，没有可复用的
+/// 派发 id 或实现方身份；`callee_plugin` 退化为请求的服务名。
+struct IfaceTrace {
+    store: Arc<cordis_core::Store>,
+    name: String,
+    callee_plugin: String,
+    caller_uid: u64,
+    parent_call_id: u64,
+    started: std::time::Instant,
+}
+
+impl IfaceTrace {
+    fn record(&self, code: &str) {
+        self.store.record_trace(cordis_core::TraceRecord {
+            ts_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            name: self.name.clone().into_boxed_str(),
+            call_id: 0,
+            parent_call_id: self.parent_call_id,
+            caller_uid: self.caller_uid,
+            callee_uid: 0,
+            callee_plugin: self.callee_plugin.clone().into_boxed_str(),
+            elapsed: self.started.elapsed(),
+            outcome: cordis_core::Outcome::Err(code.into()),
+        });
+    }
+}
+
 /// 给 `ctx_call_iface` 的 future 套上出站看门狗。
 ///
 /// 只看“提供者结算”，不改变内联/异步两条路径：超时后 future 被丢弃，调用方
 /// 收到一条可读错误，后续由 `complete_or_defer` 的 `on_done` 撤销派发记录。
+///
+/// 记录只写在超时分支：内层 future 与计时器在**同一个任务**里 poll，且
+/// `tokio::time::timeout` 先 poll 内层——已结算的调用返回 `Ok(_)`，走到这里
+/// 的调用一定没有可用的入站记录，与 `call_inbound`/`settle` 的写入互斥。
+/// 更本质的不变量是：入站写入发生在**同一次 poll** 内且该 poll 必然返回
+/// `Ready`；`timeout` 的 `Err` 分支只会在内层没有 Ready 时到达。
 fn with_iface_timeout(
     future: BoxFuture<Result<Config>>,
     service: String,
     method: String,
     policy: DispatchPolicy,
+    trace: Option<Arc<IfaceTrace>>,
 ) -> BoxFuture<Result<Config>> {
     let Some(ms) = policy.outbound_timeout_ms else {
         return future;
@@ -1945,13 +2129,18 @@ fn with_iface_timeout(
     Box::pin(async move {
         match tokio::time::timeout(std::time::Duration::from_millis(ms), future).await {
             Ok(result) => result,
-            Err(_) => Err(CallFailure::new(
-                format!("HOST_TIMEOUT: iface {service}.{method} 调用超过 {ms}ms 未结算"),
-                "HOST_TIMEOUT",
-                "timeout",
-                "unknown",
-            )
-            .into()),
+            Err(_) => {
+                if let Some(trace) = trace {
+                    trace.record("HOST_TIMEOUT");
+                }
+                Err(CallFailure::new(
+                    format!("HOST_TIMEOUT: iface {service}.{method} 调用超过 {ms}ms 未结算"),
+                    "HOST_TIMEOUT",
+                    "timeout",
+                    "unknown",
+                )
+                .into())
+            }
         }
     })
 }
@@ -3195,6 +3384,8 @@ impl ExternService for PluginIface {
                     None,
                     None,
                     None,
+                    true,
+                    call_scope_top(),
                 )
             } {
                 Ok(Inbound::Ready(value)) => Ok(value),
@@ -3248,6 +3439,8 @@ impl ExternService for PluginIface {
                     None,
                     None,
                     Some(record_sink),
+                    false,
+                    None,
                 )
             } {
                 Ok(Inbound::Ready(value)) => {
@@ -3375,11 +3568,27 @@ unsafe extern "C" fn host_ctx_call_iface(
         let timeout_method = method.clone();
         let error_format = resolved.instance.error_format;
         let future = resolved.ctx.call_iface(&service, version, &method, parsed);
+        let trace_parent = call_scope_top();
+        let trace = resolved.instance.ctx.store.has_trace_sink().then(|| {
+            Arc::new(IfaceTrace {
+                store: resolved.instance.ctx.store.clone(),
+                name: format!("{service}.{method}"),
+                callee_plugin: service.clone(),
+                caller_uid: resolved
+                    .ctx
+                    .fiber_opt()
+                    .map(|fiber| fiber.uid())
+                    .unwrap_or(cordis_core::UID_ROOT),
+                parent_call_id: trace_parent.unwrap_or(0),
+                started: std::time::Instant::now(),
+            })
+        });
         let future = with_iface_timeout(
             future,
             timeout_service,
             timeout_method,
             resolved.instance.dispatch_policy,
+            trace.clone(),
         );
         let consumer = resolved.owner;
         // 把这次 iface 调用登记成消费者实例的一条在飞记录：
@@ -3398,6 +3607,7 @@ unsafe extern "C" fn host_ctx_call_iface(
                     owner: consumer,
                     continuation,
                     kind: ContinuationKind::Iface,
+                    trace_parent,
                 }),
                 stream: None,
             },
@@ -3418,10 +3628,16 @@ unsafe extern "C" fn host_ctx_call_iface(
         let deferred = {
             let on_done = deliver.clone();
             let on_panic = deliver.clone();
+            let panic_trace = trace.clone();
             complete_or_defer(
                 future,
                 move |result| on_done(result),
-                move |payload| on_panic(Err(Box::new(CallFailure::from_payload(payload)))),
+                move |payload| {
+                    if let Some(trace) = panic_trace.as_ref() {
+                        trace.record(&payload.code);
+                    }
+                    on_panic(Err(Box::new(CallFailure::from_payload(payload))))
+                },
                 (cancel, done),
                 PanicScope {
                     scene: "iface",
@@ -3452,6 +3668,9 @@ unsafe extern "C" fn host_ctx_call_iface(
             // 未就绪：结果会通过 `OP_CALLBACK` 送到同一个续延 id 上。
             Ok(None) => Ok(json!({ "pending": true }).to_string()),
             Err(DeferFailure::NoRuntime(message)) => {
+                if let Some(trace) = trace.as_ref() {
+                    trace.record("host_call");
+                }
                 unregister_dispatch_node(consumer, iface_id);
                 Err(ErrorPayload::new(message)
                     .with_code("host_call")
@@ -3460,6 +3679,9 @@ unsafe extern "C" fn host_ctx_call_iface(
             // 首 poll panic：调用方同步拿到错误 ⇒ **先摘表再返回**，
             // 否则关闭路径会为同一次调用补发一条 abort（双交付）。
             Err(DeferFailure::Panic(payload)) => {
+                if let Some(trace) = trace.as_ref() {
+                    trace.record(&payload.code);
+                }
                 unregister_dispatch_node(consumer, iface_id);
                 Err(payload)
             }
@@ -3734,6 +3956,8 @@ unsafe extern "C" fn host_ctx_on(handle: u64, event: Blob, cb: u64, out: *mut Ou
                         cancel,
                         frame,
                         None,
+                        false,
+                        None,
                     )
                 },
                 None => Err(CallFailure::new(
@@ -3878,6 +4102,7 @@ unsafe fn dispatch_impl(
                     owner: handle,
                     continuation,
                     kind: ContinuationKind::Dispatch,
+                    trace_parent: None,
                 }),
                 stream: None,
             },
@@ -4015,7 +4240,7 @@ fn deliver_outbound(handle: u64, dispatch_id: u64, payload: &str) {
     let Some(instance) = instances().lock().unwrap().get(handle) else {
         return;
     };
-    let (removed, _active) = {
+    let (removed, trace_parent, _active) = {
         let mut table = instance.dispatches.lock().unwrap();
         if instance.closed.load(Ordering::SeqCst) || !table.contains_key(&dispatch_id) {
             return;
@@ -4024,9 +4249,11 @@ fn deliver_outbound(handle: u64, dispatch_id: u64, payload: &str) {
             return;
         };
         let record = table.remove(&dispatch_id).unwrap();
+        let trace_parent = record.outbound.as_ref().and_then(|out| out.trace_parent);
         *instance.lifecycle.lock().unwrap() += 1;
         (
             record,
+            trace_parent,
             ActiveCall {
                 active: instance.lifecycle.clone(),
                 changed: instance.calls_changed.clone(),
@@ -4043,6 +4270,9 @@ fn deliver_outbound(handle: u64, dispatch_id: u64, payload: &str) {
             gate.1.wait();
         }
     }
+    // 续延在“调用方那一跳”的调用作用域里执行（ADR 0010）：PENDING 恢复后
+    // 再发起的调用因此仍能挂回原来的父。
+    let _call_scope = trace_parent.map(call_scope_push);
     unsafe {
         if let Err(message) = call_plugin(
             instance.call,
@@ -5409,6 +5639,8 @@ mod tests {
                     None,
                     Some(frame),
                     None,
+                    false,
+                    None,
                 )
             };
             assert_eq!(NEXT_CALL_STATUS.get(), STATUS_OK);
@@ -5494,6 +5726,8 @@ mod tests {
                     None,
                     None,
                     Some(frame),
+                    None,
+                    false,
                     None,
                 )
             };
@@ -5637,6 +5871,12 @@ mod tests {
                 instance: instance.clone(),
                 dispatch_id: 95,
             },
+            trace_parent: None,
+            traced: false,
+            callee: (0, Box::from("test")),
+            caller_uid: 0,
+            name: Box::from("test"),
+            started: std::time::Instant::now(),
         };
         assert!(spawn_stream_settle(&instance, Box::new(pending)).is_err());
         assert!(instance.tasks.lock().unwrap().is_empty());
@@ -5664,6 +5904,12 @@ mod tests {
                 instance: instance.clone(),
                 dispatch_id: 96,
             },
+            trace_parent: None,
+            traced: false,
+            callee: (0, Box::from("test")),
+            caller_uid: 0,
+            name: Box::from("test"),
+            started: std::time::Instant::now(),
         };
         spawn_stream_settle(&instance, Box::new(pending)).unwrap();
         assert_eq!(instance.tasks.lock().unwrap().len(), 1);
@@ -5794,6 +6040,12 @@ mod tests {
                 instance,
                 dispatch_id: 0x5E7,
             },
+            trace_parent: None,
+            traced: false,
+            callee: (0, Box::from("test")),
+            caller_uid: 0,
+            name: Box::from("test"),
+            started: std::time::Instant::now(),
         };
         let payload = ErrorPayload::new("插件已卸载：挂起的入站续延被结算")
             .with_code("host_lifecycle")
@@ -7320,5 +7572,231 @@ mod tests {
         assert!(out.len <= 2, "out.len 不得超过 cap：{}", out.len);
         buffer.truncate(out.len);
         assert_eq!(String::from_utf8(buffer).unwrap(), "");
+    }
+
+    #[test]
+    fn call_scope_nests_and_pops() {
+        assert_eq!(call_scope_top(), None);
+        let outer = call_scope_push(7);
+        assert_eq!(call_scope_top(), Some(7));
+        {
+            let _inner = call_scope_push(9);
+            assert_eq!(call_scope_top(), Some(9));
+        }
+        assert_eq!(call_scope_top(), Some(7));
+        drop(outer);
+        assert_eq!(call_scope_top(), None);
+    }
+
+    static PROBE_SCOPE: AtomicU64 = AtomicU64::new(u64::MAX);
+    static PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RecordCollector(Arc<Mutex<Vec<cordis_core::TraceRecord>>>);
+
+    impl cordis_core::TraceSink for RecordCollector {
+        fn record(&self, record: cordis_core::TraceRecord) {
+            self.0.lock().unwrap().push(record);
+        }
+    }
+
+    unsafe extern "C" fn scope_probe_call(_: u64, _: u32, _: Blob, _: Blob, _: *mut Out) -> i32 {
+        PROBE_SCOPE.store(call_scope_top().unwrap_or(0), Ordering::SeqCst);
+        STATUS_OK
+    }
+
+    fn probe_instance() -> (u64, Instance, Arc<Mutex<Vec<cordis_core::TraceRecord>>>) {
+        let app = Box::leak(Box::new(cordis_core::App::new()));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        assert!(app.set_trace_sink(Arc::new(RecordCollector(records.clone()))));
+        let handle =
+            register_instance_with_keepalive(app.root.clone(), scope_probe_call, None, 0).unwrap();
+        let instance = instances().lock().unwrap().get(handle).unwrap();
+        (handle, instance, records)
+    }
+
+    #[test]
+    fn inbound_pushes_call_scope_only_when_traced() {
+        let _guard = PROBE_LOCK.lock().unwrap();
+        let (handle, instance, records) = probe_instance();
+        PROBE_SCOPE.store(u64::MAX, Ordering::SeqCst);
+        let result = unsafe {
+            call_inbound(
+                &instance,
+                handle,
+                OP_CALLBACK,
+                json!({"event": "svc", "method": "m"}),
+                None,
+                None,
+                None,
+                None,
+                true,
+                None,
+            )
+        };
+        assert!(result.is_ok());
+        let seen = PROBE_SCOPE.load(Ordering::SeqCst);
+        assert_ne!(seen, 0, "iface 入站必须在 CALL_SCOPE 里执行");
+        assert_ne!(seen, u64::MAX, "探针必须被写");
+        assert_eq!(records.lock().unwrap().len(), 1, "iface 入站写一条记录");
+
+        PROBE_SCOPE.store(u64::MAX, Ordering::SeqCst);
+        let result = unsafe {
+            call_inbound(
+                &instance,
+                handle,
+                OP_CALLBACK,
+                json!({"event": "svc", "method": "m"}),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+        };
+        assert!(result.is_ok());
+        assert_eq!(
+            PROBE_SCOPE.load(Ordering::SeqCst),
+            0,
+            "事件/流入站不得压 CALL_SCOPE"
+        );
+        assert_eq!(records.lock().unwrap().len(), 1, "事件/流入站不得写记录");
+        unregister_instance(handle);
+    }
+
+    #[test]
+    fn continuation_is_delivered_inside_the_callers_hop() {
+        let _guard = PROBE_LOCK.lock().unwrap();
+        let (handle, instance, _records) = probe_instance();
+        insert_dispatch(
+            &instance,
+            handle.wrapping_add(1000),
+            DispatchRecord {
+                sink: None,
+                frame: None,
+                parent: None,
+                outbound: Some(Outbound {
+                    owner: handle,
+                    continuation: 99,
+                    kind: ContinuationKind::Iface,
+                    trace_parent: Some(42),
+                }),
+                stream: None,
+            },
+        )
+        .unwrap_or_else(|_| panic!("admission"));
+        PROBE_SCOPE.store(u64::MAX, Ordering::SeqCst);
+        deliver_outbound(handle, handle.wrapping_add(1000), "{}");
+        assert_eq!(
+            PROBE_SCOPE.load(Ordering::SeqCst),
+            42,
+            "续延交付必须恢复调用方那一跳"
+        );
+        unregister_instance(handle);
+    }
+
+    #[test]
+    fn inbound_record_carries_name_and_call_id() {
+        let _guard = PROBE_LOCK.lock().unwrap();
+        let app = Box::leak(Box::new(cordis_core::App::new()));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        assert!(app.set_trace_sink(Arc::new(RecordCollector(records.clone()))));
+        let handle =
+            register_instance_with_keepalive(app.root.clone(), scope_probe_call, None, 0).unwrap();
+        let instance = instances().lock().unwrap().get(handle).unwrap();
+        PROBE_SCOPE.store(u64::MAX, Ordering::SeqCst);
+        let result = unsafe {
+            call_inbound(
+                &instance,
+                handle,
+                OP_CALLBACK,
+                json!({"event": "svc", "method": "m"}),
+                None,
+                None,
+                None,
+                None,
+                true,
+                None,
+            )
+        };
+        assert!(result.is_ok());
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(&*records[0].name, "svc.m");
+        assert_ne!(records[0].call_id, 0);
+        assert_eq!(records[0].call_id, PROBE_SCOPE.load(Ordering::SeqCst));
+        assert_eq!(records[0].outcome, cordis_core::Outcome::Ok);
+        unregister_instance(handle);
+    }
+
+    struct NoRuntimeService;
+
+    impl ExternService for NoRuntimeService {
+        fn service(&self) -> &str {
+            "no-rt@1"
+        }
+
+        fn version(&self) -> u32 {
+            1
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["run".into()]
+        }
+
+        fn call(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> BoxFuture<Result<Config>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// 同步上下文里首个 poll 未就绪、又没有 tokio runtime：调用方拿到
+    /// `host_call`，同时必须留下一条 `call_id=0` 的记录。
+    #[test]
+    fn no_runtime_is_recorded_as_host_call() {
+        let _guard = PROBE_LOCK.lock().unwrap();
+        let app = Box::leak(Box::new(cordis_core::App::new()));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        assert!(app.set_trace_sink(Arc::new(RecordCollector(records.clone()))));
+        app.root
+            .provide_iface("no-rt@1", Arc::new(NoRuntimeService))
+            .expect("provide");
+        let handle =
+            register_instance_with_keepalive(app.root.clone(), scope_probe_call, None, 0).unwrap();
+        let mut buffer = [0u8; 512];
+        let mut out = Out {
+            ptr: buffer.as_mut_ptr(),
+            cap: buffer.len(),
+            len: 0,
+        };
+        let status = unsafe {
+            host_ctx_call_iface(
+                handle,
+                Blob::new(b"no-rt@1"),
+                1,
+                Blob::new(b"run"),
+                Blob::new(b"[]"),
+                0,
+                &mut out,
+            )
+        };
+        assert_eq!(status, STATUS_ERR);
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1, "NoRuntime 必须写一条记录：{records:?}");
+        let record = &records[0];
+        assert_eq!(&*record.name, "no-rt@1.run");
+        assert_eq!(record.call_id, 0);
+        assert_eq!(record.callee_uid, 0);
+        assert_eq!(&*record.callee_plugin, "no-rt@1");
+        assert_eq!(
+            record.outcome,
+            cordis_core::Outcome::Err("host_call".into())
+        );
+        drop(records);
+        unregister_instance(handle);
     }
 }

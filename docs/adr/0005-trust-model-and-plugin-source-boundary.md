@@ -80,11 +80,14 @@ T1/T2 的 plugin、宿主、配置和宿主注入的 log sink 都在同一信任
 - 产物能对应到固定 commit / revision；
 - 由受信任 CI 从该 revision 构建；
 - 产物有 SHA256，最好有签名或 SLSA provenance；
-- 使用受支持的 ABI，并随 `xtask seal` 一起封存（变体见 §2.3 的例外）；
+- 使用受支持的 ABI；
+- 随 `xtask seal` 一起封存（`xtask seal` 只覆盖随宿主发布的插件；变体不走
+  seal，走归档仓库 + 准入台账，见 §2.3。ABI 要求对变体同样适用）；
 - 来源解析出策略时，loader 只加载 allow-list 中的
   `(plugin id, semver, source revision, artifact SHA256, abi version)`：
-  strict 恒生效，fallback 在进程级策略存在时生效，`dev_unverified` 从不生效
-  （ADR 0008 §3）。
+  strict 恒生效（未覆写 `*_admitted` 的外部来源除外），fallback 在进程级策略
+  存在时生效、无策略且未开开发模式时默认拒绝；`dev_unverified` 下
+  allow-list 不生效（ADR 0008 §3/§4）。
 
 不允许：
 
@@ -111,37 +114,54 @@ allow-list**。如果产品要求更严，可以升级为“必须同仓库”�
   被签发）、签发逻辑三者都经人工 PR 修改；单个变体不审。只有已审的
   `pipeline_revision` 可以签发，集合由人工 PR 维护（**本仓不校验该集合**，
   由流水线入口与 PR 纪律强制）；签发入口不得有“评估失败仍签发”的 override；
-- **固定 revision**：变体源进归档仓库并记 revision；准入台账记录 variant
-  revision 与 pipeline revision。sidecar 的 `PluginManifest` 目前没有这两个
-  字段，且它同样未开 `deny_unknown_fields`——写进 sidecar 会被静默丢弃，
-  阶段 1 不依赖 sidecar 承载它们；
+- **固定 revision**：变体源进归档仓库并记 variant revision；准入台账记录
+  variant revision 与 pipeline revision。sidecar 的 `PluginManifest` 有
+  `source_revision`（`verify` 会比对），但**没有** variant revision 与
+  pipeline revision 这两个字段，且未开 `deny_unknown_fields`——把后两者写进
+  sidecar 会被静默丢弃，阶段 1 不依赖 sidecar 承载它们。变体的
+  `source_revision` 由归档构建写入 manifest，准入台账必须把它与
+  `variant_revision` 显式绑定：台账持一行 `source_revision → variant_revision`
+  的映射（相等时也写明）；无法映射的变体在准入合并时不得进入 allow-list，
+  不允许“事后解释”；
 - **受控构建**：产物由受信任 CI 从该 revision 构建；归档仓库**禁止提交二进制
   产物**，否则“从该 revision 构建”退化为“取回已提交的二进制”；
 - **产物 hash 与来源记录**：artifact SHA256，加 `attestation` 三元组
   （`pipeline_id` / `pipeline_revision` / `eval_record_sha256`）。评估记录
-  本身必须含 variant revision 与 artifact SHA256，准入时与 manifest 交叉
-  相等——否则同一份好记录可以配任意二进制（重放）；
-- **ABI 同受精确门禁**：`abi_version` 不匹配的变体在准入阶段即被拒绝；
+  本身必须含 variant revision 与 artifact SHA256，准入时分别核对：
+  **variant revision 对准入台账记录**，**artifact SHA256 对 manifest 的
+  `sha256`**。锚点不能混用——manifest 里没有 variant revision，只有
+  `source_revision`。否则同一份好记录可以配任意二进制（重放）；
+- **ABI 同受精确门禁**：`abi_version` 不匹配的变体在装载前的校验中被拒绝
+  （`validate_manifest` / `verify`，不是部署准入台账）；
   `xtask seal` 只覆盖随宿主发布的插件，变体走归档仓库 + allow-list；
 - **allow-list 在来源解析出策略时生效**：条目按
   `(plugin id, semver, source revision, artifact SHA256, abi version)` 匹配。
   strict 恒生效（未覆写 `*_admitted` 的外部来源除外，ADR 0008 §4）；
   fallback 在进程级策略存在时生效（此时它仍是 allow-list 门禁），无策略且
-  未开开发模式时**默认拒绝**；`dev_unverified` 从不生效（ADR 0008 §3）。
-  所以“唯一门禁”只在 strict 下无条件成立；
+  未开开发模式时**默认拒绝**；`dev_unverified` 下 allow-list 不生效
+  （ADR 0008 §3）。
+  所以“唯一门禁”只在 strict（且来源确实覆写了 `*_admitted`）下无条件成立；
 - **准入台账旁挂 attestation 摘要**：摘要写入 allow-list 旁的准入记录，不写进
   `PluginSourcePolicy` 的 JSON。现行 `AllowedPlugin` 没有该字段，且
   `from_json` 未开 `deny_unknown_fields`——写进 policy 会被**静默丢弃**，
   不构成任何校验；阶段 1 不依赖该字段；
 - **职责分离**：准入合并（把条目写进 allow-list）必须由签发流水线**之外**的
-  主体执行。同一自动化既签发又合并时，下条的交叉相等退化为自洽检查。
+  主体执行。同一自动化既签发又合并时，下面的交叉核对退化为自洽检查。
 
-**校验发生在部署准入，不在运行时。** `loader` / `PluginSourcePolicy::verify`
-只比对 id / semver / revision / hash / ABI，不认识 `attestation`；把“缺
-attestation 即由 loader 拒绝”写成运行时行为是虚报。缺任一项的材料**不得进入
-allow-list**，这条由部署方的准入台账步骤（人工 PR 或受审 CI）执行：核对
-`eval_record` 的 `variant_revision` / `artifact_sha256` 与准入台账记录相等，
-`eval_record_sha256` 与 attestation 相等。
+**attestation 的核对发生在部署准入，不在运行时。** `loader` /
+`PluginSourcePolicy::verify` 只比对 id / semver / revision / hash / ABI，
+不认识 `attestation`；把“缺 attestation 即由 loader 拒绝”写成运行时行为是
+虚报。（`verify` 本身仍会在装载前执行 allow-list 比对，那是另一回事。）
+**准入台账是部署侧文件**：loader 不读它，它也不随产物发行。缺任一项的材料
+**不得进入 allow-list**，这条由部署方的准入台账步骤（人工 PR 或受审 CI）
+执行：核对 `eval_record` 的 `variant_revision` 与台账记录相等、
+`artifact_sha256` 与 manifest 的 `sha256` 相等、`eval_record_sha256` 与
+attestation 相等、`attestation.pipeline_revision` 与台账的 pipeline revision
+相等，并核对台账映射行的 `source_revision` 与 manifest 的 `source_revision`
+一致。
+
+**写入者与核对者不是同一主体。** 台账与 `eval_record` 由签发流水线写入，
+核对与合并由部署准入方执行；这正是上一条“职责分离”的含义。
 
 **交叉相等只能防配错与重放，不能防伪造。** `eval_record` 与准入台账由同一条
 流水线写入，两边一致也可能两边都错或都被改；真正的独立证据是签名与构建
@@ -213,11 +233,14 @@ T2 无法在本进程内消除该风险，并把处置责任放到了部署层�
 - 演化产物另记 `attestation`：pipeline id、pipeline revision、eval record
   SHA256；评估记录须含 variant revision 与 artifact SHA256（§2.3）；
   其他来源可选。`attestation` 落在准入台账侧；若要写进 `PluginManifest`，
-  属 ADR 0006 的加法并须登记 `api-inventory`；
-- 演化产物的 attestation 由准入步骤核对（职责分离，§2.3），`verify` 只比对
-  id / semver / revision / hash / ABI；
-- loader 有 allow-list（strict 恒生效；fallback 在进程级策略存在时生效；
-  `dev_unverified` 从不生效，ADR 0008 §3）；
+  属 0.2 级变更（ADR 0006：可字面量构造的公开 DTO 加字段）；注意
+  `api-inventory` 对宿主 DTO 是每类型一行，字段级差异不进门禁，需人工评审
+  （ABI 结构的字段由扫描覆盖，那是另一条路径）；
+- 演化产物的 attestation 由部署准入方核对（写入者与核对者分离，§2.3），
+  `verify` 只比对 id / semver / revision / hash / ABI；
+- loader 有 allow-list（strict 恒生效，未覆写 `*_admitted` 的外部来源除外；
+  fallback 在进程级策略存在时生效、无策略且未开开发模式时默认拒绝；
+  `dev_unverified` 下 allow-list 不生效，ADR 0008 §3/§4）；
 - `inspect` / `status` 能显示来源和 revision；
 - 没有来源信息的插件默认拒绝（或显式开发模式）。
 
@@ -376,8 +399,8 @@ T3 决策至少包含：载体选型、HostApi 收窄、权限模型、性能预
 ## 7. 验收与证据
 
 - README / 支持契约已有“插件来源”行，状态为**声明**，并注明这是来源治理
-  不是运行时安全（当前保证索引 26 行 / 17 保证，`xtask/src/contract.rs` 固定；
-  §2.3 只改该行措辞，不增行）；
+  不是运行时安全（当时的保证索引 26 行 / 17 保证；WP1/WP2/WP2b 后为 29 行 / 20 保证，
+  `xtask/src/contract.rs` 固定；§2.3 只改该行措辞，不增行）；
 - P0 每项有对应测试或故障注入记录，否则不得标记完成；
 - `cargo xtask docs` 继续只对“保证”行要求测试证据；
 - 文档不得出现“安全隔离 / 沙箱 / 不会泄漏 / 版本不冲突 / 多租户安全底座”

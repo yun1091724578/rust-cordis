@@ -10,6 +10,7 @@
 - 版本诊断边界：`docs/adr/0007-version-is-diagnostic-only.md`
 - 来源准入的作用域与优先级：`docs/adr/0008-source-admission-scope.md`
 - RSI 部署与观测底座的位置：`docs/adr/0009-rsi-deployment-substrate.md`
+- 调用链关联（父链）：`docs/adr/0010-call-graph-correlation.md`
 - 发布门禁与未确认项：`docs/release.md`
 - 封存格式：`docs/release-seal.md`
 - 公开 API / 载荷清单：`docs/api-inventory.md`
@@ -37,8 +38,8 @@
 
 ### 基线
 
-- 支持契约：**26 行 / 17 条保证**
-- API 清单：**23 常量 / 4 结构 / 41 字段 / 80 公开入口 / 32 载荷**
+- 支持契约：**29 行 / 20 条保证**
+- API 清单：**23 常量 / 4 结构 / 41 字段 / 96 公开入口 / 32 载荷**
 - 最新全绿三平台 CI：`43196946690`
 - 正式 `/2` 封存：`dist/cordis-0.1.0-formal`、`dist/cordis-0.1.1-formal`、`dist/cordis-0.1.2-formal`（0.1.2 严格同源）与 Release assets
 - 仓库公开；标准 GitHub-hosted Runner 不再消耗私有分钟
@@ -114,8 +115,9 @@ breaking 变更。
 不能反向变成 host/core 的产品主线。
 
 RSI 方向按下述口径推进：本仓做**演化产物的部署与观测地板**，不做演化循环
-（ADR 0009）。阶段 1 的 WP0（两份 ADR）已完成，WP1（iface 归因）/ WP2（变体
-身份）/ WP2b（契约方法面）/ WP4（端到端示例）见 `rsi-sdk-roadmap.html`。
+（ADR 0009）。阶段 1 的 WP0（两份 ADR）与 S2-2（调用链关联设计，ADR 0010）
+已完成；WP1（iface 归因，含 0010 的实现）、WP2（变体身份）与 WP2b（契约方法名）
+已实现，WP4（端到端示例）见 `rsi-sdk-roadmap.html`。
 
 ### 运行时优化专项（2026-11-16）
 
@@ -337,8 +339,9 @@ RSI 方向按下述口径推进：本仓做**演化产物的部署与观测地�
 
 ### RSI：部署与观测底座（2026-11-18）
 
-阶段 1 的方案与三轮评审见 `rsi-sdk-roadmap.html`（同目录）。工作包顺序：WP0（本 ADR）
-→ WP1（iface 归因）/ WP2（变体身份）/ WP2b（契约方法面）→ WP4（端到端示例）。
+阶段 1 的方案与三轮评审见 `rsi-sdk-roadmap.html`（同目录）。工作包顺序：WP0（ADR 0005/0009）
+→ S2-2（ADR 0010，调用链关联设计，已决）→ WP1（iface 归因）/ WP2（变体身份）/
+WP2b（契约方法名）→ WP4（端到端示例）。WP1 与 ADR 0010 的实现一并落地。
 
 #### RSI-WP0：RSI 部署与观测底座的 ADR（2026-11-18）
 
@@ -347,9 +350,47 @@ RSI 方向按下述口径推进：本仓做**演化产物的部署与观测地�
 - 决策：见 ADR 0005 §2.3 与 ADR 0009 —— 受审流水线代替逐变体人审（审评估器/门禁/签发逻辑）；宿主只做已选中变体的部署、热换、回滚与归因；归因 iface-only；变体身份用 `capabilities` 行的 `uid`+`sha256`；契约 = 声明三项（inject/provision/schema）+ 服务方法名集合 + `iface_spec_sha256`，比对在外部做。
 - 改动：ADR 0005 头部状态/摘要、§1.2、§2.2 不允许项、新增 §2.3（原 §2.3/§2.4 顺延为 §2.4/§2.5）、§I1、§5、§6；新增 ADR 0009；README 与 support-contract 各改一句；roadmap 增 ADR 索引行并把两处"模型生成"触发条件限定为"未按 §2.3 签发"。
 - 验收（文档项，核对来源与一致性）：ADR 0009 的每条事实引用都能在代码中命中（iface 汇合点、handlers 丢身份、指纹语义、schema 是配置 schema、`ExternService::methods` 只有方法名、sha256_file 位置）；ADR 0005 §2.2/§2.3/§I1/§5/§6 五处对“演化产物”的口径互不矛盾，且 §2.3 与 §2.2 末段的六项最低要求一一对应；`.\cargo.cmd run -p xtask -- docs` 与 `.\cargo.cmd run -p xtask -- inventory --check` 均退出 0。
-- 验收修复（三轮独立评审两轮后）：① “缺 attestation 即由 loader 拒绝”是虚报 —— `PluginSourcePolicy::verify` 不认识 attestation，改为“校验发生在准入，不在运行时”，并写明无签名时的可信上限；② attestation 不绑定产物 → 要求评估记录含 variant revision + artifact SHA256 并与 manifest 交叉相等；③ 归档仓库可能提交二进制 → 明令禁止，否则“从该 revision 构建”退化；④ 只有已审 `pipeline_revision` 可签发、不得有强制签发 override；⑤ 补 ABI 精确门禁与 `xtask seal` 的适用范围；⑥ 契约锁只能到方法名（`ExternService::methods() -> Vec<String>`，无参数形状），删掉“形状”承诺并把 IO schema 锁列为范围外；⑦ 归因埋点若只在 `call_iface` future 内，超时/取消/panic 三种丢弃都不会落记录 → 共享 outcome cell + Drop guard，且三条路径分别记 `host_timeout`/`host_cancel`/`host_drop`；⑧ `uid` 是 per-Store 且卸载后置 `u64::MAX` → `callee_uid` 在发起时快照，加稳定 `callee_plugin`，不引入 `mount_gen`；⑨ “插件无法抹除记录”改限定为“无法经公开 API”，恶意插件仍可改内存；⑩ `sha256` 取暂存副本而非原路径；⑪ attestation 摘要**不写进 policy JSON**（`AllowedPlugin` 无该字段、`from_json` 无 `deny_unknown_fields`，会静默丢弃），改放准入台账；⑫ 准入合并须与签发流水线职责分离，否则交叉相等只是自证；⑬ “变体不得用 `dev_unverified`”改为部署纪律并如实说明 loader 无法强制；⑭ 导出面不存在 → WP2b 增 `Store::services_of(&Arc<Fiber>)`（`UID_DISPOSED` 返回空并标记）与 `StatusReport.capabilities`（typed row，`StatusReport` 派生 `Eq`），方法名在 shutdown 前抓取；⑮ 契约加 `iface_spec_sha256`（接口规范原文 hash），让宿主侧导出与作者侧 YAML 同源；⑯ trace sink 挂 `App` 而非公开可达的 `Context::store`，否则插件可替换/摘除记录；⑰ panic 记 `host_drop`（不新增第四种码）；⑱ 金丝雀基线固定为“同一 App、热换前、同一用例集”，硬判据为同用例 Ok→Err / 新 Err，不用跨代分数比较；⑲ 记录点拆成两处（正常完成在 `call_iface`，异常终止在宿主包装层），异常码用已有的 `host_timeout`/`host_cancel`/`host_panic`，`host_drop` 只兜底；⑳ 回滚语义写明两种：apply 失败重挂旧模块（static 保留）、改 YAML 重投是新模块（static 全新），用例须幂等；㉑ 对齐约定补齐 `plugin` 与 `seq`、快照取 swap 后值、同一时钟、消费方轮询写入；㉒ `services_of` 改为薄封装既有 `impls_owned_by`，并声明“待验证面 0.2 前可改可删”。
-- 未覆盖（如实记录）：`PluginSourcePolicy::verify` **尚未**校验 `attestation`，§2.3 目前只是准入口径与示例要求；WP1/WP2 的代码与 trace sink 未做；support-contract 的保证计数不变（未增删行）；IO schema 级契约锁未做（需扩 `PluginDesc`）。
+- 验收修复（三轮独立评审两轮后）：① “缺 attestation 即由 loader 拒绝”是虚报 —— `PluginSourcePolicy::verify` 不认识 attestation，改为“校验发生在准入，不在运行时”，并写明无签名时的可信上限；② attestation 不绑定产物 → 要求评估记录含 variant revision + artifact SHA256 并与 manifest 交叉相等；③ 归档仓库可能提交二进制 → 明令禁止，否则“从该 revision 构建”退化；④ 只有已审 `pipeline_revision` 可签发、不得有强制签发 override；⑤ 补 ABI 精确门禁与 `xtask seal` 的适用范围；⑥ 契约锁只能到方法名（`ExternService::methods() -> Vec<String>`，无参数形状），删掉“形状”承诺并把 IO schema 锁列为范围外；⑦ 归因写入点两处（core 在派发记录之前；host 在派发结算处），超时/取消/panic 都由结算处分类，不设 Drop guard；**（此条已被 ⑲ 的三处口径取代）**；⑧ `uid` 是 per-Store 且卸载后置 `u64::MAX` → `callee_uid` 在发起时快照，加稳定 `callee_plugin`，不引入 `mount_gen`；⑨ “插件无法抹除记录”改限定为“无法经公开 API”，恶意插件仍可改内存；⑩ `sha256` 取暂存副本而非原路径；⑪ attestation 摘要**不写进 policy JSON**（`AllowedPlugin` 无该字段、`from_json` 无 `deny_unknown_fields`，会静默丢弃），改放准入台账；⑫ 准入合并须与签发流水线职责分离，否则交叉相等只是自证；⑬ “变体不得用 `dev_unverified`”改为部署纪律并如实说明 loader 无法强制；⑭ 导出面不存在 → WP2b 增 `Store::services_of(&Arc<Fiber>)`（`UID_DISPOSED` 返回空并标记）与 `StatusReport.capabilities`（typed row，`StatusReport` 派生 `Eq`），方法名在 shutdown 前抓取；⑮ 契约加 `iface_spec_sha256`（接口规范原文 hash），让宿主侧导出与作者侧 YAML 同源；⑯ trace sink 挂 `App` 而非公开可达的 `Context::store`，否则插件可替换/摘除记录；⑰ panic 记 `host_drop` —— **已被 ⑲ 取代**；⑱ 金丝雀基线固定为“同一 App、热换前、同一用例集”，硬判据为同用例 Ok→Err / 新 Err，不用跨代分数比较；⑲ 写入点最终定为三处：core 在入站派发记录之前（解析/版本/方法检查失败）；host 在同步出口或 PENDING 结算（共用 dispatch_id、互斥）；host 仅在“入站从未结算、只出站看门狗超时”时补写 `call_id=0` 的一条（父取发起时栈顶）；**（此条已被 RSI-WP1 修订为“结算两处 + 超时/panic/NoRuntime 三种未结算补写”）**；不设 Drop guard、不引入 `host_drop`；⑳ 回滚语义写明两种：apply 失败重挂旧模块（static 保留）、改 YAML 重投是新模块（static 全新），用例须幂等；㉑ 对齐约定补齐 `plugin` 与 `seq`、快照取 swap 后值、同一时钟、消费方轮询写入；㉒ `services_of` 改为复用既有 `impls_owned_by` 的 fiber 身份判据（实现上还需取 `Dyn::adapter`，故为同口径枚举而非字面包装），并声明“待验证面 0.2 前可改可删”；㉓ 归因字段在 S2-2 设计（ADR 0010）中定为 `call_id`/`parent_call_id`：`call_id` 复用入站 dispatch id；父由 host 私有 `CALL_SCOPE` 在 `call_inbound` 与 `deliver_outbound` 两个窗口推出，不改 ABI；事件/waterfall 不压该栈，T1 异步起点为根；㉔ 异常码大小写按代码（`HOST_TIMEOUT` / `host_cancel` / `host_panic`），文档不再自造小写变量。
+- 未覆盖（如实记录）：`PluginSourcePolicy::verify` **尚未**校验 `attestation`，§2.3 目前只是准入口径与示例要求（WP0 当时）；WP1/WP2 的代码与 trace sink 已在本轮后续增量实现（见 RSI-WP1/WP2），support-contract 已增至 29 行 / 20 保证（WP2b 后）；IO schema 级契约锁未做（需扩 `PluginDesc`）。
 - 工作区：本轮只改上述 5 个文档，未改代码、测试、CI/workflow。
+
+#### RSI-S2-2：调用链关联设计（2026-11-18）
+
+- 范围：新增 ADR 0010，只定义 `parent_call_id` 的语义与压栈位置；不改代码、不改 ABI、不改 `PluginIface::call` 签名。
+- 风险核实：① 现有 `DispatchRecord.parent` 已存在，缺的是取值时机；`scope_top()` 是 `thread_local`，只在同步窗口有效（`call_inbound:1863` 包 `invoke_raw`），`deliver_outbound:4037` 在 `drop(record)` 后直接 `call_plugin`，续延里没有作用域 → PENDING 恢复后的调用父为空；② 一跳有两个 id（出站 `iface_id`:3388、入站 `dispatch_id`:1832，同用 `DISPATCH_SEQ`:1164），出站 id 从不入栈，混用会指向不存在的记录；③ 事件/waterfall 也压 `DISPATCH_SCOPE`（`:3888`、`:3678`），它们的 id 没有 trace 记录，若当父就是幽灵节点；④ core 完全没有“当前调用”概念（无 `thread_local`/`task_local`），T1 异步起点无法拿到父；⑤ `CtxCallIfaceFn` 形参已随 ABI v1 冻结，不能加 id 参数。
+- 决策：见 ADR 0010 —— 新增 host 私有 `CALL_SCOPE`（thread-local + RAII），只在 `call_inbound` 执行窗口与 `deliver_outbound` 交付窗口压栈；**trace 父**取 `call_scope_top()`，取消父仍取 `scope_top()`；`call_id` 复用入站 `dispatch_id`；`Outbound` 增 `trace_parent`；`PendingContinuation` 增 trace 父/traced/callee/发起方快照；事件/waterfall/流不压 `CALL_SCOPE`。
+- 覆盖：T2→T2 同步与 PENDING 续延完整；T2→T1→T2 在 T1 同步段内发起时父是 A、跳过 T1；T1 挂起后的提供者侧、T1 异步起点、事件起点、typed 直调与流式为根/无记录；终止回调（`deliver_abort_direct`）不压栈。
+- 验收（设计项，核对代码分叉）：ADR 0010 的每条压栈点都能在代码中命中（`call_inbound:1863`、`deliver_outbound:4037`、`PluginIface::call:3187`、`host_ctx_call_iface:3389`、`DISPATCH_SEQ:1164`）；`CALL_SCOPE` 与 `DISPATCH_SCOPE` 的职责边界无重叠；`.\cargo.cmd run -p xtask -- docs` 与 `inventory --check` 通过。
+- 未覆盖（如实记录）：只做设计，未写代码；`thread_local` 不随 `await` 迁移，T1 异步起点永久为根；事件/waterfall 因果留到复评条件。
+- 工作区：本轮只改 ADR 0010、ADR 0009（引用与验收）、`docs/rsi-sdk-roadmap.html`、本文件；未改代码、测试、CI/workflow。
+
+#### RSI-WP1：服务调用归因（第一增量，2026-11-18）
+
+- 范围：core 的 trace 类型与 sink 安装、core 解析/校验失败记录、host 的 `CALL_SCOPE`、`Outbound.trace_parent`、`call_inbound` 的同步/PENDING 记录、`deliver_outbound` 的续延作用域；不改 ABI。
+- 实现：`crates/core/src/trace.rs`（`TraceRecord`/`Outcome`/`TraceSink`、poll 级 `ScopedCaller`、`App::set_trace_sink`、`Store::record_trace`）；`Context::call_iface` 在 `iface_target` 与 `check_iface_call` 失败时写 `call_id=0` 的记录并包 caller 作用域；host 新增 `CALL_SCOPE`（与 `DISPATCH_SCOPE` 分离）、`Outbound.trace_parent`、`call_inbound(trace, trace_parent)`、同步/PENDING（`settle`）记录、`deliver_outbound` 交付前压栈；`PendingContinuation` 带 trace 父、traced、callee/发起方快照。
+- 红/绿测：core 新增 `missing_service_is_recorded_with_call_id_zero`、`caller_uid_is_scoped_to_the_poll`、`installing_the_sink_twice_is_rejected`；host 新增 `call_scope_nests_and_pops`、`inbound_pushes_call_scope_only_when_traced`、`continuation_is_delivered_inside_the_callers_hop`、`inbound_record_carries_name_and_call_id`。`cargo test -p rust-cordis-core --lib/--tests`、`-p rust-cordis-host --lib`（133 passed / 1 ignored）、`-p rust-cordis-abi --lib`（36）全绿；`cargo fmt --check` 干净、`clippy -p core -p host --all-targets -- -D warnings` 通过。
+- 第二增量（2026-11-18）：补齐 ADR 0009 §2.2 的第 3 类写入点与类型清单。`with_iface_timeout` 现在接收 `IfaceTrace`（store、`service.method`、请求服务名、发起方 uid、发起时 `CALL_SCOPE` 栈顶、起始时刻），超时与 panic 分支共用它补写 `call_id=0` 的记录；超时记录为 `callee_uid=0`、`callee_plugin=请求服务名`、`outcome=Err("HOST_TIMEOUT")`——内层 future 与计时器在同一任务里 poll 且先 poll 内层，已结算的调用不会进入该分支，因此与入站写入天然互斥；`xtask/src/inventory.rs` 收录 `App::set_trace_sink`、`Store::record_trace`、`TraceRecord`、`Outcome`、`TraceSink`，`docs/api-inventory.md` 重新生成。新增两条集成证据：`abi_outbound_timeout.rs` 断言仅出站超时恰好一条记录（含 `caller_uid` 与 `elapsed >= 50ms`）；新增 `abi_trace_chain.rs` 用三个 ABI 形状插件跑 `consumer → mid@1 → leaf@1` 同步链，断言两条记录、`leaf.parent_call_id == mid.call_id`、`caller_uid` 逐跳正确且稳定 `callee_plugin`。
+- 第三增量（2026-11-18，V3 用例补齐 + 验收修复）：新增 `abi_trace_depth.rs`（三跳失败链，3 条记录、父链逐跳、叶子 `deep_bad` 传播、按叶子聚合只剩 `deep`）、`abi_trace_pending.rs`（PENDING 续延恢复后的 `c@1` 仍挂在 `m@1` 上，`elapsed ≥ 30ms`，`call_id` 与提供者 `dispatch_id` 一致）、`abi_trace_cancel.rs`（取消写 `host_cancel`，`callee_uid` 是发起时快照）、`abi_trace_scopes.rs`（事件根、T1 同步段跳过、T1 异步任务为根、T1 apply 为根）、`abi_trace_timeouts.rs`（入站/出站超时同时配置各只一条）、`abi_trace_timeout_parent.rs`（仅出站超时的父取发起时栈顶）、`abi_trace_panic_async.rs`（后台 poll panic 写一条 `host_panic`）、`abi_trace_panic_status_err.rs`（T2 经 ABI 收敛的 `STATUS_ERR` 走入站结算，带真实 id）、`abi_trace_t1_suspend.rs`（T1 服务方法挂起恢复后父为 0）、`abi_trace_protocol.rs`（STATUS_OK 但 body 非法 → `plugin_protocol`）、`abi_trace_unload.rs`（调用方存活时卸载仍写 `host_lifecycle`，`callee_uid` 快照可判别）；`panic_future_iface_sync.rs` 增断言。`host_ctx_call_iface` 的 panic 路径（首 poll 与后台 `on_panic`）复用 `IfaceTrace` 补写记录，`NoRuntime` 也补一条 `host_call`；`Store::record_trace` 截获 sink panic 并丢弃该条记录。`Store::has_trace_sink` 让 `call_iface`/`call_inbound`/出站包装在无 sink 时跳过身份快照（只多一次原子读 + 一次时钟读）；`call_inbound` 的 `CALL_SCOPE` 改用 `traced`，不再给无记录的外层跳压幽灵父。`ScopedCaller` 改用 RAII 守卫，poll panic 后 `current_caller_uid()` 仍能恢复。`support-contract` 新增“逐跳归因记录（保证）”行（WP1 时 27 行 / 18 保证；WP2 后 28 行 / 19 保证），`platform-matrix` 增对应行（Windows GNU 通过，其余待验证）。`core` 新增 `iface_check_failures_are_recorded_with_the_request_name` 与 `caller_uid_is_restored_after_inner_panic`。
+- 验收发现（已修文档）：V3 第 11 条原先的“在飞热换仍产出记录”要分两种情况。调用方是 inject 依赖者时，provider 卸载会先让依赖者退出，依赖者的出站 future 被丢弃，按 ADR 0009 §2.2“外部丢弃无记录”处理；调用方活过被调方时（根 ctx），`settle` 仍写一条 `host_lifecycle`，快照可判别。新增 `abi_trace_unload.rs` 覆盖后者：发起时 `callee_uid` 与结算时的 `UID_DISPOSED` 不同，把快照读法写死成现场读取会红。ADR 0009 §6 已按这两种情况改写。
+- 未覆盖（如实记录）：① 12 条 V3 用例都有可证伪证据；第 11 条由 `abi_trace_unload` 的“调用方存活”分支覆盖快照判别性，依赖者一起卸载的分支按 ADR 0009 §2.2 无记录；loader `Replace` 的真实时序归 WP4；② `Store::record_trace` 是公开方法，T1 插件可伪造记录（受信域，见 ADR 0009 §2.2）；③ 事件/waterfall/流与 typed 直调仍为盲区（设计边界，非实现缺口）。
+- 本地门禁（2026-11-18，Windows GNU）：`cargo test -p rust-cordis-host`（含 12 个 trace 集成二进制）、`-p rust-cordis-core`、`-p rust-cordis-abi`、`-p xtask` 全绿；`cargo fmt --check`、`clippy -- -D warnings`、`xtask inventory --check`、`xtask docs`、`xtask matrix` 通过。平台矩阵 Windows GNU 列据此填“通过”，MSVC/Linux/macOS 仍为“待验证”。
+- 工作区：改了 `crates/core/{lib,context,store}.rs`、新增 `crates/core/src/{trace,trace_tests}.rs`、`crates/host/src/lib.rs` 与 `observer_close_tests.rs`、`crates/host/tests/abi_outbound_timeout.rs`、`panic_future_iface_sync.rs`，新增 `crates/host/tests/{abi_trace_chain,abi_trace_depth,abi_trace_pending,abi_trace_cancel,abi_trace_scopes,abi_trace_t1_suspend,abi_trace_timeouts,abi_trace_timeout_parent,abi_trace_protocol,abi_trace_panic_async,abi_trace_panic_status_err,abi_trace_unload}.rs` 与 `tests/trace_support/mod.rs`、`xtask/src/inventory.rs`、`xtask/src/contract.rs`、`docs/api-inventory.md`、`docs/support-contract.md`、`docs/platform-matrix.md`、`docs/adr/0005-trust-model-and-plugin-source-boundary.md`、`docs/adr/0009-rsi-deployment-substrate.md`、`docs/adr/0010-call-graph-correlation.md`、`docs/rsi-sdk-roadmap.html`；未改 CI/workflow。
+
+#### RSI-WP2：变体身份（capabilities 行加 uid 与 sha256，2026-11-18）
+
+- 范围：`LoaderState::report().capabilities[]` 每行追加 `uid` 与 `sha256`；不改 ABI、不改 `LoadedFile`/`PluginSource` 公开形参。
+- 实现：`Mounted` 新增私有 `sha256: Option<String>`，在 `mount_loaded` 对**已暂存副本**调用 `source::sha256_file`（仅 `fingerprint.is_some()` 的文件来源；非文件来源为 `None`，报告填 `"builtin"`，hash 失败填 `"unavailable: ..."`）；`capabilities()` 追加 `uid`（`Mounted.fiber.upgrade().uid()`，失活回落 `UID_DISPOSED`）与 `sha256`。
+- 验证：`cargo test -p rust-cordis-host --test loader_capabilities_identity`（两条用例：身份/内容哈希 + hash 读取失败的 `unavailable`）；`cargo test -p rust-cordis-host --lib commit_outcome_refreshes_sha256_from_the_current_staged_copy`（HMR 换副本后重算，回滚保持旧副本哈希）；`cargo xtask demo`（demo 输出把 `sha256` 替换为 `<artifact-sha256>` 占位符，避免跨平台快照差异；替换前断言真实 cdylib 的 sha 是 64 位小写十六进制；HMR 等待预算从 3s 调到 10s 以覆盖换副本时的整文件哈希）。
+- 未覆盖（如实记录）：`uid` 是 per-Store 计数器、卸载后 `u64::MAX`（报告只遍历已挂载行，回退是防御性的）；真磁盘 `reload_one` 的时序归 WP4；跨热换的变体级对齐仍靠 `callee_plugin` + 消费方切时间窗，不承诺把在飞调用归到正确一代（ADR 0009 §2.3）。`cargo xtask demo` **必须单实例运行**：它复用 exe 旁的固定配置目录并在启动时清理 `.rN` 暂存副本，并行实例会互相删除/覆盖；`xtask ci` 串行调用，不受影响。
+- 工作区：`crates/host/src/loader.rs`、新增 `crates/host/tests/loader_capabilities_identity.rs`、`crates/host/tests/{interpolation,loader_capabilities}.rs` 快照、`examples/demo/src/main.rs` 与 `expected.txt`、`docs/support-contract.md`、`docs/platform-matrix.md`、`docs/release.md`、`docs/rsi-sdk-roadmap.html`、`xtask/src/contract.rs`。
+
+#### RSI-WP2b：契约锁（服务方法名，2026-11-18）
+
+- 范围：`cordis status --json` 导出每行的 `services: [{name, version, methods}]` 与 typed `capabilities`；不改 ABI、不加 CLI flag、不改 `LoadedFile`/`PluginSource`。
+- 实现：core 新增 `Store::services_of(&Arc<Fiber>)` 与 `ServiceInfo`，按 `impls_owned_by` 的同一 fiber 身份口径枚举 `Dyn::adapter` 可调用面，方法名排序去重；`UID_DISPOSED` 返回空。`loader.report().capabilities[]` 追加插件自述的配置 `schema`，使 `status --json` 一次导出即可覆盖契约子集。CLI 新增 `CapabilityRow` / `StatusReport.capabilities`（typed row，`StatusReport` 仍可派 `Eq`），在 `status_with_source` 关闭装载树**之前**抓取服务方法名；文本输出同步列出 capabilities。sidecar manifest 的可选 `iface_spec_sha256` 由 CLI 透明读取（不改 `PluginManifest` 这个 0.1 公开 DTO），经 `Provenance` 与 `CapabilityRow` 两处导出（缺失 `null`）。
+- 验证：`cargo test -p cordis-cli --test status status_services_methods`（fixture `provide_iface` 两个方法 → `services[0].methods == ["alpha", "beta"]`，版本与 schema 同时导出，关闭后 `loaded_instances() == 0`）；`cargo test -p cordis-cli --test source_policy status_with_source_policy_shows_manifest_provenance`（manifest 的 `iface_spec_sha256` 在 provenance 与 capabilities 两处可见）；`cargo test -p rust-cordis-core --test services_of`（只列可调用面、两条注册通道、两个 fiber 不串线、销毁后返回空；含“清理被挡住、条目仍在表里”的判别性窗口）。
+- 未覆盖（如实记录）：只锁方法名集合，参数/返回值在 ABI 上是 `Config`，形状不可见；`iface_spec_sha256` 只证明两边看的是同一份规范，不校验规范与实现是否一致；`status` 的 `schema` 只报原文/`null`，非法/超限原因看 `inspect` 的 `schema_error`；`StatusReport.capabilities` 不含 `js`（`js` 仍由 `loader.report` 读取，不在契约锁范围）；公开面按 ADR 0006 仍在 0.2 前可改。
+- 工作区：`crates/core/src/{store,lib}.rs`、新增 `crates/core/tests/services_of.rs`、`crates/host/src/loader.rs`、`crates/host/tests/{loader_capabilities,interpolation}.rs`、`crates/cli/src/lib.rs`、`crates/cli/tests/{status,source_policy}.rs`、`xtask/src/{inventory,contract}.rs`、`examples/demo/expected.txt`、`docs/{support-contract,platform-matrix,release,roadmap,api-inventory}.md`、`docs/adr/{0005,0009}`、`docs/rsi-sdk-roadmap.html`。
 
 ### 1. 公开 API / ABI 稳定与版本治理
 

@@ -474,15 +474,57 @@ impl Context {
     ) -> BoxFuture<Result<Config>> {
         // 解析与元数据在**调用时**算；校验与真正的调用留在 future 里
         // （await 之前不产生副作用——既有语义，逐字保留）。
+        //
+        // 没有安装记录出口时，调用器不构造身份快照、也不包 poll 级作用域：
+        // ADR 0009 要求“未安装 sink 只多一次原子读”。
+        let traced = self.store.has_trace_sink();
+        let started = std::time::Instant::now();
+        let caller_uid = if traced {
+            self.fiber_opt()
+                .map(|fiber| fiber.uid())
+                .unwrap_or(crate::fiber::UID_ROOT)
+        } else {
+            crate::fiber::UID_ROOT
+        };
         let (iface, caller_meta) = match self.iface_target(service) {
             Ok(pair) => pair,
-            Err(err) => return Box::pin(async move { Err(err) }),
+            Err(err) => {
+                if traced {
+                    self.store.record_trace(crate::trace::failed(
+                        format!("{service}.{method}"),
+                        caller_uid,
+                        service,
+                        "resolve_failed",
+                        started,
+                    ));
+                }
+                return Box::pin(async move { Err(err) });
+            }
         };
         let (service, method) = (service.to_string(), method.to_string());
-        Box::pin(async move {
-            Self::check_iface_call(&iface, &service, version, &method)?;
-            iface.call(caller_meta, method, args).await
-        })
+        let store = self.store.clone();
+        let (trace_service, trace_method) = (service.clone(), method.clone());
+        let future = Box::pin(async move {
+            if let Err(err) = Self::check_iface_call(&iface, &trace_service, version, &trace_method)
+            {
+                if traced {
+                    store.record_trace(crate::trace::failed(
+                        format!("{trace_service}.{trace_method}"),
+                        caller_uid,
+                        &trace_service,
+                        "iface_check_failed",
+                        started,
+                    ));
+                }
+                return Err(err);
+            }
+            iface.call(caller_meta, trace_method, args).await
+        });
+        if traced {
+            crate::trace::scope_caller(future, caller_uid)
+        } else {
+            future
+        }
     }
 
     /// 按**流**调用一个带方法的服务（ADR 0001 §5）。

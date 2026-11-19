@@ -729,11 +729,11 @@ async fn js_expression_capabilities_are_extracted_and_reported() {
     assert_eq!(
         report["capabilities"],
         json!([
-            { "label": "gate", "plugin": "quiet", "inject": [], "provision": [],
+            { "label": "gate", "plugin": "quiet", "uid": 1, "sha256": "builtin", "inject": [], "provision": [], "schema": null,
               "volatile": [], "js": { "env": ["CORDIS_M9_UNSET"], "host": [], "services": [] } },
-            { "label": "plain", "plugin": "quiet", "inject": [], "provision": [],
+            { "label": "plain", "plugin": "quiet", "uid": 2, "sha256": "builtin", "inject": [], "provision": [], "schema": null,
               "volatile": [], "js": { "env": [], "host": [], "services": [] } },
-            { "label": "shape", "plugin": "provides", "inject": [], "provision": [],
+            { "label": "shape", "plugin": "provides", "uid": 3, "sha256": "builtin", "inject": [], "provision": [], "schema": null,
               "volatile": [], "js": { "env": [], "host": ["platform"], "services": ["profileContext"] } },
         ]),
         "报告里的能力清单要带上 js 面：{report}"

@@ -6,7 +6,10 @@
 use cordis_abi::{
     Blob, Out, KIND_IFACE, OP_APPLY, OP_CALLBACK, OP_DISPOSE, STATUS_OK, STATUS_UNSUPPORTED,
 };
-use cordis_core::{App, BoxFuture, Config, Ctx, ExternService, Inject, Plugin, Result};
+use cordis_core::{
+    App, BoxFuture, Config, Ctx, ExternService, Inject, Outcome, Plugin, Result, TraceRecord,
+    TraceSink,
+};
 use cordis_host::{
     apply_via_with_error_format, dispatches_len, host_api, pending_len, set_dispatch_policy,
     DispatchPolicy,
@@ -19,6 +22,14 @@ use std::time::Duration;
 static CONSUMER: AtomicU64 = AtomicU64::new(0);
 static APPLY_OUT: Mutex<String> = Mutex::new(String::new());
 static CALLBACKS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+struct Collector(Arc<Mutex<Vec<TraceRecord>>>);
+
+impl TraceSink for Collector {
+    fn record(&self, record: TraceRecord) {
+        self.0.lock().unwrap().push(record);
+    }
+}
 
 struct NeverService;
 
@@ -128,6 +139,11 @@ async fn iface_call_times_out_and_unregisters_dispatch() {
     CONSUMER.store(0, Ordering::SeqCst);
 
     let app = App::new();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    assert!(
+        app.set_trace_sink(Arc::new(Collector(records.clone()))),
+        "trace sink 只允许安装一次"
+    );
     let provider_fiber = app.root.plugin(provider(), Config::Null);
     provider_fiber.settle().await;
     let consumer_fiber = app.root.plugin(consumer(), Config::Null);
@@ -175,6 +191,26 @@ async fn iface_call_times_out_and_unregisters_dispatch() {
     );
     assert_eq!(dispatches_len(handle), 0, "超时后必须撤销派发记录");
     assert_eq!(pending_len(handle), 0, "超时后挂起表必须归零");
+
+    // ADR 0009 §2.2 第 3 点：入站从未结算、只有出站看门狗超时时补写一条
+    // `call_id=0` 的记录——这是“入站看不到”的唯一证据。
+    {
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1, "仅出站超时必须恰好一条记录：{records:?}");
+        let record = &records[0];
+        assert_eq!(&*record.name, "slow@1.hang");
+        assert_eq!(record.call_id, 0, "没有入站派发 id 可复用");
+        assert_eq!(record.parent_call_id, 0, "调用点是 apply，没有父跳");
+        assert_eq!(record.callee_uid, 0, "实现方从未进入调用");
+        assert_eq!(&*record.callee_plugin, "slow@1", "退化为请求的服务名");
+        assert_eq!(record.outcome, Outcome::Err("HOST_TIMEOUT".into()));
+        assert_eq!(record.caller_uid, consumer_fiber.uid());
+        assert!(
+            record.elapsed >= Duration::from_millis(50),
+            "elapsed 应覆盖超时值：{:?}",
+            record.elapsed
+        );
+    }
 
     consumer_fiber.dispose().await;
     provider_fiber.dispose().await;

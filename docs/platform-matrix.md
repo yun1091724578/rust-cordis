@@ -12,7 +12,10 @@
 run [`42332542433`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542433)
 （main，commit `8ab64f9`）和
 run [`42332542329`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542329)
-（tag `v0.1.1`）三平台通过。更早的 2026-11-02/03 基线是
+（tag `v0.1.1`）三平台通过。2026-11-18 的 WP1/WP2/WP2b 增量在 Windows GNU 本地
+`cargo test --workspace --all-targets --locked`、`cargo xtask demo` 与
+`cargo xtask docs/matrix/inventory` 全绿；这三条新保证的 MSVC/Linux/macOS
+列仍为 `待验证`。更早的 2026-11-02/03 基线是
 [`41460414477`](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)
 / [`41560497289`](https://github.com/yun1091724578/rust-cordis/actions/runs/41560497289)。
 Windows MSVC / Linux / macOS 的 `test` job 均通过完整
@@ -41,6 +44,9 @@ CI run 记录，只有本地执行记录。
 | 配置 schema 在装载前可见（插件自述，不据此验证） | 通过 | 通过 | 通过 | 通过 | `crates/abi/tests/schema.rs` / `crates/macros/src/plugin.rs` / `crates/host/tests/loader_capabilities.rs` / `crates/cli/tests/inspect.rs` |
 | Pending 诊断给出精确缺失键与原因 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/pending_diagnostics.rs` / `crates/host/tests/loader_cycles.rs` / `crates/cli/tests/status.rs` |
 | 看门狗超时撤销派发记录（四条路径） | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/abi_m2_timeout.rs` / `crates/host/tests/abi_outbound_timeout.rs` / `crates/host/tests/abi_outbound_dispatch_timeout.rs` / `crates/host/tests/abi_next_timeout.rs` / `crates/host/tests/dispatch_policy_scope.rs` |
+| 逐跳归因记录（iface-only，一次调用至多一条） | 通过 | 待验证 | 待验证 | 待验证 | `crates/host/tests/abi_trace_chain.rs` / `crates/host/tests/abi_trace_depth.rs` / `crates/host/tests/abi_trace_pending.rs` / `crates/host/tests/abi_trace_cancel.rs` / `crates/host/tests/abi_trace_scopes.rs` / `crates/host/tests/abi_trace_t1_suspend.rs` / `crates/host/tests/abi_trace_timeouts.rs` / `crates/host/tests/abi_trace_timeout_parent.rs` / `crates/host/tests/abi_trace_protocol.rs` / `crates/host/tests/abi_trace_unload.rs` / `crates/host/tests/abi_trace_panic_async.rs` / `crates/host/tests/abi_trace_panic_status_err.rs` / `crates/host/tests/panic_future_iface_sync.rs` / `crates/host/src/lib.rs` / `crates/core/src/trace_tests.rs` |
+| loader.report capabilities 行带 uid 与内容 sha256 | 通过 | 待验证 | 待验证 | 待验证 | `crates/host/tests/loader_capabilities_identity.rs` |
+| status --json 导出可调用服务的名字、版本与方法名集合 | 通过 | 待验证 | 待验证 | 待验证 | `crates/cli/tests/status.rs` / `crates/cli/tests/source_policy.rs` / `crates/core/tests/services_of.rs` |
 | 插件 panic 被截在 ABI 边界内 | 通过 | 通过 | 通过 | 通过 | `crates/abi/src/sdk.rs` / `crates/abi/tests/invalid_schema_entry.rs` |
 | 重复成功/失败/丢弃 Future/卸载/waterfall/stream/重载后资源计数回到基线 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/resource_baseline.rs` |
 | 多轮暂存后台账回到基线 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/staged.rs` |

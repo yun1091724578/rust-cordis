@@ -27,7 +27,7 @@ use crate::{
 use cordis_core::{
     equal_except_volatile, split_path, values_at, BoxFuture, Call, Config, Ctx, Disposable, Dyn,
     ExternValue, Fiber, FnPlugin, Inject, Level, Mode, Plugin, RealmId, Result, Ret, UpdateOutcome,
-    ValidationError,
+    ValidationError, UID_DISPOSED,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -294,6 +294,12 @@ struct Mounted {
     /// （另一条路是重新 `open()` 旧 `staged` 文件，但那要先等 `FreeLibrary`
     /// 把文件解锁，在 Windows 上是一次不必要的赌博——留着 Arc 就不必赌。）
     plugin: Arc<dyn Plugin>,
+    /// 已暂存副本的 SHA-256（WP2 变体身份）。`None` = 非文件来源（内建/假源），
+    /// 报告里填 `"builtin"`；文件来源但 hash 失败时填 `"unavailable: ..."`。
+    sha256: Option<String>,
+    /// 挂载时是否是**文件来源**（有指纹）。不能用报告时的 `fingerprint(源路径)`
+    /// 反推：源文件在换副本与报告之间可能被移走，那会把 `builtin` 误报给文件插件。
+    file_source: bool,
 }
 
 fn fingerprint(path: &std::path::Path) -> Option<(u64, u64)> {
@@ -1605,9 +1611,8 @@ impl LoaderState {
         cycles
     }
 
-    /// **能力清单**（M5，A5 的数据面）：每行一条 inject / provision / volatile / js。
-    ///
-    /// 顺序 = 装载表顺序（label 升序），四项都可逐字断言。
+    /// **能力清单**（M5，A5 的数据面）：每行 `label` / `plugin` / `uid` /
+    /// `sha256` / `inject` / `provision` / `volatile` / `js`，各项都可逐字断言。
     /// `js` 是这一行的 `!!js` 表达式**静态**读到的宿主面（M9，D5）：env 名 / 宿主事实 /
     /// `ctx.get` 的服务名——只有引用没有值（凭据绝不进清单）。
     /// 想看**挂载之前**的能力面（含还没挂的行）用
@@ -1654,8 +1659,15 @@ impl LoaderState {
                 json!({
                     "label": record.label,
                     "plugin": record.plugin.name(),
+                    "uid": record
+                        .fiber
+                        .upgrade()
+                        .map(|fiber| fiber.uid())
+                        .unwrap_or(UID_DISPOSED),
+                    "sha256": record.sha256.clone().unwrap_or_else(|| "builtin".to_string()),
                     "inject": inject,
                     "provision": provision,
+                    "schema": record.plugin.config_schema(),
                     "volatile": record.volatile.clone().unwrap_or_default(),
                     "js": js,
                 })
@@ -3103,6 +3115,10 @@ impl LoaderState {
         // 对 ABI 插件这是一次跨边界查询，早于 apply 问也可能得到"还没准备好"的答案。
         let volatile = volatile_of(fiber.volatile_paths());
         let origin = self.origin_of(&row.label);
+        // 变体身份（WP2）：文件来源在挂载时对**已暂存副本**取一次 SHA-256；
+        // 非文件来源（内建/假源）没有稳定内容，报告里填 "builtin"。
+        let file_source = loaded.fingerprint.is_some();
+        let sha256 = staged_sha256(&loaded.staged, file_source);
         Ok(Mounted {
             label: row.label.clone(),
             origin,
@@ -3117,6 +3133,8 @@ impl LoaderState {
             declared: row.entry.clone(),
             scope_inputs: row.scope_inputs.clone(),
             volatile,
+            sha256,
+            file_source,
         })
     }
 }
@@ -4582,17 +4600,34 @@ impl Mounted {
                 if let Some(staged) = staged {
                     self.staged = staged;
                 }
+                // 变体身份必须跟当前在服务的**暂存副本**一致；HMR 的换字节
+                // 路径走这里而不是 mount_loaded，漏更新会让报告给出旧 hash。
+                self.sha256 = staged_sha256(&self.staged, self.file_source);
                 false
             }
             SwapOutcome::RolledBack { restored, .. } => {
                 self.fiber = Arc::downgrade(&restored);
                 // 回滚后线上的是**旧**插件：声明缓存必须跟着退回去。
                 self.volatile = volatile_of(restored.volatile_paths());
+                // staged 未变；重算一次，保持“sha256 == hash(staged)”不变量。
+                self.sha256 = staged_sha256(&self.staged, self.file_source);
                 false
             }
             SwapOutcome::Lost { .. } => true,
         }
     }
+}
+
+/// 已暂存副本的内容哈希（WP2）。非文件来源（没有指纹）返回 `None`，报告填
+/// `"builtin"`；文件来源但读取失败返回 `"unavailable: ..."`，绝不伪装成 builtin。
+fn staged_sha256(staged: &std::path::Path, is_file_source: bool) -> Option<String> {
+    if !is_file_source {
+        return None;
+    }
+    let hash = crate::source::sha256_file(staged)
+        .or_else(|_| crate::source::sha256_file(staged))
+        .unwrap_or_else(|_| "unavailable: read_failed".into());
+    Some(hash)
 }
 
 /// 空声明 = 不参与 volatile（与挂载路径的口径一致）。
@@ -5180,6 +5215,8 @@ mod tests {
             source: PathBuf::from("never-exists.dll"),
             staged: PathBuf::from("never-exists.r1.dll"),
             fingerprint: None,
+            sha256: None,
+            file_source: false,
             config: Config::Null,
             inject: None,
             fiber: Arc::downgrade(fiber),
@@ -5194,6 +5231,65 @@ mod tests {
             volatile: None,
             plugin,
         }
+    }
+
+    #[test]
+    fn commit_outcome_refreshes_sha256_from_the_current_staged_copy() {
+        let app = cordis_core::App::new();
+        let fiber = app.root_fiber();
+        let plugin: Arc<dyn Plugin> = Arc::new(FnPlugin {
+            name: "sha-refresh",
+            key: cordis_core::unique_key("sha-refresh"),
+            inject: Inject::default(),
+            validator: None,
+            f: Arc::new(|_ctx: Ctx, _config: Config| Box::pin(async { Ok(()) })),
+        });
+        let dir = std::env::temp_dir().join(format!("cordis-loader-sha-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("临时目录");
+        let source = dir.join("source.dll");
+        let old = dir.join("old.dll");
+        let new = dir.join("new.dll");
+        std::fs::write(&source, b"source-bytes").expect("source");
+        std::fs::write(&old, b"old-bytes").expect("old");
+        std::fs::write(&new, b"new-bytes").expect("new");
+
+        let mut record = mounted_record("sha-refresh", &fiber, plugin.clone());
+        record.source = source.clone();
+        record.staged = old.clone();
+        record.file_source = true;
+        record.sha256 = Some("stale".into());
+
+        let ok = record.commit_outcome(
+            SwapOutcome::Ok {
+                fiber: fiber.clone(),
+                plugin: plugin.clone(),
+            },
+            Some(new.clone()),
+        );
+        assert!(!ok);
+        assert_eq!(
+            record.sha256.as_deref(),
+            Some(crate::source::sha256_file(&new).unwrap().as_str()),
+            "HMR 换副本后必须重算 sha256"
+        );
+
+        record.staged = old.clone();
+        record.sha256 = Some("stale-again".into());
+        record.commit_outcome(
+            SwapOutcome::RolledBack {
+                error: "故意失败".into(),
+                restored: fiber,
+            },
+            Some(new.clone()),
+        );
+        assert_eq!(record.staged, old, "回滚不得把新副本写进记录");
+        assert_eq!(
+            record.sha256.as_deref(),
+            Some(crate::source::sha256_file(&old).unwrap().as_str()),
+            "回滚后 sha256 必须对应仍在服务的旧副本"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn read_u32(ctx: &Ctx, name: &str) -> Option<u32> {

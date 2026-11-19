@@ -181,6 +181,7 @@ fn write_manifest(artifact: &Path, sha: &str) {
         "source_revision": "tree:test",
         "abi_version": 1,
         "sha256": sha,
+        "iface_spec_sha256": "spec:test",
     });
     std::fs::write(
         cordis_host::source::manifest_path(artifact),
@@ -286,6 +287,7 @@ fn inspect_with_source_policy_shows_manifest_provenance() {
     assert_eq!(provenance["admission"], "enforced", "{json}");
     assert_eq!(provenance["sha256"], sha, "{json}");
     assert_eq!(provenance["manifest_sha256"], sha, "{json}");
+    assert_eq!(provenance["iface_spec_sha256"], "spec:test", "{json}");
     assert_eq!(provenance["manifest_hash_matches"], true, "{json}");
     assert_eq!(provenance["source_revision"], "tree:test", "{json}");
     assert_eq!(provenance["manifest"]["id"], "abi-v1-frozen", "{json}");
@@ -314,6 +316,14 @@ fn status_with_source_policy_shows_manifest_provenance() {
     assert_eq!(json["provenance"][0]["label"], "frozen", "{json}");
     assert_eq!(json["provenance"][0]["source"], "manifest", "{json}");
     assert_eq!(json["provenance"][0]["admission"], "enforced", "{json}");
+    assert_eq!(
+        json["provenance"][0]["iface_spec_sha256"], "spec:test",
+        "{json}"
+    );
+    assert_eq!(
+        json["capabilities"][0]["iface_spec_sha256"], "spec:test",
+        "status 的契约行必须带 manifest 的接口规范 hash：{json}"
+    );
     assert_eq!(
         json["provenance"][0]["manifest_hash_matches"], true,
         "{json}"

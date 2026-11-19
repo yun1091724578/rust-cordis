@@ -10,11 +10,22 @@
 use cordis_abi::{
     Blob, Out, OP_APPLY, OP_CALLBACK, OP_DISPOSE, STATUS_ERR, STATUS_OK, STATUS_UNSUPPORTED,
 };
-use cordis_core::{App, BoxFuture, Config, Ctx, ExternService, Inject, Plugin, Result};
+use cordis_core::{
+    App, BoxFuture, Config, Ctx, ExternService, Inject, Outcome, Plugin, Result, TraceRecord,
+    TraceSink,
+};
 use cordis_host::{apply_via_with_error_format, dispatches_len, host_api};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+struct Collector(Arc<Mutex<Vec<TraceRecord>>>);
+
+impl TraceSink for Collector {
+    fn record(&self, record: TraceRecord) {
+        self.0.lock().unwrap().push(record);
+    }
+}
 
 /// 在实例里真调一次宿主函数表（与插件侧 SDK 走同一条路）。
 unsafe fn call_iface(handle: u64, service: &str, method: &str, continuation: u64) -> (i32, String) {
@@ -145,6 +156,11 @@ async fn o3_iface_panic_is_a_structured_business_error() {
     IFACE_CONSUMER.store(0, Ordering::SeqCst);
 
     let app = App::new();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    assert!(
+        app.set_trace_sink(Arc::new(Collector(records.clone()))),
+        "trace sink 只允许安装一次"
+    );
     let provider = app.root.plugin(iface_provider(), Config::Null);
     provider.settle().await;
     let consumer = app.root.plugin(iface_consumer(), Config::Null);
@@ -179,6 +195,24 @@ async fn o3_iface_panic_is_a_structured_business_error() {
         0,
         "同步拿到错误之后不得残留派发记录"
     );
+
+    // ADR 0009 §2.2 第 4 点：panic 走的是“入站没有结算”的补写路径，
+    // 记录由宿主写，插件无法自报。
+    {
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "callee panic 必须恰好一条记录：{records:?}"
+        );
+        let record = &records[0];
+        assert_eq!(&*record.name, "panic@1.go");
+        assert_eq!(record.call_id, 0, "panic 没有可复用的入站派发 id");
+        assert_eq!(record.callee_uid, 0);
+        assert_eq!(&*record.callee_plugin, "panic@1");
+        assert_eq!(record.outcome, Outcome::Err("host_panic".into()));
+        assert_eq!(record.caller_uid, consumer.uid());
+    }
 
     consumer.dispose().await;
     assert!(

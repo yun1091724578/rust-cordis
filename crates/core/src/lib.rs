@@ -26,6 +26,7 @@ mod iface;
 mod scope;
 mod store;
 mod stream;
+mod trace;
 mod volatile;
 
 pub use cancel::CancelToken;
@@ -43,12 +44,13 @@ pub use iface::Iface;
 pub use scope::Scope;
 pub use store::{
     unique_key, with_provision, Check, FnPlugin, GetHook, Impl, Inject, Level, ListenerHook,
-    LogSink, Plugin, PluginKey, ProvisionReport, RealmId, ResolveError, Runtime, SetHook, Store,
-    ValidationError,
+    LogSink, Plugin, PluginKey, ProvisionReport, RealmId, ResolveError, Runtime, ServiceInfo,
+    SetHook, Store, ValidationError,
 };
 pub use stream::{
     AsyncStream, PushOutcome, StreamObserver, StreamOutcome, StreamSink, STREAM_WINDOW,
 };
+pub use trace::{current_caller_uid, Outcome, TraceRecord, TraceSink};
 pub use volatile::{
     declare_volatile, equal_except_volatile, path_value, split_path, validate_volatile_paths,
     values_at, without_volatile, VolatileRef, VolatileValues,
@@ -109,6 +111,14 @@ impl App {
     /// 根 fiber（与 `root.fiber()` 等价；根 ctx 的保活字段持有它）。
     pub fn root_fiber(&self) -> Arc<crate::Fiber> {
         self.root.fiber()
+    }
+
+    /// 安装逐跳记录出口（ADR 0009 §2.2）。只允许一次；返回是否成功。
+    ///
+    /// 应在挂载插件前安装：调用是否记录按**发起时**是否已安装决定；安装前
+    /// 已经在飞的调用不会补记。
+    pub fn set_trace_sink(&self, sink: Arc<dyn crate::TraceSink>) -> bool {
+        self.store.install_trace_sink(sink)
     }
 
     /// 挂一个插件并等它稳定。

@@ -55,6 +55,60 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub struct App",
     },
     PublicItem {
+        item: "App::set_trace_sink",
+        kind: "fn",
+        source: "crates/core/src/lib.rs",
+        marker: "pub fn set_trace_sink",
+    },
+    PublicItem {
+        item: "Store::record_trace",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn record_trace",
+    },
+    PublicItem {
+        item: "Store::has_trace_sink",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn has_trace_sink",
+    },
+    PublicItem {
+        item: "Store::services_of",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn services_of",
+    },
+    PublicItem {
+        item: "ServiceInfo",
+        kind: "struct",
+        source: "crates/core/src/store.rs",
+        marker: "pub struct ServiceInfo",
+    },
+    PublicItem {
+        item: "current_caller_uid",
+        kind: "fn",
+        source: "crates/core/src/trace.rs",
+        marker: "pub fn current_caller_uid",
+    },
+    PublicItem {
+        item: "TraceRecord",
+        kind: "struct",
+        source: "crates/core/src/trace.rs",
+        marker: "pub struct TraceRecord",
+    },
+    PublicItem {
+        item: "Outcome",
+        kind: "enum",
+        source: "crates/core/src/trace.rs",
+        marker: "pub enum Outcome",
+    },
+    PublicItem {
+        item: "TraceSink",
+        kind: "trait",
+        source: "crates/core/src/trace.rs",
+        marker: "pub trait TraceSink",
+    },
+    PublicItem {
         item: "Context",
         kind: "struct",
         source: "crates/core/src/context.rs",
@@ -1178,7 +1232,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 87, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 96, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 

@@ -84,7 +84,7 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 | 独立消费者 | `cargo xtask consumer`（三平台 CI test job） | 独立 workspace 只用公开 path 依赖；fake service、真实 ABI 服务组合、sidecar/`PluginSourcePolicy` 准入；`xtask consumer` 先构建 greeting/hello cdylib |
 | 支持契约 | `cargo xtask docs`（CI 由 `cargo test --workspace` 覆盖索引检查） | 保证索引必须引用带 `#[test]` / `#[tokio::test]` 的测试；违规非零退出 |
 | API 清单 | `cargo xtask inventory --check`（CI 由 xtask 的 inventory CLI 用例覆盖） | ABI 常量/字段与受控 marker 漂移即失败；新增宿主入口需人工加入清单 |
-| 平台矩阵（结构 + 结果） | `.\cargo.cmd xtask matrix`（Windows GNU 本地；CI 用裸 `cargo`）/ 已接入 `xtask ci` | 17 条保证逐条有行、四平台状态合法、证据引用 `.rs` 文件；结构检查本身不验证真实平台结果。2026-11-02 首次三平台 CI 通过后，17 条保证在四个平台列均已实填 `通过`；表内注明这是快照，后续变更需重跑 |
+| 平台矩阵（结构 + 结果） | `.\cargo.cmd xtask matrix`（Windows GNU 本地；CI 用裸 `cargo`）/ 已接入 `xtask ci` | 20 条保证逐条有行、四平台状态合法、证据引用 `.rs` 文件；结构检查本身不验证真实平台结果。历史 17 条保证在 2026-11-02 三平台 CI 后四列实填 `通过`；WP1/WP2/WP2b 新增的三条当前只有 2026-11-18 Windows GNU 实跑记录，MSVC/Linux/macOS 为 `待验证`。`xtask demo` 必须单实例运行（共享配置目录/暂存副本），并行会假红。表内注明这是快照，后续变更需重跑 |
 | 首发封存入口 | `cargo xtask seal [--out <dir>]` / `cargo xtask seal --verify <dir> --require-v2` / `cargo xtask seal-consume <dir>` | 构建三个宿主目标 release 插件，记录源码树 / 工具链 / ABI / SHA256，为每个 DLL 写 sidecar manifest 与根 `allow-list.json`，用同版本 `inspect --source-policy` 逐插件核对身份，并把 stdout、smoke 配置、artifact、manifest 与 allow-list 一起写入校验和；2026-11-02 Windows GNU 本地演练通过（旧 `/1` 格式）。封存对象是 `publish = false` 的示例插件，不是可发布 crate。格式与边界见 `docs/release-seal.md`；**不是 CI 门禁**，正式首发时必须运行并把整个目录归档 |
 | 资源增长回归 | `cargo test -p rust-cordis-host --test resource_baseline` / `--test staged`（三平台 CI 已包含；2026-11-02 首次通过） | 实例 / 派发 / 挂起 / 派发帧 / 流 / effect / 暂存台账回到基线；独立 soak 见 A5-2 |
 | 真实 `open_staged` soak | `cargo xtask soak`（同时运行 `soak` 与 `open_staged_soak`） | 200 轮真实 cdylib：`stage_plugin` → `LoadedPlugin::open_staged` → `OP_PING` → drop；暂存台账/实例表归零，Linux RSS 预算 128 MiB |
@@ -125,7 +125,7 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 ### A5-1 已关闭
 
 - [x] **首次 GitHub Actions 三平台结果**：2026-11-02 [run 41460414477](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)（commit `ea0489e`）已通过；2026-11-03 评审修正后 [run 41560497289](https://github.com/yun1091724578/rust-cordis/actions/runs/41560497289)（commit `617f470`）再次全绿。Linux / Windows MSVC / macOS 的 `test` job 均完成全量测试、demo 与真 DLL e2e，`lint` / `msrv` / `package` 也通过。通过结果不是持续保证，后续变更需重跑。
-- [x] **保证 × 平台矩阵**：`docs/platform-matrix.md` 的 17 条保证已在 Windows GNU / Windows MSVC / Linux / macOS 四列实填 `通过`，依据是上述三平台 CI 与本地 Windows GNU 全量门禁；表内注明这是快照，后续变更需重跑。
+- [x] **保证 × 平台矩阵**：`docs/platform-matrix.md` 当前 20 条保证逐条有行；历史 17 条在 Windows GNU / Windows MSVC / Linux / macOS 四列实填 `通过`（依据 2026-11-02/03 三平台 CI 与本地 Windows GNU 全量门禁）；WP1/WP2/WP2b 新增的三条只有 Windows GNU 实跑记录，其余平台为 `待验证`。表内注明这是快照，后续变更需重跑。
 - [x] **验证入口可重复**：本机 `cargo.cmd` 解决 Windows GNU 的 `dlltool/as` 与固定目录/代理；三平台 CI 已获得一次通过结果，但跨机可重复性仍需在后续变更上重跑验证。
 
 ### A5-2 已启用（首次 20k / 默认 1M 通过，持续运行未闭合）

@@ -1,12 +1,40 @@
 //! `cordis status`：装载后解释未就绪原因（独立测试二进制，假插件源）。
 
-use cordis_core::{Config, Ctx, Inject, PendingReason, Plugin, PluginKey};
+use cordis_core::{
+    BoxFuture, Config, Ctx, ExternService, Inject, PendingReason, Plugin, PluginKey,
+};
 use cordis_host::loader::{LoadedFile, PluginSource};
 use cordis_host::patch::Entry;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 struct PendingSource;
+
+struct StatusService;
+
+impl ExternService for StatusService {
+    fn service(&self) -> &str {
+        "status.svc"
+    }
+
+    fn version(&self) -> u32 {
+        3
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["beta".to_string(), "alpha".to_string()]
+    }
+
+    fn call(
+        &self,
+        _caller_meta: Option<Config>,
+        _method: String,
+        _args: Config,
+    ) -> BoxFuture<cordis_core::Result<Config>> {
+        Box::pin(async { Ok(Config::Null) })
+    }
+}
 
 impl PluginSource for PendingSource {
     fn load(
@@ -20,6 +48,7 @@ impl PluginSource for PendingSource {
             inject: Vec<&'static str>,
             provision: Vec<String>,
             fail: bool,
+            iface: bool,
         }
         impl Plugin for Fake {
             fn name(&self) -> &str {
@@ -34,23 +63,34 @@ impl PluginSource for PendingSource {
             fn provision(&self) -> Vec<String> {
                 self.provision.clone()
             }
+            fn config_schema(&self) -> Option<String> {
+                self.iface
+                    .then(|| r#"{"type":"object","required":["name"]}"#.to_string())
+            }
             fn apply(
                 &self,
-                _ctx: Ctx,
+                ctx: Ctx,
                 _config: Config,
             ) -> cordis_core::BoxFuture<cordis_core::Result<()>> {
                 if self.fail {
                     return Box::pin(async { Err("boom".into()) });
                 }
+                if self.iface {
+                    return Box::pin(async move {
+                        ctx.provide_iface("status.svc", Arc::new(StatusService))?;
+                        Ok(())
+                    });
+                }
                 Box::pin(async { Ok(()) })
             }
         }
         let name = entry.name.clone();
-        let (inject, provision, fail) = match name.as_str() {
-            "needs" => (vec!["missing@1"], vec![], false),
-            "broken" => (vec![], vec![], true),
-            "a" => (vec!["b"], vec!["a".to_string()], false),
-            "b" => (vec!["a"], vec!["b".to_string()], false),
+        let (inject, provision, fail, iface) = match name.as_str() {
+            "needs" => (vec!["missing@1"], vec![], false, false),
+            "broken" => (vec![], vec![], true, false),
+            "iface" => (vec![], vec!["status.svc".to_string()], false, true),
+            "a" => (vec!["b"], vec!["a".to_string()], false, false),
+            "b" => (vec!["a"], vec!["b".to_string()], false, false),
             other => return Err(format!("假插件源不认识 \"{other}\"")),
         };
         let path = PathBuf::from(format!("<fake:{name}>"));
@@ -60,6 +100,7 @@ impl PluginSource for PendingSource {
                 inject,
                 provision,
                 fail,
+                iface,
             }),
             source: path.clone(),
             staged: path,
@@ -121,6 +162,64 @@ async fn status_reports_the_precise_missing_inject_after_mounting() {
     assert_eq!(
         json["provenance"][0]["source"], "missing/manifest",
         "没有 sidecar 的挂载行必须在 JSON 里显示 missing/manifest：{json}"
+    );
+    assert_eq!(cordis_host::loaded_instances(), 0, "status 必须关闭装载树");
+}
+
+#[tokio::test]
+async fn status_services_methods() {
+    let path = std::env::temp_dir().join(format!("cordis-status-iface-{}.yml", std::process::id()));
+    std::fs::write(&path, "- id: iface\n  name: iface\n").expect("写配置");
+
+    let report = cordis_cli::status_with_source(
+        &path,
+        cordis_cli::RunOptions::default(),
+        Arc::new(PendingSource),
+    )
+    .await
+    .expect("status 装载成功");
+
+    assert_eq!(report.capabilities.len(), 1, "{report:?}");
+    let row = &report.capabilities[0];
+    assert_eq!(row.label, "iface");
+    assert_eq!(row.plugin, "iface");
+    assert_ne!(row.uid, u64::MAX, "活实例的 uid 不能是 UID_DISPOSED");
+    assert_eq!(row.sha256, "builtin");
+    assert_eq!(row.provision, vec!["status.svc".to_string()]);
+    assert!(
+        row.schema
+            .as_deref()
+            .is_some_and(|text| text.contains("required")),
+        "capabilities 必须导出插件自述的配置 schema：{row:?}"
+    );
+    assert_eq!(row.services.len(), 1, "{row:?}");
+    assert_eq!(row.services[0].name, "status.svc");
+    assert_eq!(row.services[0].version, 3);
+    assert_eq!(row.iface_spec_sha256, None);
+    assert_eq!(
+        row.services[0].methods,
+        vec!["alpha".to_string(), "beta".to_string()],
+        "方法名必须是排序后的稳定集合"
+    );
+
+    let json = report.to_json();
+    assert_eq!(
+        json["capabilities"][0]["services"][0]["methods"],
+        serde_json::json!(["alpha", "beta"]),
+        "{json}"
+    );
+    assert_eq!(json["capabilities"][0]["services"][0]["name"], "status.svc");
+    assert_eq!(json["capabilities"][0]["services"][0]["version"], 3);
+    assert_eq!(json["capabilities"][0]["iface_spec_sha256"], Value::Null);
+    assert_eq!(
+        json["capabilities"][0]["schema"].as_str(),
+        row.schema.as_deref()
+    );
+    let text = report.render();
+    assert!(text.contains("capabilities:"), "{text}");
+    assert!(
+        text.contains("status.svc (version 3): alpha, beta"),
+        "{text}"
     );
     assert_eq!(cordis_host::loaded_instances(), 0, "status 必须关闭装载树");
 }

@@ -124,12 +124,12 @@ async fn capabilities_report_aggregates_inject_provision_and_volatile() {
         report["capabilities"],
         json!([
             // 报告按 **label 升序**定序（装载表是哈希表，报告必须自己定序）。
-            { "label": "cons", "plugin": "cons", "inject": ["tools"], "provision": [], "volatile": [],
+            { "label": "cons", "plugin": "cons", "uid": 2, "sha256": "builtin", "inject": ["tools"], "provision": [], "schema": null, "volatile": [],
               "js": { "env": [], "host": [], "services": [] } },
-            { "label": "prod", "plugin": "prod", "inject": [], "provision": ["tools"], "volatile": ["data"],
+            { "label": "prod", "plugin": "prod", "uid": 1, "sha256": "builtin", "inject": [], "provision": ["tools"], "schema": null, "volatile": ["data"],
               "js": { "env": [], "host": [], "services": [] } },
         ]),
-        "每行一条，四项都要在（`js` 是 M9 加的 `!!js` 能力面）：{report}"
+        "每行一条，四项都要在（`js` 是 M9 加的 `!!js` 能力面，`schema` 是 WP2b 的契约面）：{report}"
     );
 }
 

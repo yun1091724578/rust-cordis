@@ -1,5 +1,6 @@
 /target/
 /dist/
 /.cargo-home/
+/.idea/
 .DS_Store
 *.swp

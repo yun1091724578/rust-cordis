@@ -11,11 +11,12 @@
 //! 2. 每行给全 **inject / provision / volatile** 三项，未声明 provision 的行
 //!    单独列进 `undeclared`（"这行的权限面没人声明过"，装载前就该看得见）。
 
-use cordis_core::App;
+use cordis_core::{App, ServiceInfo, UID_DISPOSED};
 use cordis_host::loader::{
     load_with_source, InterpolationMode, LoaderConfig, LoaderState, PendingRow, PluginSource,
 };
 use cordis_host::patch::{apply_entry_patches, parse_entries, parse_inject, parse_patches, Entry};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -62,6 +63,8 @@ pub struct Provenance {
     pub abi_version: Option<u32>,
     /// manifest 自述的 hash，便于与 `sha256` 对照。
     pub manifest_sha256: Option<String>,
+    /// manifest 记录的接口规范原文 hash（没有 sidecar/未声明时为 None）。
+    pub iface_spec_sha256: Option<String>,
     /// `sha256 == manifest_sha256`；sidecar 缺失时为 None。
     pub manifest_hash_matches: Option<bool>,
     /// 当前进程的准入模式：enforced / dev-unverified / denied。
@@ -88,6 +91,7 @@ impl Provenance {
                     version: Some(manifest.version),
                     abi_version: Some(manifest.abi_version),
                     manifest_sha256: Some(manifest.sha256),
+                    iface_spec_sha256: manifest_iface_spec_sha256(path),
                     manifest_hash_matches,
                     admission,
                     source: ProvenanceSource::Manifest,
@@ -101,6 +105,7 @@ impl Provenance {
                 version: None,
                 abi_version: None,
                 manifest_sha256: None,
+                iface_spec_sha256: None,
                 manifest_hash_matches: None,
                 admission,
                 source: ProvenanceSource::MissingManifest,
@@ -136,6 +141,10 @@ impl Provenance {
             "{indent}source_revision: {}\n",
             display_or_missing(self.source_revision.as_deref())
         ));
+        out.push_str(&format!(
+            "{indent}iface_spec_sha256: {}\n",
+            display_or_missing(self.iface_spec_sha256.as_deref())
+        ));
         if self.source == ProvenanceSource::Manifest {
             out.push_str(&format!(
                 "{indent}manifest: id={} version={} abi_version={}\n",
@@ -164,6 +173,7 @@ impl Provenance {
             "source": self.source.as_str(),
             "admission": self.admission,
             "manifest_sha256": self.manifest_sha256,
+            "iface_spec_sha256": self.iface_spec_sha256,
             "manifest_hash_matches": self.manifest_hash_matches,
             "source_revision": self.source_revision,
             "manifest": manifest,
@@ -175,11 +185,107 @@ fn display_or_missing(value: Option<&str>) -> &str {
     value.filter(|text| !text.is_empty()).unwrap_or("(missing)")
 }
 
+/// sidecar manifest 里的可选接口规范 hash。
+///
+/// 不进入 `PluginManifest`：那是 0.1 的公开字面量构造 DTO，加字段属 0.2 级
+/// 变更（ADR 0005/0006）。这里只做透明的审计读取：字段是字符串就保留原文，
+/// 非字符串/不可解析返回 `None`，不把它伪装成已校验的身份。
+fn manifest_iface_spec_sha256(artifact: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(cordis_host::source::manifest_path(artifact)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("iface_spec_sha256")?.as_str().map(str::to_string)
+}
+
 /// `status` 里每行挂载的 provenance。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowProvenance {
     pub label: String,
     pub provenance: Provenance,
+}
+
+/// `status` 里每行的**契约面**：声明 + 运行期注册的服务方法名。
+///
+/// 与 `loader.report().capabilities[]` 同源；这里去掉 `js`（其形状是
+/// `serde_json::Value`，而 `StatusReport` 要能整体比较），补上该 fiber 的
+/// `services`。`services` 在 `status_with_source` 关闭装载树**之前**抓取。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityRow {
+    pub label: String,
+    pub plugin: String,
+    /// 实现方 fiber 的 uid；失活时是 [`UID_DISPOSED`]。
+    pub uid: u64,
+    /// 已暂存副本的内容哈希（非文件来源为 `builtin`，读取失败为 `unavailable: ...`）。
+    pub sha256: String,
+    /// 插件声明与行级 inject 合并后的消费面（升序去重）。
+    pub inject: Vec<String>,
+    /// 插件声明能安装的 key（升序去重）。
+    pub provision: Vec<String>,
+    /// 插件自述的**配置** schema（不是服务 IO schema）。
+    pub schema: Option<String>,
+    /// sidecar manifest 记录的接口规范原文 hash（没有 manifest/未声明时为 None）。
+    pub iface_spec_sha256: Option<String>,
+    /// volatile 路径声明（插件声明顺序）。
+    pub volatile: Vec<String>,
+    /// 该 fiber 经 `provide_iface` / JSON 面注册的可调用服务。
+    pub services: Vec<ServiceInfo>,
+}
+
+impl CapabilityRow {
+    fn render_lines(&self, out: &mut String) {
+        let uid = if self.uid == UID_DISPOSED {
+            "UID_DISPOSED".to_string()
+        } else {
+            self.uid.to_string()
+        };
+        out.push_str(&format!(
+            "- {} (plugin: {}, uid: {}, sha256: {})\n",
+            self.label, self.plugin, uid, self.sha256
+        ));
+        out.push_str(&format!("  inject: {}\n", list(&self.inject)));
+        out.push_str(&format!("  provision: {}\n", list(&self.provision)));
+        let schema = self.schema.as_deref().map(compact_json);
+        out.push_str(&format!(
+            "  schema: {}\n",
+            schema.as_deref().unwrap_or("(none)")
+        ));
+        out.push_str(&format!(
+            "  iface_spec_sha256: {}\n",
+            self.iface_spec_sha256.as_deref().unwrap_or("(none)")
+        ));
+        out.push_str(&format!("  volatile: {}\n", list(&self.volatile)));
+        if self.services.is_empty() {
+            out.push_str("  services: (none)\n");
+        } else {
+            out.push_str("  services:\n");
+            for service in &self.services {
+                out.push_str(&format!(
+                    "  - {} (version {}): {}\n",
+                    service.name,
+                    service.version,
+                    list(&service.methods)
+                ));
+            }
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "label": self.label,
+            "plugin": self.plugin,
+            "uid": self.uid,
+            "sha256": self.sha256,
+            "inject": self.inject,
+            "provision": self.provision,
+            "schema": self.schema,
+            "iface_spec_sha256": self.iface_spec_sha256,
+            "volatile": self.volatile,
+            "services": self.services.iter().map(|service| serde_json::json!({
+                "name": service.name,
+                "version": service.version,
+                "methods": service.methods,
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// 一行插件的能力面（装载**之前**读到的）。
@@ -561,6 +667,8 @@ pub struct StatusReport {
     pub failed: Vec<String>,
     /// 每个已挂载行的 artifact / SHA256 / sidecar manifest 来源摘要。
     pub provenance: Vec<RowProvenance>,
+    /// 每个已挂载行的契约面（声明 + 服务方法名），按 label 升序。
+    pub capabilities: Vec<CapabilityRow>,
 }
 
 impl StatusReport {
@@ -582,6 +690,14 @@ impl StatusReport {
             for row in &self.provenance {
                 out.push_str(&format!("- {}\n", row.label));
                 row.provenance.render_lines("  ", &mut out);
+            }
+        }
+        if self.capabilities.is_empty() {
+            out.push_str("capabilities = (none)\n");
+        } else {
+            out.push_str("capabilities:\n");
+            for row in &self.capabilities {
+                row.render_lines(&mut out);
             }
         }
         if self.disabled.is_empty() {
@@ -640,6 +756,7 @@ impl StatusReport {
                 value["label"] = serde_json::Value::String(row.label.clone());
                 value
             }).collect::<Vec<_>>(),
+            "capabilities": self.capabilities.iter().map(CapabilityRow::to_json).collect::<Vec<_>>(),
             "pending": self.pending.iter().map(|row| serde_json::json!({
                 "label": row.label,
                 "plugin": row.plugin,
@@ -711,6 +828,48 @@ impl RunSession {
         self.state.cycle_paths()
     }
 
+    /// 从 `report().capabilities[]` 构造 typed 行；服务方法名必须在
+    /// `shutdown` 之前抓取。`iface_specs` 来自同一批挂载行的 provenance。
+    fn capability_rows(
+        &self,
+        rows: &[serde_json::Value],
+        iface_specs: &HashMap<String, Option<String>>,
+    ) -> Vec<CapabilityRow> {
+        rows.iter()
+            .map(|row| {
+                let label = row["label"]
+                    .as_str()
+                    .expect("loader capability row must carry a string label")
+                    .to_string();
+                let services = self
+                    .state
+                    .fiber_of(&label)
+                    .map(|fiber| self.app.store.services_of(&fiber))
+                    .unwrap_or_default();
+                CapabilityRow {
+                    iface_spec_sha256: iface_specs.get(&label).cloned().flatten(),
+                    label,
+                    plugin: row["plugin"]
+                        .as_str()
+                        .expect("loader capability row must carry a string plugin")
+                        .to_string(),
+                    uid: row["uid"]
+                        .as_u64()
+                        .expect("loader capability row must carry a u64 uid"),
+                    sha256: row["sha256"]
+                        .as_str()
+                        .expect("loader capability row must carry a string sha256")
+                        .to_string(),
+                    inject: string_list(&row["inject"]),
+                    provision: string_list(&row["provision"]),
+                    schema: row["schema"].as_str().map(str::to_string),
+                    volatile: string_list(&row["volatile"]),
+                    services,
+                }
+            })
+            .collect()
+    }
+
     /// 关闭整棵 App 树，返回关闭前的装载面。
     pub async fn shutdown(self) -> RunReport {
         let Self { app, state } = self;
@@ -751,7 +910,7 @@ pub async fn status_with_source(
     let failed = string_list(&snapshot["failed"]);
     // 用挂载记录的**原始 artifact** 路径读 sidecar：暂存副本的 `.rN` 文件名旁边
     // 没有发布方写的 manifest。sidecar 缺失时保留 `missing/manifest` 状态。
-    let provenance = session
+    let provenance: Vec<RowProvenance> = session
         .state
         .mounted_sources()
         .into_iter()
@@ -760,6 +919,18 @@ pub async fn status_with_source(
             provenance: Provenance::from_artifact(artifact),
         })
         .collect();
+    let iface_specs: HashMap<String, Option<String>> = provenance
+        .iter()
+        .map(|row| (row.label.clone(), row.provenance.iface_spec_sha256.clone()))
+        .collect();
+    // 服务方法名只在活实例上可读：必须在 shutdown 之前抓取。
+    let capabilities = session.capability_rows(
+        snapshot["capabilities"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        &iface_specs,
+    );
     session.shutdown().await;
     Ok(StatusReport {
         mounted,
@@ -768,6 +939,7 @@ pub async fn status_with_source(
         cycles,
         failed,
         provenance,
+        capabilities,
     })
 }
 

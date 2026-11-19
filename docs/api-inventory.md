@@ -83,6 +83,15 @@
 | 项 | 形态 | 位置 |
 |---|---|---|
 | `App` | struct | `crates/core/src/lib.rs` |
+| `App::set_trace_sink` | fn | `crates/core/src/lib.rs` |
+| `Store::record_trace` | fn | `crates/core/src/store.rs` |
+| `Store::has_trace_sink` | fn | `crates/core/src/store.rs` |
+| `Store::services_of` | fn | `crates/core/src/store.rs` |
+| `ServiceInfo` | struct | `crates/core/src/store.rs` |
+| `current_caller_uid` | fn | `crates/core/src/trace.rs` |
+| `TraceRecord` | struct | `crates/core/src/trace.rs` |
+| `Outcome` | enum | `crates/core/src/trace.rs` |
+| `TraceSink` | trait | `crates/core/src/trace.rs` |
 | `Context` | struct | `crates/core/src/context.rs` |
 | `Ctx` | type alias | `crates/core/src/context.rs` |
 | `Fiber` | struct | `crates/core/src/fiber.rs` |

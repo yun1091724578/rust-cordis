@@ -245,7 +245,28 @@ async fn run_demo(exe_dir: &Path, config_dir: &Path, before: &[PathBuf]) -> Resu
     }
 
     let report = app.root.require_as::<ExternValue>("loader.report")?;
-    println!("  装载报告: {}", report.0);
+    // 快照跨平台逐字节比较：sha256 是**插件产物**的内容哈希（PE/ELF/Mach-O 不同），
+    // 在 demo 输出里替换成占位符；真实报告仍由宿主原样提供。
+    let mut shown = report.0.clone();
+    if let Some(rows) = shown.get_mut("capabilities").and_then(Value::as_array_mut) {
+        for row in rows {
+            if let Some(map) = row.as_object_mut() {
+                assert!(
+                    map.get("sha256")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| {
+                            value.len() == 64
+                                && value.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        }),
+                    "demo 的插件都是文件来源，报告必须给出 64 位小写十六进制 sha256：{row}"
+                );
+                map.insert("sha256".into(), json!("<artifact-sha256>"));
+            }
+        }
+    }
+    println!("  装载报告: {shown}");
     assert_eq!(
         report
             .0
@@ -372,12 +393,11 @@ async fn run_demo(exe_dir: &Path, config_dir: &Path, before: &[PathBuf]) -> Resu
     std::fs::write(&greeting_source, &bytes)?;
     println!("  触碰了 greeting");
 
-    // 等重载发生（间隔 100ms，给足三秒）——同样两个收敛条件：reload 事件到了、
-    // rust-side 的**再激活消息**也入队了。先 flush 消息、再打印 reload 行，
-    // 顺序由这里钉死（不比墙钟）。
+    // 等重载发生（间隔 100ms；WP2 起每次换副本要对整个 artifact 算一次
+    // SHA-256，debug 下 12 MB 插件约 2s，给足十倍余量）。
     let mut reload_seen = false;
     let mut reactivated = false;
-    for _ in 0..60 {
+    for _ in 0..200 {
         reload_seen = !reloads.lock().unwrap().is_empty();
         reactivated = RUST_SIDE_MESSAGES.lock().unwrap().len() >= 2;
         if reload_seen && reactivated {
