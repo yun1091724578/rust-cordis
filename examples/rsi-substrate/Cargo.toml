@@ -1,0 +1,23 @@
+[package]
+name = "rsi-substrate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "RSI e2e: deploy, canary, attribution, contract gate, rollback"
+publish = false
+
+[lib]
+name = "rsi_substrate"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rsi-substrate"
+path = "src/main.rs"
+
+[dependencies]
+cordis-abi = { workspace = true }
+cordis-cli = { workspace = true }
+cordis-core = { workspace = true }
+cordis-host = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

@@ -134,7 +134,7 @@
 <tr><td>G2</td><td>uid ↔ 挂载行 ↔ 源文件摘要 的对应</td><td><b>（WP2 前快照）</b><del>无逐实例列表</del> → <code>report().capabilities[]</code> 已是逐行 <code>{label, plugin, inject, provision, volatile}</code>；<code>Mounted</code> 私有结构已持 <code>fiber: Weak&lt;Fiber&gt;</code>；当时缺 <code>uid</code> 与 <code>sha256</code> 两个字段。<b>WP2 已补齐</b>（行内九项含 <code>js</code>/<code>schema</code>/<code>uid</code>/<code>sha256</code>，sha 取暂存副本）。HMR 指纹是 <code>(mtime, len)</code> 不是内容哈希；内容哈希用 <code>source::sha256_file</code>。</td><td class="ref">host/src/loader.rs:1611-1675, :257-300, :299-308; host/src/source.rs:355</td></tr>
 <tr><td>G3</td><td>契约可导出、可冻结比对</td><td><code>inspect --json</code> 已输出 label/plugin/version/inject/provision/schema/provenance。但 <code>PluginDesc.schema</code> 是<b>配置</b> schema；<b>服务方法名</b>在 apply 期由 <code>provide_iface</code> 注册（<code>ExternService::methods() -> Vec&lt;String&gt;</code>，<b>只有名字、没有参数形状</b>）。<b>WP2b 已补齐</b>：<code>status --json capabilities[].services[].methods</code> 导出运行期方法名，<code>capabilities[].schema</code> 导出配置 schema。</td><td class="ref">cli/src/lib.rs; core/src/store.rs::services_of; abi/src/lib.rs:434; core/src/context.rs:448; core/src/dyn_value.rs:143; macros/src/service.rs:324</td></tr>
 <tr><td>G4</td><td>运行中宿主的状态可被外部读取</td><td><code>cordis status --json</code> 新起 App → 挂载 → 取 report → 关闭，与 <code>cordis run</code> 进程无关；<code>cordis run</code> 硬编码 <code>hmr: None</code>。</td><td class="ref">crates/cli/src/lib.rs:899-934, :684</td></tr>
-<tr><td>G5</td><td>端到端示例：部署→金丝雀→归因→回滚</td><td>无。<code>examples/harness-spike</code> 是 ABI 冒烟。</td><td class="ref">examples/harness-spike/src/main.rs:189-220</td></tr>
+<tr><td>G5</td><td>端到端示例：部署→金丝雀→归因→回滚</td><td><b>WP4 已实现</b>：<code>examples/rsi-substrate</code> 用真实 cdylib、strict 来源策略、500ms HMR、JSONL trace 与 T1 evaluator 覆盖 v1/v2/v3/panic/crash 与两条在飞换实例分支。</td><td class="ref">examples/rsi-substrate/src/scenario.rs; examples/rsi-substrate/tests/e2e.rs</td></tr>
 </table>
 
 <p class="mute">不是缺口（已有、够用）：失败重载回滚 <code>SwapOutcome::RolledBack</code>（loader.rs:4533）+ <code>record_reload_failure</code>（:4891）；Windows 文件锁——<code>stage_plugin</code> 复制为 <code>&lt;stem&gt;.s&lt;pid&gt;-&lt;n&gt;.r&lt;rev&gt;.&lt;ext&gt;</code> 再加载（host/src/lib.rs:5068-5096），原地覆盖可行；HMR 轮询 <code>stale_labels</code>+<code>reload_one</code> 默认 500ms（loader.rs:4510-4516, :214）；volatile 判定/提交；ABI 形状测试与 baseline；CI 三平台矩阵。</p>
@@ -252,39 +252,36 @@ impl App { pub fn set_trace_sink(&amp;self, sink: Arc&lt;dyn TraceSink&gt;) -&gt
 <tr><th>验证</th><td><code>cargo test -p cordis-cli --test status status_services_methods</code>：fixture 插件 provide_iface 两个方法 → <code>services[0].methods.len()==2</code>；<code>cargo test -p cordis-cli --test source_policy status_with_source_policy_shows_manifest_provenance</code>：manifest 的 <code>iface_spec_sha256</code> 在 provenance 与 capabilities 两处可见；<code>cargo test -p rust-cordis-core --test services_of</code>：两条注册通道、<code>UID_DISPOSED</code> 的残留条目窗口返回空。WP4 e2e 验收 3 覆盖"删除/改名方法被拒"。</td></tr>
 </table>
 
-<h3>WP4 · 端到端示例：<code>examples/rsi-substrate</code> <span class="tag">5 人日</span> <span class="tag p0">验收载体</span></h3>
+<h3>WP4 · 端到端示例：<code>examples/rsi-substrate</code> <span class="tag">5 人日</span> <span class="tag p0">验收载体</span> <span class="tag ok">已实现</span></h3>
 <table>
 <tr><th style="width:90px">场景</th><td>
 <b>部署金丝雀</b>（不是评估期）：已选中变体 solver-v2 带 manifest 投放到运行中宿主；canary evaluator 跑 5 个固定用例；trace 的父链把回归定位到 <b>solver</b> 那一跳（pipeline 的记录是它的父，叶子 Err 只在 solver）；驱动方据此改回 YAML → 回滚。
 <pre>
-examples/rsi-substrate/
-├── host/src/main.rs   自定义 Rust 宿主（仿 harness-spike:189-220）：
-│                      LoaderConfig{hmr: Some(500ms)}；set_trace_sink(JsonlSink→trace.jsonl)；
-│                      evaluator 读 loader.report 写 status.json；sidecar 来源策略（非 allow_unverified）；
-│                      准入步骤核对 manifest.attestation ↔ eval_record（cross-check）
-├── evaluator/         T1 插件：5 用例，经 call_iface 调 "pipeline.run"，写 score.json
-├── pipeline/          T2 cdylib：call_iface 转发到 "solver.solve"（间接层，归因靶子）
-├── solver-v1/         T2 cdylib，正确
-├── solver-v2/         T2 cdylib，契约不变、2/5 用例错（故意）
-├── solver-v3/         T2 cdylib，删掉/改名 solve 方法（故意，契约锁应拒）
-├── solver-panic/      T2 cdylib，apply 期 panic（故意，走 RolledBack）
-├── solver-crash/      T2 cdylib，solve 回调里 panic（故意，trace 仍应有 Err 记录）
-├── cordis.yaml + *.manifest.json + eval-record.json
-└── tests/e2e.rs       Rust 进程内驱动：复制文件(确保 mtime 变化)、改 YAML、等 report 变化、读三份文件断言
+examples/rsi-substrate/     真实宿主 + T1 evaluator + JSONL trace + e2e
+├── src/scenario.rs         一个 App 跑 v1/v2/v3/panic/crash 与两条在飞分支
+├── src/evaluator.rs        T1 evaluator：5 用例，写 score.json
+├── src/trace.rs            TraceSink → trace.jsonl + marker 窗口/叶子聚合
+├── src/admission.rs        attestation ↔ eval-record ↔ artifact 交叉核对
+├── src/fixtures.rs         嵌套 cargo 构建 6 个产物、写 manifest/allow-list
+├── src/main.rs             薄壳
+└── tests/e2e.rs            单测试驱动（进程级来源策略不可并行）
+examples/rsi-pipeline/      T2 cdylib：pipeline@1.run / run_hold → solver@1
+examples/rsi-solver/        T2 cdylib：v1/v2/v3/panic/crash feature 产出五个变体
 </pre>
-<p class="mute"><code>evolve.py</code> 不进仓库。外部驱动约定写在 ADR 0009 §3：替换 cdylib + manifest → 改 YAML → 轮询 status.json → 读 trace.jsonl/score.json；宿主在 report 每次变化时落 mounts 快照（plugin/label/uid/sha256/seq/UTC ms），evaluator 落每用例起止 ts，二者一起才能把记录归到"哪一代、哪个用例"。</p>
+<p class="mute"><code>evolve.py</code> 不进仓库。外部驱动约定写在 ADR 0009 §3：替换 cdylib + manifest → 改 YAML → 轮询 status.json → 读 trace.jsonl/score.json；示例宿主在阶段点落 status.json（capabilities + services + reloads），evaluator 写 score.json。</p>
 </td></tr>
 <tr><th>验证（e2e 断言）</th><td>
 <ol>
 <li>v1：score 5/5；trace 中 evaluator→pipeline 5 条 Ok、pipeline→solver 5 条 Ok。</li>
 <li>投 v2：热换成功、solver uid 变、sha256 变；trace 中 pipeline→solver 2 条 Err 且 evaluator→pipeline 对应 2 条 Err —— <b>按父链取叶子 Err 再按 <code>callee_plugin</code> 聚合：solver 行 40%、pipeline 行 0%（它只是透传）</b>；改回 YAML → uid 再变，<b>同一用例回到 Ok</b>。<b>金丝雀硬判据是"同一用例 Ok→Err"或"出现叶子 Err 命中 solver"，不是分数</b>（同进程 static 污染使跨代分数不可比）。<b>这一步证明归因可定位到链中一跳。</b></li>
-<li>投 v3 前做契约 diff：<code>services[solver].methods</code> 少了/改名了，或 <code>iface_spec_sha256</code> 与 manifest 不符 → 拒绝投放；宿主无感知。</li>
-<li>投 solver-panic：<code>SwapOutcome::RolledBack</code>；<code>report.failed</code> 含 solver；<b>uid 变为新值</b>（回滚会重建 fiber），<code>sha256</code> 回到 v1 的值，evaluator 仍 5/5。用例本身必须幂等：apply 失败回滚复用同一模块（static 保留），改 YAML 重投是新模块（static 全新）。</li>
+<li>投 v3 前做契约 diff：<code>services[solver].methods</code> 少了/改名了（示例还断言 <code>iface_spec_sha256</code> 存在且 manifest 通过 admission）→ 拒绝投放；宿主无感知。</li>
+<li>投 solver-panic：<code>SwapOutcome::RolledBack</code>；<code>loader/reload</code> 的 <code>error</code> 含 <code>panic</code>（<b>不是</b> <code>report.failed</code>；reconcile 的 Replace 路径不回滚，示例用当前监控路径的 HMR 触发）；<b>uid 变为新值</b>，<code>sha256</code> 回到 v1 的值，evaluator 仍 5/5。</li>
 <li>投 solver-crash：solve 回调 panic → 恰好一条 <code>Err</code> 记录且 <code>callee_plugin</code> = solver；宿主不退出。<b>这是“记录由宿主写”的硬证据</b>（T2 无法经 ABI 自报；T1 例外：<code>Store::record_trace</code> 是公开方法，见 ADR 0009 §2.2）。</li>
 <li>在飞换实例：调用方是 inject 依赖者时，换实例会把它一起卸载，出站 future 被丢弃 ⇒ 按 ADR 0009 §2.2 <b>无记录</b>；调用方活过被调方时（根 ctx/无依赖），<code>settle</code> 仍写一条 <code>host_lifecycle</code>，<code>callee_uid</code> 必须是发起时快照（判别性用例 <code>abi_trace_unload</code>）。WP4 用真实 loader 验证依赖者分支与新调用归属到新 uid。</li>
-<li>全程同一 App 实例（不重启）；Windows + Linux 均通过（CI <code>--workspace</code> 自动覆盖）。</li>
-</ol></td></tr>
-<tr><th>风险</th><td>示例 manifest 必须含 <code>attestation</code> 三项 + <code>iface_spec_sha256</code>（D1 后 sidecar 是示例要证明的东西，<b>不再</b>保留 <code>set_allow_unverified(true)</code> 退路）。<code>PluginSourcePolicy::verify</code> <b>不</b>校验 attestation：示例宿主的准入函数自己做交叉核对（eval-record 的 artifact SHA256/variant revision ↔ manifest），并遵守职责分离（合并准入者 ≠ 签发流水线）。</td></tr>
+<li>全程同一 App 实例（不重启）；Windows GNU 本地已通过，Linux/macOS 待 CI <code>--workspace</code> 实跑（当前不是已通过结论）。</li>
+</ol>
+<p class="mute">验证命令：<code>cargo test -p rsi-substrate --test e2e</code>（单测试；进程级来源策略不可并行）。</p></td></tr>
+<tr><th>风险</th><td>示例 manifest 含 <code>attestation</code> 三项 + <code>iface_spec_sha256</code>（D1 后 sidecar 是示例要证明的东西，<b>不再</b>保留 <code>set_allow_unverified(true)</code> 退路）。<code>PluginSourcePolicy::verify</code> <b>不</b>校验 attestation：示例宿主的 <code>admission::verify</code> 自己做交叉核对（eval-record 的 artifact SHA256/variant revision ↔ manifest，attestation 的 eval-record SHA ↔ 已审 pipeline revision），并遵守职责分离（合并准入者 ≠ 签发流水线）。</td></tr>
 </table>
 
 <h3>缓冲 <span class="tag">1 人日</span></h3>
@@ -320,7 +317,7 @@ examples/rsi-substrate/
 <tr><td>V3</td><td>父链与逐跳事实完整（同步/PENDING/事件根/T1 跳过/T1 起点/失败路径），一跳一条，PENDING 等待期计入 elapsed</td><td>§WP1 验证清单（零开销与回归两项不计入行为判据）</td><td>WP1 + ADR 0010</td></tr>
 <tr><td>V4</td><td>capabilities 行 sha256 稳定且敏感，热重挂后 uid 变化</td><td>§WP2 两条集成用例 + 一条 HMR 换副本单测（同内容不同 mtime / 同长一字节 / 重挂 uid / 回滚）</td><td>WP2</td></tr>
 <tr><td>V5</td><td>status --json 含 <code>services[].methods</code>（方法名集合）与 capabilities</td><td>§WP2b 测试</td><td>WP2b</td></tr>
-<tr><td>V6</td><td>端到端七条断言（含父链与在飞换实例的两种分支），Windows + Linux</td><td><code>cargo test -p rsi-substrate --test e2e</code></td><td>WP4</td></tr>
+<tr><td>V6</td><td>端到端七条断言（含父链与在飞换实例的两种分支），Windows GNU 已通过；Linux/macOS 待 CI</td><td><code>cargo test -p rsi-substrate --test e2e</code></td><td>WP4</td></tr>
 <tr><td>V7</td><td>新增 pub 项已登记并归"待验证"</td><td><code>xtask inventory --check</code> 通过；support-contract 用词检查</td><td>WP0</td></tr>
 </table>
 <p class="mute"><del>V8 "每行改动可追溯"</del> 不是可执行验收，已由 R1 评审承担。</p>

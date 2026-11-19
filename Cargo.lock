@@ -272,6 +272,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsi-pipeline"
+version = "0.1.2"
+dependencies = [
+ "rust-cordis-abi",
+ "serde_json",
+]
+
+[[package]]
+name = "rsi-solver"
+version = "0.1.2"
+dependencies = [
+ "rust-cordis-abi",
+ "serde_json",
+]
+
+[[package]]
+name = "rsi-substrate"
+version = "0.1.2"
+dependencies = [
+ "cordis-cli",
+ "rust-cordis-abi",
+ "rust-cordis-core",
+ "rust-cordis-host",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rust-cordis-abi"
 version = "0.1.2"
 dependencies = [

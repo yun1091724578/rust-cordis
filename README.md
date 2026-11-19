@@ -90,6 +90,8 @@ cargo test --workspace
 cargo build -p plugin-greeting -p plugin-hello -p plugin-harness-tool
 cargo run -p demo
 cargo run -p harness-spike
+cargo run -p rsi-substrate
+cargo test -p rsi-substrate --test e2e
 ```
 
 跨平台统一入口（推荐）：

@@ -13,6 +13,9 @@ members = [
     "examples/plugins/harness-tool",
     "examples/demo",
     "examples/harness-spike",
+    "examples/rsi-pipeline",
+    "examples/rsi-solver",
+    "examples/rsi-substrate",
     "xtask",
 ]
 

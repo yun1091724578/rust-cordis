@@ -1,0 +1,15 @@
+[package]
+name = "rsi-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "RSI substrate e2e: the indirect T2 pipeline plugin"
+publish = false
+
+[lib]
+name = "rsi_pipeline"
+crate-type = ["cdylib"]
+
+[dependencies]
+cordis-abi = { workspace = true }
+serde_json = { workspace = true }

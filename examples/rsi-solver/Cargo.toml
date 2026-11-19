@@ -1,0 +1,23 @@
+[package]
+name = "rsi-solver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "RSI substrate e2e: one cdylib with v1/v2/v3/panic/crash variants"
+publish = false
+
+[lib]
+name = "rsi_solver"
+crate-type = ["cdylib"]
+
+[features]
+default = ["v1"]
+v1 = []
+v2 = []
+v3 = []
+panic = []
+crash = []
+
+[dependencies]
+cordis-abi = { workspace = true }
+serde_json = { workspace = true }

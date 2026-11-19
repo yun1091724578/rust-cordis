@@ -116,8 +116,8 @@ breaking 变更。
 
 RSI 方向按下述口径推进：本仓做**演化产物的部署与观测地板**，不做演化循环
 （ADR 0009）。阶段 1 的 WP0（两份 ADR）与 S2-2（调用链关联设计，ADR 0010）
-已完成；WP1（iface 归因，含 0010 的实现）、WP2（变体身份）与 WP2b（契约方法名）
-已实现，WP4（端到端示例）见 `rsi-sdk-roadmap.html`。
+已完成；WP1（iface 归因，含 0010 的实现）、WP2（变体身份）、WP2b（契约方法名）
+与 WP4（端到端示例）已实现，验收载体见 `examples/rsi-substrate`。
 
 ### 运行时优化专项（2026-11-16）
 
@@ -391,6 +391,14 @@ WP2b（契约方法名）→ WP4（端到端示例）。WP1 与 ADR 0010 的实�
 - 验证：`cargo test -p cordis-cli --test status status_services_methods`（fixture `provide_iface` 两个方法 → `services[0].methods == ["alpha", "beta"]`，版本与 schema 同时导出，关闭后 `loaded_instances() == 0`）；`cargo test -p cordis-cli --test source_policy status_with_source_policy_shows_manifest_provenance`（manifest 的 `iface_spec_sha256` 在 provenance 与 capabilities 两处可见）；`cargo test -p rust-cordis-core --test services_of`（只列可调用面、两条注册通道、两个 fiber 不串线、销毁后返回空；含“清理被挡住、条目仍在表里”的判别性窗口）。
 - 未覆盖（如实记录）：只锁方法名集合，参数/返回值在 ABI 上是 `Config`，形状不可见；`iface_spec_sha256` 只证明两边看的是同一份规范，不校验规范与实现是否一致；`status` 的 `schema` 只报原文/`null`，非法/超限原因看 `inspect` 的 `schema_error`；`StatusReport.capabilities` 不含 `js`（`js` 仍由 `loader.report` 读取，不在契约锁范围）；公开面按 ADR 0006 仍在 0.2 前可改。
 - 工作区：`crates/core/src/{store,lib}.rs`、新增 `crates/core/tests/services_of.rs`、`crates/host/src/loader.rs`、`crates/host/tests/{loader_capabilities,interpolation}.rs`、`crates/cli/src/lib.rs`、`crates/cli/tests/{status,source_policy}.rs`、`xtask/src/{inventory,contract}.rs`、`examples/demo/expected.txt`、`docs/{support-contract,platform-matrix,release,roadmap,api-inventory}.md`、`docs/adr/{0005,0009}`、`docs/rsi-sdk-roadmap.html`。
+
+#### RSI-WP4：端到端示例（2026-11-19）
+
+- 范围：新增 `examples/rsi-pipeline`（T2 间接层）、`examples/rsi-solver`（单 crate 五变体）与 `examples/rsi-substrate`（真实宿主 + T1 evaluator + JSONL trace + e2e），不加 ABI、不改 loader 产品行为。
+- 实现：solver 用 `v1/v2/v3/panic/crash` feature 产出 5 个不同字节的 cdylib；pipeline 用 `run` / `run_hold` 转发 `solver@1`，同步分支返回 `Reply`、异步分支 `fulfill`；宿主用 `PolicyPluginSource::strict` + 500ms HMR、`App::set_trace_sink` 写 `trace.jsonl`、evaluator 跑固定 5 用例写 `score.json`，并在阶段点写 `status.json`（含 capabilities/services/reloads/ts）。示例 manifest 由示例自己生成，带真实的 `iface_spec_sha256`（对 spec 文件取 hash）与 `attestation` 三项；`admission::verify` 交叉核对 artifact SHA、variant revision、eval-record SHA、spec hash 与已审 pipeline revision，并有负向单测。
+- 验证：`cargo test -p rsi-substrate --test e2e`。覆盖 v1 5/5 与 5+5 两跳链；v2 先过 `contract_gate` 正例再热换，solver uid/sha 变化而 pipeline uid 不变，按父链叶子 Err 聚合到 solver；YAML 改回 baseline 后逐 case 2/4 回到 Ok；v3 方法集 diff 在投放前被 gate 拒绝且运行中 uid/sha 不变；panic 走 `RolledBack`、uid 变化且 sha 回 v1；crash 恰好一条 `panic` Err；在飞换实例两条分支（依赖者无 solver 跳、根调用一条 `host_lifecycle` 且 `callee_uid` 为旧值）；全程同一 App。
+- 未覆盖（如实记录）：示例只跑 Windows GNU 本地；Linux/macOS 交给 CI `--workspace`。契约 gate 只比较 `services[].methods`，`iface_spec_sha256` 仅作准入材料，不比较规范与实现。`status.json` 是示例自己的观测快照，不是产品 CLI 面。e2e 是长测（含 6 次嵌套 `cargo build --offline --locked`），`xtask ci` 会串行覆盖。
+- 工作区：新增 `examples/rsi-{pipeline,solver,substrate}/`、根 `Cargo.toml` / `Cargo.lock`、`README.md`；`docs/roadmap.md`、`docs/rsi-sdk-roadmap.html`。
 
 ### 1. 公开 API / ABI 稳定与版本治理
 
