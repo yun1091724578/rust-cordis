@@ -1,5 +1,18 @@
 # 发布检查清单
 
+## 0.1.3 SDK 发布记录（2026-11-22）
+
+正式标签 `v0.1.3`，ABI v1 零破坏；除原有 4 个底层 crate 外，本次一并开放门面 crate `rust-cordis-sdk`：
+
+- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.3`
+- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.3`
+- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.3`
+- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.3`
+- [`rust-cordis-sdk`](https://crates.io/crates/rust-cordis-sdk) `0.1.3`（首次开放发布，库名 `cordis`）
+
+核心变更：ADR 0011 跨 ABI 多会话 `correlation_id` 传播、RSI 多会话并发参考层（金丝雀路由/会话亲和/优雅排空/有界工作池/非阻塞 JSONL Trace）、全仓存量审查 19 项性能与正确性修复、`tokio` 默认特性瘦身与 CI 门禁补齐。
+若后续推送到 crates.io，发布顺序为 `core → abi → macros → host → sdk`。
+
 ## 0.1.1 发布记录（2026-11-07）
 
 0.1.1 是元数据补丁，源码提交 `8ab64f98001c19d3bca2b1cd2cd6dd4469645c8a`，
