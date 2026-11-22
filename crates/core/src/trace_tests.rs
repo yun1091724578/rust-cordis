@@ -47,7 +47,7 @@ async fn caller_uid_is_scoped_to_the_poll() {
             Ok(Config::Null)
         }
     };
-    let future = scope_caller(Box::pin(inner), 7);
+    let future = scope_caller(Box::pin(inner), 7, None);
     assert_eq!(current_caller_uid(), 0, "作用域外必须是 0");
     let value = future.await.unwrap();
     assert_eq!(value, Config::Null);
@@ -58,12 +58,17 @@ async fn caller_uid_is_scoped_to_the_poll() {
 #[test]
 fn caller_uid_is_restored_after_inner_panic() {
     let inner: BoxFuture<Result<Config>> = Box::pin(async { panic!("poll 边界 panic") });
-    let mut future = scope_caller(inner, 7);
+    let mut future = scope_caller(inner, 7, Some(Arc::from("sess-panic")));
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let caught = catch_unwind(AssertUnwindSafe(|| Pin::new(&mut future).poll(&mut cx)));
     assert!(caught.is_err(), "内层 poll 必须真的 panic");
     assert_eq!(current_caller_uid(), 0, "unwind 也必须恢复 caller 作用域");
+    assert_eq!(
+        current_correlation_id(),
+        None,
+        "unwind 也必须恢复 correlation 作用域"
+    );
 }
 
 struct CheckService;
@@ -141,6 +146,7 @@ fn trace_sink_panic_is_contained() {
         caller_uid: crate::fiber::UID_ROOT,
         callee_uid: 0,
         callee_plugin: Box::from("x"),
+        correlation_id: None,
         elapsed: std::time::Duration::from_millis(1),
         outcome: Outcome::Ok,
     });
@@ -155,4 +161,56 @@ fn installing_the_sink_twice_is_rejected() {
         !app.set_trace_sink(Arc::new(Collector(Arc::new(Mutex::new(Vec::new()))))),
         "只允许安装一次"
     );
+}
+
+#[tokio::test]
+async fn correlation_id_from_ctx_is_recorded_on_resolve_and_check_failures() {
+    let app = App::new();
+    let records = collect(&app);
+    app.root
+        .provide_iface("check@1", Arc::new(CheckService))
+        .expect("provide");
+
+    let sess = app.root.with_correlation("sess-42");
+    assert_eq!(sess.correlation_id(), Some("sess-42"));
+    assert_eq!(sess.extend().correlation_id(), Some("sess-42"));
+    assert_eq!(sess.filter_subtree().correlation_id(), Some("sess-42"));
+    assert_eq!(sess.isolate("x", None).correlation_id(), Some("sess-42"));
+    assert_eq!(
+        sess.intercept("x", Config::Null).correlation_id(),
+        Some("sess-42")
+    );
+    assert_eq!(app.root.correlation_id(), None);
+
+    sess.call_iface("missing@1", 1, "run", Config::Null)
+        .await
+        .expect_err("缺服务失败");
+    sess.call_iface("check@1", 1, "nope", Config::Null)
+        .await
+        .expect_err("缺方法失败");
+
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].correlation_id.as_deref(), Some("sess-42"));
+    assert_eq!(records[1].correlation_id.as_deref(), Some("sess-42"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_correlation_survives_await_across_concurrent_tasks() {
+    let mut handles = Vec::new();
+    for i in 0..8usize {
+        let id = format!("sess-{i}");
+        handles.push(tokio::spawn(scope_correlation(id.clone(), async move {
+            assert_eq!(current_correlation_id().as_deref(), Some(id.as_str()));
+            tokio::task::yield_now().await;
+            assert_eq!(current_correlation_id().as_deref(), Some(id.as_str()));
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            assert_eq!(current_correlation_id().as_deref(), Some(id.as_str()));
+            id
+        })));
+    }
+    for (i, handle) in handles.into_iter().enumerate() {
+        assert_eq!(handle.await.unwrap(), format!("sess-{i}"));
+    }
+    assert_eq!(current_correlation_id(), None);
 }

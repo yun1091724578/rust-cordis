@@ -23,13 +23,13 @@ use crate::Ctx;
 use crate::Fiber;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 /// 拓扑锁：`bind_parent` 的"检查祖先关系 + 写父指针"必须是一个原子步。
 ///
-/// 只锁节点自己的 `parent` 会让两个线程同时通过检查（A→B 与 B→A），
-/// 形成强引用环；查询与修改共用这把锁后，拓扑在任意时刻都是一致的。
-static TOPOLOGY: Mutex<()> = Mutex::new(());
+/// 读多写少：查询（每次带作用域的事件派发）持读锁可并发，`bind_parent` 持写锁独占，
+/// 避免两个线程同时通过检查（A→B 与 B→A）形成强引用环。
+static TOPOLOGY: RwLock<()> = RwLock::new(());
 
 /// 作用域谓词：派发点用它逐个裁决"某个注册参不参与这次派发"。
 ///
@@ -84,20 +84,37 @@ impl ScopeAnchor {
     /// 存在（旧版本或外部错误状态），遍历也必须在有限步内结束。
     pub fn is_ancestor_or_self_of(self: &Arc<Self>, other: &Arc<ScopeAnchor>) -> bool {
         let _topology = TOPOLOGY
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.is_ancestor_or_self_locked(other)
     }
 
     fn is_ancestor_or_self_locked(self: &Arc<Self>, other: &Arc<ScopeAnchor>) -> bool {
+        // 常规作用域链深度很浅（多会话 agent 通常 1~6 层）：先用栈上数组查环，
+        // 避免热路径分配 HashSet；仅在深度超过 16 时退回 HashSet。
         let mut cursor = Some(other.clone());
-        let mut visited = HashSet::new();
+        let mut inline = [0u64; 16];
+        let mut inline_len = 0usize;
+        let mut overflow: Option<HashSet<u64>> = None;
         while let Some(node) = cursor {
             if node.uid == self.uid {
                 return true;
             }
-            if !visited.insert(node.uid) {
+            if let Some(visited) = overflow.as_mut() {
+                if !visited.insert(node.uid) {
+                    return false;
+                }
+            } else if inline[..inline_len].contains(&node.uid) {
                 return false;
+            } else if inline_len < inline.len() {
+                inline[inline_len] = node.uid;
+                inline_len += 1;
+            } else {
+                let mut set: HashSet<u64> = inline.into_iter().collect();
+                if !set.insert(node.uid) {
+                    return false;
+                }
+                overflow = Some(set);
             }
             cursor = node.parent.lock().unwrap().clone();
         }
@@ -114,9 +131,9 @@ impl ScopeAnchor {
         self: &Arc<Self>,
         parent: &Arc<ScopeAnchor>,
     ) -> std::result::Result<(), String> {
-        // 检查与写入在同一个拓扑临界区里：两个方向相反的并发绑定只能成功一个。
+        // 检查与写入在同一个拓扑写临界区里：两个方向相反的并发绑定只能成功一个。
         let _topology = TOPOLOGY
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.uid == parent.uid || self.is_ancestor_or_self_locked(parent) {
             return Err(format!(

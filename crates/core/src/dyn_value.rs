@@ -145,6 +145,11 @@ pub trait ExternService: Send + Sync + 'static {
     fn version(&self) -> u32;
     /// 方法名清单。用于诊断、能力发现，以及**调用前的可用性检查**。
     fn methods(&self) -> Vec<String>;
+    /// 快速判断服务是否暴露指定方法；默认回落到 [`Self::methods`]，提供方可覆写
+    /// 以避免每次 `call_iface` 克隆整份方法名列表。
+    fn has_method(&self, method: &str) -> bool {
+        self.methods().iter().any(|known| known == method)
+    }
     /// 调用一个方法。
     ///
     /// `caller_meta` 是**调用点**上的合并结果 `d(k) ⊕ ι(k)`（M3，论文 §6.3）：

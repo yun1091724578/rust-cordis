@@ -55,7 +55,7 @@ impl Fixture {
         .await
         .unwrap();
         let handle = instance_handle_of(&app.root).unwrap();
-        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let instance = instances().read().unwrap().get(handle).unwrap();
         calls()
             .lock()
             .unwrap()

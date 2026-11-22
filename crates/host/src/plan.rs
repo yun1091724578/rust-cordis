@@ -115,11 +115,14 @@ pub fn resolve(entries: &[PlanEntry]) -> Result<ResolvedPlan, Vec<String>> {
 
     for (key, providers) in &mut by_key {
         providers.sort_by(|a, b| b.version.cmp(&a.version).then(a.plugin.cmp(&b.plugin)));
-        if providers.len() > 1 && providers[0].version == providers[1].version {
-            errors.push(format!(
-                "服务键 {key} 的版本 {} 被多个插件提供：{} 和 {}",
-                providers[0].version, providers[0].plugin, providers[1].plugin
-            ));
+        let mut reported = BTreeSet::new();
+        for pair in providers.windows(2) {
+            if pair[0].version == pair[1].version && reported.insert(pair[0].version.clone()) {
+                errors.push(format!(
+                    "服务键 {key} 的版本 {} 被多个插件提供：{} 和 {}",
+                    pair[0].version, pair[0].plugin, pair[1].plugin
+                ));
+            }
         }
     }
 
@@ -311,6 +314,23 @@ mod tests {
         assert!(
             error.contains("bad-requires") && error.contains("requires.svc"),
             "错误必须指出插件与字段：{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_lower_version_providers() {
+        let entries = vec![
+            entry("p-v2", "2.0.0", &[("svc", "2.0.0")], &[]),
+            entry("p-v1-a", "1.0.0", &[("svc", "1.0.0")], &[]),
+            entry("p-v1-b", "1.0.0", &[("svc", "1.0.0")], &[]),
+            entry("consumer", "1.0.0", &[], &[("svc", "^1")]),
+        ];
+        let errors = resolve(&entries).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("svc") && err.contains("1.0.0") && err.contains("p-v1-a")),
+            "低版本并列提供者必须报歧义：{errors:?}"
         );
     }
 }

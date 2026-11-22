@@ -349,7 +349,7 @@ impl Entry {
         Value::Object(object)
     }
 
-    fn overlay(&mut self, patch: &Patch) {
+    fn overlay(&mut self, patch: &Patch, warn: &mut dyn FnMut(&str)) {
         // `patch.name` 在这里**故意不处理**：它是对目标行身份的断言，
         // 不匹配时整条 patch 都要跳过（`patch.ts:97-100`）。
         // 那个判断属于调用方 `apply_entry_patches`——只有它手里有 `warn`，
@@ -360,14 +360,35 @@ impl Entry {
         // 后续装载与保存都还会看见旧列表。
         if let Some(group) = patch.group {
             self.group = group;
+            if !group {
+                self.children.clear();
+            }
         }
         if let Some(config) = &patch.config {
             if self.group {
                 self.config = None;
-                self.children = config
-                    .as_array()
-                    .map(|list| list.iter().filter_map(Entry::from_value).collect())
-                    .unwrap_or_default();
+                if config.is_null() {
+                    self.children.clear();
+                } else if let Some(list) = config.as_array() {
+                    let mut children = Vec::with_capacity(list.len());
+                    for (index, item) in list.iter().enumerate() {
+                        match Entry::from_value_checked(item) {
+                            Ok(child) => children.push(child),
+                            Err(err) => warn(&format!(
+                                "patch: group \"{}\" 的第 {} 个子条目非法（已跳过）: {err}",
+                                entry_label(self),
+                                index + 1
+                            )),
+                        }
+                    }
+                    self.children = children;
+                } else {
+                    warn(&format!(
+                        "patch: group \"{}\" 的 config 必须是子条目数组（收到{}），已忽略",
+                        entry_label(self),
+                        json_kind(config)
+                    ));
+                }
             } else if config.is_null() {
                 self.config = None;
             } else {
@@ -448,6 +469,19 @@ impl Patch {
         let (disabled, disabled_expr) =
             parse_disabled(object.get("disabled")).map_err(|err| format!("{err} (at disabled)"))?;
         let inject = object.get("inject").cloned();
+        let intercept = object.get("intercept").cloned();
+        for (field, value) in [("inject", &inject), ("intercept", &intercept)] {
+            if let Some((path, expr)) = value
+                .as_ref()
+                .filter(|v| !v.is_null())
+                .and_then(|v| first_js_expr(v, field))
+            {
+                return Err(format!(
+                    "entry-level {field} 的 !!js 尚未支持（at {path}: {expr}）；\
+                     目前只有 config 与 disabled 支持求值"
+                ));
+            }
+        }
         if let Some(value) = inject.as_ref().filter(|value| !value.is_null()) {
             parse_inject(value).map_err(|err| format!("{err} (at inject)"))?;
         }
@@ -473,7 +507,7 @@ impl Patch {
             disabled_expr,
             inject,
             isolate,
-            intercept: object.get("intercept").cloned(),
+            intercept,
         })
     }
 }
@@ -505,15 +539,14 @@ impl PatchOwners {
     }
 
     fn note(&mut self, entry: &Entry, layer: usize) {
-        let Some(id) = entry.id.as_deref() else {
-            return;
-        };
-        let owners = self.by_id.entry(id.to_string()).or_default();
-        if entry.config.is_some() {
-            owners.config = Some(layer);
-        }
-        if entry.disabled || entry.disabled_expr.is_some() {
-            owners.disabled = Some(layer);
+        if let Some(id) = entry.id.as_deref() {
+            let owners = self.by_id.entry(id.to_string()).or_default();
+            if entry.config.is_some() {
+                owners.config = Some(layer);
+            }
+            if entry.disabled || entry.disabled_expr.is_some() {
+                owners.disabled = Some(layer);
+            }
         }
         for child in &entry.children {
             self.note(child, layer);
@@ -619,7 +652,7 @@ pub(crate) fn apply_entry_patches_tracked(
                         owners.untrack(child);
                     }
                 }
-                target.overlay(patch);
+                target.overlay(patch, warn);
                 owners.note_overlay(target, patch, layer);
             }
             None => warn(&format!("patch 目标 \"{id}\" 未找到，已跳过")),
@@ -820,7 +853,12 @@ fn rewrite_tag_outside_quotes(input: &str, from: &str, to: &str) -> String {
             i += 1;
             continue;
         }
-        if input[i..].starts_with(from) {
+        let before_ok = i == 0
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b'\n' | b'\r' | b':' | b'-' | b'[' | b'{' | b','
+            );
+        if before_ok && input[i..].starts_with(from) {
             let after = i + from.len();
             if after >= bytes.len() || matches!(bytes[after], b' ' | b'\t' | b'\r' | b'\n') {
                 out.push_str(to);
@@ -1126,4 +1164,68 @@ pub fn dump_overlay(
     let json = Value::Array(vec![Value::Object(object)]);
     let text = serde_yaml::to_string(&yaml_with_tags(&json)).map_err(|e| e.to_string())?;
     Ok(restore_js_tags(&text))
+}
+
+#[cfg(test)]
+mod review_regression_tests {
+    use super::*;
+
+    #[test]
+    fn patch_rejects_js_expr_in_inject_and_intercept() {
+        let err = parse_patches("- id: a\n  inject:\n    svc: !!js foo\n").unwrap_err();
+        assert!(err.contains("entry-level inject"), "unexpected err: {err}");
+
+        let err = parse_patches("- id: a\n  intercept:\n    svc: !!js bar\n").unwrap_err();
+        assert!(
+            err.contains("entry-level intercept"),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn group_overlay_warns_on_invalid_children_and_clears_on_ungroup() {
+        let root = parse_entries(
+            "- id: g\n  name: grp\n  group: true\n  config:\n    - id: c1\n      name: p1\n",
+        )
+        .unwrap();
+        let patches = parse_patches(
+            "- id: g\n  config:\n    - id: c2\n      name: p2\n      disabled: \"not-a-bool\"\n",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let out = apply_entry_patches(root.clone(), &patches, &mut |w| {
+            warnings.push(w.to_string())
+        });
+        assert!(
+            warnings.iter().any(|w| w.contains("子条目非法")),
+            "expected warning for invalid child, got {warnings:?}"
+        );
+        assert!(out[0].children.is_empty());
+
+        let ungroup = parse_patches("- id: g\n  group: false\n").unwrap();
+        let out = apply_entry_patches(root, &ungroup, &mut |_| {});
+        assert!(!out[0].group);
+        assert!(out[0].children.is_empty());
+    }
+
+    #[test]
+    fn rewrite_tag_ignores_token_glued_to_preceding_word() {
+        let yaml = "- name: p\n  config:\n    text: note!!js hello\n";
+        let entries = parse_entries(yaml).unwrap();
+        let text = entries[0].config.as_ref().unwrap()["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(text, "note!!js hello");
+    }
+
+    #[test]
+    fn patch_owners_tracks_named_child_inside_anonymous_group() {
+        let patches = parse_patches(
+            "- insert:\n  - name: grp\n    group: true\n    config:\n      - id: child1\n        name: p1\n        config:\n          k: 1\n",
+        )
+        .unwrap();
+        let mut owners = PatchOwners::default();
+        let _ = apply_entry_patches_tracked(Vec::new(), &patches, 2, &mut owners, &mut |_| {});
+        assert_eq!(owners.config_layer("child1"), Some(2));
+    }
 }

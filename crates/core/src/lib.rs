@@ -50,7 +50,10 @@ pub use store::{
 pub use stream::{
     AsyncStream, PushOutcome, StreamObserver, StreamOutcome, StreamSink, STREAM_WINDOW,
 };
-pub use trace::{current_caller_uid, Outcome, TraceRecord, TraceSink};
+pub use trace::{
+    current_caller_uid, current_correlation_id, enter_correlation, scope_correlation,
+    CorrelationGuard, Outcome, ScopedCorrelation, TraceRecord, TraceSink,
+};
 pub use volatile::{
     declare_volatile, equal_except_volatile, path_value, split_path, validate_volatile_paths,
     values_at, without_volatile, VolatileRef, VolatileValues,

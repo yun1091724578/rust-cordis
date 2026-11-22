@@ -11,6 +11,7 @@
 - 来源准入的作用域与优先级：`docs/adr/0008-source-admission-scope.md`
 - RSI 部署与观测底座的位置：`docs/adr/0009-rsi-deployment-substrate.md`
 - 调用链关联（父链）：`docs/adr/0010-call-graph-correlation.md`
+- 多会话并发关联标识（`correlation_id`）：`docs/adr/0011-correlation-id-propagation.md`
 - 发布门禁与未确认项：`docs/release.md`
 - 封存格式：`docs/release-seal.md`
 - 公开 API / 载荷清单：`docs/api-inventory.md`

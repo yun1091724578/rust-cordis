@@ -566,7 +566,7 @@ impl Store {
     pub(crate) fn lookup_visible(&self, ctx: &Ctx, name: &str) -> Option<Arc<Impl>> {
         let realm = ctx
             .isolate
-            .get(&name.into())
+            .get(name)
             .copied()
             .or_else(|| self.realms.lock().unwrap().get(name).copied())?;
         self.lookup(realm)
@@ -703,7 +703,7 @@ impl Store {
     /// 等价 JS 的 `ctx[symbols.isolate][name]` 沿原型链查表，查不到则落到
     /// `root[isolate][name] ??= Symbol(name)` 建立的全域默认域。
     pub fn realm_of(&self, ctx: &Context, name: &str) -> RealmId {
-        if let Some(realm) = ctx.isolate.get(&name.into()) {
+        if let Some(realm) = ctx.isolate.get(name) {
             return *realm;
         }
         let mut realms = self.realms.lock().unwrap();

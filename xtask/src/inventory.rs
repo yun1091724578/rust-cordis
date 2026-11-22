@@ -91,6 +91,24 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub fn current_caller_uid",
     },
     PublicItem {
+        item: "current_correlation_id",
+        kind: "fn",
+        source: "crates/core/src/trace.rs",
+        marker: "pub fn current_correlation_id",
+    },
+    PublicItem {
+        item: "enter_correlation",
+        kind: "fn",
+        source: "crates/core/src/trace.rs",
+        marker: "pub fn enter_correlation",
+    },
+    PublicItem {
+        item: "scope_correlation",
+        kind: "fn",
+        source: "crates/core/src/trace.rs",
+        marker: "pub fn scope_correlation",
+    },
+    PublicItem {
         item: "TraceRecord",
         kind: "struct",
         source: "crates/core/src/trace.rs",
@@ -113,6 +131,24 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         kind: "struct",
         source: "crates/core/src/context.rs",
         marker: "pub struct Context",
+    },
+    PublicItem {
+        item: "Context::with_correlation",
+        kind: "fn",
+        source: "crates/core/src/context.rs",
+        marker: "pub fn with_correlation(",
+    },
+    PublicItem {
+        item: "Context::correlation_id",
+        kind: "fn",
+        source: "crates/core/src/context.rs",
+        marker: "pub fn correlation_id(&self)",
+    },
+    PublicItem {
+        item: "Context::correlation_id_arc",
+        kind: "fn",
+        source: "crates/core/src/context.rs",
+        marker: "pub fn correlation_id_arc(&self)",
     },
     PublicItem {
         item: "Ctx",
@@ -1232,7 +1268,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 96, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 102, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 

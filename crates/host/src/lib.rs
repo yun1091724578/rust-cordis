@@ -169,6 +169,8 @@ struct Outbound {
     kind: ContinuationKind,
     /// trace 父（ADR 0010 §2.2）：只有 iface 出站写它；续延交付时用它压 CALL_SCOPE。
     trace_parent: Option<u64>,
+    /// 关联标识（ADR 0011）：续延交付时恢复，保证跨 `STATUS_PENDING` 的多会话归因不串线。
+    trace_correlation: Option<Arc<str>>,
 }
 
 /// 一条在飞派发的记录（M2/M2b/M2c 共用）：
@@ -377,9 +379,9 @@ impl Slab {
     }
 }
 
-fn instances() -> &'static Mutex<Slab> {
-    static INSTANCES: OnceLock<Mutex<Slab>> = OnceLock::new();
-    INSTANCES.get_or_init(|| Mutex::new(Slab::default()))
+fn instances() -> &'static RwLock<Slab> {
+    static INSTANCES: OnceLock<RwLock<Slab>> = OnceLock::new();
+    INSTANCES.get_or_init(|| RwLock::new(Slab::default()))
 }
 
 /// 注册一个 ABI 实例，并在**同一把实例表锁**内执行 per-App 容量准入。
@@ -394,7 +396,7 @@ fn register_instance_with_keepalive(
 ) -> std::result::Result<u64, String> {
     let dispatch_policy = dispatch_policy_for_ctx(&ctx);
     let host_limits = host_limits_for_ctx(&ctx);
-    let mut slab = instances().lock().unwrap();
+    let mut slab = instances().write().unwrap();
     let used = slab
         .slots
         .iter()
@@ -437,7 +439,7 @@ fn register_instance_with_keepalive(
 }
 
 fn unregister_instance(handle: u64) {
-    let removed = instances().lock().unwrap().remove(handle);
+    let removed = instances().write().unwrap().remove(handle);
     // 排水：`owner == root` 的派生句柄全部撤销。只撤句柄——不给派生句柄发
     // OP_DISPOSE（派生 ctx 没有自己的插件入口），子 fiber 的拆除由父 fiber 的
     // effect 链负责（`Fiber::new` 已把子 dispose 注册成父的 effect，且先于本
@@ -476,7 +478,7 @@ fn force_dead_weak(handle: u64) -> Option<Weak<dyn Any + Send + Sync>> {
     let weak = Arc::downgrade(&dead);
     drop(dead);
     let owner = {
-        let mut slab = instances().lock().unwrap();
+        let mut slab = instances().write().unwrap();
         let (instance, owner) = slab.slot_mut(handle)?;
         instance.keepalive = Some(weak.clone());
         owner.take()
@@ -497,7 +499,7 @@ fn force_dead_weak(handle: u64) -> Option<Weak<dyn Any + Send + Sync>> {
 /// 打破"注册期内 `upgrade()` 必成功"的不变量：owner 被摘到测试手里，槽位不再替它兜着。
 #[cfg(test)]
 fn take_slot_owner(handle: u64) -> Option<KeepaliveOwner> {
-    let mut slab = instances().lock().unwrap();
+    let mut slab = instances().write().unwrap();
     let (_, owner) = slab.slot_mut(handle)?;
     owner.take()
 }
@@ -508,7 +510,7 @@ fn take_slot_owner(handle: u64) -> Option<KeepaliveOwner> {
 /// `&self` 里存不下"当前实例"；而句柄由 `apply_via` 在装载时注册、随 fiber 卸载注销，
 /// 唯一稳定的关联就是 ctx 本身。表很小，线性查找足够（volatile 提交是低频操作）。
 fn instance_handle_of(ctx: &Ctx) -> Option<u64> {
-    let slab = instances().lock().unwrap();
+    let slab = instances().read().unwrap();
     for index in 0..slab.slots.len() {
         if let Some((generation, instance, _)) =
             slab.slots.get(index).and_then(|slot| slot.as_ref())
@@ -523,7 +525,7 @@ fn instance_handle_of(ctx: &Ctx) -> Option<u64> {
 
 /// 当前存活实例数（诊断用）。
 pub fn loaded_instances() -> usize {
-    instances().lock().unwrap().live()
+    instances().read().unwrap().live()
 }
 
 // ------------------------------------------------------------ 派生句柄表（M1）
@@ -586,7 +588,7 @@ fn resolve_handle(handle: u64) -> Option<Resolved> {
             owner: entry.owner,
         })
     } else {
-        let instance = instances().lock().unwrap().get(handle)?;
+        let instance = instances().read().unwrap().get(handle)?;
         Some(Resolved {
             ctx: instance.ctx.clone(),
             instance,
@@ -736,7 +738,7 @@ impl StreamObserver for HostStreamObserver {
             deliver_stream_credit_gone(self.handle, self.dispatch_id, on_credit, outcome);
         }
         // ② 流结束 ⇒ 这次派发结束（`remove` 幂等：宿主自己收回的路径早已摘过）。
-        let instance = instances().lock().unwrap().get(self.handle);
+        let instance = instances().read().unwrap().get(self.handle);
         if let Some(instance) = instance {
             let removed = instance
                 .dispatches
@@ -763,7 +765,7 @@ fn stream_outcome_message(outcome: &StreamOutcome) -> String {
 /// 父节点仍是它）；**先取 call、放锁、后调用**（插件会重入宿主：推块、再登记额度）。
 fn deliver_to_plugin(handle: u64, dispatch_id: u64, on_credit: u64, payload: &str, what: &str) {
     let _scope = scope_push(handle, dispatch_id);
-    let target = instances().lock().unwrap().get(handle);
+    let target = instances().read().unwrap().get(handle);
     #[cfg(test)]
     if let Some(instance) = &target {
         let gate = instance.observer_gate.lock().unwrap().take();
@@ -843,7 +845,7 @@ unsafe fn with_stream_instance(
     out: *mut Out,
     f: impl FnOnce(&Instance) -> std::result::Result<i32, ErrorPayload>,
 ) -> i32 {
-    let instance = instances().lock().unwrap().get(handle);
+    let instance = instances().read().unwrap().get(handle);
     match instance {
         None => fail(
             out,
@@ -1601,7 +1603,7 @@ pub fn waterfall_len(handle: u64) -> usize {
 
 fn count_dispatches(handle: u64, predicate: impl Fn(&DispatchRecord) -> bool) -> usize {
     instances()
-        .lock()
+        .read()
         .unwrap()
         .get(handle)
         .map(|instance| {
@@ -1669,6 +1671,13 @@ impl Drop for CallScopeGuard {
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn call_scope_push(call_id: u64) -> CallScopeGuard {
     CALL_SCOPE.with(|scope| scope.borrow_mut().push(call_id));
     CallScopeGuard
@@ -1718,6 +1727,7 @@ struct PendingContinuation {
     /// 发起时快照：settle 可能晚于 provider 卸载，届时 uid 已被处置。
     callee: (u64, Box<str>),
     caller_uid: u64,
+    correlation_id: Option<Arc<str>>,
     name: Box<str>,
     started: std::time::Instant,
 }
@@ -1779,6 +1789,7 @@ impl PendingContinuation {
             traced,
             callee,
             caller_uid,
+            correlation_id,
             name,
             started,
         } = self;
@@ -1806,16 +1817,14 @@ impl PendingContinuation {
                 return;
             }
             instance.ctx.store.record_trace(cordis_core::TraceRecord {
-                ts_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
+                ts_ms: now_ms(),
                 name: name.clone(),
                 call_id: dispatch_id,
                 parent_call_id: trace_parent.unwrap_or(0),
                 caller_uid,
                 callee_uid: callee.0,
                 callee_plugin: callee.1.clone(),
+                correlation_id: correlation_id.clone(),
                 elapsed: started.elapsed(),
                 outcome,
             });
@@ -1886,8 +1895,9 @@ unsafe fn call_inbound(
     let started = std::time::Instant::now();
     // 没有安装记录出口时，连身份快照都不构造（事件/流路径最常见）。
     let traced = trace && instance.ctx.store.has_trace_sink();
-    let (caller_uid, callee, name) = if traced {
+    let (caller_uid, correlation_id, callee, name) = if traced {
         let caller_uid = cordis_core::current_caller_uid();
+        let correlation_id = cordis_core::current_correlation_id();
         let service_hint = payload
             .get("event")
             .or_else(|| payload.get("service"))
@@ -1909,9 +1919,9 @@ unsafe fn call_inbound(
             }
             _ => format!("op:{op}").into_boxed_str(),
         };
-        (caller_uid, callee, name)
+        (caller_uid, correlation_id, callee, name)
     } else {
-        (0, (0, Box::from("")), Box::from(""))
+        (0, None, (0, Box::from("")), Box::from(""))
     };
     let _lifecycle = admit_call(instance).ok_or_else(|| {
         CallFailure::new(
@@ -1922,7 +1932,7 @@ unsafe fn call_inbound(
         )
     })?;
     {
-        let live = instances().lock().unwrap().get(handle);
+        let live = instances().read().unwrap().get(handle);
         if !live
             .as_ref()
             .is_some_and(|live| Arc::ptr_eq(&live.ctx, &instance.ctx))
@@ -1976,16 +1986,14 @@ unsafe fn call_inbound(
             return;
         }
         instance.ctx.store.record_trace(cordis_core::TraceRecord {
-            ts_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            ts_ms: now_ms(),
             name: name.clone(),
             call_id: dispatch_id,
             parent_call_id: trace_parent.unwrap_or(0),
             caller_uid,
             callee_uid: callee.0,
             callee_plugin: callee.1.clone(),
+            correlation_id: correlation_id.clone(),
             elapsed: started.elapsed(),
             outcome,
         });
@@ -2028,6 +2036,7 @@ unsafe fn call_inbound(
             traced,
             callee,
             caller_uid,
+            correlation_id,
             name,
             started,
         }))),
@@ -2084,22 +2093,21 @@ struct IfaceTrace {
     callee_plugin: String,
     caller_uid: u64,
     parent_call_id: u64,
+    correlation_id: Option<Arc<str>>,
     started: std::time::Instant,
 }
 
 impl IfaceTrace {
     fn record(&self, code: &str) {
         self.store.record_trace(cordis_core::TraceRecord {
-            ts_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            ts_ms: now_ms(),
             name: self.name.clone().into_boxed_str(),
             call_id: 0,
             parent_call_id: self.parent_call_id,
             caller_uid: self.caller_uid,
             callee_uid: 0,
             callee_plugin: self.callee_plugin.clone().into_boxed_str(),
+            correlation_id: self.correlation_id.clone(),
             elapsed: self.started.elapsed(),
             outcome: cordis_core::Outcome::Err(code.into()),
         });
@@ -2126,6 +2134,12 @@ fn with_iface_timeout(
     let Some(ms) = policy.outbound_timeout_ms else {
         return future;
     };
+    // 无 tokio 运行时的线程（如插件自建线程）无法构造 tokio 计时器，直接包装会让
+    // 首 poll 在 `tokio::time::timeout` 里 panic 并被误记成 `host_panic`；跳过包装，
+    // 交给 `complete_or_defer` 的同步快路径或 `DeferFailure::NoRuntime`（`host_call`）。
+    if tokio::runtime::Handle::try_current().is_err() {
+        return future;
+    }
     Box::pin(async move {
         match tokio::time::timeout(std::time::Duration::from_millis(ms), future).await {
             Ok(result) => result,
@@ -2157,6 +2171,9 @@ fn with_dispatch_timeout(
     let Some(ms) = policy.outbound_timeout_ms else {
         return Box::pin(async move { Ok(future.await) });
     };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Box::pin(async move { Ok(future.await) });
+    }
     Box::pin(async move {
         match tokio::time::timeout(std::time::Duration::from_millis(ms), future).await {
             Ok(ret) => Ok(ret),
@@ -2179,6 +2196,9 @@ fn with_next_timeout(
     let Some(ms) = policy.outbound_timeout_ms else {
         return Box::pin(async move { Ok(future.await) });
     };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Box::pin(async move { Ok(future.await) });
+    }
     Box::pin(async move {
         match tokio::time::timeout(std::time::Duration::from_millis(ms), future).await {
             Ok(ret) => Ok(ret),
@@ -2621,7 +2641,7 @@ unsafe fn with_instance_payload<T>(
 where
     T: AsRef<[u8]>,
 {
-    let instance = instances().lock().unwrap().get(handle);
+    let instance = instances().read().unwrap().get(handle);
     match instance {
         None => fail(
             out,
@@ -2991,7 +3011,7 @@ pub unsafe fn call_plugin_detailed(
 /// 将摘表与准入合并。直接使用快照里的裸 `CallFn` 会打进已释放的库。
 unsafe fn call_live(handle: u64, op: u32, payload: &str) -> std::result::Result<Value, String> {
     let instance =
-        instances().lock().unwrap().get(handle).ok_or_else(|| {
+        instances().read().unwrap().get(handle).ok_or_else(|| {
             format!("ctx 句柄 {handle} 已失效（插件已卸载，或句柄来自上一代实例）")
         })?;
     let _lifecycle = admit_call(&instance)
@@ -3347,6 +3367,10 @@ impl ExternService for PluginIface {
         self.methods.clone()
     }
 
+    fn has_method(&self, method: &str) -> bool {
+        self.methods.iter().any(|known| known == method)
+    }
+
     fn call(
         &self,
         caller_meta: Option<Config>,
@@ -3568,8 +3592,17 @@ unsafe extern "C" fn host_ctx_call_iface(
         let timeout_method = method.clone();
         let error_format = resolved.instance.error_format;
         let future = resolved.ctx.call_iface(&service, version, &method, parsed);
-        let trace_parent = call_scope_top();
-        let trace = resolved.instance.ctx.store.has_trace_sink().then(|| {
+        let traced = resolved.instance.ctx.store.has_trace_sink();
+        let trace_parent = traced.then(call_scope_top).flatten();
+        let trace_correlation = traced
+            .then(|| {
+                resolved
+                    .ctx
+                    .correlation_id_arc()
+                    .or_else(cordis_core::current_correlation_id)
+            })
+            .flatten();
+        let trace = traced.then(|| {
             Arc::new(IfaceTrace {
                 store: resolved.instance.ctx.store.clone(),
                 name: format!("{service}.{method}"),
@@ -3580,6 +3613,7 @@ unsafe extern "C" fn host_ctx_call_iface(
                     .map(|fiber| fiber.uid())
                     .unwrap_or(cordis_core::UID_ROOT),
                 parent_call_id: trace_parent.unwrap_or(0),
+                correlation_id: trace_correlation.clone(),
                 started: std::time::Instant::now(),
             })
         });
@@ -3608,6 +3642,7 @@ unsafe extern "C" fn host_ctx_call_iface(
                     continuation,
                     kind: ContinuationKind::Iface,
                     trace_parent,
+                    trace_correlation,
                 }),
                 stream: None,
             },
@@ -3944,7 +3979,7 @@ unsafe extern "C" fn host_ctx_on(handle: u64, event: Blob, cb: u64, out: *mut Ou
             // 每次调用重新取表项；取不到就把它当作"没有意见"，绝不碰裸 CallFn。
             // 注意先把实例取到局部变量再调用：`match instances().lock()...` 的
             // 临时 guard 会活到整个 match 结束，`call_inbound` 内部再取同一把锁就死锁。
-            let live = instances().lock().unwrap().get(plugin_handle);
+            let live = instances().read().unwrap().get(plugin_handle);
             let result = match live {
                 Some(instance) => unsafe {
                     call_inbound(
@@ -4103,6 +4138,7 @@ unsafe fn dispatch_impl(
                     continuation,
                     kind: ContinuationKind::Dispatch,
                     trace_parent: None,
+                    trace_correlation: None,
                 }),
                 stream: None,
             },
@@ -4228,7 +4264,7 @@ unsafe fn dispatch_impl(
 /// 摘除一条**出站派发**的登记节点。返回 `true` 表示"它还在表里"——
 /// 即这次派发仍由正常路径收尾；被取消（或已注销）时返回 `false`。
 fn unregister_dispatch_node(handle: u64, dispatch_id: u64) -> bool {
-    let instance = instances().lock().unwrap().get(handle);
+    let instance = instances().read().unwrap().get(handle);
     let removed =
         instance.and_then(|instance| instance.dispatches.lock().unwrap().remove(&dispatch_id));
     removed.is_some()
@@ -4237,10 +4273,10 @@ fn unregister_dispatch_node(handle: u64, dispatch_id: u64) -> bool {
 // 普通出站的终态认领与调用准入必须在同一表锁内；关闭先赢则留给排水 abort。
 // next 的入站记录可能早已终态，不能复用这个依赖记录存在的认领路径。
 fn deliver_outbound(handle: u64, dispatch_id: u64, payload: &str) {
-    let Some(instance) = instances().lock().unwrap().get(handle) else {
+    let Some(instance) = instances().read().unwrap().get(handle) else {
         return;
     };
-    let (removed, trace_parent, _active) = {
+    let (removed, trace_parent, trace_correlation, _active) = {
         let mut table = instance.dispatches.lock().unwrap();
         if instance.closed.load(Ordering::SeqCst) || !table.contains_key(&dispatch_id) {
             return;
@@ -4250,10 +4286,15 @@ fn deliver_outbound(handle: u64, dispatch_id: u64, payload: &str) {
         };
         let record = table.remove(&dispatch_id).unwrap();
         let trace_parent = record.outbound.as_ref().and_then(|out| out.trace_parent);
+        let trace_correlation = record
+            .outbound
+            .as_ref()
+            .and_then(|out| out.trace_correlation.clone());
         *instance.lifecycle.lock().unwrap() += 1;
         (
             record,
             trace_parent,
+            trace_correlation,
             ActiveCall {
                 active: instance.lifecycle.clone(),
                 changed: instance.calls_changed.clone(),
@@ -4270,9 +4311,10 @@ fn deliver_outbound(handle: u64, dispatch_id: u64, payload: &str) {
             gate.1.wait();
         }
     }
-    // 续延在“调用方那一跳”的调用作用域里执行（ADR 0010）：PENDING 恢复后
-    // 再发起的调用因此仍能挂回原来的父。
+    // 续延在“调用方那一跳”的调用作用域与关联标识下执行（ADR 0010 / ADR 0011）：
+    // PENDING 恢复后再发起的调用因此仍能挂回原来的父与所属会话。
     let _call_scope = trace_parent.map(call_scope_push);
+    let _correlation = cordis_core::enter_correlation(trace_correlation);
     unsafe {
         if let Err(message) = call_plugin(
             instance.call,
@@ -4318,7 +4360,7 @@ unsafe extern "C" fn host_ctx_dispatch(
 unsafe extern "C" fn host_log(handle: u64, level: u32, message: Blob) -> i32 {
     let message = message.as_str().to_string();
     let ctx = instances()
-        .lock()
+        .read()
         .unwrap()
         .get(handle)
         .map(|instance| instance.ctx);
@@ -4775,7 +4817,7 @@ fn apply_via_with_keepalive_and_format(
             Disposable::new(move || {
                 Box::pin(async move {
                     // 先关闭准入，再异步等待已经登记的同步调用退出。
-                    let instance = instances().lock().unwrap().get(handle);
+                    let instance = instances().read().unwrap().get(handle);
                     let mut outbound = Vec::new();
                     if let Some(instance) = &instance {
                         let close_lease = {
@@ -5445,7 +5487,7 @@ mod tests {
             .await
             .unwrap();
         let handle = TASK_TEST_HANDLE.get();
-        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let instance = instances().read().unwrap().get(handle).unwrap();
         insert_dispatch(
             &instance,
             91,
@@ -5488,7 +5530,7 @@ mod tests {
         .await
         .unwrap();
         let handle = TASK_TEST_HANDLE.get();
-        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let instance = instances().read().unwrap().get(handle).unwrap();
         let (tx, _rx) = tokio::sync::oneshot::channel();
         insert_dispatch(
             &instance,
@@ -5616,7 +5658,7 @@ mod tests {
             .await
             .unwrap();
             let handle = TASK_TEST_HANDLE.get();
-            let instance = instances().lock().unwrap().get(handle).unwrap();
+            let instance = instances().read().unwrap().get(handle).unwrap();
             let dropped = Arc::new(AtomicBool::new(false));
             NEXT_DROP_MARKER.with_borrow_mut(|marker| *marker = Some(dropped.clone()));
             NEXT_DISPOSE_AFTER_DROP.set(false);
@@ -5701,7 +5743,7 @@ mod tests {
             .await
             .unwrap();
             let handle = TASK_TEST_HANDLE.get();
-            let instance = instances().lock().unwrap().get(handle).unwrap();
+            let instance = instances().read().unwrap().get(handle).unwrap();
             let release = Arc::new(tokio::sync::Notify::new());
             let started = Arc::new(AtomicBool::new(false));
             let frame = Next::some({
@@ -5875,6 +5917,7 @@ mod tests {
             traced: false,
             callee: (0, Box::from("test")),
             caller_uid: 0,
+            correlation_id: None,
             name: Box::from("test"),
             started: std::time::Instant::now(),
         };
@@ -5908,6 +5951,7 @@ mod tests {
             traced: false,
             callee: (0, Box::from("test")),
             caller_uid: 0,
+            correlation_id: None,
             name: Box::from("test"),
             started: std::time::Instant::now(),
         };
@@ -6044,6 +6088,7 @@ mod tests {
             traced: false,
             callee: (0, Box::from("test")),
             caller_uid: 0,
+            correlation_id: None,
             name: Box::from("test"),
             started: std::time::Instant::now(),
         };
@@ -6653,7 +6698,7 @@ mod tests {
             cordis_abi::ERROR_FORMAT_V1,
         )
         .unwrap();
-        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let instance = instances().read().unwrap().get(handle).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tail_calls = calls.clone();
         let frame = Next::some(move |_| {
@@ -6720,7 +6765,7 @@ mod tests {
             cordis_abi::ERROR_FORMAT_V1,
         )
         .unwrap();
-        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let instance = instances().read().unwrap().get(handle).unwrap();
         let record = || DispatchRecord {
             sink: None,
             frame: Some(Next::none()),
@@ -6756,7 +6801,7 @@ mod tests {
         )
         .expect("默认容量下实例必须能登记");
         {
-            let instances = instances().lock().unwrap();
+            let instances = instances().read().unwrap();
             let instance = instances.get(handle).expect("实例必须已登记");
             assert!(
                 insert_dispatch(
@@ -6913,7 +6958,7 @@ mod tests {
         let handle = ABI_TEST_HANDLE.with(|cell| cell.get());
         assert_ne!(handle, u64::MAX, "插件应被调用过（拿到过句柄）");
         assert!(
-            instances().lock().unwrap().get(handle).is_none(),
+            instances().read().unwrap().get(handle).is_none(),
             "apply 失败后句柄必须已回收（由 dispose effect 单点负责）"
         );
     }
@@ -7589,6 +7634,7 @@ mod tests {
     }
 
     static PROBE_SCOPE: AtomicU64 = AtomicU64::new(u64::MAX);
+    static PROBE_CORRELATION: Mutex<Option<String>> = Mutex::new(None);
     static PROBE_LOCK: Mutex<()> = Mutex::new(());
 
     struct RecordCollector(Arc<Mutex<Vec<cordis_core::TraceRecord>>>);
@@ -7601,6 +7647,8 @@ mod tests {
 
     unsafe extern "C" fn scope_probe_call(_: u64, _: u32, _: Blob, _: Blob, _: *mut Out) -> i32 {
         PROBE_SCOPE.store(call_scope_top().unwrap_or(0), Ordering::SeqCst);
+        *PROBE_CORRELATION.lock().unwrap() =
+            cordis_core::current_correlation_id().map(|id| id.to_string());
         STATUS_OK
     }
 
@@ -7610,7 +7658,7 @@ mod tests {
         assert!(app.set_trace_sink(Arc::new(RecordCollector(records.clone()))));
         let handle =
             register_instance_with_keepalive(app.root.clone(), scope_probe_call, None, 0).unwrap();
-        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let instance = instances().read().unwrap().get(handle).unwrap();
         (handle, instance, records)
     }
 
@@ -7680,17 +7728,29 @@ mod tests {
                     continuation: 99,
                     kind: ContinuationKind::Iface,
                     trace_parent: Some(42),
+                    trace_correlation: Some(Arc::from("sess-resume")),
                 }),
                 stream: None,
             },
         )
         .unwrap_or_else(|_| panic!("admission"));
         PROBE_SCOPE.store(u64::MAX, Ordering::SeqCst);
+        *PROBE_CORRELATION.lock().unwrap() = None;
         deliver_outbound(handle, handle.wrapping_add(1000), "{}");
         assert_eq!(
             PROBE_SCOPE.load(Ordering::SeqCst),
             42,
             "续延交付必须恢复调用方那一跳"
+        );
+        assert_eq!(
+            PROBE_CORRELATION.lock().unwrap().as_deref(),
+            Some("sess-resume"),
+            "续延交付必须恢复调用方的 correlation_id"
+        );
+        assert_eq!(
+            cordis_core::current_correlation_id(),
+            None,
+            "续延交付结束后必须恢复 correlation 作用域"
         );
         unregister_instance(handle);
     }
@@ -7703,7 +7763,7 @@ mod tests {
         assert!(app.set_trace_sink(Arc::new(RecordCollector(records.clone()))));
         let handle =
             register_instance_with_keepalive(app.root.clone(), scope_probe_call, None, 0).unwrap();
-        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let instance = instances().read().unwrap().get(handle).unwrap();
         PROBE_SCOPE.store(u64::MAX, Ordering::SeqCst);
         let result = unsafe {
             call_inbound(
@@ -7794,6 +7854,57 @@ mod tests {
         assert_eq!(&*record.callee_plugin, "no-rt@1");
         assert_eq!(
             record.outcome,
+            cordis_core::Outcome::Err("host_call".into())
+        );
+        drop(records);
+        unregister_instance(handle);
+    }
+
+    #[test]
+    fn no_runtime_with_outbound_timeout_is_still_recorded_as_host_call() {
+        let _guard = PROBE_LOCK.lock().unwrap();
+        let app = Box::leak(Box::new(cordis_core::App::new()));
+        set_dispatch_policy_for(&app.root, DispatchPolicy::new(None, Some(50)));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        assert!(app.set_trace_sink(Arc::new(RecordCollector(records.clone()))));
+        app.root
+            .provide_iface("no-rt-to@1", Arc::new(NoRuntimeService))
+            .expect("provide");
+        let handle = register_instance_with_keepalive(
+            app.root.clone(),
+            scope_probe_call,
+            None,
+            cordis_abi::ERROR_FORMAT_V1,
+        )
+        .unwrap();
+        let mut buffer = [0u8; 512];
+        let mut out = Out {
+            ptr: buffer.as_mut_ptr(),
+            cap: buffer.len(),
+            len: 0,
+        };
+        let status = unsafe {
+            host_ctx_call_iface(
+                handle,
+                Blob::new(b"no-rt-to@1"),
+                1,
+                Blob::new(b"run"),
+                Blob::new(b"[]"),
+                0,
+                &mut out,
+            )
+        };
+        assert_eq!(status, STATUS_ERR);
+        let text = String::from_utf8_lossy(&buffer[..out.len.min(buffer.len())]);
+        let payload = ErrorPayload::from_json(&text).expect("结构化错误载荷");
+        assert_eq!(
+            payload.code, "host_call",
+            "配置出站超时后在无运行时线程调用仍须归类为 host_call，不得误报 host_panic：{payload:?}"
+        );
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1, "NoRuntime 必须写一条记录：{records:?}");
+        assert_eq!(
+            records[0].outcome,
             cordis_core::Outcome::Err("host_call".into())
         );
         drop(records);

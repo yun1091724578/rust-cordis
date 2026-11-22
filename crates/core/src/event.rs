@@ -249,17 +249,32 @@ pub(crate) fn run_waterfall(
     tail: BoxFuture<Ret>,
     cancel: Option<crate::CancelToken>,
 ) -> BoxFuture<Ret> {
-    // 从头部剥一层，余下的递归成"下游"。返回 boxed future，避免无限类型。
-    if handlers.is_empty() {
+    // 一次性反转后从尾部 pop，避免每层 `remove(0)` 带来的 O(n²) 搬移。
+    handlers.reverse();
+    run_waterfall_rev(handlers, ctx, args, tail, cancel)
+}
+
+fn run_waterfall_rev(
+    mut reversed_handlers: Vec<Handler>,
+    ctx: Ctx,
+    args: Args,
+    tail: BoxFuture<Ret>,
+    cancel: Option<crate::CancelToken>,
+) -> BoxFuture<Ret> {
+    let Some(head) = reversed_handlers.pop() else {
         return tail;
-    }
-    let head = handlers.remove(0);
-    let rest = handlers;
+    };
     let rest_ctx = ctx.clone();
     let rest_cancel = cancel.clone();
     Box::pin(async move {
         let next = Next::some(move |new_args: Args| {
-            run_waterfall(rest, rest_ctx.clone(), new_args, tail, rest_cancel)
+            run_waterfall_rev(
+                reversed_handlers,
+                rest_ctx.clone(),
+                new_args,
+                tail,
+                rest_cancel,
+            )
         });
         let call = Call {
             ctx,

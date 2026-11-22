@@ -74,11 +74,15 @@ mod imp {
 #[cfg(unix)]
 mod imp {
     use super::*;
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+    use std::os::unix::ffi::OsStrExt;
 
     extern "C" {
-        fn dlopen(filename: *const i8, flags: i32) -> *mut c_void;
-        fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+        fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         fn dlclose(handle: *mut c_void) -> i32;
+        fn dlerror() -> *const c_char;
     }
 
     const RTLD_NOW: i32 = 2;
@@ -88,13 +92,28 @@ mod imp {
     unsafe impl Send for DynLib {}
     unsafe impl Sync for DynLib {}
 
+    fn last_dlerror() -> String {
+        let ptr = unsafe { dlerror() };
+        if ptr.is_null() {
+            "unknown dlerror".to_string()
+        } else {
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
     impl DynLib {
         pub fn open(path: &Path) -> Result<Self, String> {
-            let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|err| err.to_string())?;
             let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW) };
             if handle.is_null() {
-                return Err(format!("dlopen 失败: {}", path.display()));
+                return Err(format!(
+                    "dlopen 失败 ({}): {}",
+                    path.display(),
+                    last_dlerror()
+                ));
             }
             Ok(Self(handle))
         }

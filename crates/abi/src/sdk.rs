@@ -1352,7 +1352,7 @@ struct Registry {
     /// 与 `handlers` 的区别只在"能不能挂起"；与 `async_handlers` 的区别在
     /// `AsyncHandler` 只拿到 `(args, dispatch_id)`，而这里要按 `method` 二次分派
     /// （方法名是契约，见 `provide_iface` 的说明）。
-    async_ifaces: Mutex<HashMap<u64, HashMap<String, AsyncIfaceFn>>>,
+    async_ifaces: Mutex<HashMap<u64, Arc<HashMap<String, AsyncIfaceFn>>>>,
     continuations: Mutex<HashMap<u64, Continuation>>,
     cleanups: Mutex<HashMap<u64, Cleanup>>,
     /// 回调 id → 注册它的实例句柄。`OP_DISPOSE` 只清这个实例的登记，
@@ -1402,7 +1402,10 @@ impl Registry {
 
     fn register_async_iface_for(&self, owner: u64, table: HashMap<String, AsyncIfaceFn>) -> u64 {
         let id = self.next_id();
-        self.async_ifaces.lock().unwrap().insert(id, table);
+        self.async_ifaces
+            .lock()
+            .unwrap()
+            .insert(id, Arc::new(table));
         self.remember(id, owner);
         id
     }

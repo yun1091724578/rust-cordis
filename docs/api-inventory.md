@@ -89,10 +89,16 @@
 | `Store::services_of` | fn | `crates/core/src/store.rs` |
 | `ServiceInfo` | struct | `crates/core/src/store.rs` |
 | `current_caller_uid` | fn | `crates/core/src/trace.rs` |
+| `current_correlation_id` | fn | `crates/core/src/trace.rs` |
+| `enter_correlation` | fn | `crates/core/src/trace.rs` |
+| `scope_correlation` | fn | `crates/core/src/trace.rs` |
 | `TraceRecord` | struct | `crates/core/src/trace.rs` |
 | `Outcome` | enum | `crates/core/src/trace.rs` |
 | `TraceSink` | trait | `crates/core/src/trace.rs` |
 | `Context` | struct | `crates/core/src/context.rs` |
+| `Context::with_correlation` | fn | `crates/core/src/context.rs` |
+| `Context::correlation_id` | fn | `crates/core/src/context.rs` |
+| `Context::correlation_id_arc` | fn | `crates/core/src/context.rs` |
 | `Ctx` | type alias | `crates/core/src/context.rs` |
 | `Fiber` | struct | `crates/core/src/fiber.rs` |
 | `FiberState` | enum | `crates/core/src/fiber.rs` |

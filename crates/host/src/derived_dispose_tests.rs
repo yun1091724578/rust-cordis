@@ -283,7 +283,7 @@ type DropLog = Arc<Mutex<Vec<(&'static str, bool, bool)>>>;
 struct DropProbe(&'static str, DropLog);
 impl Drop for DropProbe {
     fn drop(&mut self) {
-        let instances_free = instances().try_lock().is_ok();
+        let instances_free = instances().try_write().is_ok();
         let derived_free = derived_table().try_lock().is_ok();
         self.1
             .lock()

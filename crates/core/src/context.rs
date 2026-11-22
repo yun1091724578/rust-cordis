@@ -87,6 +87,9 @@ pub struct Context {
     /// 与 `isolate`（服务域）/`intercept`（元数据）都不同：它是"注册**在哪里**"的
     /// 身份，派发期由调用点自己的谓词裁决（见 [`crate::hook_scope`]）。
     hook_scope: Option<Arc<crate::ScopeAnchor>>,
+    /// 关联标识（ADR 0011）：多会话并发下绑定到会话上下文的 `session_id` / `run_id`，
+    /// 由所有派生 ctx 继承并在 `call_iface` 发起时进入调用作用域。
+    correlation_id: Option<Arc<str>>,
     pub base_url: Option<String>,
     /// **仅供根 ctx**：强持根 fiber，保证 `App::new().root` 这种只留下 root 的用法
     /// 仍保有 fiber 身份。根 fiber 对 ctx 只持弱引用（`ctx_weak`），所以这里不构成环；
@@ -115,6 +118,7 @@ impl Context {
         intercept: Arc<Scope<Box<str>, Config>>,
         declare: Arc<Scope<Box<str>, Config>>,
         hook_scope: Option<Arc<crate::ScopeAnchor>>,
+        correlation_id: Option<Arc<str>>,
         fiber: Option<Weak<Fiber>>,
         base_url: Option<String>,
     ) -> Ctx {
@@ -126,6 +130,7 @@ impl Context {
             intercept,
             declare,
             hook_scope,
+            correlation_id,
             base_url,
             root_keepalive: Mutex::new(None),
         })
@@ -138,6 +143,7 @@ impl Context {
             Scope::root(),
             Scope::root(),
             Scope::root(),
+            None,
             None,
             None,
             None,
@@ -205,6 +211,7 @@ impl Context {
             self.intercept.clone(),
             self.declare.clone(),
             Some(anchor),
+            self.correlation_id.clone(),
             self.fiber_weak(),
             self.base_url.clone(),
         )
@@ -283,6 +290,7 @@ impl Context {
             intercept,
             declare,
             self.hook_scope.clone(),
+            self.correlation_id.clone(),
             self.fiber_weak(),
             self.base_url.clone(),
         )
@@ -291,6 +299,36 @@ impl Context {
     /// 派生一个子上下文（两张表都原样继承）。
     pub fn extend(self: &Ctx) -> Ctx {
         self.extend_with(self.intercept.clone(), self.declare.clone())
+    }
+
+    /// 派生一个绑定关联标识的子上下文（ADR 0011）。
+    ///
+    /// 用于单机多会话并发：每个会话派生一份带 `session_id` / `run_id` 的 ctx，
+    /// 其后代 ctx（`extend`/`filter`/`isolate`/`intercept`）自动继承该标识，
+    /// 所有经它发起的 `call_iface` 及其下游 T2→T2 调用链（含 `STATUS_PENDING` 续延）
+    /// 都会把同一 `correlation_id` 写入 `TraceRecord`。
+    pub fn with_correlation(self: &Ctx, id: impl Into<Arc<str>>) -> Ctx {
+        Self::assemble(
+            self.store.clone(),
+            Some(self.clone()),
+            self.isolate.clone(),
+            self.intercept.clone(),
+            self.declare.clone(),
+            self.hook_scope.clone(),
+            Some(id.into()),
+            self.fiber_weak(),
+            self.base_url.clone(),
+        )
+    }
+
+    /// 读取本上下文绑定的关联标识；未绑定时为 `None`。
+    pub fn correlation_id(&self) -> Option<&str> {
+        self.correlation_id.as_deref()
+    }
+
+    /// 读取本上下文绑定的共享关联标识（O(1) 引用计数克隆，避免热路径重复堆分配）。
+    pub fn correlation_id_arc(&self) -> Option<Arc<str>> {
+        self.correlation_id.clone()
     }
 
     /// 隔离域：`name` 从此走独立的服务域。传入相同 `label` 即共享同一域
@@ -305,6 +343,7 @@ impl Context {
             self.intercept.clone(),
             self.declare.clone(),
             self.hook_scope.clone(),
+            self.correlation_id.clone(),
             self.fiber_weak(),
             self.base_url.clone(),
         )
@@ -322,11 +361,10 @@ impl Context {
     /// "右偏"在非对象层上同样成立（JS 的 `Object.assign` 也是如此）。
     /// `Config::Null` 表示"这一层没有配置"，直接跳过（与 `Fiber::new` 的跳过一致）。
     fn merge_chain(chain: &Arc<Scope<Box<str>, Config>>, name: &str) -> Option<Config> {
-        let key: Box<str> = name.into();
         let mut layers = Vec::new();
         let mut cursor = Some(chain.clone());
         while let Some(scope) = cursor {
-            if let Some(found) = scope.own(&key) {
+            if let Some(found) = scope.own(name) {
                 layers.push(found.clone());
             }
             cursor = scope.parent_arc();
@@ -486,6 +524,13 @@ impl Context {
         } else {
             crate::fiber::UID_ROOT
         };
+        let correlation_id = if traced || self.correlation_id.is_some() {
+            self.correlation_id
+                .clone()
+                .or_else(crate::trace::current_correlation_id)
+        } else {
+            None
+        };
         let (iface, caller_meta) = match self.iface_target(service) {
             Ok(pair) => pair,
             Err(err) => {
@@ -493,6 +538,7 @@ impl Context {
                     self.store.record_trace(crate::trace::failed(
                         format!("{service}.{method}"),
                         caller_uid,
+                        correlation_id,
                         service,
                         "resolve_failed",
                         started,
@@ -504,13 +550,16 @@ impl Context {
         let (service, method) = (service.to_string(), method.to_string());
         let store = self.store.clone();
         let (trace_service, trace_method) = (service.clone(), method.clone());
+        let check_correlation = correlation_id.clone();
         let future = Box::pin(async move {
             if let Err(err) = Self::check_iface_call(&iface, &trace_service, version, &trace_method)
             {
                 if traced {
+                    let corr = check_correlation.or_else(crate::trace::current_correlation_id);
                     store.record_trace(crate::trace::failed(
                         format!("{trace_service}.{trace_method}"),
                         caller_uid,
+                        corr,
                         &trace_service,
                         "iface_check_failed",
                         started,
@@ -520,8 +569,8 @@ impl Context {
             }
             iface.call(caller_meta, trace_method, args).await
         });
-        if traced {
-            crate::trace::scope_caller(future, caller_uid)
+        if traced || correlation_id.is_some() {
+            crate::trace::scope_caller(future, caller_uid, correlation_id)
         } else {
             future
         }
@@ -637,8 +686,8 @@ impl Context {
             }
             .into());
         }
-        let methods = iface.methods();
-        if !methods.iter().any(|known| known == method) {
+        if !iface.has_method(method) {
+            let methods = iface.methods();
             return Err(format!(
                 "service \"{service}\" 没有方法 \"{method}\"；可用方法: {methods:?}"
             )

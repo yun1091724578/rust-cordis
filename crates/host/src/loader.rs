@@ -1473,13 +1473,24 @@ impl LoaderState {
     /// `fingerprint` 为 `None` 的行（假源、非文件来源）永远不算陈旧——
     /// 把"未知"当成"永远变了"会让每个轮询周期都重挂一次。
     pub fn stale_labels(&self) -> Vec<String> {
-        let table = self.mounted.lock().unwrap();
-        table
-            .values()
-            .filter(|record| {
-                record.fingerprint.is_some() && fingerprint(&record.source) != record.fingerprint
-            })
-            .map(|record| record.label.clone())
+        let candidates: Vec<_> = {
+            let table = self.mounted.lock().unwrap();
+            table
+                .values()
+                .filter(|record| record.fingerprint.is_some())
+                .map(|record| {
+                    (
+                        record.label.clone(),
+                        record.source.clone(),
+                        record.fingerprint,
+                    )
+                })
+                .collect()
+        };
+        candidates
+            .into_iter()
+            .filter(|(_, source, expected)| fingerprint(source) != *expected)
+            .map(|(label, _, _)| label)
             .collect()
     }
 

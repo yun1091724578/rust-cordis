@@ -352,14 +352,35 @@ pub(crate) fn validate_manifest(manifest: &PluginManifest) -> Result<(), String>
 }
 
 /// 计算一个文件的 SHA-256（审计/诊断面；加载路径用 [`PluginSourcePolicy::verify`]）。
+///
+/// 采用 64 KiB 分块流式计算，避免把整个 DLL 读进内存再拷贝一份。
 pub fn sha256_file(path: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(path)
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
         .map_err(|err| format!("读取插件 artifact {} 失败: {err}", path.display()))?;
-    Ok(sha256_hex(&bytes))
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|err| format!("读取插件 artifact {} 失败: {err}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize_hex())
 }
 
-/// 无依赖 SHA-256，和 `xtask seal` 保持同一实现语义。
-fn sha256_hex(bytes: &[u8]) -> String {
+/// 无依赖流式 SHA-256，和 `xtask seal` 保持同一实现语义。
+struct Sha256 {
+    h: [u32; 8],
+    block: [u8; 64],
+    block_len: usize,
+    total_len: u64,
+}
+
+impl Sha256 {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -373,19 +394,44 @@ fn sha256_hex(bytes: &[u8]) -> String {
         0xc67178f2,
     ];
 
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let mut message = bytes.to_vec();
-    let bit_len = (bytes.len() as u64) * 8;
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
+    fn new() -> Self {
+        Self {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            block: [0u8; 64],
+            block_len: 0,
+            total_len: 0,
+        }
     }
-    message.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in message.chunks_exact(64) {
+    fn update(&mut self, mut input: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(input.len() as u64);
+        if self.block_len > 0 {
+            let need = 64 - self.block_len;
+            let take = need.min(input.len());
+            self.block[self.block_len..self.block_len + take].copy_from_slice(&input[..take]);
+            self.block_len += take;
+            input = &input[take..];
+            if self.block_len == 64 {
+                let block = self.block;
+                self.compress(&block);
+                self.block_len = 0;
+            }
+        }
+        let chunks = input.chunks_exact(64);
+        let remainder = chunks.remainder();
+        for chunk in chunks {
+            self.compress(chunk);
+        }
+        if !remainder.is_empty() {
+            self.block[..remainder.len()].copy_from_slice(remainder);
+            self.block_len = remainder.len();
+        }
+    }
+
+    fn compress(&mut self, chunk: &[u8]) {
         let mut w = [0u32; 64];
         for (index, word) in w.iter_mut().take(16).enumerate() {
             let start = index * 4;
@@ -409,15 +455,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
                 .wrapping_add(s1);
         }
 
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for index in 0..64 {
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = self.h;
+        for (&k_i, &w_i) in Self::K.iter().zip(w.iter()) {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
             let temp1 = hh
                 .wrapping_add(s1)
                 .wrapping_add(ch)
-                .wrapping_add(K[index])
-                .wrapping_add(w[index]);
+                .wrapping_add(k_i)
+                .wrapping_add(w_i);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
@@ -430,15 +476,30 @@ fn sha256_hex(bytes: &[u8]) -> String {
             b = a;
             a = temp1.wrapping_add(temp2);
         }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+        self.h[0] = self.h[0].wrapping_add(a);
+        self.h[1] = self.h[1].wrapping_add(b);
+        self.h[2] = self.h[2].wrapping_add(c);
+        self.h[3] = self.h[3].wrapping_add(d);
+        self.h[4] = self.h[4].wrapping_add(e);
+        self.h[5] = self.h[5].wrapping_add(f);
+        self.h[6] = self.h[6].wrapping_add(g);
+        self.h[7] = self.h[7].wrapping_add(hh);
     }
 
-    h.iter().map(|word| format!("{word:08x}")).collect()
+    fn finalize_hex(mut self) -> String {
+        let bit_len = self.total_len.wrapping_mul(8);
+        self.block[self.block_len] = 0x80;
+        self.block_len += 1;
+        if self.block_len > 56 {
+            self.block[self.block_len..64].fill(0);
+            let block = self.block;
+            self.compress(&block);
+            self.block_len = 0;
+        }
+        self.block[self.block_len..56].fill(0);
+        self.block[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.block;
+        self.compress(&block);
+        self.h.iter().map(|word| format!("{word:08x}")).collect()
+    }
 }

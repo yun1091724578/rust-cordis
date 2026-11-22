@@ -72,7 +72,7 @@ impl Fixture {
         .expect("假插件必须装载成功");
         let handle = instance_handle_of(&app.root).expect("装载后必须有实例句柄");
         let instance = instances()
-            .lock()
+            .read()
             .unwrap()
             .get(handle)
             .expect("实例必须可解析");

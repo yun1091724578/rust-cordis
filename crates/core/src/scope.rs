@@ -8,6 +8,7 @@
 //! 同一个类型同时服务于 `isolate`（name → 域）与 `intercept`（name → 配置）两张表，
 //! 这是本实现"短小"的第一个杠杆点。
 
+use std::borrow::Borrow;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -34,11 +35,14 @@ impl<K: Eq, V> Scope<K, V> {
     }
 
     /// 读：沿链冒泡，子遮蔽父。等价 JS 的 `key in obj` + `obj[key]`。
-    pub fn get(&self, key: &K) -> Option<&V> {
+    pub fn get<Q: ?Sized + Eq>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
         let mut cursor = Some(self);
         while let Some(scope) = cursor {
             if let Some((k, v)) = &scope.entry {
-                if k == key {
+                if k.borrow() == key {
                     return Some(v);
                 }
             }
@@ -48,9 +52,12 @@ impl<K: Eq, V> Scope<K, V> {
     }
 
     /// 只看自己这一层，不冒泡（等价 `Object.hasOwn(obj, key)`）。
-    pub fn own(&self, key: &K) -> Option<&V> {
+    pub fn own<Q: ?Sized + Eq>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
         match &self.entry {
-            Some((k, v)) if k == key => Some(v),
+            Some((k, v)) if k.borrow() == key => Some(v),
             _ => None,
         }
     }

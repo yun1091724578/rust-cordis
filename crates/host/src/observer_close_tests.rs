@@ -99,7 +99,7 @@ impl Fixture {
         .await
         .unwrap();
         let handle = instance_handle_of(&app.root).unwrap();
-        let instance = instances().lock().unwrap().get(handle).unwrap();
+        let instance = instances().read().unwrap().get(handle).unwrap();
         let log = Arc::new(Events::default());
         logs().lock().unwrap().insert(handle, log.clone());
         Self {
@@ -367,7 +367,7 @@ async fn real_outbound_terminal_window(iface: bool) {
                 let response: Value = serde_json::from_slice(&buffer[..out.len]).unwrap();
                 assert_eq!(response["pending"], true);
                 while instances()
-                    .lock()
+                    .read()
                     .unwrap()
                     .get(handle)
                     .is_some_and(|i| !i.tasks.lock().unwrap().is_empty())
@@ -436,6 +436,7 @@ async fn cancel_close_window(close_first: bool, format: u32, kind: ContinuationK
                 continuation: 99,
                 kind,
                 trace_parent: None,
+                trace_correlation: None,
             }),
         },
     )
@@ -644,6 +645,7 @@ async fn dead_weak_cleanup(timeout: bool) {
                 continuation: 99,
                 kind: ContinuationKind::Iface,
                 trace_parent: None,
+                trace_correlation: None,
             }),
         },
     )
@@ -676,6 +678,7 @@ async fn dead_weak_cleanup(timeout: bool) {
             traced: false,
             callee: (0, Box::from("test")),
             caller_uid: 0,
+            correlation_id: None,
             name: Box::from("test"),
             started: std::time::Instant::now(),
         };
@@ -773,6 +776,7 @@ async fn o1d_outbound_terminal_window() {
                         continuation: 99,
                         kind,
                         trace_parent: None,
+                        trace_correlation: None,
                     }),
                 },
             )
@@ -866,6 +870,7 @@ async fn o1d_close_wins_keeps_outbound_for_abort() {
                     continuation: 99,
                     kind,
                     trace_parent: None,
+                    trace_correlation: None,
                 }),
             },
         )
@@ -1042,6 +1047,7 @@ async fn o1c_close_lease_covers_gone_abort_dispose() {
                 continuation: 10,
                 kind: ContinuationKind::Iface,
                 trace_parent: None,
+                trace_correlation: None,
             }),
         },
     )
