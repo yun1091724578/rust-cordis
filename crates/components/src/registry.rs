@@ -73,15 +73,28 @@ impl RegistryHandle {
     /// 返回的 disposer 先摘服务表条目、再摘表里的名字；不跑它也不泄漏
     /// （注册表卸载时连同槽位一起回收）。
     pub fn put(self: &Arc<Self>, name: &str, value: Dyn) -> Result<Disposable, Error> {
+        if name == HANDLE_KEY || name == RegistryService::KEY {
+            return Err(format!("槽位 \"{name}\" 为注册表保留键，不能覆写").into());
+        }
         let ctx = self.live_ctx()?;
         {
-            let names = self.names.lock().unwrap();
+            let mut names = self.names.lock().unwrap();
             if names.iter().any(|existing| existing == name) {
                 return Err(format!("槽位 \"{name}\" 已经注册过：原地换值请用 replace").into());
             }
+            // 先占位再释放锁，避免并发 `put` 同名槽位的 TOCTOU，同时不跨 `provide` 持锁。
+            names.push(name.to_string());
         }
-        let provided = ctx.provide(name, value)?;
-        self.names.lock().unwrap().push(name.to_string());
+        let provided = match ctx.provide(name, value) {
+            Ok(provided) => provided,
+            Err(err) => {
+                self.names
+                    .lock()
+                    .unwrap()
+                    .retain(|existing| existing != name);
+                return Err(err);
+            }
+        };
         let table = Arc::downgrade(self);
         let name_owned = name.to_string();
         Ok(Disposable::new(move || {

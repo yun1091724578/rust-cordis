@@ -409,14 +409,17 @@ fn compact_json(text: &str) -> String {
         .unwrap_or_else(|_| text.to_string())
 }
 
+fn parent_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// 审阅一份配置文件的**每一行**：解析行 → 预挂载探测（[`cordis_host::probe_capabilities`]）
 /// → 汇总。**一行都不挂**。
 pub fn inspect(config_path: &Path) -> Result<InspectReport, String> {
-    let dir = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    inspect_in(config_path, &[dir])
+    inspect_in(config_path, &[parent_dir(config_path)])
 }
 
 /// [`inspect`] 的显式搜索目录版本（CLI 的 `--plugin-dir` 用）。
@@ -517,11 +520,7 @@ impl ValidateReport {
 
 /// 验证主配置 + patch 层，**不挂载任何插件**。
 pub fn validate(config_path: &Path, patches: &[PathBuf]) -> Result<ValidateReport, String> {
-    let base_dir = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    validate_in(config_path, patches, &[base_dir])
+    validate_in(config_path, patches, &[parent_dir(config_path)])
 }
 
 /// [`validate`] 的显式搜索目录版本（CLI 的 `--plugin-dir` 用）。
@@ -533,10 +532,7 @@ pub fn validate_in(
     let text = std::fs::read_to_string(config_path)
         .map_err(|err| format!("读取 {} 失败: {err}", config_path.display()))?;
     let mut entries = parse_entries(&text)?;
-    let base_dir = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base_dir = parent_dir(config_path);
 
     let mut warnings = Vec::new();
     for patch_path in patches {
@@ -611,10 +607,7 @@ fn precheck_config(config_path: &Path, patches: &[PathBuf]) -> Result<(), RunErr
         .map_err(|err| RunError::config(format!("读取 {} 失败: {err}", config_path.display())))?;
     parse_entries(&text).map_err(RunError::config)?;
 
-    let base_dir = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base_dir = parent_dir(config_path);
     for patch_path in patches {
         let path = if patch_path.is_absolute() {
             patch_path.clone()

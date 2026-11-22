@@ -295,6 +295,7 @@ dependencies = [
  "rust-cordis-abi",
  "rust-cordis-core",
  "rust-cordis-host",
+ "serde",
  "serde_json",
  "tokio",
 ]

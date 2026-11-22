@@ -27,6 +27,7 @@ pub fn config(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         syn::Fields::Named(fields) => fields
             .named
             .iter()
+            .filter(|field| !should_skip_probe(&field.attrs))
             .filter_map(|field| {
                 field
                     .ident
@@ -95,5 +96,27 @@ pub fn config(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                     .unwrap_or(::cordis::serde_json::Value::Null)
             }
         }
+    })
+}
+
+/// 跳过无法直接 `serde_json::from_value::<#ty>` 探测的字段（如 `#[serde(skip)]`、
+/// `#[serde(skip_deserializing)]`、`#[serde(with = "...")]`、`#[serde(deserialize_with = "...")]`）。
+fn should_skip_probe(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("serde") {
+            return false;
+        }
+        let Ok(nested) = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return false;
+        };
+        nested.iter().any(|meta| {
+            let path = meta.path();
+            path.is_ident("skip")
+                || path.is_ident("skip_deserializing")
+                || path.is_ident("with")
+                || path.is_ident("deserialize_with")
+        })
     })
 }

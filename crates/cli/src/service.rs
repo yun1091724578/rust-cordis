@@ -170,36 +170,43 @@ mod windows {
         STATUS_HANDLE.store(handle, Ordering::SeqCst);
         set_status(SERVICE_START_PENDING, 0, 1, 30_000);
 
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                eprintln!("cordis service: 无法创建 tokio runtime: {err}");
-                set_status(SERVICE_STOPPED, 4, 0, 0);
-                STATUS_HANDLE.store(0, Ordering::SeqCst);
-                return;
+        let exit_code = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("cordis service: 无法创建 tokio runtime: {err}");
+                    return 4;
+                }
+            };
+
+            runtime.block_on(async {
+                match RunSession::start(&args.config, args.options.clone(), disk_source()).await {
+                    Ok(session) => {
+                        if !crate::shutdown::is_requested() {
+                            set_status(SERVICE_RUNNING, 0, 0, 0);
+                        }
+                        crate::shutdown::wait_service().await;
+                        let _ = session.shutdown().await;
+                        crate::shutdown::complete();
+                        0
+                    }
+                    Err(err) => {
+                        eprintln!("cordis service: {err}");
+                        err.exit_code() as u32
+                    }
+                }
+            })
+        })) {
+            Ok(code) => code,
+            Err(_) => {
+                eprintln!("cordis service: 运行时发生未捕获 panic，已拦截防止跨 FFI 展开");
+                crate::shutdown::complete();
+                4
             }
         };
-
-        let exit_code = runtime.block_on(async {
-            match RunSession::start(&args.config, args.options.clone(), disk_source()).await {
-                Ok(session) => {
-                    if !crate::shutdown::is_requested() {
-                        set_status(SERVICE_RUNNING, 0, 0, 0);
-                    }
-                    crate::shutdown::wait_service().await;
-                    let _ = session.shutdown().await;
-                    crate::shutdown::complete();
-                    0
-                }
-                Err(err) => {
-                    eprintln!("cordis service: {err}");
-                    err.exit_code() as u32
-                }
-            }
-        });
 
         set_status(SERVICE_STOPPED, exit_code, 0, 0);
         STATUS_HANDLE.store(0, Ordering::SeqCst);

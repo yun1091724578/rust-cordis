@@ -67,13 +67,10 @@ fn inspect(args: &[String]) -> ExitCode {
         eprintln!("inspect 失败: {err}");
         return ExitCode::from(3);
     }
-    let search = parsed.plugin_dir.map(|dir| vec![dir]).unwrap_or_else(|| {
-        let dir = Path::new(&parsed.path)
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        vec![dir]
-    });
+    let search = parsed
+        .plugin_dir
+        .map(|dir| vec![dir])
+        .unwrap_or_else(|| vec![parent_dir(Path::new(&parsed.path))]);
     match cordis_cli::inspect_in(Path::new(&parsed.path), &search) {
         Ok(report) => {
             if parsed.json {
@@ -99,13 +96,10 @@ fn validate(args: &[String]) -> ExitCode {
         eprintln!("validate 失败: {err}");
         return ExitCode::from(3);
     }
-    let search = parsed.plugin_dir.map(|dir| vec![dir]).unwrap_or_else(|| {
-        let dir = Path::new(&parsed.path)
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        vec![dir]
-    });
+    let search = parsed
+        .plugin_dir
+        .map(|dir| vec![dir])
+        .unwrap_or_else(|| vec![parent_dir(Path::new(&parsed.path))]);
     match cordis_cli::validate_in(Path::new(&parsed.path), &parsed.patches, &search) {
         Ok(report) => {
             print!("{}", report.render());
@@ -218,21 +212,21 @@ fn service(args: &[String]) -> ExitCode {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--name" => match iter.next() {
-                Some(value) => name = Some(value.to_string()),
-                None => return usage_error("service", "--name 缺少服务名"),
+            "--name" => match next_value(&mut iter, "--name") {
+                Ok(value) => name = Some(value),
+                Err(message) => return usage_error("service", &message),
             },
-            "--patch" => match iter.next() {
-                Some(value) => patches.push(PathBuf::from(value)),
-                None => return usage_error("service", "--patch 缺少文件名"),
+            "--patch" => match next_value(&mut iter, "--patch") {
+                Ok(value) => patches.push(PathBuf::from(value)),
+                Err(message) => return usage_error("service", &message),
             },
-            "--plugin-dir" => match iter.next() {
-                Some(value) => plugin_dir = Some(PathBuf::from(value)),
-                None => return usage_error("service", "--plugin-dir 缺少目录"),
+            "--plugin-dir" => match next_value(&mut iter, "--plugin-dir") {
+                Ok(value) => plugin_dir = Some(PathBuf::from(value)),
+                Err(message) => return usage_error("service", &message),
             },
-            "--source-policy" => match iter.next() {
-                Some(value) => source_policy = Some(PathBuf::from(value)),
-                None => return usage_error("service", "--source-policy 缺少文件"),
+            "--source-policy" => match next_value(&mut iter, "--source-policy") {
+                Ok(value) => source_policy = Some(PathBuf::from(value)),
+                Err(message) => return usage_error("service", &message),
             },
             "--allow-unverified" => allow_unverified = true,
             "--no-strict" => strict = false,
@@ -351,6 +345,13 @@ fn activate_source_policy(path: &Option<PathBuf>, allow_unverified: bool) -> Res
         "未配置插件来源策略；请传 --source-policy，或显式传 --allow-unverified 启用开发模式"
             .to_string(),
     )
+}
+
+fn parent_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn next_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, String> {

@@ -23,3 +23,6 @@ semver = "1"
 
 [features]
 dhat-heap = ["dep:dhat"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

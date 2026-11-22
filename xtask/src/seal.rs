@@ -993,8 +993,10 @@ fn verify_dir(dir: &Path) -> Result<SealManifest, Vec<String>> {
         if manifest.host_workspace_version.trim().is_empty() {
             errors.push("host.workspace_version 为空".to_string());
         }
-        if manifest.host_source_sha256.len() != 64 {
-            errors.push("host.source_sha256 必须是 64 位十六进制".to_string());
+        if !is_sha256(&manifest.host_source_sha256)
+            || manifest.host_source_sha256.bytes().all(|byte| byte == b'0')
+        {
+            errors.push("host.source_sha256 必须是有效的非零 64 位十六进制".to_string());
         }
         if manifest.host_source_files == 0 {
             errors.push("host.source_files 必须大于 0".to_string());

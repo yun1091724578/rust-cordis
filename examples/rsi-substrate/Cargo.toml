@@ -19,5 +19,6 @@ cordis-abi = { workspace = true }
 cordis-cli = { workspace = true }
 cordis-core = { workspace = true }
 cordis-host = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -60,8 +60,8 @@ fn parse_args(args: TokenStream, ident: &Ident) -> syn::Result<(String, u32)> {
 struct Method {
     attrs: Vec<syn::Attribute>,
     ident: Ident,
-    /// `(参数名, 参数类型)`，按声明顺序。
-    args: Vec<(String, Type)>,
+    /// `(is_mut, 参数名, 参数类型)`，按声明顺序。
+    args: Vec<(bool, String, Type)>,
     /// 返回类型**原样**（`Result<T, E>`）。
     output: Type,
 }
@@ -121,7 +121,11 @@ impl Method {
                     "服务方法的参数必须是简单名字（`who: String`），不能是解构/通配模式",
                 ));
             };
-            args.push((pattern.ident.to_string(), (**ty).clone()));
+            args.push((
+                pattern.mutability.is_some(),
+                pattern.ident.to_string(),
+                (**ty).clone(),
+            ));
         }
         let ReturnType::Type(_, output) = &sig.output else {
             return Err(syn::Error::new(
@@ -141,16 +145,20 @@ impl Method {
     }
 
     /// 脱糖后的签名（trait 声明与 impl 定义必须逐字一致，否则 impl 对不上 trait）。
-    fn signature(&self) -> TokenStream {
+    fn signature(&self, allow_mut: bool) -> TokenStream {
         let Method {
             ident,
             args,
             output,
             ..
         } = self;
-        let params = args.iter().map(|(name, ty)| {
+        let params = args.iter().map(|(is_mut, name, ty)| {
             let name = Ident::new(name, ty.span());
-            quote!(#name: #ty)
+            if allow_mut && *is_mut {
+                quote!(mut #name: #ty)
+            } else {
+                quote!(#name: #ty)
+            }
         });
         quote! {
             fn #ident<'async_trait>(&'async_trait self, #(#params),*)
@@ -182,16 +190,21 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
                 let mut method = Method::parse(&function.sig)?;
                 method.attrs = function.attrs.clone();
                 let attrs = &method.attrs;
-                let signature = method.signature();
                 emitted.push(match &function.default {
                     // trait 里的默认实现同样脱糖：否则默认方法借不到 `&self`。
-                    Some(body) => quote! {
-                        #(#attrs)*
-                        #signature {
-                            ::std::boxed::Box::pin(async move #body)
+                    Some(body) => {
+                        let signature = method.signature(true);
+                        quote! {
+                            #(#attrs)*
+                            #signature {
+                                ::std::boxed::Box::pin(async move #body)
+                            }
                         }
-                    },
-                    None => quote!(#(#attrs)* #signature;),
+                    }
+                    None => {
+                        let signature = method.signature(false);
+                        quote!(#(#attrs)* #signature;)
+                    }
                 });
                 methods.push(method);
             }
@@ -233,10 +246,14 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
         } else {
             quote!(let mut envelope = ::cordis::typed::service::open(#companion::NAME, method.as_str(), args, #arity)?;)
         };
-        let takes = method.args.iter().enumerate().map(|(index, (arg_name, arg_type))| {
-            let bind = format_ident!("a{index}");
-            quote!(let #bind: #arg_type = envelope.take::<#arg_type>(#arg_name)?;)
-        });
+        let takes = method
+            .args
+            .iter()
+            .enumerate()
+            .map(|(index, (_, arg_name, arg_type))| {
+                let bind = format_ident!("a{index}");
+                quote!(let #bind: #arg_type = envelope.take::<#arg_type>(#arg_name)?;)
+            });
         let binds: Vec<Ident> = (0..arity).map(|index| format_ident!("a{index}")).collect();
         let call = &method.ident;
         quote! {
@@ -252,6 +269,12 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
             }
         }
     });
+
+    let has_method_body = if names.is_empty() {
+        quote!(false)
+    } else {
+        quote!(::core::matches!(method, #(#names)|*))
+    };
 
     Ok(quote! {
         #(#attrs)*
@@ -325,6 +348,10 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
                 ::std::vec![#(#names.to_string()),*]
             }
 
+            fn has_method(&self, method: &str) -> bool {
+                #has_method_body
+            }
+
             fn call(
                 &self,
                 _caller_meta: ::core::option::Option<::cordis::core::Config>,
@@ -362,13 +389,14 @@ fn expand_impl(item: ItemImpl) -> syn::Result<TokenStream> {
             "服务 impl 不能带泛型参数（与 `#[cordis::service]` 的 trait 侧同一限制）",
         ));
     }
+    let item_attrs = &item.attrs;
     let self_ty = item.self_ty.clone();
     let mut emitted: Vec<TokenStream> = Vec::new();
     for entry in &item.items {
         match entry {
             syn::ImplItem::Fn(function) => {
                 let method = Method::parse(&function.sig)?;
-                let signature = method.signature();
+                let signature = method.signature(true);
                 let docs = &function.attrs;
                 let block = &function.block;
                 emitted.push(quote! {
@@ -382,6 +410,7 @@ fn expand_impl(item: ItemImpl) -> syn::Result<TokenStream> {
         }
     }
     Ok(quote! {
+        #(#item_attrs)*
         impl #trait_path for #self_ty {
             #(#emitted)*
         }
