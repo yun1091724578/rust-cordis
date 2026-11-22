@@ -8,7 +8,6 @@
 use cordis_abi::cordis_plugin;
 use cordis_abi::sdk::{self, AsyncReply, PluginResult};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 cordis_plugin! {
@@ -25,8 +24,15 @@ fn apply(ctx: &sdk::Ctx, _config: Value) -> PluginResult {
     ctx.provide_iface_async("pipeline@1", 1, vec![("run", run), ("run_hold", run_hold)])
 }
 
-/// Build a method that forwards to `solver@1`; when the host does not inline
-/// the outbound callback, the method stays pending and settles later.
+enum ForwardState {
+    Waiting,
+    InlineReady(Result<Value, String>),
+    SwitchedToAsync,
+}
+
+/// Build a method that forwards to `solver@1`; uses a single-mutex 3-state
+/// machine so inline completion and async `OP_CALLBACK` continuation can never
+/// race and drop a settlement.
 fn make_forwarder(ctx: sdk::Ctx, method: &'static str) -> sdk::AsyncIfaceFn {
     Arc::new(move |args: Value, _meta: Option<Value>, dispatch_id: u64| {
         let target = if method == "run_hold" {
@@ -34,31 +40,41 @@ fn make_forwarder(ctx: sdk::Ctx, method: &'static str) -> sdk::AsyncIfaceFn {
         } else {
             "solve"
         };
-        let slot = Arc::new(Mutex::new(None::<Result<Value, String>>));
-        let inline = Arc::new(AtomicBool::new(false));
-        let callback_slot = slot.clone();
-        let callback_inline = inline.clone();
+        let state = Arc::new(Mutex::new(ForwardState::Waiting));
+        let cb_state = state.clone();
         let callback_ctx = ctx;
         ctx.call_iface("solver@1", 1, target, args, move |result| {
-            if callback_inline.load(Ordering::SeqCst) {
-                // Async continuation: the inbound dispatch is still pending.
+            let async_result = {
+                let mut guard = cb_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match *guard {
+                    ForwardState::Waiting => {
+                        *guard = ForwardState::InlineReady(result);
+                        None
+                    }
+                    ForwardState::SwitchedToAsync => Some(result),
+                    ForwardState::InlineReady(_) => None,
+                }
+            };
+            if let Some(result) = async_result {
                 let value = match result {
                     Ok(value) => value,
                     Err(err) => json!({ "error": err }),
                 };
                 let _ = callback_ctx.fulfill(dispatch_id, value);
-            } else {
-                *callback_slot
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
             }
         })?;
-        inline.store(true, Ordering::SeqCst);
-        let result = slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        match result {
+        let immediate = {
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match std::mem::replace(&mut *guard, ForwardState::SwitchedToAsync) {
+                ForwardState::InlineReady(res) => Some(res),
+                ForwardState::Waiting | ForwardState::SwitchedToAsync => None,
+            }
+        };
+        match immediate {
             Some(Ok(value)) => Ok(AsyncReply::Reply(value)),
             Some(Err(err)) => Err(err),
             None => Ok(AsyncReply::Pending),
