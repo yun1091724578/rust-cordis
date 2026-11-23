@@ -12,6 +12,7 @@
 - RSI 部署与观测底座的位置：`docs/adr/0009-rsi-deployment-substrate.md`
 - 调用链关联（父链）：`docs/adr/0010-call-graph-correlation.md`
 - 多会话并发关联标识（`correlation_id`）：`docs/adr/0011-correlation-id-propagation.md`
+- YAML 语料与替代库评估：`docs/adr/0012-yaml-parser-evaluation.md`
 - 发布门禁与未确认项：`docs/release.md`
 - 封存格式：`docs/release-seal.md`
 - 公开 API / 载荷清单：`docs/api-inventory.md`
@@ -140,8 +141,8 @@ RSI 方向按下述口径推进：本仓做**演化产物的部署与观测地�
 | O8 | credit 拒绝兼容性与 ABI 扩容边界 | 实现验收完成：credit 上限、只读扩容上限与测量边界，见下方 O8 记录 |
 | O9 | 贯穿 reload_one 与暂存验证的局部来源策略 | 实现验收完成：显式来源准入、双源隔离与 reload/probe 单快照，见下方 O9 记录 |
 | O10 | 门禁与发布证据补缺 | 进行中：本地门禁（A/B）与 package 隔离验收（C）已落地；剩余证据表、契约收口与 workflow 授权项 |
-| O11 | 宿主按状态所有权拆分 | 等待正确性批次完成 |
-| O12 | YAML 语料与替代库评估 | 语料待启动，替换未决策 |
+| O11 | 宿主按状态所有权拆分 | 本批实现验收完成：从 `crates/host/src/lib.rs`（7969→4523 行）按所有权拆出 `policy.rs`（统一双 WeakMap 清理）、`ffi_buf.rs`（缓冲池与底层调用）、`staging.rs`（暂存与挂载）及 `tests.rs`；公开 facade 与行为不变，`inventory` 与单测全绿 |
+| O12 | YAML 语料与替代库评估 | 评估与语料完成：新增 `crates/host/tests/yaml_corpus.rs` 钉住 `!!js`/引号/块标量/BOM/`null`/嵌套组/非法输入语义；`docs/adr/0012-yaml-parser-evaluation.md` 完成候选对比，明确决策 0.1.x 保留 `serde_yaml 0.9`、触发迁移时优先 `yaml_serde` 或 0.2 迁 `serde-saphyr` |
 | O13 | 接入文档与平台路径边界 | 待实施 |
 
 代码合入顺序优先 O1 → O2 → O3 → O4；O6 可独立先行。O5a/O5b 排在前四项之后是排期，不是技术依赖。
