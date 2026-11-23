@@ -11,13 +11,12 @@ rem   cargo.cmd test --workspace --offline     # 日常 TDD（依赖已缓存）
 rem   cargo.cmd fetch                          # 首次/新增依赖时联网拉取
 rem   cargo.cmd run -p demo                    # 运行 demo
 setlocal
-set "CARGO_HOME=C:\cordis-rs-cargo-home"
+if not defined CARGO_HOME set "CARGO_HOME=C:\cordis-rs-cargo-home"
 if not exist "%CARGO_HOME%" mkdir "%CARGO_HOME%"
 rem 本机路径含中文，GNU ld 无法处理；本机便利包装把 target 指到 ASCII 目录。
 rem 仓库里的 .cargo/config.toml 不再保存这个绝对路径（CI/其他机器可移植）。
 if not defined CARGO_TARGET_DIR set "CARGO_TARGET_DIR=C:\cordis-rs-target"
-rem 本机代理只放在这个本地包装器里，不进仓库配置。
-if not defined CARGO_HTTP_PROXY set "CARGO_HTTP_PROXY=http://127.0.0.1:7897"
+rem 如需 HTTP 代理请自行在环境中设置 CARGO_HTTP_PROXY / HTTPS_PROXY，脚本不再硬编码本机端口。
 rem windows-gnu 的 proc-macro lib-test 会固定传 -C prefer-dynamic；本机没有独立
 rem mingw，dlltool 会失败。静态链接 std 绕开它（仅本机包装器）。
 if not defined RUSTFLAGS set "RUSTFLAGS=-C prefer-dynamic=no"

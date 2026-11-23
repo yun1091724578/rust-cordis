@@ -16,14 +16,16 @@ publish = false
 [workspace]
 
 [dependencies]
+cordis = { package = "rust-cordis-sdk", path = "{{SDK}}" }
 cordis-abi = { package = "rust-cordis-abi", version = "{{VERSION}}" }
 cordis-core = { package = "rust-cordis-core", version = "{{VERSION}}" }
 cordis-host = { package = "rust-cordis-host", path = "{{HOST}}" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 
-# host 的打包清单把 core/abi 写成 registry 的 `^<version>`（crates.io 上并没有这个
+# host/sdk 的打包清单把 core/abi/macros 写成 registry 的 `^<version>`（crates.io 上并没有这个
 # 版本），patch 把这些要求重定向到解包目录——这正是"用产物构建"的关键一步。
 [patch.crates-io]
 rust-cordis-abi = { path = "{{ABI}}" }
 rust-cordis-core = { path = "{{CORE}}" }
+rust-cordis-macros = { path = "{{MACROS}}" }

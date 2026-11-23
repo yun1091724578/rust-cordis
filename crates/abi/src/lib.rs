@@ -256,7 +256,14 @@ impl Blob {
     }
 
     /// # Safety
-    /// 同 `as_bytes`。
+    /// `ptr` 必须在 `len` 字节内有效；本方法会做 UTF-8 校验，非法 UTF-8 返回 `Err` 而非 UB。
+    pub unsafe fn try_as_str<'a>(self) -> Result<&'a str, std::str::Utf8Error> {
+        std::str::from_utf8(self.as_bytes())
+    }
+
+    /// # Safety
+    /// 同 `as_bytes`，且调用方必须保证字节序列已是合法 UTF-8。
+    /// 来自不可信/外部插件的 `Blob` 请使用 [`Blob::try_as_str`]。
     pub unsafe fn as_str<'a>(self) -> &'a str {
         std::str::from_utf8_unchecked(self.as_bytes())
     }
@@ -498,7 +505,11 @@ pub type EntryFn = unsafe extern "C" fn() -> *const PluginDesc;
 /// `PluginDesc.id` 的可读化（诊断用）。
 ///
 /// # Safety
-/// `desc` 必须指向一个仍然有效的 `PluginDesc`。
+/// `desc` 必须指向一个仍然有效的 `PluginDesc`，且 `id` 为合法 UTF-8。
+#[deprecated(
+    since = "0.1.3",
+    note = "未校验 UTF-8 且无内部调用；请直接读取 `(*desc).id.try_as_str()`，将在 0.2 移除"
+)]
 pub unsafe fn plugin_id(desc: *const PluginDesc) -> String {
     let raw = (*desc).id.as_str();
     raw.to_string()

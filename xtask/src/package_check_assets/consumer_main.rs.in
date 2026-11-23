@@ -20,6 +20,21 @@ use std::sync::Arc;
 const PROBE_TEXT: &str = "package-check-probe";
 const PROBE_TIMES: u64 = 7;
 
+/// 验证 `rust-cordis-sdk` + `rust-cordis-macros` 打包产物能独立展开并跑通 typed/JSON 双面调用。
+#[cordis::service(name = "sdk_probe", version = 1)]
+pub trait SdkProbe {
+    async fn upper(&self, text: String) -> Result<String, String>;
+}
+
+struct SdkProbeImpl;
+
+#[cordis::service_impl]
+impl SdkProbe for SdkProbeImpl {
+    async fn upper(&self, text: String) -> Result<String, String> {
+        Ok(text.to_uppercase())
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -58,6 +73,24 @@ async fn run() -> Result<(), String> {
     let call: CallFn = unsafe { (*desc).call };
 
     let app = App::new();
+    SdkProbeService::provide(&app.root, Arc::new(SdkProbeImpl))
+        .map_err(|err| format!("注册 SDK typed 服务失败: {err}"))?;
+    let sdk_typed = SdkProbeService::of(&app.root)
+        .map_err(|err| format!("解析 SDK typed 服务失败: {err}"))?
+        .upper(PROBE_TEXT.to_string())
+        .await
+        .map_err(|err| format!("调用 SDK typed 服务失败: {err}"))?;
+    if sdk_typed != PROBE_TEXT.to_uppercase() {
+        return Err(format!("SDK typed 服务返回不符: {sdk_typed}"));
+    }
+    let sdk_json = app
+        .root
+        .call_iface(SdkProbeService::KEY, 1, "upper", json!([PROBE_TEXT]))
+        .await
+        .map_err(|err| format!("调用 SDK JSON 面失败: {err}"))?;
+    if sdk_json != json!(PROBE_TEXT.to_uppercase()) {
+        return Err(format!("SDK JSON 面返回不符: {sdk_json}"));
+    }
     app.root
         .provide(
             "probe.input",

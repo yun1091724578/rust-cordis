@@ -1043,7 +1043,7 @@ unsafe extern "C" fn host_stream_fail(
     reason: Blob,
     out: *mut Out,
 ) -> i32 {
-    let reason = reason.as_str().to_string();
+    let reason = String::from_utf8_lossy(reason.as_bytes()).into_owned();
     with_stream_instance(handle, out, move |instance| {
         match stream_of(instance, dispatch_id) {
             None => Ok(STATUS_STREAM_GONE),
@@ -3021,8 +3021,17 @@ unsafe fn call_live(handle: u64, op: u32, payload: &str) -> std::result::Result<
 
 // ------------------------------------------------------------ 宿主函数实现
 
+unsafe fn blob_to_string(blob: Blob, field: &str) -> std::result::Result<String, String> {
+    blob.try_as_str()
+        .map(str::to_string)
+        .map_err(|err| format!("{field} 不是合法 UTF-8: {err}"))
+}
+
 unsafe extern "C" fn host_ctx_get(handle: u64, name: Blob, out: *mut Out) -> i32 {
-    let name = name.as_str().to_string();
+    let name = match blob_to_string(name, "get 的服务名") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     // 统一解析（M1）：实例句柄与派生句柄同路——派生 ctx 读的是隔离域
     //（fiberless 的宽容读走内核的 unchecked root 语义，见 Store::resolve）。
     with_resolved(handle, out, |resolved| match resolved.ctx.get(&name) {
@@ -3039,7 +3048,10 @@ unsafe extern "C" fn host_ctx_get(handle: u64, name: Blob, out: *mut Out) -> i32
 /// 2. **读 committed 快照**：组件在**自己的拆除过程**中仍能读到正在离开的依赖，
 ///    而宽容读在提供者进入 UNLOADING 之后只能返回 `missing`。
 unsafe extern "C" fn host_ctx_require(handle: u64, name: Blob, out: *mut Out) -> i32 {
-    let name = name.as_str().to_string();
+    let name = match blob_to_string(name, "require 的服务名") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     with_resolved_as(
         handle,
         out,
@@ -3084,7 +3096,10 @@ fn encode_service(name: &str, value: Dyn) -> std::result::Result<String, String>
 /// 没 provide 过 → `without provide`；实现者不是当前 fiber → `in multiple fibers`。
 /// 换值**不通知依赖者**：依赖者的 epoch 只关心实现者身份，而 `set` 不改变身份。
 unsafe extern "C" fn host_ctx_set(handle: u64, name: Blob, value_json: Blob, out: *mut Out) -> i32 {
-    let name = name.as_str().to_string();
+    let name = match blob_to_string(name, "set 的服务名") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     let parsed: Value = match serde_json::from_slice(value_json.as_bytes()) {
         Ok(value) => value,
         Err(err) => return fail(out, &format!("set 的载荷不是合法 JSON: {err}")),
@@ -3110,8 +3125,14 @@ unsafe extern "C" fn host_ctx_set(handle: u64, name: Blob, value_json: Blob, out
 /// （G18：子 context 带 fiber 是 M4 的事），所以 M1 的可用面是
 /// `ctx_get`/`ctx_require` 的隔离域读；`provide`/`on` 请经 `ctx_use` 挂子组件。
 unsafe extern "C" fn host_ctx_isolate(handle: u64, key: Blob, label: Blob, out: *mut Out) -> i32 {
-    let key = key.as_str().to_string();
-    let label = label.as_str().to_string();
+    let key = match blob_to_string(key, "isolate 的 key") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
+    let label = match blob_to_string(label, "isolate 的 label") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     with_resolved(handle, out, |resolved| {
         let realm = (!label.is_empty()).then(|| resolved.ctx.store.named_realm(&key, &label));
         let derived = resolved.ctx.isolate(&key, realm);
@@ -3131,7 +3152,10 @@ unsafe extern "C" fn host_ctx_intercept(
     metadata: Blob,
     out: *mut Out,
 ) -> i32 {
-    let key = key.as_str().to_string();
+    let key = match blob_to_string(key, "intercept 的 key") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     let metadata: Value = match serde_json::from_slice(metadata.as_bytes()) {
         Ok(value) => value,
         Err(err) => return fail(out, &format!("intercept 的 metadata 不是合法 JSON: {err}")),
@@ -3150,7 +3174,10 @@ unsafe extern "C" fn host_ctx_intercept(
 /// 一个 effect**（内核 `Fiber::new` 负责）：父 dispose ⇒ 子 dispose，
 /// 宿主不需要为父子关系记账。返回子 fiber 的派生句柄。
 unsafe extern "C" fn host_ctx_use(handle: u64, url: Blob, config: Blob, out: *mut Out) -> i32 {
-    let url = url.as_str().to_string();
+    let url = match blob_to_string(url, "use 的 url") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     let config: Value = match serde_json::from_slice(config.as_bytes()) {
         Ok(value) => value,
         Err(err) => return fail(out, &format!("use 的 config 不是合法 JSON: {err}")),
@@ -3322,7 +3349,10 @@ unsafe extern "C" fn host_ctx_provide(
     value_json: Blob,
     out: *mut Out,
 ) -> i32 {
-    let name = name.as_str().to_string();
+    let name = match blob_to_string(name, "provide 的服务名") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     let parsed: Value = match serde_json::from_slice(value_json.as_bytes()) {
         Ok(value) => value,
         Err(err) => return fail(out, &format!("provide 的载荷不是合法 JSON: {err}")),
@@ -3536,7 +3566,10 @@ unsafe extern "C" fn host_ctx_provide_iface(
     dispatcher: u64,
     out: *mut Out,
 ) -> i32 {
-    let service = name.as_str().to_string();
+    let service = match blob_to_string(name, "provide_iface 的服务名") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     let parsed: Value = match serde_json::from_slice(methods.as_bytes()) {
         Ok(value) => value,
         Err(err) => return fail(out, &format!("方法清单不是合法 JSON: {err}")),
@@ -3575,8 +3608,14 @@ unsafe extern "C" fn host_ctx_call_iface(
     continuation: u64,
     out: *mut Out,
 ) -> i32 {
-    let service = service.as_str().to_string();
-    let method = method.as_str().to_string();
+    let service = match blob_to_string(service, "call_iface 的服务名") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
+    let method = match blob_to_string(method, "call_iface 的方法名") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     let parsed: Value = match serde_json::from_slice(args.as_bytes()) {
         Ok(value) => value,
         Err(err) => return fail(out, &format!("call_iface 的 args 不是合法 JSON: {err}")),
@@ -3940,7 +3979,10 @@ fn deliver_next(
 }
 
 unsafe extern "C" fn host_ctx_on(handle: u64, event: Blob, cb: u64, out: *mut Out) -> i32 {
-    let event = event.as_str().to_string();
+    let event = match blob_to_string(event, "on 的事件名") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     with_instance(handle, out, |instance| {
         let ctx = instance.ctx.clone();
         let plugin_handle = handle;
@@ -4105,7 +4147,10 @@ unsafe fn dispatch_impl(
     continuation: u64,
     out: *mut Out,
 ) -> i32 {
-    let event = event.as_str().to_string();
+    let event = match blob_to_string(event, "dispatch 的事件名") {
+        Ok(value) => value,
+        Err(err) => return fail(out, &err),
+    };
     let parsed: Value = match serde_json::from_slice(payload.as_bytes()) {
         Ok(value) => value,
         Err(err) => return fail(out, &format!("dispatch 的载荷不是合法 JSON: {err}")),
@@ -4358,7 +4403,7 @@ unsafe extern "C" fn host_ctx_dispatch(
 }
 
 unsafe extern "C" fn host_log(handle: u64, level: u32, message: Blob) -> i32 {
-    let message = message.as_str().to_string();
+    let message = String::from_utf8_lossy(message.as_bytes()).into_owned();
     let ctx = instances()
         .read()
         .unwrap()
@@ -4455,15 +4500,25 @@ impl LoadedPlugin {
             .map_err(|error| format!("插件文件 {}：{error}", path.display()))?;
         let (id, inject_json, provision_json, schema, schema_error, error_format) = unsafe {
             let schema = schema_from_blob((*desc).schema);
+            let id = blob_to_string((*desc).id, "PluginDesc.id")
+                .map_err(|error| format!("插件文件 {}：{error}", path.display()))?;
+            let inject_json = blob_to_string((*desc).inject, "PluginDesc.inject")
+                .map_err(|error| format!("插件文件 {}：{error}", path.display()))?;
+            // provision 是 v2 尾追加字段：v1 插件（size 只到冻结前缀）经
+            // `field_at` 读作「未声明」；Blob 指向插件内存，必须立刻拷成 String
+            // （附录 A）。
+            let provision_json = match PluginDesc::field_at::<Blob>(
+                desc,
+                std::mem::offset_of!(PluginDesc, provision),
+            ) {
+                Some(blob) => blob_to_string(blob, "PluginDesc.provision")
+                    .map_err(|error| format!("插件文件 {}：{error}", path.display()))?,
+                None => String::new(),
+            };
             (
-                (*desc).id.as_str().to_string(),
-                (*desc).inject.as_str().to_string(),
-                // provision 是 v2 尾追加字段：v1 插件（size 只到冻结前缀）经
-                // `field_at` 读作「未声明」；Blob 指向插件内存，必须立刻拷成 String
-                // （附录 A）。
-                PluginDesc::field_at::<Blob>(desc, std::mem::offset_of!(PluginDesc, provision))
-                    .map(|blob| blob.as_str().to_string())
-                    .unwrap_or_default(),
+                id,
+                inject_json,
+                provision_json,
                 schema.text,
                 schema.error,
                 PluginDesc::error_format_at(desc),
@@ -5100,9 +5155,10 @@ impl Capabilities {
             desc,
             std::mem::offset_of!(crate::PluginDesc, provision),
         )
-        .map(|blob| blob.as_str().to_string())
+        .map(|blob| String::from_utf8_lossy(blob.as_bytes()).into_owned())
         .unwrap_or_default();
-        let inject = parse_inject((*desc).inject.as_str());
+        let inject_raw = String::from_utf8_lossy((*desc).inject.as_bytes());
+        let inject = parse_inject(&inject_raw);
         // 与 `Capabilities::of_plugin` 保持一致：保留插件声明顺序，不在这里排序。
         let inject: Vec<String> = inject.0.iter().map(|(name, _)| name.to_string()).collect();
         let volatile = match unsafe {
@@ -5135,7 +5191,7 @@ impl Capabilities {
         };
         let schema = schema_from_blob((*desc).schema);
         Self {
-            plugin: (*desc).id.as_str().to_string(),
+            plugin: String::from_utf8_lossy((*desc).id.as_bytes()).into_owned(),
             // 冻结的 PluginDesc 没有 semver 字段；sidecar 版本不会从这里冒充。
             version: None,
             inject,

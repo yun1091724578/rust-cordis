@@ -32,22 +32,30 @@ use serde_json::Value;
 /// 顺序有约束：core/abi/macros 在前、host 最后（host 依赖 core/abi 的 registry 形式，
 /// 必须最后打包）。下面几个常量按位置切分这张表，所以新增 crate 时只改这里——
 /// 任何一处手抄的副本都会在下次新增 crate 时静默漏掉，让新鲜度检查退化。
-const ALL_PACKAGES: [&str; 4] = [
+const ALL_PACKAGES: [&str; 5] = [
     "rust-cordis-core",
     "rust-cordis-abi",
     "rust-cordis-macros",
     "rust-cordis-host",
+    "rust-cordis-sdk",
 ];
-/// 打包顺序：host 之前的全部。写法上就是"同一张表的前三项"——const 里还不能对
-/// 数组做范围切片（`&ALL_PACKAGES[..3]` 需要 const `Index`），所以逐项取下标。
+/// 打包顺序：无内部依赖的底层包（core/abi/macros）在前。
 const HEAD_PACKAGES: &[&str] = &[ALL_PACKAGES[0], ALL_PACKAGES[1], ALL_PACKAGES[2]];
-/// 依赖 core/abi 的宿主包，必须单独、最后打包。
-const HOST_PACKAGE: &str = ALL_PACKAGES[3];
+/// 依赖内部包的尾部包（host/sdk），通过临时 patch 后打包。
+const TAIL_PACKAGES: &[&str] = &[ALL_PACKAGES[3], ALL_PACKAGES[4]];
 const CORE_PACKAGE: &str = ALL_PACKAGES[0];
 const ABI_PACKAGE: &str = ALL_PACKAGES[1];
-/// 消费者直接依赖的子集：从 [`ALL_PACKAGES`] 派生（macros 只在 sdk 的宏展开里出现，
-/// 这个消费者用不到它）。
-const CONSUMER_PACKAGES: &[&str] = &[CORE_PACKAGE, ABI_PACKAGE, HOST_PACKAGE];
+const MACROS_PACKAGE: &str = ALL_PACKAGES[2];
+const HOST_PACKAGE: &str = ALL_PACKAGES[3];
+const SDK_PACKAGE: &str = ALL_PACKAGES[4];
+/// 消费者直接/经宏展开依赖的全部 5 个发布包。
+const CONSUMER_PACKAGES: &[&str] = &[
+    CORE_PACKAGE,
+    ABI_PACKAGE,
+    MACROS_PACKAGE,
+    HOST_PACKAGE,
+    SDK_PACKAGE,
+];
 
 /// 消费者模板：`include_str!` 而不是 `format!`（模板里满是 `{}`）。
 const CONSUMER_MANIFEST: &str = include_str!("package_check_assets/consumer_cargo.toml.in");
@@ -600,7 +608,7 @@ impl Check {
         for package in HEAD_PACKAGES {
             packaged.push(self.collect(package, version, prepared.started)?);
         }
-        packaged.push(self.package_host(prepared)?);
+        packaged.extend(self.package_tail(prepared)?);
         Ok(packaged)
     }
 
@@ -697,18 +705,22 @@ impl Check {
     /// 所以"仓库源码不参与消费者构建"由另外两处保证，而不是靠这一步的 patch：
     /// 打包清单里不会留下 path（`unpack_into` 里逐条断言），消费者侧的依赖图只认
     /// 解包目录（`resolve` 阶段的 `cargo metadata` 判据）。
-    fn package_host(&self, prepared: &Prepared) -> Result<Packaged, String> {
+    fn package_tail(&self, prepared: &Prepared) -> Result<Vec<Packaged>, String> {
         let version = prepared.version.as_str();
         let patch = self.root().join("package-patch.toml");
         let mut text = format!(
-            "# 只在这一次 `cargo package` 里生效：让 host 被打包时改写出来的 registry\n\
+            "# 只在这一次 `cargo package` 里生效：让 host/sdk 被打包时改写出来的 registry\n\
              # 依赖（^{version}）能被解析。它不进产物、不影响消费者。\n\
              #\n\
              # 为什么指 workspace 里的 path 包而不是解包副本：解包副本是一个新的\n\
              # package id，会要求改写仓库 Cargo.lock，而这一步必须带 --locked。\n\
              [patch.crates-io]\n"
         );
-        for (package, relative) in [(CORE_PACKAGE, "crates/core"), (ABI_PACKAGE, "crates/abi")] {
+        for (package, relative) in [
+            (CORE_PACKAGE, "crates/core"),
+            (ABI_PACKAGE, "crates/abi"),
+            (MACROS_PACKAGE, "crates/macros"),
+        ] {
             let dir = self.repo.join(relative);
             if !dir.join("Cargo.toml").exists() {
                 return Err(format!("{package} 的源码目录不存在：{}", dir.display()));
@@ -720,19 +732,25 @@ impl Check {
         }
         fs::write(&patch, text).map_err(|err| format!("写 {} 失败：{err}", patch.display()))?;
 
-        let mut args = vec![
-            "package".to_string(),
-            "-p".to_string(),
-            HOST_PACKAGE.to_string(),
+        let mut args = vec!["package".to_string()];
+        for package in TAIL_PACKAGES {
+            args.push("-p".to_string());
+            args.push((*package).to_string());
+        }
+        args.extend([
             "--no-verify".to_string(),
             "--allow-dirty".to_string(),
             "--locked".to_string(),
             "--config".to_string(),
             patch.to_string_lossy().into_owned(),
-        ];
+        ]);
         self.with_network(&mut args);
         self.step_status(&self.cargo(), &args, &self.repo, &[])?;
-        self.collect(HOST_PACKAGE, version, prepared.started)
+        let mut out = Vec::with_capacity(TAIL_PACKAGES.len());
+        for package in TAIL_PACKAGES {
+            out.push(self.collect(package, version, prepared.started)?);
+        }
+        Ok(out)
     }
 
     fn unpack(&self, crates: &[Packaged]) -> Result<Vec<Unpacked>, String> {
@@ -785,13 +803,17 @@ impl Check {
         let host = self.directory_of(unpacked, HOST_PACKAGE)?;
         let core = self.directory_of(unpacked, CORE_PACKAGE)?;
         let abi = self.directory_of(unpacked, ABI_PACKAGE)?;
+        let macros = self.directory_of(unpacked, MACROS_PACKAGE)?;
+        let sdk = self.directory_of(unpacked, SDK_PACKAGE)?;
         let version = unpacked_version(&host)?;
 
         let manifest_text = CONSUMER_MANIFEST
             .replace("{{VERSION}}", &version)
             .replace("{{HOST}}", &toml_path(&host))
             .replace("{{CORE}}", &toml_path(&core))
-            .replace("{{ABI}}", &toml_path(&abi));
+            .replace("{{ABI}}", &toml_path(&abi))
+            .replace("{{MACROS}}", &toml_path(&macros))
+            .replace("{{SDK}}", &toml_path(&sdk));
         let dir = root.join("consumer");
         let manifest = dir.join("Cargo.toml");
         fs::write(&manifest, &manifest_text)
@@ -907,7 +929,7 @@ impl Check {
                 ));
             }
         }
-        println!("[package-check] 溯源通过：core/abi/host 全部来自解包目录");
+        println!("[package-check] 溯源通过：core/abi/macros/host/sdk 全部来自解包目录");
         Ok(())
     }
 
@@ -1103,7 +1125,7 @@ impl Check {
             println!("  服务调用：{line}");
         }
         println!("  判据①：消费者 Cargo.toml 的 path 全部落在解包目录内（无仓库源码 path）");
-        println!("  判据②：cargo metadata 里 core/abi/host 全部来自解包目录，依赖图无仓库源码");
+        println!("  判据②：cargo metadata 里 core/abi/macros/host/sdk 全部来自解包目录，依赖图无仓库源码");
         println!(
             "  未上传 registry：只执行 cargo package（不执行 publish）；CARGO_HOME = {}",
             cargo_home_note()
@@ -1641,22 +1663,31 @@ mod tests {
     #[test]
     fn package_lists_are_derived_from_one_table() {
         // 清残留/新鲜度按 ALL_PACKAGES 走：任何一个包只写在别处都会静默漏删。
-        assert_eq!(ALL_PACKAGES.len(), 4);
-        // host 最后一个单独打包，其余一起打包，两张表合起来正好覆盖全部。
-        assert_eq!(HEAD_PACKAGES.len() + 1, ALL_PACKAGES.len());
-        assert_eq!(HOST_PACKAGE, ALL_PACKAGES[ALL_PACKAGES.len() - 1]);
-        assert!(!HEAD_PACKAGES.contains(&HOST_PACKAGE));
-        // 消费者子集必须全部来自同一张表，且不含只在宏展开里出现的宏包。
+        assert_eq!(ALL_PACKAGES.len(), 5);
+        // 底层包在前，依赖内部包的 host/sdk 在后，两张表合起来正好覆盖全部。
+        assert_eq!(
+            HEAD_PACKAGES.len() + TAIL_PACKAGES.len(),
+            ALL_PACKAGES.len()
+        );
+        for package in TAIL_PACKAGES {
+            assert!(!HEAD_PACKAGES.contains(package));
+        }
+        // 消费者子集覆盖全部 5 个可发布包（含 sdk 与过程宏）。
         for package in CONSUMER_PACKAGES {
             assert!(
                 ALL_PACKAGES.contains(package),
                 "{package} 不在 ALL_PACKAGES 里"
             );
         }
-        assert!(!CONSUMER_PACKAGES.contains(&"rust-cordis-macros"));
         assert_eq!(
             CONSUMER_PACKAGES,
-            &[CORE_PACKAGE, ABI_PACKAGE, HOST_PACKAGE][..]
+            &[
+                CORE_PACKAGE,
+                ABI_PACKAGE,
+                MACROS_PACKAGE,
+                HOST_PACKAGE,
+                SDK_PACKAGE,
+            ][..]
         );
     }
 

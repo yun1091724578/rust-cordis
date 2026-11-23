@@ -174,23 +174,16 @@ Stop-Service Cordis
 
 ## 发布状态
 
-**0.1.1 已发布到 crates.io（2026-11-07）**：
+- **crates.io 当前最高正式版为 `0.1.1`（2026-11-07）**：
+  - [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.1`
+  - [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.1`
+  - [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.1`
+  - [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.1`
+- **Git 仓库当前为 `0.1.3`（尚未推送 crates.io）**：
+  - 自 `0.1.3` 起，`rust-cordis-sdk`（库名 `cordis`）已开放发布并纳入 `cargo xtask package-check` 的 5-crate 解包构建与双面调用验收；`cordis-components`、`cordis-cli` 与 examples 仍保持 `publish = false`。
+  - 完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
 
-- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.1`
-- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.1`
-- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.1`
-- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.1`
-
-0.1.1 是元数据补丁：`repository` / `homepage` 已补齐，发布时不再产生该 warning；
-ABI 和公开 API 未变。`rust-cordis-sdk`、`cordis-components`、`cordis-cli` 与 examples
-保持 `publish = false`。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
-
-首发支持路径已定为**低层 ABI + 固定 revision 的源码依赖**：仓外工程 `../desolate`
-已用真实 DLL 验证装载、调用、失败、卸载、重载和 v1→v2 升级。标准 typed 门面
-`rust-cordis-sdk` 仍为 `publish = false`，过程宏依赖其 `cordis::typed` 运行时胶水；
-registry typed SDK 不在首发范围。仓外技术接入与 31 篇样例归档任务已完成；R1
-还需真实数据与长期维护反馈，第三方复现是额外证据而非门禁，详见
-[`docs/release.md`](docs/release.md)。
+仓外工程 `../desolate` 已用真实 DLL 验证装载、调用、失败、卸载、重载和 v1→v2 升级；详见 [`docs/release.md`](docs/release.md)。
 
 `../desolate` 中的 agent 链（模型流 → 归档工具 → 超时未知 → 关闭）是**仓外
 消费者验证**，不是本仓产品主线；agent 事件、模型 provider 与 SSE 传输不会

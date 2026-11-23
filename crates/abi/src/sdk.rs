@@ -832,29 +832,8 @@ impl Ctx {
     where
         F: FnOnce(Result<Json, String>) + Send + 'static,
     {
-        let api = self.call_iface_fn().ok_or("宿主不支持 ctx_call_iface")?;
         let cb = registry().register_text_continuation_for(self.handle, Box::new(on_done));
-        let payload = args.to_string();
-        let response = match self.invoke(|out| unsafe {
-            api(
-                self.handle,
-                Blob::new(service.as_bytes()),
-                version,
-                Blob::new(method.as_bytes()),
-                Blob::new(payload.as_bytes()),
-                cb,
-                out,
-            )
-        }) {
-            Ok(response) => response,
-            Err(err) => {
-                // 调用没起来：已经登记的续延必须撤销，否则永远等不到 on_done。
-                registry().forget(cb);
-                return Err(err);
-            }
-        };
-        settle_inline(cb, &response);
-        Ok(())
+        self.call_iface_with_cb(service, version, method, args, cb)
     }
 
     /// [`Ctx::call_iface`] 的详细版本：`on_done` 收到完整 `ErrorPayload`，旧字符串
@@ -872,8 +851,22 @@ impl Ctx {
     where
         F: FnOnce(Result<Json, crate::ErrorPayload>) + Send + 'static,
     {
-        let api = self.call_iface_fn().ok_or("宿主不支持 ctx_call_iface")?;
         let cb = registry().register_detailed_continuation_for(self.handle, Box::new(on_done));
+        self.call_iface_with_cb(service, version, method, args, cb)
+    }
+
+    fn call_iface_with_cb(
+        &self,
+        service: &str,
+        version: u32,
+        method: &str,
+        args: Json,
+        cb: u64,
+    ) -> PluginResult {
+        let Some(api) = self.call_iface_fn() else {
+            registry().forget(cb);
+            return Err("宿主不支持 ctx_call_iface".into());
+        };
         let payload = args.to_string();
         let response = match self.invoke(|out| unsafe {
             api(
@@ -888,6 +881,7 @@ impl Ctx {
         }) {
             Ok(response) => response,
             Err(err) => {
+                // 调用没起来：已经登记的续延必须撤销，否则永远等不到 on_done。
                 registry().forget(cb);
                 return Err(err);
             }
@@ -1192,16 +1186,7 @@ impl Ctx {
             let status = call(&mut out);
             match status {
                 STATUS_OK => {
-                    if out.len > buffer.len() {
-                        return Err(protocol_error(
-                            format!(
-                                "宿主响应声称 {} 字节，超过插件缓冲 {cap} 字节；消息未完整写入",
-                                out.len
-                            ),
-                            "host_protocol",
-                        ));
-                    }
-                    buffer.truncate(out.len);
+                    truncate_checked(&mut buffer, out.len, cap)?;
                     return Ok(buffer);
                 }
                 STATUS_TOO_SMALL => {
@@ -1221,16 +1206,7 @@ impl Ctx {
                     continue;
                 }
                 STATUS_ERR => {
-                    if out.len > buffer.len() {
-                        return Err(protocol_error(
-                            format!(
-                                "宿主响应声称 {} 字节，超过插件缓冲 {cap} 字节；消息未完整写入",
-                                out.len
-                            ),
-                            "host_protocol",
-                        ));
-                    }
-                    buffer.truncate(out.len);
+                    truncate_checked(&mut buffer, out.len, cap)?;
                     return Err(decode_host_error(self.host, &buffer));
                 }
                 STATUS_UNSUPPORTED => {
@@ -1299,38 +1275,34 @@ impl Ctx {
                     continue;
                 }
                 STATUS_ERR => {
-                    if out.len > buffer.len() {
-                        return Err(protocol_error(
-                            format!(
-                                "宿主响应声称 {} 字节，超过插件缓冲 {cap} 字节；消息未完整写入",
-                                out.len
-                            ),
-                            "host_protocol",
-                        )
-                        .error);
-                    }
-                    buffer.truncate(out.len);
+                    truncate_checked(&mut buffer, out.len, cap).map_err(|err| err.error)?;
                     return Err(decode_host_error(self.host, &buffer).error);
                 }
                 STATUS_UNSUPPORTED => return Err("宿主不支持这个操作（版本过旧？）".into()),
                 other => {
-                    if out.len > buffer.len() {
-                        return Err(protocol_error(
-                            format!(
-                                "宿主响应声称 {} 字节，超过插件缓冲 {cap} 字节；消息未完整写入",
-                                out.len
-                            ),
-                            "host_protocol",
-                        )
-                        .error);
-                    }
-                    buffer.truncate(out.len);
+                    truncate_checked(&mut buffer, out.len, cap).map_err(|err| err.error)?;
                     return Ok((other, buffer));
                 }
             }
         }
         Err("响应在多次重试后仍然放不下".into())
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn truncate_checked(
+    buffer: &mut Vec<u8>,
+    len: usize,
+    cap: usize,
+) -> Result<(), crate::ErrorPayload> {
+    if len > buffer.len() {
+        return Err(protocol_error(
+            format!("宿主响应声称 {len} 字节，超过插件缓冲 {cap} 字节；消息未完整写入"),
+            "host_protocol",
+        ));
+    }
+    buffer.truncate(len);
+    Ok(())
 }
 
 // ------------------------------------------------------------------ 回调表
@@ -1796,7 +1768,7 @@ where
 /// `provision` 是"我能安装哪些 key"的声明，写进 `PluginDesc` 的**尾字段**：
 /// 宿主在挂载之前就能读到它（`Capabilities`/`probe_capabilities`/`inspect`），
 /// v1 宿主根本不看这个字段（它们只读冻结前缀）。命名空间与 `impls_owned_by` 同一口径
-/// （今天都是裸名；M6 换 `<name>@<major>` 时两边一起换）。
+/// （支持裸名或 `<name>@<major>`）。
 ///
 /// # 一个进程只该有一个（重要）
 /// 这是"**不经动态库**造一个 ABI 形状插件"的装配入口（宿主夹具、spike、示例用）。
@@ -1960,16 +1932,21 @@ unsafe extern "C" fn call(ctx: u64, op: u32, a: Blob, b: Blob, out: *mut Out) ->
             // 初始化失败（含 panic）时宿主不会给这个实例发 OP_DISPOSE（它从未成功
             // apply 过），但 apply 里已经注册的回调必须在这里回收，否则它们会
             // 永远持有插件捕获的对象。volatile 副本同理。
+            // 回收过程会运行用户闭包的 Drop，必须同样包在 catch_unwind 内，防止跨 extern "C" abort。
             if op == OP_APPLY && status != STATUS_OK {
-                registry().dispose_owner(ctx);
-                forget_volatile(ctx);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    registry().dispose_owner(ctx);
+                    forget_volatile(ctx);
+                }));
             }
             status
         }
         Err(payload) => {
             if op == OP_APPLY {
-                registry().dispose_owner(ctx);
-                forget_volatile(ctx);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    registry().dispose_owner(ctx);
+                    forget_volatile(ctx);
+                }));
             }
             let message = format!(
                 "插件在 {} 中 panic: {}",

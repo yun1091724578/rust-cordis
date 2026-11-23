@@ -1,16 +1,17 @@
 # 发布检查清单
 
-## 0.1.3 SDK 发布记录（2026-11-22）
+## 0.1.3 SDK 发布准备（2026-11-22，已打 Tag，尚未推送 crates.io）
 
-正式标签 `v0.1.3`，ABI v1 零破坏；除原有 4 个底层 crate 外，本次一并开放门面 crate `rust-cordis-sdk`：
+Git 标签 `v0.1.3`（ABI v1 零破坏；`crates.io` 当前最高正式版仍为 `0.1.1`，`0.1.2` 与 `0.1.3` 均未推送 crates.io）。
+自 `0.1.3` 起，可发布范围扩大为以下 **5 个 crate**（全部纳入 `cargo xtask package-check` 解包构建与双面调用验收）：
 
-- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.3`
-- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.3`
-- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.3`
-- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.3`
-- [`rust-cordis-sdk`](https://crates.io/crates/rust-cordis-sdk) `0.1.3`（首次开放发布，库名 `cordis`）
+- `rust-cordis-core` `0.1.3`
+- `rust-cordis-abi` `0.1.3`
+- `rust-cordis-macros` `0.1.3`
+- `rust-cordis-host` `0.1.3`
+- `rust-cordis-sdk` `0.1.3`（首次移除 `publish = false`，库名 `cordis`）
 
-核心变更：ADR 0011 跨 ABI 多会话 `correlation_id` 传播、RSI 多会话并发参考层（金丝雀路由/会话亲和/优雅排空/有界工作池/非阻塞 JSONL Trace）、全仓存量审查 19 项性能与正确性修复、`tokio` 默认特性瘦身与 CI 门禁补齐。
+核心变更：ADR 0011 跨 ABI 多会话 `correlation_id` 传播、RSI 多会话并发参考层（金丝雀路由/会话亲和/优雅排空/有界工作池/非阻塞 JSONL Trace）、全仓存量审查修复（含 `Blob::try_as_str` 与 `dispose_owner` `catch_unwind`）、`tokio` 默认特性瘦身与 CI 门禁补齐。
 若后续推送到 crates.io，发布顺序为 `core → abi → macros → host → sdk`。
 
 ## 0.1.1 发布记录（2026-11-07）
@@ -186,22 +187,19 @@ SCM smoke passed: create -> RUNNING -> stop -> STOPPED
 
 ## 当前可发布 crate
 
-此处表示当前允许打包的范围，不代表完整 typed SDK 已具备 registry 交付路径。
-CI 使用 `cargo package --no-verify`，不替代解包构建和独立消费工程验证。
+此处表示当前允许打包的范围；CI 使用 `cargo package --no-verify`，本地解包构建与双面调用验证以 `cargo xtask package-check` 为准。
 
 - `rust-cordis-core`
 - `rust-cordis-abi`
-- `rust-cordis-host`
 - `rust-cordis-macros`
+- `rust-cordis-host`
+- `rust-cordis-sdk`（0.1.3 起开放，库名 `cordis`）
 
-`rust-cordis-sdk`、`cordis-components`、`cordis-cli` 与 examples 目前保持 `publish = false`。
+`cordis-components`、`cordis-cli` 与 examples 目前保持 `publish = false`。
 
-## 发布范围与仓外验收（R2：首发低层 ABI）
+## 历史发布范围与仓外验收（R2：0.1.0/0.1.1 首发低层 ABI）
 
-**决策（2026-11-03）**：首发承诺的支持路径是**低层 ABI + 固定 revision 的源码依赖**。
-registry typed SDK **不在首发范围**；`rust-cordis-sdk` 继续保持 `publish = false`，
-`rust-cordis-macros` 虽可打包，但单独发布不构成 typed 门面，直到单独决定并验证
-registry 交付。
+**历史决策（2026-11-03，适用于 0.1.0/0.1.1）**：首发阶段承诺的支持路径是**低层 ABI + 固定 revision 的源码依赖**，当时 `rust-cordis-sdk` 保持 `publish = false`（0.1.3 起已开放并纳入 `xtask package-check`）。
 
 - [x] 冻结首发承诺的使用路径：低层 ABI + 固定 revision 源码依赖。
   宏生成代码依赖 `::cordis::typed`，目前由不发布的 `rust-cordis-sdk` 提供；不能把四个
