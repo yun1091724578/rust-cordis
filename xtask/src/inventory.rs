@@ -291,7 +291,7 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
     PublicItem {
         item: "call_plugin_detailed",
         kind: "unsafe fn",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/ffi_buf.rs",
         marker: "pub unsafe fn call_plugin_detailed(",
     },
     PublicItem {
@@ -333,25 +333,25 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
     PublicItem {
         item: "set_dispatch_policy",
         kind: "fn",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/policy.rs",
         marker: "pub fn set_dispatch_policy(",
     },
     PublicItem {
         item: "set_dispatch_policy_for",
         kind: "fn",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/policy.rs",
         marker: "pub fn set_dispatch_policy_for",
     },
     PublicItem {
         item: "set_host_limits_for",
         kind: "fn",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/policy.rs",
         marker: "pub fn set_host_limits_for",
     },
     PublicItem {
         item: "set_default_host_limits",
         kind: "fn",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/policy.rs",
         marker: "pub fn set_default_host_limits",
     },
     PublicItem {
@@ -465,25 +465,25 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
     PublicItem {
         item: "DispatchPolicy",
         kind: "struct",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/policy.rs",
         marker: "pub struct DispatchPolicy",
     },
     PublicItem {
         item: "DispatchPolicy::new",
         kind: "fn",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/policy.rs",
         marker: "pub fn new(timeout_ms: Option<u64>, outbound_timeout_ms: Option<u64>) -> Self",
     },
     PublicItem {
         item: "HostLimits",
         kind: "struct",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/policy.rs",
         marker: "pub struct HostLimits",
     },
     PublicItem {
         item: "HostLimits::new",
         kind: "fn",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/policy.rs",
         marker: "pub fn new(\n        max_instances_per_app: usize,",
     },
     PublicItem {
@@ -513,19 +513,19 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
     PublicItem {
         item: "stage_plugin",
         kind: "fn",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/staging.rs",
         marker: "pub fn stage_plugin",
     },
     PublicItem {
         item: "staged_leaked",
         kind: "fn",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/staging.rs",
         marker: "pub fn staged_leaked",
     },
     PublicItem {
         item: "StagedFile",
         kind: "struct",
-        source: "crates/host/src/lib.rs",
+        source: "crates/host/src/staging.rs",
         marker: "pub struct StagedFile",
     },
     PublicItem {

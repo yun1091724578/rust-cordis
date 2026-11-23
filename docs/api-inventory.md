@@ -122,17 +122,17 @@
 | `Ctx::next_detailed` | fn | `crates/abi/src/sdk.rs` |
 | `STREAM_WINDOW` | const | `crates/core/src/stream.rs` |
 | `host_api` | fn | `crates/host/src/lib.rs` |
-| `call_plugin_detailed` | unsafe fn | `crates/host/src/lib.rs` |
+| `call_plugin_detailed` | unsafe fn | `crates/host/src/ffi_buf.rs` |
 | `DERIVED_HANDLE_TAG` | const | `crates/host/src/lib.rs` |
 | `apply_via` | fn | `crates/host/src/lib.rs` |
 | `apply_via_with_keepalive` | fn | `crates/host/src/lib.rs` |
 | `apply_via_with_error_format` | fn | `crates/host/src/lib.rs` |
 | `apply_via_with_keepalive_and_error_format` | fn | `crates/host/src/lib.rs` |
 | `set_plugin_source` | fn | `crates/host/src/lib.rs` |
-| `set_dispatch_policy` | fn | `crates/host/src/lib.rs` |
-| `set_dispatch_policy_for` | fn | `crates/host/src/lib.rs` |
-| `set_host_limits_for` | fn | `crates/host/src/lib.rs` |
-| `set_default_host_limits` | fn | `crates/host/src/lib.rs` |
+| `set_dispatch_policy` | fn | `crates/host/src/policy.rs` |
+| `set_dispatch_policy_for` | fn | `crates/host/src/policy.rs` |
+| `set_host_limits_for` | fn | `crates/host/src/policy.rs` |
+| `set_default_host_limits` | fn | `crates/host/src/policy.rs` |
 | `open_verified` | fn | `crates/host/src/lib.rs` |
 | `open_staged_verified` | fn | `crates/host/src/lib.rs` |
 | `PluginSourcePolicy` | struct | `crates/host/src/source.rs` |
@@ -151,17 +151,17 @@
 | `read_manifest` | fn | `crates/host/src/source.rs` |
 | `sha256_file` | fn | `crates/host/src/source.rs` |
 | `mounted_sources` | fn | `crates/host/src/loader.rs` |
-| `DispatchPolicy` | struct | `crates/host/src/lib.rs` |
-| `DispatchPolicy::new` | fn | `crates/host/src/lib.rs` |
-| `HostLimits` | struct | `crates/host/src/lib.rs` |
-| `HostLimits::new` | fn | `crates/host/src/lib.rs` |
+| `DispatchPolicy` | struct | `crates/host/src/policy.rs` |
+| `DispatchPolicy::new` | fn | `crates/host/src/policy.rs` |
+| `HostLimits` | struct | `crates/host/src/policy.rs` |
+| `HostLimits::new` | fn | `crates/host/src/policy.rs` |
 | `streams_len` | fn | `crates/host/src/lib.rs` |
 | `pending_len` | fn | `crates/host/src/lib.rs` |
 | `waterfall_len` | fn | `crates/host/src/lib.rs` |
 | `dispatches_len` | fn | `crates/host/src/lib.rs` |
-| `stage_plugin` | fn | `crates/host/src/lib.rs` |
-| `staged_leaked` | fn | `crates/host/src/lib.rs` |
-| `StagedFile` | struct | `crates/host/src/lib.rs` |
+| `stage_plugin` | fn | `crates/host/src/staging.rs` |
+| `staged_leaked` | fn | `crates/host/src/staging.rs` |
+| `StagedFile` | struct | `crates/host/src/staging.rs` |
 | `LoadedPlugin` | struct | `crates/host/src/lib.rs` |
 | `probe_capabilities` | fn | `crates/host/src/lib.rs` |
 | `probe_capabilities_in` | fn | `crates/host/src/lib.rs` |
