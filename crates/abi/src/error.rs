@@ -106,3 +106,30 @@ impl ErrorPayload {
         })
     }
 }
+
+impl std::fmt::Display for ErrorPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for ErrorPayload {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_payload_implements_display_and_std_error() {
+        let payload = ErrorPayload::new("rate limited")
+            .with_code("provider.rate_limited")
+            .with_category("business")
+            .with_certainty("not_executed")
+            .with_retry("safe")
+            .with_detail(json!({ "status": 429, "retry_after_ms": 5000 }));
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(payload.clone());
+        assert_eq!(boxed.to_string(), "rate limited");
+        let recovered = boxed.downcast_ref::<ErrorPayload>().expect("downcast works");
+        assert_eq!(recovered, &payload);
+    }
+}

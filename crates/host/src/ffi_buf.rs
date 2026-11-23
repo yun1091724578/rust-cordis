@@ -164,6 +164,9 @@ impl std::fmt::Display for CallFailure {
 impl std::error::Error for CallFailure {}
 
 pub(crate) fn payload_of(err: &(dyn std::error::Error + 'static)) -> ErrorPayload {
+    if let Some(payload) = err.downcast_ref::<ErrorPayload>() {
+        return payload.clone();
+    }
     err.downcast_ref::<CallFailure>()
         .map(|failure| failure.payload.clone())
         .unwrap_or_else(|| ErrorPayload::new(err.to_string()))
@@ -604,5 +607,38 @@ pub unsafe fn call_plugin_detailed(
         Err(message) => Err(cordis_abi::ErrorPayload::new(message)
             .with_code("plugin_protocol")
             .with_category("protocol")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_of_preserves_public_error_payload_and_falls_back_for_plain_errors() {
+        let structured = ErrorPayload::new("upstream rate limited")
+            .with_code("provider.rate_limited")
+            .with_category("business")
+            .with_certainty("not_executed")
+            .with_retry("safe")
+            .with_detail(json!({ "status": 429, "retry_after_ms": 1500 }));
+        let err: cordis_core::Error = Box::new(structured.clone());
+
+        let extracted = payload_of(err.as_ref());
+        assert_eq!(extracted, structured);
+
+        let v1_arg = error_arg(ERROR_FORMAT_V1, &extracted);
+        assert_eq!(v1_arg["error"], "upstream rate limited");
+        assert_eq!(v1_arg["code"], "provider.rate_limited");
+        assert_eq!(v1_arg["category"], "business");
+        assert_eq!(v1_arg["certainty"], "not_executed");
+        assert_eq!(v1_arg["retry"], "safe");
+        assert_eq!(v1_arg["detail"]["status"], 429);
+
+        let plain: cordis_core::Error = "plain error string".into();
+        let plain_payload = payload_of(plain.as_ref());
+        assert_eq!(plain_payload.error, "plain error string");
+        assert_eq!(plain_payload.code, "unknown");
+        assert_eq!(plain_payload.category, "unknown");
     }
 }
