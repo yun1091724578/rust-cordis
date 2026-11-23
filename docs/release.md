@@ -1,18 +1,17 @@
 # 发布检查清单
 
-## 0.1.3 SDK 发布准备（2026-11-22，已打 Tag，尚未推送 crates.io）
+## 0.1.3 SDK 发布记录（2026-11-23）
 
-Git 标签 `v0.1.3`（ABI v1 零破坏；`crates.io` 当前最高正式版仍为 `0.1.1`，`0.1.2` 与 `0.1.3` 均未推送 crates.io）。
-自 `0.1.3` 起，可发布范围扩大为以下 **5 个 crate**（全部纳入 `cargo xtask package-check` 解包构建与双面调用验收）：
+正式发布到 crates.io，发布源码提交 `804ea50`，正式标签 `v0.1.3`，ABI v1 零破坏；除原有 4 个底层 crate 外，首次正式上架门面 crate `rust-cordis-sdk`：
 
-- `rust-cordis-core` `0.1.3`
-- `rust-cordis-abi` `0.1.3`
-- `rust-cordis-macros` `0.1.3`
-- `rust-cordis-host` `0.1.3`
-- `rust-cordis-sdk` `0.1.3`（首次移除 `publish = false`，库名 `cordis`）
+- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.3`
+- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.3`
+- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.3`
+- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.3`
+- [`rust-cordis-sdk`](https://crates.io/crates/rust-cordis-sdk) `0.1.3`（首次上架，库名 `cordis`）
 
-核心变更：ADR 0011 跨 ABI 多会话 `correlation_id` 传播、RSI 多会话并发参考层（金丝雀路由/会话亲和/优雅排空/有界工作池/非阻塞 JSONL Trace）、全仓存量审查修复（含 `Blob::try_as_str` 与 `dispose_owner` `catch_unwind`）、`tokio` 默认特性瘦身与 CI 门禁补齐。
-若后续推送到 crates.io，发布顺序为 `core → abi → macros → host → sdk`。
+发布顺序为 `core → abi → macros → host → sdk`；`host` 与 `sdk` 的发布验证均从 crates.io 真实下载并编译了 `0.1.3` 底层依赖。
+核心变更：ADR 0011 跨 ABI 多会话 `correlation_id` 传播、RSI 多会话并发参考层（金丝雀路由/会话亲和/优雅排空/有界工作池/非阻塞 JSONL Trace）、全仓审查修复（含 `Blob::try_as_str`、`dispose_owner` `catch_unwind`、O11 宿主按所有权拆模块、O12 YAML 语料基线与评估 ADR 0012）、`tokio` 默认特性瘦身与 5-crate `package-check` 验收。
 
 ## 0.1.1 发布记录（2026-11-07）
 

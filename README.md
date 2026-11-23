@@ -174,14 +174,15 @@ Stop-Service Cordis
 
 ## 发布状态
 
-- **crates.io 当前最高正式版为 `0.1.1`（2026-11-07）**：
-  - [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.1`
-  - [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.1`
-  - [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.1`
-  - [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.1`
-- **Git 仓库当前为 `0.1.3`（尚未推送 crates.io）**：
-  - 自 `0.1.3` 起，`rust-cordis-sdk`（库名 `cordis`）已开放发布并纳入 `cargo xtask package-check` 的 5-crate 解包构建与双面调用验收；`cordis-components`、`cordis-cli` 与 examples 仍保持 `publish = false`。
-  - 完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
+**`0.1.3` 已正式发布到 crates.io（2026-11-23）**：
+
+- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.3`
+- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.3`
+- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.3`
+- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.3`
+- [`rust-cordis-sdk`](https://crates.io/crates/rust-cordis-sdk) `0.1.3`（库名 `cordis`，首次正式上架）
+
+`cordis-components`、`cordis-cli` 与 examples 仍保持 `publish = false`。完整门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；首发产物封存格式与同版本加载检查见 [`docs/release-seal.md`](docs/release-seal.md)。
 
 仓外工程 `../desolate` 已用真实 DLL 验证装载、调用、失败、卸载、重载和 v1→v2 升级；详见 [`docs/release.md`](docs/release.md)。
 
