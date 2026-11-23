@@ -593,7 +593,19 @@ impl Context {
         let (iface, caller_meta) = self.iface_target(service)?;
         Self::check_iface_call(&iface, service, version, method)?;
         let (sink, mut stream) = crate::StreamSink::new(crate::STREAM_WINDOW);
-        let mut future = iface.call_stream(caller_meta, method.to_string(), args, sink.clone());
+        let correlation_id = self
+            .correlation_id
+            .clone()
+            .or_else(crate::trace::current_correlation_id);
+        let mut future: BoxFuture<Result<()>> = {
+            let _guard = correlation_id
+                .as_ref()
+                .map(|cid| crate::trace::enter_correlation(Some(cid.clone())));
+            iface.call_stream(caller_meta, method.to_string(), args, sink.clone())
+        };
+        if let Some(cid) = correlation_id {
+            future = Box::pin(crate::trace::scope_correlation(cid, future));
+        }
         // 提供者的前半段要**现在就跑到第一个挂起点**：同步实现的提供者（含一切跨 ABI 的）
         // 在这一步就把窗口填满；真异步的提供者交给运行时继续跑——消费者于是可以立刻
         // 开始取块（生产与消费并行，而不是串行等待整条流算完）。

@@ -214,3 +214,84 @@ async fn scope_correlation_survives_await_across_concurrent_tasks() {
     }
     assert_eq!(current_correlation_id(), None);
 }
+
+#[tokio::test]
+async fn call_iface_stream_propagates_correlation_id_sync_and_async() {
+    struct StreamCidService {
+        seen_sync: Arc<Mutex<Option<String>>>,
+        seen_async: Arc<Mutex<Option<String>>>,
+    }
+
+    impl crate::ExternService for StreamCidService {
+        fn service(&self) -> &str {
+            "stream_cid@1"
+        }
+
+        fn version(&self) -> u32 {
+            1
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["stream".into()]
+        }
+
+        fn call(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> BoxFuture<Result<Config>> {
+            Box::pin(async { Ok(Config::Null) })
+        }
+
+        fn call_stream(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+            sink: crate::StreamSink,
+        ) -> BoxFuture<Result<()>> {
+            *self.seen_sync.lock().unwrap() = current_correlation_id().map(|s| s.to_string());
+            let seen_async = self.seen_async.clone();
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                *seen_async.lock().unwrap() = current_correlation_id().map(|s| s.to_string());
+                let _ = sink.send(serde_json::json!({"ok": true})).await;
+                sink.close();
+                Ok(())
+            })
+        }
+    }
+
+    let app = App::new();
+    let seen_sync = Arc::new(Mutex::new(None));
+    let seen_async = Arc::new(Mutex::new(None));
+    app.root
+        .provide_iface(
+            "stream_cid@1",
+            Arc::new(StreamCidService {
+                seen_sync: seen_sync.clone(),
+                seen_async: seen_async.clone(),
+            }),
+        )
+        .expect("provide");
+
+    let mut stream = app
+        .root
+        .with_correlation("sess-stream-014")
+        .call_iface_stream("stream_cid@1", 1, "stream", Config::Null)
+        .expect("call_iface_stream");
+    let first = stream.next().await.expect("ok").expect("chunk");
+    assert_eq!(first, serde_json::json!({"ok": true}));
+    assert!(stream.next().await.expect("ok").is_none());
+
+    assert_eq!(
+        seen_sync.lock().unwrap().as_deref(),
+        Some("sess-stream-014")
+    );
+    assert_eq!(
+        seen_async.lock().unwrap().as_deref(),
+        Some("sess-stream-014")
+    );
+    app.close().await;
+}
