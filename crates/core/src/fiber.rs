@@ -241,6 +241,160 @@ impl std::fmt::Display for ReloadDeferred {
 
 impl std::error::Error for ReloadDeferred {}
 
+/// 生命周期三段等待预算（按 App / `Store` 配置，缺省全部 `None` = 不设上限）。
+///
+/// 三段预算分别约束不同阶段，绝不混用：
+/// - `apply_timeout_ms`：单次插件 `apply`（装载激活）的等待预算；
+/// - `drain_timeout_ms`：卸载时等待在途原生调用、受管后台任务与非祖先消费者排空的等待预算；
+/// - `dispose_timeout_ms`：`Fiber::dispose_with_report` / `App::close_with_report`
+///   （调用方未显式传超时参数时）及热重载前卸载的等待预算。
+///
+/// **同进程保活红线（ADR 0005 §4）**：超时只代表宿主停止等待并上报故障；
+/// 同步阻塞中的原生线程不会被强杀，动态库保活仍须等到最后一次原生调用退出后才能卸载。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LifecyclePolicy {
+    pub apply_timeout_ms: Option<u64>,
+    pub drain_timeout_ms: Option<u64>,
+    pub dispose_timeout_ms: Option<u64>,
+}
+
+impl LifecyclePolicy {
+    /// 带校验的构造入口：`Some(0)` 被拒绝（0 不是“无限”，`None` 才是不设上限）。
+    pub fn new(
+        apply_timeout_ms: Option<u64>,
+        drain_timeout_ms: Option<u64>,
+        dispose_timeout_ms: Option<u64>,
+    ) -> std::result::Result<Self, String> {
+        let policy = Self {
+            apply_timeout_ms,
+            drain_timeout_ms,
+            dispose_timeout_ms,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// 校验三段等待预算：任一项为 `Some(0)` 时返回可读错误。
+    pub(crate) fn validate(self) -> std::result::Result<(), String> {
+        let fields = [
+            ("apply_timeout_ms", self.apply_timeout_ms),
+            ("drain_timeout_ms", self.drain_timeout_ms),
+            ("dispose_timeout_ms", self.dispose_timeout_ms),
+        ];
+        for (name, value) in fields {
+            if value == Some(0) {
+                return Err(format!(
+                    "LifecyclePolicy.{name} 不能为 0；不设上限请传 None，否则请给出正整数毫秒"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 清理错误来源分类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CleanupErrorKind {
+    /// 原生 `Disposable` 恢复回调 panic 或被取消。
+    DisposerPanic,
+    /// 宿主/载体登记的清理回调失败（例如 T2 `OP_CLEANUP` 返回错误）。
+    HostCleanup,
+    /// 宿主/载体卸载通知失败（例如 T2 `OP_DISPOSE` 返回错误）。
+    HostDispose,
+    /// 生命周期内部清理任务异常或状态迁移 panic。
+    InternalCleanup,
+    /// 清理阶段（排水 / 卸载）超过等待预算，后台清理仍在进行。
+    Timeout,
+}
+
+impl CleanupErrorKind {
+    /// 稳定的机器可读类别名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DisposerPanic => "disposer_panic",
+            Self::HostCleanup => "host_cleanup",
+            Self::HostDispose => "host_dispose",
+            Self::InternalCleanup => "internal_cleanup",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// 一条结构化的清理错误记录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupError {
+    /// 产生该错误的 fiber 名称。
+    pub fiber: String,
+    /// 产生该错误的 fiber 唯一编号（创建时固定，不会在处置后坍缩为 `UID_DISPOSED`）。
+    pub uid: u64,
+    /// 错误来源分类。
+    pub kind: CleanupErrorKind,
+    /// 可读错误详情。
+    pub message: String,
+}
+
+/// 一次结构化关闭 / 处置的结果分类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CloseStatus {
+    /// 清理已完成，且未发生任何清理错误。
+    Completed,
+    /// 清理已完成，但过程中产生了一项或多项清理错误。
+    CompletedWithErrors,
+    /// 等待超出预算，后台清理任务仍在进行中（动态库与在途调用保活不受破坏）。
+    TimedOut,
+    /// 在受管后台任务内部重入发起关闭：关闭已启动并移交后台继续执行。
+    Deferred,
+}
+
+impl CloseStatus {
+    /// 稳定的机器可读状态名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::CompletedWithErrors => "completed_with_errors",
+            Self::TimedOut => "timed_out",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+/// 一次 `Fiber::dispose_with_report` 或 `App::close_with_report` 的结构化关闭报告。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseReport {
+    /// 关停结果的终态分类。
+    pub status: CloseStatus,
+    /// 本次关停期间收集到的全部结构化清理错误。
+    pub errors: Vec<CleanupError>,
+    /// 后台清理是否仍在进行（`TimedOut` / `Deferred` 时为 `true`）。
+    pub still_running: bool,
+    /// 本次关停等待耗时。
+    pub elapsed: std::time::Duration,
+}
+
+/// 后台延后清理的 RAII 凭证：持有它表示仍有清理工作在后台收尾，Drop 时销账并唤醒等待者。
+pub struct BackgroundCleanupGuard {
+    store: Arc<Store>,
+    id: u64,
+}
+
+impl BackgroundCleanupGuard {
+    pub(crate) fn new(store: Arc<Store>, id: u64) -> Self {
+        Self { store, id }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for BackgroundCleanupGuard {
+    fn drop(&mut self) {
+        self.store.finish_background_cleanup(self.id);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettleDisposition {
     /// 本次调用已同步等到状态机收敛。
@@ -460,6 +614,10 @@ impl Drop for UpdateChain {
 
 pub struct Fiber {
     uid: AtomicU64,
+    /// 创建时固定的唯一编号（不会被 `dispose()` 覆写成 `UID_DISPOSED`），用于错误归因与收集器路由。
+    id: u64,
+    /// 从自身到根 fiber 的不可变祖先链 `[self.id, parent.id, ..., UID_ROOT]`。
+    ancestor_ids: Arc<[u64]>,
     pub store: Arc<Store>,
     /// 创建它的上下文（对应 JS 构造函数里的 `parent: Context`）。
     parent: Option<Ctx>,
@@ -544,8 +702,10 @@ pub struct Fiber {
     desired: Mutex<Option<u64>>,
     running: Mutex<Option<u64>>,
     error: Mutex<Option<Error>>,
-    /// 清理/卸载任务异常时的诊断；生命周期仍会收敛，但资源完整性只能尽力保证。
-    cleanup_error: Mutex<Option<String>>,
+    /// 清理/卸载阶段收集到的结构化错误（带单调序号用于并发收集器去重）。
+    cleanup_errors: Mutex<Vec<(u64, CleanupError)>>,
+    /// 本子树是否启用了带等待预算的关闭路径（供宿主决定是否把同步 OP_CLEANUP / OP_DISPOSE 移交 blocking 池）。
+    budgeted_dispose: AtomicBool,
     /// 支持范围外拓扑只告警一次，避免卸载链上重复刷屏。
     unsupported_ancestor_logged: AtomicBool,
     /// 因会形成运行时环而被拒绝的服务名；卸载等待时必须跳过这些声明，
@@ -586,6 +746,8 @@ impl Fiber {
         let (dispose_tx, _) = tokio::sync::watch::channel(false);
         let fiber = Arc::new(Self {
             uid: AtomicU64::new(UID_ROOT),
+            id: UID_ROOT,
+            ancestor_ids: Arc::from([UID_ROOT]),
             store: store.clone(),
             parent: None,
             ctx: Mutex::new(None),
@@ -616,7 +778,8 @@ impl Fiber {
             desired: Mutex::new(None),
             running: Mutex::new(None),
             error: Mutex::new(None),
-            cleanup_error: Mutex::new(None),
+            cleanup_errors: Mutex::new(Vec::new()),
+            budgeted_dispose: AtomicBool::new(false),
             unsupported_ancestor_logged: AtomicBool::new(false),
             cycle_blocked: Mutex::new(HashSet::new()),
             revision: AtomicU64::new(0),
@@ -660,8 +823,18 @@ impl Fiber {
         }
         let ctx = parent.extend_with(parent.intercept.clone(), declare);
         let (dispose_tx, _) = tokio::sync::watch::channel(false);
+        let id = store.next_fiber_uid();
+        let mut ancestors = Vec::with_capacity(4);
+        ancestors.push(id);
+        if let Some(parent_fiber) = parent.fiber_opt() {
+            ancestors.extend_from_slice(&parent_fiber.ancestor_ids);
+        } else {
+            ancestors.push(UID_ROOT);
+        }
         let fiber = Arc::new(Self {
-            uid: AtomicU64::new(store.next_fiber_uid()),
+            uid: AtomicU64::new(id),
+            id,
+            ancestor_ids: Arc::from(ancestors),
             store: store.clone(),
             parent: Some(parent.clone()),
             ctx: Mutex::new(None),
@@ -691,7 +864,8 @@ impl Fiber {
             desired: Mutex::new(None),
             running: Mutex::new(None),
             error: Mutex::new(None),
-            cleanup_error: Mutex::new(None),
+            cleanup_errors: Mutex::new(Vec::new()),
+            budgeted_dispose: AtomicBool::new(false),
             unsupported_ancestor_logged: AtomicBool::new(false),
             cycle_blocked: Mutex::new(HashSet::new()),
             revision: AtomicU64::new(0),
@@ -719,14 +893,21 @@ impl Fiber {
                 // 注册表在子 fiber 卸载前一直强持它，所以递归处置仍然成立；
                 // 而子 fiber 已处置后，这里不会把对象继续钉在父 fiber 上。
                 let this = Arc::downgrade(&fiber);
+                let parent_weak = Arc::downgrade(&parent_fiber);
                 // 竞态保护：`try_plugin` 检查之后父 fiber 仍可能进入 UNLOADING。
                 // 此时不要 panic（那会跨 ABI 边界 abort 进程），而是让返回的
                 // fiber 以 FAILED 收敛，调用方 settle() 时拿到可读错误。
                 match parent_fiber.try_effect_registered(move |_| {
                     Disposable::new(move || {
                         let this = this.upgrade();
+                        let parent_budgeted = parent_weak
+                            .upgrade()
+                            .is_some_and(|parent| parent.budgeted_dispose.load(Ordering::SeqCst));
                         Box::pin(async move {
                             if let Some(this) = this {
+                                if parent_budgeted {
+                                    this.mark_budgeted_dispose();
+                                }
                                 this.dispose().await;
                             }
                         })
@@ -772,16 +953,93 @@ impl Fiber {
         self.error.lock().unwrap().as_ref().map(|e| e.to_string())
     }
 
-    /// 清理/卸载任务异常时的诊断。`Some` 表示已尽力收敛，但兜底排水可能不完整。
+    /// 清理/卸载阶段摘要错误的可读消息（兼容 0.1 既有入口；全量结构化错误见 [`Fiber::cleanup_errors`]）。
+    ///
+    /// 若发生清理监督者自身异常（[`CleanupErrorKind::InternalCleanup`]），优先返回该异常，
+    /// 否则返回首条清理错误。
     pub fn cleanup_error(&self) -> Option<String> {
-        self.cleanup_error.lock().unwrap().clone()
+        let errors = self.cleanup_errors.lock().unwrap();
+        errors
+            .iter()
+            .find(|(_, err)| err.kind == CleanupErrorKind::InternalCleanup)
+            .or_else(|| errors.first())
+            .map(|(_, err)| err.message.clone())
     }
 
-    fn record_cleanup_error(&self, message: String) {
-        let mut slot = self.cleanup_error.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(message);
+    /// 清理/卸载阶段记录到的全部结构化错误。
+    pub fn cleanup_errors(&self) -> Vec<CleanupError> {
+        self.cleanup_errors
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, err)| err.clone())
+            .collect()
+    }
+
+    fn cleanup_errors_with_seq(&self) -> Vec<(u64, CleanupError)> {
+        self.cleanup_errors.lock().unwrap().clone()
+    }
+
+    /// 记录一条结构化清理错误，并向覆盖本 fiber 的活动关闭报告收集器广播。
+    ///
+    /// 宿主载体（如 T2 `OP_CLEANUP` / `OP_DISPOSE`）可通过本入口把清理失败汇总到
+    /// [`Fiber::cleanup_errors`] 与 [`CloseReport::errors`] 中，避免只打日志而丢给调用方。
+    pub fn record_cleanup_error(&self, kind: CleanupErrorKind, message: impl Into<String>) {
+        let seq = self.store.next_cleanup_error_seq();
+        let entry = CleanupError {
+            fiber: self.name(),
+            uid: self.id,
+            kind,
+            message: message.into(),
+        };
+        self.cleanup_errors
+            .lock()
+            .unwrap()
+            .push((seq, entry.clone()));
+        self.store
+            .broadcast_cleanup_error(&self.ancestor_ids, seq, &entry);
+    }
+
+    /// 登记一条与本 fiber 关联的后台延后清理任务（例如排水超时后继续等待原生调用退出并保活动态库）。
+    pub fn defer_background_cleanup(&self) -> BackgroundCleanupGuard {
+        self.store
+            .register_background_cleanup(self.ancestor_ids.clone())
+    }
+
+    /// 本 fiber 及其后代子树当前仍在后台进行的延后清理任务数。
+    pub fn pending_background_cleanups(&self) -> usize {
+        self.store.pending_background_cleanups_under(self.id)
+    }
+
+    /// 等待本 fiber 及其后代子树全部后台延后清理任务完成。
+    pub async fn wait_background_cleanups(&self) {
+        self.store.wait_background_cleanups_under(self.id).await;
+    }
+
+    /// 标记本 fiber 正在按带等待预算的路径处置（供宿主把同步 `OP_CLEANUP`/`OP_DISPOSE` 移交阻塞池）。
+    pub(crate) fn mark_budgeted_dispose(&self) {
+        self.budgeted_dispose.store(true, Ordering::SeqCst);
+    }
+
+    /// 宿主是否应把同步卸载/清理调用（`OP_CLEANUP`/`OP_DISPOSE`）移交 blocking 线程池以保证等待预算可触发。
+    pub fn should_offload_dispose(&self) -> bool {
+        if self.store.lifecycle_policy().dispose_timeout_ms.is_some()
+            || self.budgeted_dispose.load(Ordering::SeqCst)
+        {
+            return true;
         }
+        let mut cursor = self.parent_ctx();
+        while let Some(ctx) = cursor {
+            if let Some(parent) = ctx.fiber_opt() {
+                if parent.budgeted_dispose.load(Ordering::SeqCst) {
+                    return true;
+                }
+                cursor = parent.parent_ctx();
+            } else {
+                cursor = ctx.parent.clone();
+            }
+        }
+        false
     }
 
     /// 当前**raw** 配置（校验前的那份）。
@@ -1600,7 +1858,13 @@ impl Fiber {
     /// 取消并等待本 fiber 拥有的一切原生后台任务。
     ///
     /// 必须在 `close_effects()` 之后调用：闸门已关，表里不会再有迟到者。
-    async fn dispose_native_tasks(&self) {
+    /// 若配置了 `drain` 预算且超时，会把剩余未退出任务的等待移交后台（登记
+    /// [`BackgroundCleanupGuard`]），并记录 [`CleanupErrorKind::Timeout`]，不强杀也不丢跟踪。
+    async fn dispose_native_tasks(
+        self: &Arc<Self>,
+        budget: Option<std::time::Duration>,
+        deadline: Option<tokio::time::Instant>,
+    ) {
         let tasks: Vec<Arc<NativeTaskSlot>> = {
             let mut table = self.native_tasks.lock().unwrap();
             table.drain().map(|(_, slot)| slot).collect()
@@ -1608,13 +1872,47 @@ impl Fiber {
         for task in &tasks {
             task.cancel.cancel();
         }
-        for task in tasks {
-            let done = task.done.lock().unwrap().take();
-            if let Some(done) = done {
+        let mut pending: Vec<tokio::sync::oneshot::Receiver<()>> = tasks
+            .into_iter()
+            .filter_map(|task| task.done.lock().unwrap().take())
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(deadline) = deadline else {
+            for done in pending {
                 // 取消是协作式的：任务可能在取消前已经结束（`Ok`），也可能
                 // 因 panic 丢掉发送端（`Err`）。两种都表示"不会再跑了"。
                 let _ = done.await;
             }
+            return;
+        };
+        let mut idx = 0usize;
+        while idx < pending.len() {
+            if tokio::time::timeout_at(deadline, &mut pending[idx])
+                .await
+                .is_err()
+            {
+                let leftover: Vec<_> = pending.drain(idx..).collect();
+                let budget_ms = budget.map(|d| d.as_millis()).unwrap_or(0);
+                let reason = format!(
+                    "等待受管后台任务退出超时（预算 {budget_ms} ms，仍有 {} 条任务在后台运行）",
+                    leftover.len()
+                );
+                self.record_cleanup_error(CleanupErrorKind::Timeout, reason.clone());
+                self.store.log(Level::Error, &self.name(), &reason);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let guard = self.defer_background_cleanup();
+                    handle.spawn(async move {
+                        let _guard = guard;
+                        for done in leftover {
+                            let _ = done.await;
+                        }
+                    });
+                }
+                return;
+            }
+            idx += 1;
         }
     }
 
@@ -1752,7 +2050,10 @@ impl Fiber {
                             "生命周期清理任务 panic: {}",
                             crate::panic_message(&*payload)
                         );
-                        this.record_cleanup_error(reason.clone());
+                        this.record_cleanup_error(
+                            CleanupErrorKind::InternalCleanup,
+                            reason.clone(),
+                        );
                         this.store.log(Level::Error, &this.name(), &reason);
                         this.recover_cleanup().await;
                     }
@@ -1772,12 +2073,15 @@ impl Fiber {
                             "生命周期卸载任务 panic: {}",
                             crate::panic_message(&*payload)
                         );
-                        this.record_cleanup_error(reason.clone());
+                        this.record_cleanup_error(
+                            CleanupErrorKind::InternalCleanup,
+                            reason.clone(),
+                        );
                         this.store.log(Level::Error, &this.name(), &reason);
                         *this.error.lock().unwrap() = Some(reason.into());
                         *this.running.lock().unwrap() = None;
                         this.close_effects().await;
-                        this.dispose_native_tasks().await;
+                        this.dispose_native_tasks(None, None).await;
                         this.dispose_effects().await;
                         *this.committed.lock().unwrap() = None;
                         this.set_state(FiberState::Failed);
@@ -1832,7 +2136,23 @@ impl Fiber {
                 return;
             }
         };
-        match CatchPanic::new(apply).await {
+        let apply_timeout = self
+            .store
+            .lifecycle_policy()
+            .apply_timeout_ms
+            .map(std::time::Duration::from_millis);
+        let outcome = match apply_timeout {
+            Some(limit) => match tokio::time::timeout(limit, CatchPanic::new(apply)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    let reason = format!("插件 apply 超时（预算 {} ms）", limit.as_millis());
+                    self.fail(&ctx, reason.into()).await;
+                    return;
+                }
+            },
+            None => CatchPanic::new(apply).await,
+        };
+        match outcome {
             Ok(Ok(())) => {
                 *self.error.lock().unwrap() = None;
                 *self.running.lock().unwrap() = Some(epoch);
@@ -1852,8 +2172,15 @@ impl Fiber {
         self.store.log(Level::Error, &self.name(), &err.to_string());
         *self.error.lock().unwrap() = Some(err);
         *self.running.lock().unwrap() = None;
+        let drain_budget = self
+            .store
+            .lifecycle_policy()
+            .drain_timeout_ms
+            .map(std::time::Duration::from_millis);
+        let drain_deadline = drain_budget.map(|limit| tokio::time::Instant::now() + limit);
         self.close_effects().await;
-        self.dispose_native_tasks().await;
+        self.dispose_native_tasks(drain_budget, drain_deadline)
+            .await;
         self.dispose_effects().await;
         // 失败也是一次拆除：提交视图同样要清。JS 里失败会把 epoch 置 INACTIVE，
         // 紧随其后的那次 `_unload` 会做同一件事。
@@ -1866,9 +2193,16 @@ impl Fiber {
         // 先关门，确保没有迟到的 effect / 原生任务登记；再取消并等待本 fiber
         // 自己的后台任务（它们可能正调用即将拆除的依赖），然后等依赖者拆完，
         // 最后才动提供者的恢复栈（论文 Algorithm 5 第 25 行）。
+        let drain_budget = self
+            .store
+            .lifecycle_policy()
+            .drain_timeout_ms
+            .map(std::time::Duration::from_millis);
+        let drain_deadline = drain_budget.map(|limit| tokio::time::Instant::now() + limit);
         self.close_effects().await;
-        self.dispose_native_tasks().await;
-        self.wait_for_dependents().await;
+        self.dispose_native_tasks(drain_budget, drain_deadline)
+            .await;
+        self.wait_for_dependents(drain_budget, drain_deadline).await;
         self.dispose_effects().await;
         // 提交视图在**所有 disposer 都跑完之后**才清空（`fiber.ts:459`）。
         // 这一行的**位置**就是"被拆掉的组件仍能读到正在离开的依赖"的全部实现——
@@ -1896,9 +2230,15 @@ impl Fiber {
     ///
     /// `set_state(Unloading)` 已经让 `check_impl` 把依赖者摘掉并触发 settle；
     /// 这里再取一次通知结果并**逐个 await**，把"提供者资源关闭"推迟到消费者
-    /// 恢复栈跑完之后。
-    async fn wait_for_dependents(self: &Arc<Self>) {
+    /// 恢复栈跑完之后。若配置了 `drain` 预算且超时，剩余等待移交后台并记账。
+    async fn wait_for_dependents(
+        self: &Arc<Self>,
+        budget: Option<std::time::Duration>,
+        deadline: Option<tokio::time::Instant>,
+    ) {
         let Some(ctx) = self.ctx_opt() else { return };
+        let mut to_wait: Vec<Arc<Fiber>> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
         for (name, realm) in self.store.impls_owned_by_with_realm(self) {
             let dependents = self.store.notify_realm(&[&name], &ctx, realm, false);
             for fiber in dependents {
@@ -1909,6 +2249,16 @@ impl Fiber {
                     self.warn_ancestor_consumer(&fiber);
                     continue;
                 }
+                if seen.insert(fiber.id) {
+                    to_wait.push(fiber);
+                }
+            }
+        }
+        if to_wait.is_empty() {
+            return;
+        }
+        let Some(deadline) = deadline else {
+            for fiber in to_wait {
                 if fiber.is_disposed() {
                     // uid 已经是 DISPOSED 不代表恢复栈跑完了：消费者可能正卡在
                     // 自己的 disposer 里。等它真正完成，而不是看到终态就跳过——
@@ -1919,6 +2269,46 @@ impl Fiber {
                     // 执行恢复栈的时刻。
                     fiber.settle().await;
                 }
+            }
+            return;
+        };
+        let mut iter = to_wait.into_iter();
+        while let Some(fiber) = iter.next() {
+            let mut wait_fut: BoxFuture<()> = if fiber.is_disposed() {
+                let target = fiber.clone();
+                Box::pin(async move { target.wait_disposed().await })
+            } else {
+                fiber.settle()
+            };
+            if tokio::time::timeout_at(deadline, &mut wait_fut)
+                .await
+                .is_err()
+            {
+                let rest: Vec<Arc<Fiber>> = iter.collect();
+                let budget_ms = budget.map(|d| d.as_millis()).unwrap_or(0);
+                let reason = format!(
+                    "等待依赖者 <{}#{}> 卸载超时（预算 {budget_ms} ms，仍有 {} 个依赖者在后台清理）",
+                    fiber.name(),
+                    fiber.id,
+                    rest.len() + 1
+                );
+                self.record_cleanup_error(CleanupErrorKind::Timeout, reason.clone());
+                self.store.log(Level::Error, &self.name(), &reason);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let guard = self.defer_background_cleanup();
+                    handle.spawn(async move {
+                        let _guard = guard;
+                        wait_fut.await;
+                        for other in rest {
+                            if other.is_disposed() {
+                                other.wait_disposed().await;
+                            } else {
+                                other.settle().await;
+                            }
+                        }
+                    });
+                }
+                return;
             }
         }
     }
@@ -1950,15 +2340,26 @@ impl Fiber {
                 Ok(handle) => {
                     if let Err(err) = handle.spawn(async move { item.run().await }).await {
                         let reason = if err.is_panic() {
-                            "disposer panicked"
+                            format!(
+                                "disposer panicked: {}",
+                                crate::panic_message(&*err.into_panic())
+                            )
                         } else {
-                            "disposer task was cancelled"
+                            "disposer task was cancelled".to_string()
                         };
-                        self.store.log(Level::Error, &name, reason);
+                        self.record_cleanup_error(CleanupErrorKind::DisposerPanic, reason.clone());
+                        self.store.log(Level::Error, &name, &reason);
                     }
                 }
-                // 没有运行时（同步上下文）：直接执行，不隔离。
-                Err(_) => item.run().await,
+                // 没有运行时（同步上下文）：仍捕获 panic 并记账，不让单条 disposer 中断整条恢复栈。
+                Err(_) => {
+                    if let Err(payload) = CatchPanic::new(item.run()).await {
+                        let reason =
+                            format!("disposer panicked: {}", crate::panic_message(&*payload));
+                        self.record_cleanup_error(CleanupErrorKind::DisposerPanic, reason.clone());
+                        self.store.log(Level::Error, &name, &reason);
+                    }
+                }
             }
         }
     }
@@ -2275,6 +2676,106 @@ impl Fiber {
         })
     }
 
+    /// 带结构化报告与可选等待预算的关闭入口。
+    ///
+    /// - `timeout` 为 `Some(d)` 时优先使用本次调用的等待预算；为 `None` 时回退到
+    ///   [`LifecyclePolicy::dispose_timeout_ms`]（同样为 `None` 表示不设上限）；
+    /// - 汇总本 fiber 及其全部后代子树上的清理错误（原生 disposer panic、宿主
+    ///   `OP_CLEANUP` / `OP_DISPOSE` 失败、内部清理异常与超时）；若此前已由无报告的
+    ///   [`Fiber::dispose`] 完成处置，再次调用仅能返回本 fiber 自身记录到的清理错误；
+    /// - 等待超时时立刻返回 [`CloseStatus::TimedOut`]（`still_running == true`），
+    ///   共享清理任务与后台延后清理任务仍继续运行，不破坏同进程动态库与在途调用保活；
+    /// - 在受管后台任务内部重入调用时返回 [`CloseStatus::Deferred`]（`still_running == true`）。
+    pub fn dispose_with_report(
+        self: &Arc<Self>,
+        timeout: Option<std::time::Duration>,
+    ) -> crate::dyn_value::BoxFuture<CloseReport> {
+        let this = self.clone();
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let effective_timeout = timeout.or_else(|| {
+                this.store
+                    .lifecycle_policy()
+                    .dispose_timeout_ms
+                    .map(std::time::Duration::from_millis)
+            });
+            if effective_timeout.is_some() {
+                this.mark_budgeted_dispose();
+            }
+            // 先挂收集器、再读已有错误：配合全局单调序号去重，并发关闭既不漏记也不重复记。
+            let collector = Arc::new(Mutex::new(Vec::<(u64, CleanupError)>::new()));
+            this.store
+                .attach_cleanup_collector(this.id, Arc::downgrade(&collector));
+
+            let self_reentrant = current_task_waited_by(&this);
+            let first = this.uid.swap(UID_DISPOSED, Ordering::SeqCst) != UID_DISPOSED;
+            let pre_existing = this.cleanup_errors_with_seq();
+            if first && !this.begin_dispose() {
+                let _done = DisposeDone(this.clone());
+                this.finish_dispose().await;
+            }
+            if self_reentrant {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let guard = this.defer_background_cleanup();
+                    let target = this.clone();
+                    handle.spawn(async move {
+                        let _guard = guard;
+                        target.wait_disposed().await;
+                    });
+                }
+                let errors = merge_cleanup_errors(pre_existing, &collector);
+                return CloseReport {
+                    status: CloseStatus::Deferred,
+                    errors,
+                    still_running: true,
+                    elapsed: started.elapsed(),
+                };
+            }
+
+            let wait_timed_out = match effective_timeout {
+                Some(limit) => tokio::time::timeout(limit, this.wait_disposed())
+                    .await
+                    .is_err(),
+                None => {
+                    this.wait_disposed().await;
+                    false
+                }
+            };
+            if wait_timed_out {
+                let limit_ms = effective_timeout.map(|d| d.as_millis()).unwrap_or(0);
+                let reason = format!(
+                    "等待 fiber `{}` 关闭超时（预算 {limit_ms} ms），后台清理仍在进行",
+                    this.name()
+                );
+                this.record_cleanup_error(CleanupErrorKind::Timeout, reason.clone());
+                this.store.log(Level::Error, &this.name(), &reason);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let guard = this.defer_background_cleanup();
+                    let target = this.clone();
+                    handle.spawn(async move {
+                        let _guard = guard;
+                        target.wait_disposed().await;
+                    });
+                }
+            }
+            let still_running = wait_timed_out || this.pending_background_cleanups() > 0;
+            let errors = merge_cleanup_errors(pre_existing, &collector);
+            let status = if still_running {
+                CloseStatus::TimedOut
+            } else if !errors.is_empty() {
+                CloseStatus::CompletedWithErrors
+            } else {
+                CloseStatus::Completed
+            };
+            CloseReport {
+                status,
+                errors,
+                still_running,
+                elapsed: started.elapsed(),
+            }
+        })
+    }
+
     pub(crate) fn is_current_task_waited_by(self: &Arc<Self>) -> bool {
         current_task_waited_by(self)
     }
@@ -2297,7 +2798,7 @@ impl Fiber {
                 "生命周期状态迁移 panic: {}",
                 crate::panic_message(&*payload)
             );
-            self.record_cleanup_error(reason.clone());
+            self.record_cleanup_error(CleanupErrorKind::InternalCleanup, reason.clone());
             self.store.log(Level::Error, &self.name(), &reason);
         }
 
@@ -2322,7 +2823,7 @@ impl Fiber {
             } else {
                 "生命周期清理任务被取消".to_string()
             };
-            self.record_cleanup_error(reason.clone());
+            self.record_cleanup_error(CleanupErrorKind::InternalCleanup, reason.clone());
             self.store.log(Level::Error, &self.name(), &reason);
             self.recover_cleanup().await;
         }
@@ -2342,10 +2843,10 @@ impl Fiber {
             .is_err()
         {
             let reason = "清理兜底等待 effect setup 超时".to_string();
-            self.record_cleanup_error(reason.clone());
+            self.record_cleanup_error(CleanupErrorKind::Timeout, reason.clone());
             self.store.log(Level::Error, &self.name(), &reason);
         }
-        self.dispose_native_tasks().await;
+        self.dispose_native_tasks(None, None).await;
         let drain = self.clone();
         if let Err(err) = tokio::spawn(async move { drain.dispose_effects().await }).await {
             let reason = if err.is_panic() {
@@ -2353,7 +2854,7 @@ impl Fiber {
             } else {
                 "清理兜底排水被取消".to_string()
             };
-            self.record_cleanup_error(reason.clone());
+            self.record_cleanup_error(CleanupErrorKind::InternalCleanup, reason.clone());
             self.store.log(Level::Error, &self.name(), &reason);
         }
         *self.committed.lock().unwrap() = None;
@@ -2365,7 +2866,7 @@ impl Fiber {
                 "清理兜底状态迁移 panic: {}",
                 crate::panic_message(&*payload)
             );
-            self.record_cleanup_error(reason.clone());
+            self.record_cleanup_error(CleanupErrorKind::InternalCleanup, reason.clone());
             self.store.log(Level::Error, &self.name(), &reason);
         }
         self.clear_context();
@@ -2405,6 +2906,20 @@ impl Drop for DisposeDone {
         }
         self.0.dispose_tx.send_replace(true);
     }
+}
+
+fn merge_cleanup_errors(
+    mut pre_existing: Vec<(u64, CleanupError)>,
+    collector: &Arc<Mutex<Vec<(u64, CleanupError)>>>,
+) -> Vec<CleanupError> {
+    let collected = collector.lock().unwrap().clone();
+    if pre_existing.is_empty() {
+        return collected.into_iter().map(|(_, err)| err).collect();
+    }
+    pre_existing.extend(collected);
+    pre_existing.sort_by_key(|(seq, _)| *seq);
+    pre_existing.dedup_by_key(|(seq, _)| *seq);
+    pre_existing.into_iter().map(|(_, err)| err).collect()
 }
 
 fn effect_handle(owner: Weak<Fiber>, id: u64, cell: Arc<Mutex<Option<Disposable>>>) -> Disposable {

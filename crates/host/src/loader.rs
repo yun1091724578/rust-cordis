@@ -25,9 +25,9 @@ use crate::{
     DispatchPolicy, HostLimits, LoadedPlugin, StagedFile,
 };
 use cordis_core::{
-    equal_except_volatile, split_path, values_at, BoxFuture, Call, Config, Ctx, Disposable, Dyn,
-    ExternValue, Fiber, FnPlugin, Inject, Level, Mode, Plugin, RealmId, Result, Ret, UpdateOutcome,
-    ValidationError, UID_DISPOSED,
+    equal_except_volatile, split_path, values_at, BoxFuture, Call, CloseReport, CloseStatus,
+    Config, Ctx, Disposable, Dyn, ExternValue, Fiber, FiberState, FnPlugin, Inject, Level, Mode,
+    PendingInject, Plugin, RealmId, Result, Ret, UpdateOutcome, ValidationError, UID_DISPOSED,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -878,6 +878,8 @@ pub struct LoaderState {
     disposing: Mutex<HashSet<String>>,
     /// 最近一次真正执行过的对账产物（`report.reconcile` 与测试用）。
     last: Mutex<Option<ReconcileOutcome>>,
+    /// 最近一次热重载的结构化报告（`report.lastReload` 与 [`LoaderState::last_reload`]）。
+    last_reload: Mutex<Option<ReloadReport>>,
     /// 最近一次声明预检的分类结论（O7，`report.preflight`）。
     ///
     /// 与 `last` 同构：**只做诊断**，不参与任何门禁。`None` 只可能出现在"还没跑过
@@ -1256,6 +1258,7 @@ impl LoaderState {
             writeback: AtomicU64::new(0),
             disposing: Mutex::new(HashSet::new()),
             last: Mutex::new(None),
+            last_reload: Mutex::new(None),
             preflight: Mutex::new(None),
             disabled: Mutex::new(Vec::new()),
             published: AtomicBool::new(false),
@@ -1502,6 +1505,15 @@ impl LoaderState {
     /// 最近一次真正执行过的对账产物（`report.reconcile` 与测试用）。
     pub fn last_outcome(&self) -> Option<ReconcileOutcome> {
         self.last.lock().unwrap().clone()
+    }
+
+    /// 最近一次热重载的结构化报告（区分 `Active` / `Pending` / 回滚 / 拒绝与旧实例清理报告）。
+    pub fn last_reload(&self) -> Option<ReloadReport> {
+        self.last_reload.lock().unwrap().clone()
+    }
+
+    fn record_reload(&self, report: ReloadReport) {
+        *self.last_reload.lock().unwrap() = Some(report);
     }
 
     /// `!!js` 求值失败的累计次数（M4-4：`loader.report.interpolation.failed`）。
@@ -1763,7 +1775,7 @@ impl LoaderState {
                 }
                 .to_json()
             });
-        json!({
+        let mut report = json!({
             "mounted": self.mounted_labels().len(),
             "disabled": self.disabled.lock().unwrap().clone(),
             "volatile": { "declared": declared, "supported": supported },
@@ -1794,7 +1806,11 @@ impl LoaderState {
             "capabilities": self.capabilities(),
             "failed": outcome.failures,
             "preflight": preflight,
-        })
+        });
+        if let Some(last_reload) = self.last_reload.lock().unwrap().as_ref() {
+            report["lastReload"] = last_reload.to_json();
+        }
+        report
     }
 
     /// volatile 的两个计数（M4-6）：`declared` = 有声明的**已挂载行数**；
@@ -4550,21 +4566,119 @@ fn attach_watcher(ctx: &Ctx, state: Arc<LoaderState>, interval_ms: u64) {
     });
 }
 
+/// 一次单行热重载的收敛状态分类。
+///
+/// 明确区分「新实例已真正 Active」与「新实例已挂载但必需依赖未就绪（Pending）」，
+/// 避免把未满足依赖的 `Pending` 静默上报成“已激活上线”。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReloadStatus {
+    /// 新实例已挂载并收敛到 `FiberState::Active`。
+    Active,
+    /// 新实例已挂载，但必需依赖尚未齐备（`FiberState::Pending`），待依赖就绪后自动激活。
+    Pending,
+    /// 新实例装载失败，已回滚到旧实例。
+    RolledBack,
+    /// 新旧实例均不可用，或旧实例卸载超时导致无法安全换入新实例（条目已从装载表移除）。
+    Lost,
+    /// 预检 / 来源准入 / 暂存 / 打开 / 探活失败，未触碰当前运行中的实例。
+    Rejected,
+    /// 目标行标当前不在装载表中（无需重载）。
+    NotMounted,
+}
+
+impl ReloadStatus {
+    /// 稳定的机器可读状态名（用于 `loader/reload` 事件与 `loader.report["lastReload"]`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Pending => "pending",
+            Self::RolledBack => "rolled_back",
+            Self::Lost => "lost",
+            Self::Rejected => "rejected",
+            Self::NotMounted => "not_mounted",
+        }
+    }
+}
+
+/// 一次单行热重载的结构化报告。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReloadReport {
+    /// 被重载的行标。
+    pub label: String,
+    /// 重载收敛结果（显式区分 `Active` 与 `Pending`）。
+    pub status: ReloadStatus,
+    /// 停留在 `Pending` 时的未满足依赖诊断列表；`Active` 时为空。
+    pub pending: Vec<PendingInject>,
+    /// 卸载旧实例时的结构化关闭报告（汇总原生 disposer panic、T2 `OP_CLEANUP`/`OP_DISPOSE` 与超时）。
+    pub dispose_report: Option<CloseReport>,
+    /// 失败、回滚或拒绝时的可读错误消息。
+    pub error: Option<String>,
+}
+
+impl ReloadReport {
+    /// 转成稳定的 JSON 诊断载荷（供 `loader.report["lastReload"]` 与 `loader/reload` 使用）。
+    pub fn to_json(&self) -> serde_json::Value {
+        let dispose = self.dispose_report.as_ref().map(|report| {
+            json!({
+                "status": report.status.as_str(),
+                "stillRunning": report.still_running,
+                "elapsedMs": u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
+                "errors": report.errors.iter().map(|err| json!({
+                    "fiber": err.fiber,
+                    "uid": err.uid,
+                    "kind": err.kind.as_str(),
+                    "message": err.message,
+                })).collect::<Vec<_>>(),
+            })
+        });
+        let pending: Vec<serde_json::Value> = self
+            .pending
+            .iter()
+            .map(|item| {
+                json!({
+                    "key": item.key,
+                    "reason": item.reason.as_str(),
+                    "related": item.related,
+                })
+            })
+            .collect();
+        json!({
+            "label": self.label,
+            "status": self.status.as_str(),
+            "pending": pending,
+            "dispose": dispose,
+            "error": self.error,
+        })
+    }
+}
+
 /// 一次"换名重挂"的结果（M1-2）。
 ///
-/// 三态让"非法状态不可表达"：回滚成功与"新旧都失败"必须被调用方区分对待。
+/// 三态让"非法状态不可表达"：回滚成功与"新旧都失败"必须被调用方区分对待；
+/// `Ok` 内部进一步携带 `status`（`Active` vs `Pending`）与 `pending` 诊断，
+/// 以及旧实例卸载时的结构化 `dispose_report`。
 enum SwapOutcome {
-    /// 新实例已上线。
+    /// 新实例已挂载（`status` 区分 `Active` 与 `Pending`）。
     Ok {
         fiber: Arc<Fiber>,
         plugin: Arc<dyn Plugin>,
+        status: ReloadStatus,
+        pending: Vec<PendingInject>,
+        dispose_report: Option<CloseReport>,
     },
     /// 新版本 apply 失败，已回滚到旧实例（`restored` 即当前在服务的 fiber）。
-    RolledBack { error: String, restored: Arc<Fiber> },
-    /// 回滚也失败：该条目当前**没有**可用实例，需要人工介入。
+    RolledBack {
+        error: String,
+        restored: Arc<Fiber>,
+        pending: Vec<PendingInject>,
+        dispose_report: Option<CloseReport>,
+    },
+    /// 回滚也失败，或旧实例卸载超时未完成：该条目当前**没有**可用实例，需要人工介入。
     Lost {
         error: String,
         rollback_error: String,
+        dispose_report: Option<CloseReport>,
     },
 }
 
@@ -4573,18 +4687,63 @@ impl SwapOutcome {
     #[cfg_attr(not(test), allow(dead_code))]
     fn describe(&self) -> &'static str {
         match self {
+            SwapOutcome::Ok {
+                status: ReloadStatus::Pending,
+                ..
+            } => "Ok(新实例已挂载但依赖未就绪/Pending)",
             SwapOutcome::Ok { .. } => "Ok(新实例已上线)",
             SwapOutcome::RolledBack { .. } => "RolledBack(已回滚到旧实例)",
             SwapOutcome::Lost { .. } => "Lost(新旧实例均不可用)",
         }
     }
 
-    /// 需要向调用方/日志报告的错误（成功时为 None）。
+    /// 需要向测试/日志报告的错误（成功时为 None）。
+    #[cfg(test)]
     fn error_message(&self) -> Option<&str> {
         match self {
             SwapOutcome::Ok { .. } => None,
             SwapOutcome::RolledBack { error, .. } => Some(error),
             SwapOutcome::Lost { error, .. } => Some(error),
+        }
+    }
+
+    fn to_report(&self, label: &str) -> ReloadReport {
+        match self {
+            SwapOutcome::Ok {
+                status,
+                pending,
+                dispose_report,
+                ..
+            } => ReloadReport {
+                label: label.to_string(),
+                status: *status,
+                pending: pending.clone(),
+                dispose_report: dispose_report.clone(),
+                error: None,
+            },
+            SwapOutcome::RolledBack {
+                error,
+                pending,
+                dispose_report,
+                ..
+            } => ReloadReport {
+                label: label.to_string(),
+                status: ReloadStatus::RolledBack,
+                pending: pending.clone(),
+                dispose_report: dispose_report.clone(),
+                error: Some(error.clone()),
+            },
+            SwapOutcome::Lost {
+                error,
+                dispose_report,
+                ..
+            } => ReloadReport {
+                label: label.to_string(),
+                status: ReloadStatus::Lost,
+                pending: Vec::new(),
+                dispose_report: dispose_report.clone(),
+                error: Some(error.clone()),
+            },
         }
     }
 }
@@ -4601,7 +4760,7 @@ impl Mounted {
     fn commit_outcome(&mut self, outcome: SwapOutcome, staged: Option<PathBuf>) -> bool {
         self.fingerprint = fingerprint(&self.source);
         match outcome {
-            SwapOutcome::Ok { fiber, plugin } => {
+            SwapOutcome::Ok { fiber, plugin, .. } => {
                 self.fiber = Arc::downgrade(&fiber);
                 // M4-5：volatile 声明是**插件版本**的一部分——新插件可能声明了另一组路径。
                 // 缓存不跟着换，下一次 diff 会拿旧路径去判"只差 volatile"，把一次
@@ -4666,10 +4825,26 @@ fn volatile_of(paths: Vec<String>) -> Option<Vec<String>> {
 /// 返回 [`SwapOutcome`]：回滚成功时，`restored` 才是"当前在服务的实例"——
 /// 调用方必须把它写回记录（M1-2）。
 async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcome {
-    // 卸载旧实例。这一步无法与安装合并：同一隔离域里一个服务名只能有一个实现，
+    // 卸载旧实例（带结构化报告，并遵守 App 的 LifecyclePolicy 等待预算）。
+    // 这一步无法与安装合并：同一隔离域里一个服务名只能有一个实现，
     // 旧实例还在时新实例的 `provide` 必然冲突。
-    if let Some(fiber) = record.fiber.upgrade() {
-        fiber.dispose().await;
+    let dispose_report = if let Some(fiber) = record.fiber.upgrade() {
+        Some(fiber.dispose_with_report(None).await)
+    } else {
+        None
+    };
+    if let Some(report) = &dispose_report {
+        if report.still_running {
+            let reason = format!(
+                "旧实例卸载未在预算内完成（状态={}），后台清理仍在进行，拒绝挂载新实例",
+                report.status.as_str()
+            );
+            return SwapOutcome::Lost {
+                error: reason.clone(),
+                rollback_error: reason,
+                dispose_report,
+            };
+        }
     }
 
     // 挂新实例。**用记录里的派生上下文**（M4-1）：行级 isolate/intercept 挂在它上面，
@@ -4683,15 +4858,35 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
     );
     fiber.settle().await;
     let Some(error) = fiber.error() else {
+        let (status, pending) = if fiber.state() == FiberState::Active {
+            (ReloadStatus::Active, Vec::new())
+        } else {
+            (ReloadStatus::Pending, fiber.pending_injects())
+        };
         return SwapOutcome::Ok {
             fiber,
             plugin: new_plugin,
+            status,
+            pending,
+            dispose_report,
         };
     };
 
     // 新实例失败：先把它拆干净——半途注册的副作用必须回收，
     // 否则它们会跟着回滚后的旧实例一起留在线上。
-    fiber.dispose().await;
+    let new_dispose = fiber.dispose_with_report(None).await;
+    let dispose_report = merge_close_reports(dispose_report, new_dispose.clone());
+    if new_dispose.still_running && fiber.state() != FiberState::Disposed {
+        let rollback_error = format!(
+            "失败新实例的清理未在预算内完成（状态={}），后台清理仍在进行，拒绝挂载回滚实例",
+            new_dispose.status.as_str()
+        );
+        return SwapOutcome::Lost {
+            error: format!("{error}；且无法安全回滚：{rollback_error}"),
+            rollback_error,
+            dispose_report,
+        };
+    }
 
     // 用旧插件把旧实例装回来。
     let restored = mount(
@@ -4703,10 +4898,19 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
     restored.settle().await;
     match restored.error() {
         // 回滚成功：报新版本的失败，并说明已经回到旧实例。
-        None => SwapOutcome::RolledBack {
-            error: format!("{error}（已回滚到旧实例）"),
-            restored,
-        },
+        None => {
+            let pending = if restored.state() == FiberState::Active {
+                Vec::new()
+            } else {
+                restored.pending_injects()
+            };
+            SwapOutcome::RolledBack {
+                error: format!("{error}（已回滚到旧实例）"),
+                restored,
+                pending,
+                dispose_report,
+            }
+        }
         // 回滚也失败：必须把两件事都报出来。此时线上**确实**是空的，
         // 静默才是最坏的结果——调用方需要知道要人工介入。
         Some(rollback_error) => SwapOutcome::Lost {
@@ -4714,170 +4918,58 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
                 "{error}；且回滚失败：{rollback_error}（该条目当前没有可用实例，需要人工介入）"
             ),
             rollback_error,
+            dispose_report,
         },
     }
 }
 
-/// **手动**重挂一行：预检新库（落新文件名 + 打开 + ABI 探活）→ 换名重挂 → 更新记录。
-///
-/// HMR 监听器在"插件文件指纹变了"时调它；**外部的确定性驱动**（acceptance spike、
-/// 集成测试）也用它——于是"重载"这件事不必等墙钟轮询，而是"触碰文件 + 调一次"。
-///
-/// 依赖预检（连同它的报告落点）与换实例**同一个 `mutation` 临界区**：否则并发对账
-/// 可以在预检与挂载之间 `adopt` 新树，让一份报告里 `preflight` 与 `mounted` 描述两棵树。
-/// 预检失败也写 `last` + 刷新 `loader.report`，与对账路径同构。
-pub async fn reload_one(
+/// 把失败新实例的清理报告合并到旧实例的清理报告中（有错误或仍在后台运行时保留，绝不静默丢弃）。
+fn merge_close_reports(old: Option<CloseReport>, failed_new: CloseReport) -> Option<CloseReport> {
+    if failed_new.errors.is_empty() && !failed_new.still_running {
+        return old;
+    }
+    match old {
+        None => Some(failed_new),
+        Some(mut base) => {
+            base.errors.extend(failed_new.errors);
+            base.still_running |= failed_new.still_running;
+            base.elapsed += failed_new.elapsed;
+            base.status = if base.still_running {
+                CloseStatus::TimedOut
+            } else if !base.errors.is_empty() {
+                CloseStatus::CompletedWithErrors
+            } else {
+                CloseStatus::Completed
+            };
+            Some(base)
+        }
+    }
+}
+
+async fn finish_reload_swap(
     ctx: &Ctx,
     state: &Arc<LoaderState>,
     label: &str,
-) -> std::result::Result<(), String> {
-    // 预检 → 换实例 → 改记录 → 发布报告：整个变更序列与对账/启停互斥。
-    // 不互斥时，一次在飞的对账会把这里刚卸下的行按旧目标重新挂回去（或挂成两份）。
-    // 更隐蔽的一种在**快照**上：对账可以在"取快照"与"写报告"之间 `adopt` 一棵新树，
-    // 于是报告里的 `preflight` 描述旧树、`mounted` 描述新树——一份报告混着两棵树。
-    // 所以**先取锁、再快照**：报告始终描述当前树。预检是同步的，持锁期间不 await、
-    // 不调用户代码（与 `reconcile_attempt` 里那次预检同一做法）。
-    let guard = state.mutation.lock().await;
-    // P1-1：插件文件变化也可能改变 sidecar 依赖，先按当前树重跑预检。
-    // 这棵树**就是**当前树（不是候选），所以结论可以直接落报告。
-    match state.preflight_dependencies(&state.tree_snapshot()) {
-        Ok(report) => state.record_preflight(report),
-        Err(err) => {
-            // 与下面的准入/校验拒绝分支同构：**推进指纹 + 记录失败 + 刷新报告**再返回。
-            // 早退的后果是只坏一半：指纹没动 ⇒ 这一行永远 stale ⇒ watcher 每 500ms
-            // 重跑整树预检与逐行 SHA-256，并且每轮再打一条同样的 Error。
-            //
-            // 也**不能**用 `ReconcileOutcome::default()` 覆盖 `last`：那会把上一轮
-            // 真正执行过的对账计数（`report.reconcile.*`）一起清零。
-            let failure = format!("依赖预检失败（reload 未执行）: {err}");
-            advance_fingerprint(state, label);
-            record_reload_failure(state, label, &failure);
-            state.publish_report();
-            ctx.log(
-                Level::Error,
-                &format!("热重载 {label}: {failure}（保留当前实例）"),
-            );
-            drop(guard);
-            return Err(failure);
-        }
-    }
-    let Some(mut record) = state.mounted.lock().unwrap().get(label).cloned() else {
-        return Ok(());
-    };
-
-    // ① 预检：新库先落到新文件名、打开、ABI 探活。**全部通过才动正在跑的实例**
-    //    ——这是比"先卸后装"更好的地方：坏构建不会让你先失去能力再发现它坏了。
-    //    有来源策略时，和 `DiskPluginSource` 一样先验原始 artifact，再验暂存副本的
-    //    hash；不通过就不产生/不保留暂存副本。
-    //
-    //    O9：准入结论来自**这个装载器的来源对象**（`state.source`），不是进程级全局
-    //    ——`PolicyPluginSource` 包一层就能让显式严格不被别人的 dev 开关放宽。
-    //    下面的 verify 与 `open_staged_verified` 共用这**一个** `active_policy`：
-    //    两次各读一次全局会读到两份不同的快照。
-    //
-    //    拒绝（含"默认拒绝"）都走同一条路：推进指纹 + 刷新报告 + 记日志再返回，
-    //    与下面的开失败分支同构。曾经的 `?` 早退只做了一半——watcher 的指纹没动，
-    //    每 500ms 重打同一条日志，`loader.report` 也不刷新。
-    let active_policy = match state.source.admission().resolve() {
-        Ok(policy) => policy,
-        Err(err) => {
-            advance_fingerprint(state, label);
-            record_reload_failure(state, label, &err);
-            state.publish_report();
-            ctx.log(
-                Level::Error,
-                &format!("热重载 {label}: 来源准入被拒绝（保留当前实例）: {err}"),
-            );
-            return Err(err);
-        }
-    };
-    if let Some(policy) = &active_policy {
-        if let Err(err) = policy.verify(&record.source) {
-            // 坏版本也要推进指纹，否则 HMR 会按 500ms 周期反复重试。
-            advance_fingerprint(state, label);
-            record_reload_failure(state, label, &err);
-            state.publish_report();
-            ctx.log(
-                Level::Error,
-                &format!("热重载 {label}: 来源策略拒绝新库（保留当前实例）: {err}"),
-            );
-            return Err(err);
-        }
-    }
-    let staged = match stage_plugin(&record.source, state.next_revision()) {
-        Ok(staged) => staged,
-        Err(err) => {
-            // 复制错误多半是瞬时的（文件正在被写、被杀毒软件短暂锁住）：只记录，
-            // **不推进指纹**——否则这一行要等文件再变一次才会被重试。
-            ctx.log(
-                Level::Error,
-                &format!("热重载 {label}: 暂存新库失败（保留当前实例，下轮重试）: {err}"),
-            );
-            state.publish_report();
-            return Err(err.to_string());
-        }
-    };
-    // 测试停点（O9）：暂存副本已落地、还没被校验/打开。用它把
-    // "verify 与 open_staged_verified 之间副本被换掉"钉成确定性的一刻。
-    #[cfg(test)]
-    state.hooks.pass_before_staged_open(&staged);
-    let plugin = match &active_policy {
-        Some(policy) => LoadedPlugin::open_staged_verified(&record.source, &staged, policy),
-        None => LoadedPlugin::open_staged(&staged),
-    };
-    let plugin = match plugin {
-        Ok(plugin) => plugin,
-        Err(err) => {
-            // 打不开的副本永远不会被认领：立刻销账并删除，否则每个坏构建都会
-            // 在泄漏台账里留下一个 `.rN`（`stagedLeaked` 只增不减）。
-            drop(StagedFile::new(&staged));
-            // 预检失败也要推进指纹：HMR 否则会每 500ms 重试同一个坏库（重试风暴）。
-            advance_fingerprint(state, label);
-            record_reload_failure(state, label, &err.to_string());
-            state.publish_report();
-            ctx.log(
-                Level::Error,
-                &format!("热重载 {label}: 新库无法打开（保留当前实例）: {err}"),
-            );
-            return Err(err.to_string());
-        }
-    };
-    if !plugin.ping() {
-        // `plugin` 在此 drop：先卸库、后删暂存副本（`LoadedPlugin` 的字段声明序）。
-        drop(plugin);
-        advance_fingerprint(state, label);
-        record_reload_failure(state, label, "ABI 探活失败（保留当前实例）");
-        state.publish_report();
-        ctx.log(
-            Level::Error,
-            &format!("热重载 {label}: ABI 探活失败（保留当前实例）"),
-        );
-        return Err("ABI 探活失败".into());
-    }
-
-    // ② 换名重挂。成功则新实例上线，失败则**回滚到旧实例**（回滚在 swap_entry 内完成）。
-    //
-    //    先把记录**摘出装载表**再动手（M4-3）：`swap_entry` 会 dispose 旧实例，而
-    //    "表里的记录指向已 dispose 的实例"正是要消灭的状态。摘掉之后：
-    //    - 观测者看到的是"这一行暂时不在服务"（真实情况）；
-    //    - `disposing` 标记让 `internal/plugin` 观察者不把这次有意卸载误判成插件自我卸载。
-    let new_plugin: Arc<dyn Plugin> = Arc::new(plugin);
+    mut record: Mounted,
+    new_plugin: Arc<dyn Plugin>,
+    staged: Option<PathBuf>,
+    guard: tokio::sync::MutexGuard<'_, ()>,
+) -> ReloadReport {
+    // 先把记录**摘出装载表**再动手（M4-3）：`swap_entry` 会 dispose 旧实例，而
+    // "表里的记录指向已 dispose 的实例"正是要消灭的状态。摘掉之后：
+    // - 观测者看到的是"这一行暂时不在服务"（真实情况）；
+    // - `disposing` 标记让 `internal/plugin` 观察者不把这次有意卸载误判成插件自我卸载。
     state.disposing.lock().unwrap().insert(label.to_string());
     state.mounted.lock().unwrap().remove(label);
-    let outcome = swap_entry(&record, new_plugin.clone()).await;
+    let outcome = swap_entry(&record, new_plugin).await;
     state.disposing.lock().unwrap().remove(label);
 
-    // ③ 更新记录（M1-2：记录必须**始终指向当前在服务的实例**）。
-    //
-    // 失败分支同样要推进指纹——不推进它，轮询会每 500ms 重试同一个坏版本（重试风暴）；
-    // `staged` / `plugin` / `fiber` 的修正交给 `commit_outcome` 单点负责。
-    // `Lost`（新旧实例都不可用）时不放回表里，避免后续 diff/重载基于幽灵记录。
-    let error = outcome.error_message().map(|err| err.to_string());
+    let report = outcome.to_report(label);
     let lost_reason = match &outcome {
         SwapOutcome::Lost { rollback_error, .. } => Some(rollback_error.clone()),
         _ => None,
     };
-    let remove_entry = record.commit_outcome(outcome, Some(staged));
+    let remove_entry = record.commit_outcome(outcome, staged);
     if remove_entry {
         ctx.log(
             Level::Error,
@@ -4894,32 +4986,236 @@ pub async fn reload_one(
             .insert(label.to_string(), record.clone());
     }
 
+    state.record_reload(report.clone());
     // `loader.report` 是实时诊断面：重载改了实例/记录/失败，报告必须跟上。
     // （`publish_report` 自己会挡住"装载器不在 ACTIVE"的收尾期时序。）
     state.publish_report();
     drop(guard);
 
-    // ⑤ 广播。监听者用它做可视化、指标或"重载后重放状态"。
+    let report_json = report.to_json();
+    // 广播。监听者用它做可视化、指标或"重载后重放状态"。
     ctx.emit(
         "loader/reload",
         vec![Dyn::new(ExternValue(json!({
             "label": label,
             "source": record.source.to_string_lossy(),
-            "error": error,
+            "status": report.status.as_str(),
+            "pending": report_json["pending"],
+            "dispose": report_json["dispose"],
+            "error": report.error,
         })))],
     )
     .await;
-    ctx.log(
-        match &error {
-            Some(_) => Level::Error,
-            None => Level::Info,
-        },
-        &format!(
-            "热重载 {label}: {}",
-            error.clone().unwrap_or_else(|| "成功".into())
-        ),
-    );
-    Ok(())
+
+    let dispose_error_count = report
+        .dispose_report
+        .as_ref()
+        .map(|dispose| dispose.errors.len())
+        .unwrap_or(0);
+    match report.status {
+        ReloadStatus::Active if dispose_error_count == 0 => {
+            ctx.log(Level::Info, &format!("热重载 {label}: 成功"));
+        }
+        ReloadStatus::Active => {
+            ctx.log(
+                Level::Warn,
+                &format!("热重载 {label}: 成功（旧实例清理产生 {dispose_error_count} 条错误）"),
+            );
+        }
+        ReloadStatus::Pending => {
+            let keys: Vec<&str> = report
+                .pending
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect();
+            ctx.log(
+                Level::Warn,
+                &format!(
+                    "热重载 {label}: 已挂载但依赖未就绪（Pending: {}）",
+                    keys.join(", ")
+                ),
+            );
+        }
+        ReloadStatus::RolledBack | ReloadStatus::Lost => {
+            ctx.log(
+                Level::Error,
+                &format!(
+                    "热重载 {label}: {}",
+                    report.error.as_deref().unwrap_or("失败")
+                ),
+            );
+        }
+        ReloadStatus::Rejected | ReloadStatus::NotMounted => {}
+    }
+
+    report
+}
+
+/// **手动**重挂一行并返回结构化 [`ReloadReport`]：预检新库（落新文件名 + 打开 + ABI 探活）
+/// → 换名重挂 → 更新记录。
+///
+/// 与 [`reload_one`] 执行同一套受 `mutation` 临界区保护的流程，但直接返回 [`ReloadReport`]，
+/// 显式区分 `Active` / `Pending` / `RolledBack` / `Lost` / `Rejected` / `NotMounted`
+/// 并附带旧实例的 [`CloseReport`]。
+pub async fn reload_one_report(ctx: &Ctx, state: &Arc<LoaderState>, label: &str) -> ReloadReport {
+    let reject = |state: &Arc<LoaderState>, error: String| -> ReloadReport {
+        let report = ReloadReport {
+            label: label.to_string(),
+            status: ReloadStatus::Rejected,
+            pending: Vec::new(),
+            dispose_report: None,
+            error: Some(error),
+        };
+        state.record_reload(report.clone());
+        report
+    };
+
+    // 预检 → 换实例 → 改记录 → 发布报告：整个变更序列与对账/启停互斥。
+    let guard = state.mutation.lock().await;
+    match state.preflight_dependencies(&state.tree_snapshot()) {
+        Ok(report) => state.record_preflight(report),
+        Err(err) => {
+            let failure = format!("依赖预检失败（reload 未执行）: {err}");
+            advance_fingerprint(state, label);
+            record_reload_failure(state, label, &failure);
+            let report = reject(state, failure.clone());
+            state.publish_report();
+            ctx.log(
+                Level::Error,
+                &format!("热重载 {label}: {failure}（保留当前实例）"),
+            );
+            drop(guard);
+            return report;
+        }
+    }
+    let Some(record) = state.mounted.lock().unwrap().get(label).cloned() else {
+        return ReloadReport {
+            label: label.to_string(),
+            status: ReloadStatus::NotMounted,
+            pending: Vec::new(),
+            dispose_report: None,
+            error: None,
+        };
+    };
+
+    let active_policy = match state.source.admission().resolve() {
+        Ok(policy) => policy,
+        Err(err) => {
+            advance_fingerprint(state, label);
+            record_reload_failure(state, label, &err);
+            let report = reject(state, err.clone());
+            state.publish_report();
+            ctx.log(
+                Level::Error,
+                &format!("热重载 {label}: 来源准入被拒绝（保留当前实例）: {err}"),
+            );
+            return report;
+        }
+    };
+    if let Some(policy) = &active_policy {
+        if let Err(err) = policy.verify(&record.source) {
+            advance_fingerprint(state, label);
+            record_reload_failure(state, label, &err);
+            let report = reject(state, err.clone());
+            state.publish_report();
+            ctx.log(
+                Level::Error,
+                &format!("热重载 {label}: 来源策略拒绝新库（保留当前实例）: {err}"),
+            );
+            return report;
+        }
+    }
+    let staged = match stage_plugin(&record.source, state.next_revision()) {
+        Ok(staged) => staged,
+        Err(err) => {
+            let msg = err.to_string();
+            ctx.log(
+                Level::Error,
+                &format!("热重载 {label}: 暂存新库失败（保留当前实例，下轮重试）: {msg}"),
+            );
+            let report = reject(state, msg);
+            state.publish_report();
+            return report;
+        }
+    };
+    #[cfg(test)]
+    state.hooks.pass_before_staged_open(&staged);
+    let plugin = match &active_policy {
+        Some(policy) => LoadedPlugin::open_staged_verified(&record.source, &staged, policy),
+        None => LoadedPlugin::open_staged(&staged),
+    };
+    let plugin = match plugin {
+        Ok(plugin) => plugin,
+        Err(err) => {
+            drop(StagedFile::new(&staged));
+            let msg = err.to_string();
+            advance_fingerprint(state, label);
+            record_reload_failure(state, label, &msg);
+            let report = reject(state, msg.clone());
+            state.publish_report();
+            ctx.log(
+                Level::Error,
+                &format!("热重载 {label}: 新库无法打开（保留当前实例）: {msg}"),
+            );
+            return report;
+        }
+    };
+    if !plugin.ping() {
+        drop(plugin);
+        advance_fingerprint(state, label);
+        record_reload_failure(state, label, "ABI 探活失败（保留当前实例）");
+        let report = reject(state, "ABI 探活失败".into());
+        state.publish_report();
+        ctx.log(
+            Level::Error,
+            &format!("热重载 {label}: ABI 探活失败（保留当前实例）"),
+        );
+        return report;
+    }
+
+    let new_plugin: Arc<dyn Plugin> = Arc::new(plugin);
+    finish_reload_swap(ctx, state, label, record, new_plugin, Some(staged), guard).await
+}
+
+/// **手动**重挂一行：预检新库（落新文件名 + 打开 + ABI 探活）→ 换名重挂 → 更新记录。
+///
+/// 兼容 0.1 返回值约定（预检/准入/打开/探活失败返回 `Err`，换入流程完成后返回 `Ok(())`）；
+/// 需要显式区分 `Active` 与 `Pending` 或读取旧实例清理错误时，请调用 [`reload_one_report`]
+/// 或在重载后读取 [`LoaderState::last_reload`]。
+pub async fn reload_one(
+    ctx: &Ctx,
+    state: &Arc<LoaderState>,
+    label: &str,
+) -> std::result::Result<(), String> {
+    let report = reload_one_report(ctx, state, label).await;
+    if report.status == ReloadStatus::Rejected {
+        Err(report.error.unwrap_or_else(|| "热重载被拒绝".into()))
+    } else {
+        Ok(())
+    }
+}
+
+/// 使用已准备好的 [`Plugin`] 实例热替换指定行，并返回结构化 [`ReloadReport`]。
+///
+/// 适用于内置/自定义 `PluginSource` 或内存内载体（不经磁盘暂存与动态库重开），
+/// 与 [`reload_one_report`] 共享同一套 `mutation` 互斥、旧实例结构化关闭、回滚与报告发布路径。
+pub async fn reload_one_with_plugin(
+    ctx: &Ctx,
+    state: &Arc<LoaderState>,
+    label: &str,
+    new_plugin: Arc<dyn Plugin>,
+) -> ReloadReport {
+    let guard = state.mutation.lock().await;
+    let Some(record) = state.mounted.lock().unwrap().get(label).cloned() else {
+        return ReloadReport {
+            label: label.to_string(),
+            status: ReloadStatus::NotMounted,
+            pending: Vec::new(),
+            dispose_report: None,
+            error: None,
+        };
+    };
+    finish_reload_swap(ctx, state, label, record, new_plugin, None, guard).await
 }
 
 /// 预检失败时也要把指纹推进到装载表：不然 HMR 每 500ms 重试同一个坏库（重试风暴）。
@@ -5274,6 +5570,9 @@ mod tests {
             SwapOutcome::Ok {
                 fiber: fiber.clone(),
                 plugin: plugin.clone(),
+                status: ReloadStatus::Active,
+                pending: Vec::new(),
+                dispose_report: None,
             },
             Some(new.clone()),
         );
@@ -5290,6 +5589,8 @@ mod tests {
             SwapOutcome::RolledBack {
                 error: "故意失败".into(),
                 restored: fiber,
+                pending: Vec::new(),
+                dispose_report: None,
             },
             Some(new.clone()),
         );

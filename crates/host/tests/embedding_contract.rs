@@ -4,11 +4,14 @@
 //! It pins the SDK path an external service runtime would take:
 //! App -> LoaderConfig::new -> load_with_source -> mounted lifecycle -> close.
 
-use cordis_core::{plugin_fn, App, Config, Ctx, Dyn, FiberState, Inject, Plugin};
+use cordis_core::{plugin_fn, App, CloseStatus, Config, Ctx, Dyn, FiberState, Inject, Plugin};
 use cordis_host::loaded_instances;
 use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
 use cordis_host::patch::Entry;
-use cordis_host::{Capabilities, DispatchPolicy, HostLimits};
+use cordis_host::{
+    lifecycle_policy_for, set_lifecycle_policy_for, Capabilities, DispatchPolicy, HostLimits,
+    LifecyclePolicy,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -143,6 +146,40 @@ fn config_dtos_remain_literal_constructible_in_0_1() {
         max_pending_per_instance: 4,
         max_streams_per_instance: 2,
     };
+    let _lifecycle = LifecyclePolicy {
+        apply_timeout_ms: Some(10),
+        drain_timeout_ms: Some(20),
+        dispose_timeout_ms: Some(30),
+    };
+}
+
+#[tokio::test]
+async fn lifecycle_policy_and_close_with_report_work_via_public_api() {
+    assert!(LifecyclePolicy::new(Some(0), None, None).is_err());
+    let policy = LifecyclePolicy::new(Some(1_000), Some(1_000), Some(1_000)).expect("valid policy");
+    let app = App::new();
+    set_lifecycle_policy_for(&app.root, policy).expect("valid policy accepted");
+    assert_eq!(lifecycle_policy_for(&app.root), policy);
+    assert!(
+        set_lifecycle_policy_for(
+            &app.root,
+            LifecyclePolicy {
+                drain_timeout_ms: Some(0),
+                ..LifecyclePolicy::default()
+            }
+        )
+        .is_err(),
+        "字面量构造的 Some(0) 预算必须被拒绝"
+    );
+    assert_eq!(
+        lifecycle_policy_for(&app.root),
+        policy,
+        "拒绝非法预算不得覆盖原生效配置"
+    );
+    let report = app.close_with_report(None).await;
+    assert_eq!(report.status, CloseStatus::Completed);
+    assert!(!report.still_running);
+    assert!(report.errors.is_empty());
 }
 
 struct Tagged {

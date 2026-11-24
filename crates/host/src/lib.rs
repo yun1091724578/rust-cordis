@@ -46,8 +46,8 @@ mod staging;
 
 pub use ffi_buf::call_plugin_detailed;
 pub use policy::{
-    set_default_host_limits, set_dispatch_policy, set_dispatch_policy_for, set_host_limits_for,
-    DispatchPolicy, HostLimits,
+    lifecycle_policy_for, set_default_host_limits, set_dispatch_policy, set_dispatch_policy_for,
+    set_host_limits_for, set_lifecycle_policy_for, DispatchPolicy, HostLimits, LifecyclePolicy,
 };
 pub use staging::{describe, mount, resolve_plugin_path, stage_plugin, staged_leaked, StagedFile};
 
@@ -71,9 +71,9 @@ use cordis_abi::{
     STATUS_UNSUPPORTED,
 };
 use cordis_core::{
-    BoxFuture, CancelToken, Config, Ctx, Disposable, Dyn, Error, ExternService, ExternValue, Fiber,
-    Inject, Level, Next, Plugin, PluginKey, PushOutcome, Result, Ret, StreamObserver,
-    StreamOutcome, StreamSink,
+    BoxFuture, CancelToken, CleanupErrorKind, Config, Ctx, Disposable, Dyn, Error, ExternService,
+    ExternValue, Fiber, Inject, Level, Next, Plugin, PluginKey, PushOutcome, Result, Ret,
+    StreamObserver, StreamOutcome, StreamSink,
 };
 use serde_json::{json, Value};
 use std::any::Any;
@@ -136,6 +136,10 @@ struct Instance {
     keepalive: Option<Weak<dyn Any + Send + Sync>>,
     /// 实例是否已经进入关闭流程（不再接受新的入站回调）。
     closed: Arc<AtomicBool>,
+    /// `OP_APPLY` 是否因 `LifecyclePolicy::apply_timeout_ms` 被宿主放弃等待。
+    apply_timed_out: Arc<AtomicBool>,
+    /// `OP_APPLY` 超时仍在运行时延后登记的 `OP_CLEANUP` 回调 id（保持 LIFO 顺序，待 `OP_APPLY` 退出后先于 `OP_DISPOSE` 执行）。
+    deferred_cleanups: Arc<Mutex<Vec<u64>>>,
     /// 短锁登记调用，不跨 FFI 持锁；关闭与准入共用 dispatches 锁。
     lifecycle: Arc<Mutex<usize>>,
     calls_changed: Arc<tokio::sync::Notify>,
@@ -440,6 +444,8 @@ fn register_instance_with_keepalive(
         dispatches: Arc::new(Mutex::new(HashMap::new())),
         keepalive: weak,
         closed: Arc::new(AtomicBool::new(false)),
+        apply_timed_out: Arc::new(AtomicBool::new(false)),
+        deferred_cleanups: Arc::new(Mutex::new(Vec::new())),
         lifecycle: Arc::new(Mutex::new(0)),
         calls_changed: Arc::new(tokio::sync::Notify::new()),
         credits: Arc::new(Mutex::new(HashMap::new())),
@@ -1356,7 +1362,7 @@ impl Drop for ActiveCall {
         // 最后强引用在锁外释放，退出通知必须晚于调用保护期。
         drop(std::mem::replace(&mut self.lease, Err(())));
         *self.active.lock().unwrap() -= 1;
-        self.changed.notify_one();
+        self.changed.notify_waiters();
     }
 }
 
@@ -1384,6 +1390,8 @@ fn admit_call(instance: &Instance) -> Option<ActiveCall> {
 async fn wait_lifecycle_exclusive(instance: &Instance) {
     loop {
         let changed = instance.calls_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
         if *instance.lifecycle.lock().unwrap() == 0 {
             return;
         }
@@ -3297,24 +3305,92 @@ unsafe extern "C" fn host_ctx_effect(handle: u64, cb: u64, out: *mut Out) -> i32
         let call = instance.call;
         let error_format = instance.error_format;
         let plugin_handle = handle;
+        let fiber = instance.ctx.fiber();
+        let fiber_weak = Arc::downgrade(&fiber);
         // M5-1：走 `try_effect`——**卸载期**（或已释放的 fiber）注册 effect 会回一条
         // 可读错误。走 `ctx.effect` 的话，这里会在 `extern "C"` 边界上 abort 整个进程，
         // 而"清理里想再挂一个收尾动作"是完全正常的插件写法。
-        instance
-            .ctx
-            .fiber()
+        fiber
             .try_effect(move |_| {
                 Disposable::new(move || {
+                    let fiber_weak = fiber_weak.clone();
                     Box::pin(async move {
+                        let instance = instances().read().unwrap().get(plugin_handle);
+                        let Some(instance) = instance else {
+                            return;
+                        };
+                        // 若 OP_APPLY 已超时并仍在阻塞运行，不能并发重入插件调用 OP_CLEANUP；
+                        // 按 LIFO 登记到 deferred_cleanups，待 OP_APPLY 退出后先于 OP_DISPOSE 补跑。
+                        if instance.apply_timed_out.load(Ordering::SeqCst)
+                            && *instance.lifecycle.lock().unwrap() > 0
+                        {
+                            instance.deferred_cleanups.lock().unwrap().push(cb);
+                            return;
+                        }
+                        let Some(active) = admit_call(&instance) else {
+                            return;
+                        };
                         let payload = json!({ "id": cb }).to_string();
-                        if let Err(message) = call_plugin(
-                            call,
-                            plugin_handle,
-                            cordis_abi::OP_CLEANUP,
-                            &payload,
-                            error_format,
-                        ) {
-                            eprintln!("[cordis] 插件清理回调失败: {message}");
+                        let fiber = fiber_weak.upgrade();
+                        let offload = fiber.as_ref().is_some_and(|f| f.should_offload_dispose());
+                        let result = if offload {
+                            match tokio::runtime::Handle::try_current() {
+                                Ok(rt) => match rt
+                                    .spawn_blocking(move || {
+                                        let _active = active;
+                                        unsafe {
+                                            call_plugin(
+                                                call,
+                                                plugin_handle,
+                                                cordis_abi::OP_CLEANUP,
+                                                &payload,
+                                                error_format,
+                                            )
+                                        }
+                                    })
+                                    .await
+                                {
+                                    Ok(res) => res,
+                                    Err(err) => Err(if err.is_panic() {
+                                        format!(
+                                            "阻塞线程执行 OP_CLEANUP panic: {}",
+                                            cordis_core::panic_message(&*err.into_panic())
+                                        )
+                                    } else {
+                                        "OP_CLEANUP 阻塞任务被取消".to_string()
+                                    }),
+                                },
+                                Err(_) => {
+                                    let _active = active;
+                                    unsafe {
+                                        call_plugin(
+                                            call,
+                                            plugin_handle,
+                                            cordis_abi::OP_CLEANUP,
+                                            &payload,
+                                            error_format,
+                                        )
+                                    }
+                                }
+                            }
+                        } else {
+                            let _active = active;
+                            unsafe {
+                                call_plugin(
+                                    call,
+                                    plugin_handle,
+                                    cordis_abi::OP_CLEANUP,
+                                    &payload,
+                                    error_format,
+                                )
+                            }
+                        };
+                        if let Err(message) = result {
+                            let detail = format!("插件清理回调失败: {message}");
+                            eprintln!("[cordis] {detail}");
+                            if let Some(fiber) = fiber {
+                                fiber.record_cleanup_error(CleanupErrorKind::HostCleanup, detail);
+                            }
                         }
                     })
                 })
@@ -3644,16 +3720,22 @@ unsafe extern "C" fn host_log(handle: u64, level: u32, message: Blob) -> i32 {
 
 // ------------------------------------------------------------ 动态库加载
 
+/// 动态库与暂存副本的联合保活壳。
+///
+/// **字段声明顺序即析构顺序**：必须先 drop `_library`（`FreeLibrary` / `dlclose` 解锁文件），
+/// 再 drop `_staged`（`remove_file` 删除暂存副本，Windows 上反序必然删不掉）。
+/// 两者合进同一个 `Arc` 后，任何持有保活 lease 的在飞调用或超时后台收尾都能同时把动态库与
+/// 暂存文件保活到最后一次原生调用退出之后（ADR 0005 §4）。
+struct LoadedLibrary {
+    _library: dylib::DynLib,
+    _staged: Option<StagedFile>,
+}
+
 /// 一个从动态库装载进来的插件。
 pub struct LoadedPlugin {
-    /// 持有动态库句柄就持有 `dlopen` 的引用计数；drop 即卸载。
+    /// 动态库句柄 + 暂存副本的联合引用计数；drop 即按序卸库并删副本。
     /// **字段顺序有意义**：它必须活到最后，见 `raw_desc` 的说明。
-    _library: Arc<dylib::DynLib>,
-    /// 暂存副本的所有权（M0b，G11）：**必须声明在 `_library` 之后**——
-    /// 字段按声明序 drop，"先 FreeLibrary 解锁、后 remove_file 删文件"
-    /// 由结构本身保证（Windows 上反着来必然删不掉：库还锁着文件）。
-    /// `None` = 直接 `open` 的原始路径（不是暂存副本，删不得）。
-    staged: Option<StagedFile>,
+    library: Arc<LoadedLibrary>,
     desc: *const PluginDesc,
     call: CallFn,
     name: String,
@@ -3744,8 +3826,10 @@ impl LoadedPlugin {
         let call = unsafe { (*desc).call };
 
         Ok(LoadedPlugin {
-            _library: Arc::new(library),
-            staged: None,
+            library: Arc::new(LoadedLibrary {
+                _library: library,
+                _staged: None,
+            }),
             desc,
             call,
             name: id,
@@ -3763,7 +3847,9 @@ impl LoadedPlugin {
     /// 装载失败则不认领：文件留在泄漏台账里，`stagedLeaked` 会暴露它。
     pub fn open_staged(path: impl AsRef<Path>) -> Result<LoadedPlugin> {
         let mut plugin = Self::open(path.as_ref())?;
-        plugin.staged = Some(StagedFile::new(path.as_ref()));
+        Arc::get_mut(&mut plugin.library)
+            .expect("新打开的 LoadedPlugin 独占 library")
+            ._staged = Some(StagedFile::new(path.as_ref()));
         Ok(plugin)
     }
 
@@ -3852,7 +3938,9 @@ impl LoadedPlugin {
             )
             .into());
         }
-        plugin.staged = Some(StagedFile::new(staged));
+        Arc::get_mut(&mut plugin.library)
+            .expect("新打开的 LoadedPlugin 独占 library")
+            ._staged = Some(StagedFile::new(staged));
         Ok(plugin)
     }
 
@@ -3922,9 +4010,10 @@ impl Plugin for LoadedPlugin {
     }
 
     fn apply(&self, ctx: Ctx, config: Config) -> BoxFuture<Result<()>> {
-        // 动态库句柄以**弱引用**登记为实例保活：`Instance` 克隆不延长 owner——
-        // owner 由实例表槽位持有到注销，最后 drop 在表锁之外（那一下才是 `FreeLibrary`）。
-        let keepalive: Arc<dyn Any + Send + Sync> = self._library.clone();
+        // 动态库句柄与暂存副本以**弱引用**登记为实例保活：`Instance` 克隆不延长 owner——
+        // owner 由实例表槽位持有到注销，在飞调用与超时后台收尾持有 lease，最后 drop 在表锁之外
+        // （那一下才先 `FreeLibrary`、再删暂存副本）。
+        let keepalive: Arc<dyn Any + Send + Sync> = self.library.clone();
         apply_via_with_keepalive_and_format(
             self.call,
             ctx,
@@ -4060,6 +4149,457 @@ pub fn apply_via_with_keepalive(
     apply_via_with_keepalive_and_format(call, ctx, config, name, keepalive, 0)
 }
 
+struct ApplyInFlightGuard {
+    completed: bool,
+    apply_timed_out: Arc<AtomicBool>,
+}
+
+impl Drop for ApplyInFlightGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.apply_timed_out.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn invoke_apply_op(
+    call: CallFn,
+    handle: u64,
+    name: &str,
+    payload: &str,
+    error_format: u32,
+) -> Result<()> {
+    // apply 是不可重放的（它可能已经注册了一半 effect）；TOO_SMALL 绝不重试。
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut out = Out {
+        ptr: buffer.as_mut_ptr(),
+        cap: buffer.len(),
+        len: 0,
+    };
+    let status = unsafe {
+        call(
+            handle,
+            OP_APPLY,
+            Blob::new(payload.as_bytes()),
+            Blob::EMPTY,
+            &mut out,
+        )
+    };
+    if status == STATUS_TOO_SMALL {
+        return Err(format!(
+            "插件 {name} 装载失败: apply 输出需要 {} 字节，超过 16 KiB 初始缓冲；\
+             写 op 不允许自动重试（会重复执行插件的 apply）",
+            out.len
+        )
+        .into());
+    }
+    if status != STATUS_OK {
+        if out.len > buffer.len() {
+            return Err(format!(
+                "插件 {name} 装载失败: 插件回调输出声称 {} 字节，超过宿主缓冲 {} 字节；消息未完整写入",
+                out.len,
+                buffer.len()
+            )
+            .into());
+        }
+        buffer.truncate(out.len);
+        let message = if status == STATUS_ERR {
+            let text = String::from_utf8_lossy(&buffer);
+            decode_plugin_error(error_format, &text).error
+        } else {
+            format!("插件回调返回了意料之外的状态码 {status}")
+        };
+        return Err(format!("插件 {name} 装载失败: {message}").into());
+    }
+    Ok(())
+}
+
+fn invoke_dispose_op(
+    call: CallFn,
+    handle: u64,
+    error_format: u32,
+) -> std::result::Result<(), String> {
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut out = Out {
+        ptr: buffer.as_mut_ptr(),
+        cap: buffer.len(),
+        len: 0,
+    };
+    let status = unsafe { call(handle, OP_DISPOSE, Blob::EMPTY, Blob::EMPTY, &mut out) };
+    if status == STATUS_OK {
+        return Ok(());
+    }
+    if out.len > buffer.len() {
+        Err(format!(
+            "插件卸载通知输出声称 {} 字节，超过宿主缓冲 {} 字节",
+            out.len,
+            buffer.len()
+        ))
+    } else {
+        buffer.truncate(out.len);
+        let text = String::from_utf8_lossy(&buffer);
+        let error = decode_plugin_error(error_format, &text);
+        Err(format!("插件卸载通知失败: {}", error.error))
+    }
+}
+
+enum TeardownStatus {
+    Completed,
+    DeferredToBackground,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_teardown_ffi(
+    handle: u64,
+    instance: &Instance,
+    close_lease: std::result::Result<Option<Arc<dyn Any + Send + Sync>>, ()>,
+    credits: HashMap<(u64, u64), usize>,
+    outbound: Vec<Outbound>,
+    deferred_cleanups: Vec<u64>,
+    run_dispose: bool,
+    error_format: u32,
+) -> Vec<(CleanupErrorKind, String)> {
+    let mut errors = Vec::new();
+    if close_lease.is_err() {
+        return errors;
+    }
+    let unload_error = ErrorPayload::new("插件已卸载：等待中的调用被结算")
+        .with_code("host_lifecycle")
+        .with_category("lifecycle")
+        .with_certainty("unknown");
+    for ((dispatch_id, id), count) in credits {
+        let payload = json!({
+            "kind": KIND_STREAM_CREDIT,
+            "id": id,
+            "args": [{ "error": "插件已卸载：这条流已被收回" }],
+        })
+        .to_string();
+        for _ in 0..count {
+            let _scope = scope_push(handle, dispatch_id);
+            let _ = unsafe {
+                call_plugin(
+                    instance.call,
+                    handle,
+                    OP_CALLBACK,
+                    &payload,
+                    instance.error_format,
+                )
+            };
+        }
+    }
+    for outbound in outbound {
+        deliver_abort_direct(instance, outbound, &unload_error);
+    }
+    for cb in deferred_cleanups {
+        let payload = json!({ "id": cb }).to_string();
+        if let Err(message) = unsafe {
+            call_plugin(
+                instance.call,
+                handle,
+                cordis_abi::OP_CLEANUP,
+                &payload,
+                error_format,
+            )
+        } {
+            let detail = format!("插件清理回调失败: {message}");
+            eprintln!("[cordis] {detail}");
+            errors.push((CleanupErrorKind::HostCleanup, detail));
+        }
+    }
+    if run_dispose {
+        if let Err(message) = invoke_dispose_op(instance.call, handle, error_format) {
+            eprintln!("[cordis] {message}");
+            errors.push((CleanupErrorKind::HostDispose, message));
+        }
+    }
+    drop(close_lease);
+    errors
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_instance_teardown_unbounded(
+    handle: u64,
+    instance: &Instance,
+    close_lease: std::result::Result<Option<Arc<dyn Any + Send + Sync>>, ()>,
+    applied_flag: &AtomicBool,
+    error_format: u32,
+    fiber: Option<&Arc<Fiber>>,
+    offload_dispose: bool,
+    mut outbound: Vec<Outbound>,
+) {
+    loop {
+        let (drained, tasks) = {
+            let mut table = instance.dispatches.lock().unwrap();
+            let drained: Vec<DispatchRecord> = table.drain().map(|(_, record)| record).collect();
+            let tasks: Vec<_> = instance
+                .tasks
+                .lock()
+                .unwrap()
+                .drain()
+                .map(|(_, task)| task)
+                .collect();
+            (drained, tasks)
+        };
+        #[cfg(test)]
+        instance.close_drained.notify_one();
+        if drained.is_empty() && tasks.is_empty() {
+            break;
+        }
+        for mut record in drained {
+            if let Some(sink) = &record.stream {
+                sink.fail_error(
+                    ErrorPayload::new("插件已卸载：这条流没有收尾就被收回")
+                        .with_code("host_lifecycle")
+                        .with_category("lifecycle")
+                        .with_certainty("unknown"),
+                );
+            }
+            if let Some(tx) = record.sink.take() {
+                let _ = tx.send(Err(ErrorPayload::new("插件已卸载：挂起的入站续延被结算")
+                    .with_code("host_lifecycle")
+                    .with_category("lifecycle")
+                    .with_certainty("unknown")));
+            }
+            if let Some(entry) = record.outbound {
+                outbound.push(entry);
+            }
+        }
+        for task in &tasks {
+            task.cancel.cancel();
+        }
+        for rx in tasks.into_iter().map(|task| task.done) {
+            let _ = rx.await;
+        }
+    }
+    finish_teardown_ffi_phase(
+        handle,
+        instance,
+        close_lease,
+        applied_flag,
+        error_format,
+        fiber,
+        offload_dispose,
+        outbound,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_teardown_ffi_phase(
+    handle: u64,
+    instance: &Instance,
+    close_lease: std::result::Result<Option<Arc<dyn Any + Send + Sync>>, ()>,
+    applied_flag: &AtomicBool,
+    error_format: u32,
+    fiber: Option<&Arc<Fiber>>,
+    offload_dispose: bool,
+    outbound: Vec<Outbound>,
+) {
+    // 出站续延、credit 驳回、延迟 OP_CLEANUP 与 OP_DISPOSE 均在持有 close_lease 下按序执行；
+    // 开启 dispose 等待预算时整体移交 blocking 线程池，避免任意插件同步阻塞拖死 async worker。
+    let credits = std::mem::take(&mut *instance.credits.lock().unwrap());
+    let deferred_cleanups = std::mem::take(&mut *instance.deferred_cleanups.lock().unwrap());
+    let run_dispose = applied_flag.load(Ordering::SeqCst);
+    let errors = if offload_dispose {
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                let instance_clone = instance.clone();
+                match rt
+                    .spawn_blocking(move || {
+                        run_teardown_ffi(
+                            handle,
+                            &instance_clone,
+                            close_lease,
+                            credits,
+                            outbound,
+                            deferred_cleanups,
+                            run_dispose,
+                            error_format,
+                        )
+                    })
+                    .await
+                {
+                    Ok(errs) => errs,
+                    Err(err) => {
+                        let detail = if err.is_panic() {
+                            format!(
+                                "阻塞线程执行插件卸载收尾 panic: {}",
+                                cordis_core::panic_message(&*err.into_panic())
+                            )
+                        } else {
+                            "插件卸载收尾阻塞任务被取消".to_string()
+                        };
+                        eprintln!("[cordis] {detail}");
+                        vec![(CleanupErrorKind::HostDispose, detail)]
+                    }
+                }
+            }
+            Err(_) => run_teardown_ffi(
+                handle,
+                instance,
+                close_lease,
+                credits,
+                outbound,
+                deferred_cleanups,
+                run_dispose,
+                error_format,
+            ),
+        }
+    } else {
+        run_teardown_ffi(
+            handle,
+            instance,
+            close_lease,
+            credits,
+            outbound,
+            deferred_cleanups,
+            run_dispose,
+            error_format,
+        )
+    };
+    if let Some(fiber) = fiber {
+        for (kind, message) in errors {
+            fiber.record_cleanup_error(kind, message);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_instance_teardown(
+    handle: u64,
+    plugin_name: &str,
+    instance: &Instance,
+    close_lease: std::result::Result<Option<Arc<dyn Any + Send + Sync>>, ()>,
+    applied_flag: &Arc<AtomicBool>,
+    error_format: u32,
+    fiber: Option<&Arc<Fiber>>,
+    offload_dispose: bool,
+    drain_budget: Option<std::time::Duration>,
+    drain_deadline: Option<tokio::time::Instant>,
+    mut outbound: Vec<Outbound>,
+) -> TeardownStatus {
+    let Some(deadline) = drain_deadline else {
+        finish_instance_teardown_unbounded(
+            handle,
+            instance,
+            close_lease,
+            applied_flag,
+            error_format,
+            fiber,
+            offload_dispose,
+            outbound,
+        )
+        .await;
+        return TeardownStatus::Completed;
+    };
+    // closed 与登记共用 dispatches 锁；任务凭证不随业务摘表消失。
+    loop {
+        let (drained, tasks) = {
+            let mut table = instance.dispatches.lock().unwrap();
+            let drained: Vec<DispatchRecord> = table.drain().map(|(_, record)| record).collect();
+            let tasks: Vec<_> = instance
+                .tasks
+                .lock()
+                .unwrap()
+                .drain()
+                .map(|(_, task)| task)
+                .collect();
+            (drained, tasks)
+        };
+        #[cfg(test)]
+        instance.close_drained.notify_one();
+        if drained.is_empty() && tasks.is_empty() {
+            break;
+        }
+        for mut record in drained {
+            if let Some(sink) = &record.stream {
+                sink.fail_error(
+                    ErrorPayload::new("插件已卸载：这条流没有收尾就被收回")
+                        .with_code("host_lifecycle")
+                        .with_category("lifecycle")
+                        .with_certainty("unknown"),
+                );
+            }
+            if let Some(tx) = record.sink.take() {
+                let _ = tx.send(Err(ErrorPayload::new("插件已卸载：挂起的入站续延被结算")
+                    .with_code("host_lifecycle")
+                    .with_category("lifecycle")
+                    .with_certainty("unknown")));
+            }
+            if let Some(entry) = record.outbound {
+                outbound.push(entry);
+            }
+        }
+        for task in &tasks {
+            task.cancel.cancel();
+        }
+        let mut pending_rx: Vec<tokio::sync::oneshot::Receiver<()>> =
+            tasks.into_iter().map(|task| task.done).collect();
+        let mut idx = 0usize;
+        while idx < pending_rx.len() {
+            if tokio::time::timeout_at(deadline, &mut pending_rx[idx])
+                .await
+                .is_err()
+            {
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    let leftover_rx: Vec<_> = pending_rx.drain(idx..).collect();
+                    let limit_ms = drain_budget.map(|d| d.as_millis()).unwrap_or(0);
+                    let detail = format!(
+                        "等待插件 {plugin_name} 宿主后台任务排空超时（预算 {limit_ms} ms，仍有 {} 条任务在后台运行），\
+                         已将动态库保活与 OP_DISPOSE 清理移交后台等待退出",
+                        leftover_rx.len()
+                    );
+                    eprintln!("[cordis] {detail}");
+                    if let Some(fiber) = fiber {
+                        fiber.record_cleanup_error(CleanupErrorKind::Timeout, detail);
+                    }
+                    let bg_guard = fiber.map(|f| f.defer_background_cleanup());
+                    let instance = instance.clone();
+                    let applied_flag = applied_flag.clone();
+                    let fiber = fiber.cloned();
+                    rt.spawn(async move {
+                        let _bg_guard = bg_guard;
+                        for rx in leftover_rx {
+                            let _ = rx.await;
+                        }
+                        wait_lifecycle_exclusive(&instance).await;
+                        finish_instance_teardown_unbounded(
+                            handle,
+                            &instance,
+                            close_lease,
+                            &applied_flag,
+                            error_format,
+                            fiber.as_ref(),
+                            true,
+                            outbound,
+                        )
+                        .await;
+                        unregister_instance(handle);
+                    });
+                    return TeardownStatus::DeferredToBackground;
+                }
+                for rx in pending_rx.drain(idx..) {
+                    let _ = rx.await;
+                }
+                break;
+            }
+            idx += 1;
+        }
+    }
+    finish_teardown_ffi_phase(
+        handle,
+        instance,
+        close_lease,
+        applied_flag,
+        error_format,
+        fiber,
+        offload_dispose,
+        outbound,
+    )
+    .await;
+    TeardownStatus::Completed
+}
+
 /// 带插件错误能力位的内部版本；公开 wrapper 传 0，保持旧调用方语义。
 fn apply_via_with_keepalive_and_format(
     call: CallFn,
@@ -4082,116 +4622,133 @@ fn apply_via_with_keepalive_and_format(
             unregister_instance(handle);
             return Err("插件 fiber 已被处置，无法注册清理 effect".into());
         };
+        let fiber_weak = Arc::downgrade(&fiber);
+        let plugin_name = name.clone();
         let registered = fiber.try_effect(move |_| {
             Disposable::new(move || {
+                let fiber_weak = fiber_weak.clone();
+                let applied_flag = applied_flag.clone();
+                let plugin_name = plugin_name.clone();
                 Box::pin(async move {
                     // 先关闭准入，再异步等待已经登记的同步调用退出。
                     let instance = instances().read().unwrap().get(handle);
-                    let mut outbound = Vec::new();
-                    if let Some(instance) = &instance {
+                    let fiber = fiber_weak.upgrade();
+                    if let Some(instance) = instance {
                         let close_lease = {
                             let _table = instance.dispatches.lock().unwrap();
                             instance.closed.store(true, Ordering::SeqCst);
-                            call_lease(instance)
+                            call_lease(&instance)
                         };
-                        wait_lifecycle_exclusive(instance).await;
-                        // closed 与登记共用 dispatches 锁；任务凭证不随业务摘表消失。
-                        loop {
-                            let (drained, tasks) = {
-                                let mut table = instance.dispatches.lock().unwrap();
-                                let drained: Vec<DispatchRecord> =
-                                    table.drain().map(|(_, record)| record).collect();
-                                let tasks: Vec<_> = instance.tasks.lock().unwrap().drain()
-                                    .map(|(_, task)| task).collect();
-                                (drained, tasks)
-                            };
-                            #[cfg(test)]
-                            instance.close_drained.notify_one();
-                            if drained.is_empty() && tasks.is_empty() {
-                                break;
-                            }
-                            for mut record in drained {
-                                // 流（ADR 0001 §5）：先排水——没收尾的流以错误结束，且
-                                // **等待中的 credit 回调在这里被驳回**（跨 ABI 的提供者
-                                // 只有这条路能知道"别推了"），然后才 OP_DISPOSE。
-                                if let Some(sink) = &record.stream {
-                                    sink.fail_error(
-                                        ErrorPayload::new("插件已卸载：这条流没有收尾就被收回")
+                        let drain_timeout = instance
+                            .ctx
+                            .store
+                            .lifecycle_policy()
+                            .drain_timeout_ms
+                            .map(std::time::Duration::from_millis);
+                        let drain_deadline =
+                            drain_timeout.map(|limit| tokio::time::Instant::now() + limit);
+                        let drain_timed_out = if instance.apply_timed_out.load(Ordering::SeqCst) {
+                            *instance.lifecycle.lock().unwrap() > 0
+                        } else if let Some(deadline) = drain_deadline {
+                            tokio::time::timeout_at(deadline, wait_lifecycle_exclusive(&instance))
+                                .await
+                                .is_err()
+                        } else {
+                            wait_lifecycle_exclusive(&instance).await;
+                            false
+                        };
+                        if drain_timed_out {
+                            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                                let detail = if instance.apply_timed_out.load(Ordering::SeqCst) {
+                                    format!(
+                                        "插件 {plugin_name} 的 OP_APPLY 超时后仍在运行，\
+                                         已将动态库保活与 OP_DISPOSE 清理移交后台等待原生调用退出"
+                                    )
+                                } else {
+                                    let limit_ms =
+                                        drain_timeout.map(|d| d.as_millis()).unwrap_or(0);
+                                    format!(
+                                        "等待插件 {plugin_name} 在途原生调用排空超时（预算 {limit_ms} ms），\
+                                         已将动态库保活与 OP_DISPOSE 清理移交后台等待原生调用退出"
+                                    )
+                                };
+                                eprintln!("[cordis] {detail}");
+                                if let Some(fiber) = &fiber {
+                                    fiber.record_cleanup_error(CleanupErrorKind::Timeout, detail);
+                                }
+                                // 先就地结算宿主侧等待者（流与入站挂起续延）并取消宿主后台任务，
+                                // 避免外部调用方一直挂起；涉及插件 FFI 的回调、OP_DISPOSE 与
+                                // 实例注销/动态库卸载必须严格等到最后一次原生调用退出后由后台任务完成。
+                                {
+                                    let mut table = instance.dispatches.lock().unwrap();
+                                    for record in table.values_mut() {
+                                        if let Some(sink) = &record.stream {
+                                            sink.fail_error(
+                                                ErrorPayload::new(
+                                                    "插件已卸载：这条流没有收尾就被收回",
+                                                )
+                                                .with_code("host_lifecycle")
+                                                .with_category("lifecycle")
+                                                .with_certainty("unknown"),
+                                            );
+                                        }
+                                        if let Some(tx) = record.sink.take() {
+                                            let _ = tx.send(Err(ErrorPayload::new(
+                                                "插件已卸载：挂起的入站续延被结算",
+                                            )
                                             .with_code("host_lifecycle")
                                             .with_category("lifecycle")
-                                            .with_certainty("unknown"),
-                                    );
+                                            .with_certainty("unknown")));
+                                        }
+                                    }
+                                    let tasks = instance.tasks.lock().unwrap();
+                                    for task in tasks.values() {
+                                        task.cancel.cancel();
+                                    }
                                 }
-                                if let Some(tx) = record.sink.take() {
-                                    let _ = tx.send(Err(ErrorPayload::new(
-                                        "插件已卸载：挂起的入站续延被结算",
+                                let bg_guard = fiber.as_ref().map(|f| f.defer_background_cleanup());
+                                rt.spawn(async move {
+                                    let _bg_guard = bg_guard;
+                                    wait_lifecycle_exclusive(&instance).await;
+                                    finish_instance_teardown_unbounded(
+                                        handle,
+                                        &instance,
+                                        close_lease,
+                                        &applied_flag,
+                                        error_format,
+                                        fiber.as_ref(),
+                                        true,
+                                        Vec::new(),
                                     )
-                                    .with_code("host_lifecycle")
-                                    .with_category("lifecycle")
-                                    .with_certainty("unknown")));
-                                }
-                                if let Some(entry) = record.outbound {
-                                    outbound.push(entry);
-                                }
+                                    .await;
+                                    unregister_instance(handle);
+                                });
+                                return;
                             }
-                            // 关闭不能只送 abort：宿主创建的任务必须**终止并等待**，
-                            // 否则 `App::close` 返回后工具/副作用仍可能继续执行。
-                            for task in &tasks {
-                                task.cancel.cancel();
-                            }
-                            for rx in tasks.into_iter().map(|task| task.done) {
-                                let _ = rx.await;
-                            }
+                            // 无运行时无法移交后台：保活红线优先，退回同步等待。
+                            wait_lifecycle_exclusive(&instance).await;
                         }
-                        // 出站续延在 `closed` 之后仍要送达一次（插件在等它），
-                        // 但不能再走 call_live（会被 closed 拒绝），直接调用持有保活的实例。
-                        let unload_error = ErrorPayload::new("插件已卸载：等待中的调用被结算")
-                            .with_code("host_lifecycle")
-                            .with_category("lifecycle")
-                            .with_certainty("unknown");
-                        let credits = std::mem::take(&mut *instance.credits.lock().unwrap());
-                        if close_lease.is_ok() {
-                            for ((dispatch_id, id), count) in credits {
-                                let payload = json!({
-                                    "kind": KIND_STREAM_CREDIT,
-                                    "id": id,
-                                    "args": [{ "error": "插件已卸载：这条流已被收回" }],
-                                }).to_string();
-                                for _ in 0..count {
-                                    let _scope = scope_push(handle, dispatch_id);
-                                    let _ = unsafe { call_plugin(instance.call, handle, OP_CALLBACK, &payload, instance.error_format) };
-                                }
-                            }
-                        }
-                        for outbound in outbound {
-                            if close_lease.is_ok() {
-                                deliver_abort_direct(instance, outbound, &unload_error);
-                            }
-                        }
-                        if applied_flag.load(Ordering::SeqCst) && close_lease.is_ok() {
-                            let mut buffer = vec![0u8; 16 * 1024];
-                            let mut out = Out {
-                                ptr: buffer.as_mut_ptr(),
-                                cap: buffer.len(),
-                                len: 0,
-                            };
-                            let status = unsafe {
-                                call(handle, OP_DISPOSE, Blob::EMPTY, Blob::EMPTY, &mut out)
-                            };
-                            if status != STATUS_OK {
-                                if out.len > buffer.len() {
-                                    eprintln!(
-                                        "[cordis] 插件卸载通知输出声称 {} 字节，超过宿主缓冲 {} 字节",
-                                        out.len,
-                                        buffer.len()
-                                    );
-                                } else {
-                                    buffer.truncate(out.len);
-                                    let text = String::from_utf8_lossy(&buffer);
-                                    let error = decode_plugin_error(error_format, &text);
-                                    eprintln!("[cordis] 插件卸载通知失败: {}", error.error);
-                                }
-                            }
+                        let offload_dispose = fiber
+                            .as_ref()
+                            .is_some_and(|f| f.should_offload_dispose());
+                        if matches!(
+                            finish_instance_teardown(
+                                handle,
+                                &plugin_name,
+                                &instance,
+                                close_lease,
+                                &applied_flag,
+                                error_format,
+                                fiber.as_ref(),
+                                offload_dispose,
+                                drain_timeout,
+                                drain_deadline,
+                                Vec::new(),
+                            )
+                            .await,
+                            TeardownStatus::DeferredToBackground
+                        ) {
+                            return;
                         }
                     }
                     unregister_instance(handle);
@@ -4203,48 +4760,51 @@ fn apply_via_with_keepalive_and_format(
             return Err(err);
         }
         let payload = config.to_string();
-        // apply 是不可重放的（它可能已经注册了一半 effect）；TOO_SMALL 绝不重试。
-        let mut buffer = vec![0u8; 16 * 1024];
-        let mut out = Out {
-            ptr: buffer.as_mut_ptr(),
-            cap: buffer.len(),
-            len: 0,
-        };
-        let status = unsafe {
-            call(
-                handle,
-                OP_APPLY,
-                Blob::new(payload.as_bytes()),
-                Blob::EMPTY,
-                &mut out,
-            )
-        };
-        if status == STATUS_TOO_SMALL {
-            return Err(format!(
-                "插件 {name} 装载失败: apply 输出需要 {} 字节，超过 16 KiB 初始缓冲；\
-                 写 op 不允许自动重试（会重复执行插件的 apply）",
-                out.len
-            )
-            .into());
-        }
-        if status != STATUS_OK {
-            if out.len > buffer.len() {
-                return Err(format!(
-                    "插件 {name} 装载失败: 插件回调输出声称 {} 字节，超过宿主缓冲 {} 字节；消息未完整写入",
-                    out.len,
-                    buffer.len()
-                )
-                .into());
+        let offload_apply = ctx.store.lifecycle_policy().apply_timeout_ms.is_some();
+        if offload_apply {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let Some(instance) = instances().read().unwrap().get(handle) else {
+                    return Err(format!("插件 {name} 装载失败: 实例已被提前注销").into());
+                };
+                let Some(active) = admit_call(&instance) else {
+                    return Err(format!("插件 {name} 装载失败: 实例已关闭").into());
+                };
+                let mut in_flight = ApplyInFlightGuard {
+                    completed: false,
+                    apply_timed_out: instance.apply_timed_out.clone(),
+                };
+                let applied_for_apply = applied.clone();
+                let name_owned = name.clone();
+                let correlation_id = cordis_core::current_correlation_id();
+                let result = rt
+                    .spawn_blocking(move || {
+                        let _active = active;
+                        let _corr =
+                            correlation_id.map(|cid| cordis_core::enter_correlation(Some(cid)));
+                        let res =
+                            invoke_apply_op(call, handle, &name_owned, &payload, error_format);
+                        if res.is_ok() {
+                            applied_for_apply.store(true, Ordering::SeqCst);
+                        }
+                        res
+                    })
+                    .await;
+                in_flight.completed = true;
+                return match result {
+                    Ok(res) => res,
+                    Err(err) => Err(if err.is_panic() {
+                        format!(
+                            "插件 {name} 装载失败: apply 阻塞线程 panic: {}",
+                            cordis_core::panic_message(&*err.into_panic())
+                        )
+                        .into()
+                    } else {
+                        format!("插件 {name} 装载失败: apply 阻塞任务被取消").into()
+                    }),
+                };
             }
-            buffer.truncate(out.len);
-            let message = if status == STATUS_ERR {
-                let text = String::from_utf8_lossy(&buffer);
-                decode_plugin_error(error_format, &text).error
-            } else {
-                format!("插件回调返回了意料之外的状态码 {status}")
-            };
-            return Err(format!("插件 {name} 装载失败: {message}").into());
         }
+        invoke_apply_op(call, handle, &name, &payload, error_format)?;
         applied.store(true, Ordering::SeqCst);
         Ok(())
     })

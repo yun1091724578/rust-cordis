@@ -37,7 +37,8 @@ pub use dyn_value::{
 };
 pub use event::{is_bailed, Args, Call, Filter, Handler, Mode, Next, Ret};
 pub use fiber::{
-    Fiber, FiberState, PendingInject, PendingReason, ReloadDeferred, SpawnScopedError,
+    BackgroundCleanupGuard, CleanupError, CleanupErrorKind, CloseReport, CloseStatus, Fiber,
+    FiberState, LifecyclePolicy, PendingInject, PendingReason, ReloadDeferred, SpawnScopedError,
     UpdateOutcome, UID_DISPOSED, UID_ROOT,
 };
 pub use hook_scope::{ScopeAnchor, ScopePredicate};
@@ -125,9 +126,55 @@ impl App {
         self.store.install_trace_sink(sink)
     }
 
+    /// 设置本 `App` 的生命周期三段等待预算（apply / drain / dispose）。
+    ///
+    /// 任一项传入 `Some(0)` 会返回 `Err` 且不改动当前生效配置。
+    pub fn set_lifecycle_policy(&self, policy: LifecyclePolicy) -> std::result::Result<(), String> {
+        self.store.set_lifecycle_policy(policy)
+    }
+
+    /// 读取本 `App` 当前的生命周期等待预算。
+    pub fn lifecycle_policy(&self) -> LifecyclePolicy {
+        self.store.lifecycle_policy()
+    }
+
     /// 挂一个插件并等它稳定。
     pub async fn plugin(&self, plugin: Arc<dyn Plugin>, config: Config) -> Result<Arc<Fiber>> {
         self.root.plugin_and_await(plugin, config).await
+    }
+
+    /// 带结构化报告与可选等待预算的统一关闭入口。
+    ///
+    /// - `timeout` 为 `Some(d)` 时优先按该预算等待；为 `None` 时沿用
+    ///   [`LifecyclePolicy::dispose_timeout_ms`]（同样为 `None` 表示不设上限）；
+    /// - 若关停超出预算或受管后台任务重入导致后台清理仍在进行（`report.still_running == true`），
+    ///   根上下文与全局 hook 会保持存活直到根树清理与后台延后清理全部结束，再由受跟踪的收尾任务
+    ///   清空 hook 并释放根上下文；调用方随后等待 `store.wait_background_cleanups()` 返回时，
+    ///   所有后台清理与 hook 摘除均已彻底完成。
+    pub async fn close_with_report(self, timeout: Option<std::time::Duration>) -> CloseReport {
+        let root = self.root_fiber();
+        let report = root.dispose_with_report(timeout).await;
+        if report.still_running {
+            let store = self.store.clone();
+            let root_ctx = self.root;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let finalize_guard = root.defer_background_cleanup();
+                let finalize_id = finalize_guard.id();
+                handle.spawn(async move {
+                    root.wait_disposed().await;
+                    store.wait_background_cleanups_except(finalize_id).await;
+                    store.clear_hooks();
+                    drop(root_ctx);
+                    drop(finalize_guard);
+                });
+            } else {
+                store.clear_hooks();
+                drop(root_ctx);
+            }
+        } else {
+            self.store.clear_hooks();
+        }
+        report
     }
 
     /// 统一关闭入口：递归处置根树，并清空根级 hook。

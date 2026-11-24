@@ -85,6 +85,13 @@
 |---|---|---|
 | `App` | struct | `crates/core/src/lib.rs` |
 | `App::set_trace_sink` | fn | `crates/core/src/lib.rs` |
+| `App::set_lifecycle_policy` | fn | `crates/core/src/lib.rs` |
+| `App::lifecycle_policy` | fn | `crates/core/src/lib.rs` |
+| `App::close_with_report` | fn | `crates/core/src/lib.rs` |
+| `Store::set_lifecycle_policy` | fn | `crates/core/src/store.rs` |
+| `Store::lifecycle_policy` | fn | `crates/core/src/store.rs` |
+| `Store::pending_background_cleanups` | fn | `crates/core/src/store.rs` |
+| `Store::wait_background_cleanups` | fn | `crates/core/src/store.rs` |
 | `Store::record_trace` | fn | `crates/core/src/store.rs` |
 | `Store::has_trace_sink` | fn | `crates/core/src/store.rs` |
 | `Store::services_of` | fn | `crates/core/src/store.rs` |
@@ -107,6 +114,20 @@
 | `Fiber::scoped_task_count` | fn | `crates/core/src/fiber.rs` |
 | `SpawnScopedError` | enum | `crates/core/src/fiber.rs` |
 | `ReloadDeferred` | struct | `crates/core/src/fiber.rs` |
+| `LifecyclePolicy` | struct | `crates/core/src/fiber.rs` |
+| `LifecyclePolicy::new` | fn | `crates/core/src/fiber.rs` |
+| `CleanupErrorKind` | enum | `crates/core/src/fiber.rs` |
+| `CleanupError` | struct | `crates/core/src/fiber.rs` |
+| `CloseStatus` | enum | `crates/core/src/fiber.rs` |
+| `CloseReport` | struct | `crates/core/src/fiber.rs` |
+| `BackgroundCleanupGuard` | struct | `crates/core/src/fiber.rs` |
+| `Fiber::cleanup_errors` | fn | `crates/core/src/fiber.rs` |
+| `Fiber::record_cleanup_error` | fn | `crates/core/src/fiber.rs` |
+| `Fiber::defer_background_cleanup` | fn | `crates/core/src/fiber.rs` |
+| `Fiber::pending_background_cleanups` | fn | `crates/core/src/fiber.rs` |
+| `Fiber::wait_background_cleanups` | fn | `crates/core/src/fiber.rs` |
+| `Fiber::should_offload_dispose` | fn | `crates/core/src/fiber.rs` |
+| `Fiber::dispose_with_report` | fn | `crates/core/src/fiber.rs` |
 | `FiberState` | enum | `crates/core/src/fiber.rs` |
 | `Plugin` | trait | `crates/core/src/store.rs` |
 | `ExternService` | trait | `crates/core/src/dyn_value.rs` |
@@ -141,6 +162,8 @@
 | `set_dispatch_policy_for` | fn | `crates/host/src/policy.rs` |
 | `set_host_limits_for` | fn | `crates/host/src/policy.rs` |
 | `set_default_host_limits` | fn | `crates/host/src/policy.rs` |
+| `set_lifecycle_policy_for` | fn | `crates/host/src/policy.rs` |
+| `lifecycle_policy_for` | fn | `crates/host/src/policy.rs` |
 | `open_verified` | fn | `crates/host/src/lib.rs` |
 | `open_staged_verified` | fn | `crates/host/src/lib.rs` |
 | `PluginSourcePolicy` | struct | `crates/host/src/source.rs` |
@@ -189,6 +212,11 @@
 | `LoadedFile` | struct | `crates/host/src/loader.rs` |
 | `load_with_source` | fn | `crates/host/src/loader.rs` |
 | `LoaderConfig::new` | fn | `crates/host/src/loader.rs` |
+| `ReloadStatus` | enum | `crates/host/src/loader.rs` |
+| `ReloadReport` | struct | `crates/host/src/loader.rs` |
+| `LoaderState::last_reload` | fn | `crates/host/src/loader.rs` |
+| `reload_one_report` | fn | `crates/host/src/loader.rs` |
+| `reload_one_with_plugin` | fn | `crates/host/src/loader.rs` |
 | `Entry` | struct | `crates/host/src/patch.rs` |
 | `service` | attribute macro | `crates/macros/src/lib.rs` |
 | `service_impl` | attribute macro | `crates/macros/src/lib.rs` |

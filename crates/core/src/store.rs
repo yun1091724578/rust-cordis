@@ -387,6 +387,18 @@ pub enum Level {
 
 pub type LogSink = Arc<dyn Fn(Level, &str, &str) + Send + Sync>;
 
+type CleanupErrorLog = Mutex<Vec<(u64, crate::fiber::CleanupError)>>;
+
+struct CleanupCollector {
+    root_id: u64,
+    errors: Weak<CleanupErrorLog>,
+}
+
+struct BackgroundCleanupEntry {
+    id: u64,
+    ancestors: Arc<[u64]>,
+}
+
 pub struct Store {
     impls: Mutex<HashMap<RealmId, Arc<Impl>>>,
     realms: Mutex<HashMap<Box<str>, RealmId>>,
@@ -425,6 +437,15 @@ pub struct Store {
     log_sink: Mutex<LogSink>,
     /// 逐跳记录出口（ADR 0009）：只在 `App` 上安装一次；未安装时一次原子读。
     trace_sink: OnceLock<Arc<dyn TraceSink>>,
+    /// 生命周期三段等待预算（apply / drain / dispose；缺省全 `None`）。
+    lifecycle_policy: Mutex<crate::fiber::LifecyclePolicy>,
+    /// 活动中的关闭报告收集器（弱引用，报告返回后自动过期清理）。
+    cleanup_collectors: Mutex<Vec<CleanupCollector>>,
+    cleanup_error_sn: AtomicU64,
+    /// 因等待预算到期而被移交到后台继续收尾的清理任务台账（例如保活中的动态库排水）。
+    background_cleanups: Mutex<Vec<BackgroundCleanupEntry>>,
+    background_cleanup_sn: AtomicU64,
+    background_cleanup_notify: tokio::sync::Notify,
 }
 
 impl Default for Store {
@@ -456,6 +477,12 @@ impl Store {
                 eprintln!("[{level:?}] {name}: {msg}");
             })),
             trace_sink: OnceLock::new(),
+            lifecycle_policy: Mutex::new(crate::fiber::LifecyclePolicy::default()),
+            cleanup_collectors: Mutex::new(Vec::new()),
+            cleanup_error_sn: AtomicU64::new(1),
+            background_cleanups: Mutex::new(Vec::new()),
+            background_cleanup_sn: AtomicU64::new(1),
+            background_cleanup_notify: tokio::sync::Notify::new(),
         };
         // 内置监听器钩子（上游 `events.ts:54-58` 的那个 `internal/listener` 监听器）：
         // 把**非全局**的 `internal/update` 注册路由进 fiber 自己的钩子链——
@@ -476,6 +503,132 @@ impl Store {
 
     pub fn set_log_sink(&self, sink: LogSink) {
         *self.log_sink.lock().unwrap() = sink;
+    }
+
+    /// 设置本 `App` / `Store` 的生命周期等待预算（apply / drain / dispose）。
+    ///
+    /// 按 `Store` 隔离，不影响同进程内的其他 `App`；缺省全部 `None`（不设上限）。
+    /// 任一项传入 `Some(0)` 会返回 `Err` 且不改动当前生效配置。
+    pub fn set_lifecycle_policy(
+        &self,
+        policy: crate::fiber::LifecyclePolicy,
+    ) -> std::result::Result<(), String> {
+        policy.validate()?;
+        *self.lifecycle_policy.lock().unwrap() = policy;
+        Ok(())
+    }
+
+    /// 读取本 `App` / `Store` 当前的生命周期等待预算。
+    pub fn lifecycle_policy(&self) -> crate::fiber::LifecyclePolicy {
+        *self.lifecycle_policy.lock().unwrap()
+    }
+
+    pub(crate) fn next_cleanup_error_seq(&self) -> u64 {
+        self.cleanup_error_sn.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub(crate) fn attach_cleanup_collector(&self, root_id: u64, errors: Weak<CleanupErrorLog>) {
+        let mut collectors = self.cleanup_collectors.lock().unwrap();
+        collectors.retain(|entry| entry.errors.strong_count() > 0);
+        collectors.push(CleanupCollector { root_id, errors });
+    }
+
+    pub(crate) fn broadcast_cleanup_error(
+        &self,
+        ancestors: &[u64],
+        seq: u64,
+        error: &crate::fiber::CleanupError,
+    ) {
+        let targets: Vec<Arc<CleanupErrorLog>> = {
+            let mut collectors = self.cleanup_collectors.lock().unwrap();
+            collectors.retain(|entry| entry.errors.strong_count() > 0);
+            collectors
+                .iter()
+                .filter(|entry| ancestors.contains(&entry.root_id))
+                .filter_map(|entry| entry.errors.upgrade())
+                .collect()
+        };
+        for target in targets {
+            target.lock().unwrap().push((seq, error.clone()));
+        }
+    }
+
+    pub(crate) fn register_background_cleanup(
+        self: &Arc<Self>,
+        ancestors: Arc<[u64]>,
+    ) -> crate::fiber::BackgroundCleanupGuard {
+        let id = self.background_cleanup_sn.fetch_add(1, Ordering::SeqCst);
+        self.background_cleanups
+            .lock()
+            .unwrap()
+            .push(BackgroundCleanupEntry { id, ancestors });
+        crate::fiber::BackgroundCleanupGuard::new(Arc::clone(self), id)
+    }
+
+    pub(crate) fn finish_background_cleanup(&self, id: u64) {
+        {
+            let mut list = self.background_cleanups.lock().unwrap();
+            list.retain(|entry| entry.id != id);
+        }
+        self.background_cleanup_notify.notify_waiters();
+    }
+
+    /// 当前仍在后台运行的延后清理任务数（例如排水超时后继续等待原生调用退出并保活动态库的任务）。
+    pub fn pending_background_cleanups(&self) -> usize {
+        self.background_cleanups.lock().unwrap().len()
+    }
+
+    pub(crate) fn pending_background_cleanups_under(&self, root_id: u64) -> usize {
+        self.background_cleanups
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.ancestors.contains(&root_id))
+            .count()
+    }
+
+    /// 等待本 `Store` 中全部被移交到后台的延后清理任务结束。
+    pub async fn wait_background_cleanups(&self) {
+        loop {
+            let notified = self.background_cleanup_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.pending_background_cleanups() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn wait_background_cleanups_except(&self, skip_id: u64) {
+        loop {
+            let notified = self.background_cleanup_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let remaining = self
+                .background_cleanups
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.id != skip_id)
+                .count();
+            if remaining == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn wait_background_cleanups_under(&self, root_id: u64) {
+        loop {
+            let notified = self.background_cleanup_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.pending_background_cleanups_under(root_id) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// 安装逐跳记录出口。只允许安装一次；返回是否安装成功。

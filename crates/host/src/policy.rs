@@ -3,6 +3,7 @@
 //! 两个注册表共享同一语义：per-App 优先（以 `Weak<Store>` 追踪 App 生命周期并在读写时清理失活条目），
 //! 缺失时回落到进程级默认值；实例在注册时取一份快照。
 
+pub use cordis_core::LifecyclePolicy;
 use cordis_core::{Ctx, Store};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -244,6 +245,23 @@ pub fn set_host_limits_for(ctx: &Ctx, limits: HostLimits) -> std::result::Result
         },
     );
     Ok(())
+}
+
+/// 设置**单个 App** 的生命周期三段等待预算（apply / drain / dispose）。
+///
+/// 底层直接写入 `ctx.store`，因此同 App 下内核（`Fiber::load` / `unload` / `dispose_with_report`）
+/// 与宿主 T2 载体（`OP_APPLY` / 排水 / `OP_CLEANUP` / `OP_DISPOSE`）共享同一份配置；
+/// 不同 `App` 互不影响。任一项传入 `Some(0)` 会返回 `Err` 且不改动当前生效配置。
+pub fn set_lifecycle_policy_for(
+    ctx: &Ctx,
+    policy: LifecyclePolicy,
+) -> std::result::Result<(), String> {
+    ctx.store.set_lifecycle_policy(policy)
+}
+
+/// 读取**单个 App** 当前的生命周期等待预算。
+pub fn lifecycle_policy_for(ctx: &Ctx) -> LifecyclePolicy {
+    ctx.store.lifecycle_policy()
 }
 
 /// 内部读取：per-App 优先；缺失或 App 已释放时回落到进程级默认。

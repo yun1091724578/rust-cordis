@@ -61,6 +61,48 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub fn set_trace_sink",
     },
     PublicItem {
+        item: "App::set_lifecycle_policy",
+        kind: "fn",
+        source: "crates/core/src/lib.rs",
+        marker: "pub fn set_lifecycle_policy(",
+    },
+    PublicItem {
+        item: "App::lifecycle_policy",
+        kind: "fn",
+        source: "crates/core/src/lib.rs",
+        marker: "pub fn lifecycle_policy(&self) -> LifecyclePolicy",
+    },
+    PublicItem {
+        item: "App::close_with_report",
+        kind: "fn",
+        source: "crates/core/src/lib.rs",
+        marker: "pub async fn close_with_report(",
+    },
+    PublicItem {
+        item: "Store::set_lifecycle_policy",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn set_lifecycle_policy(",
+    },
+    PublicItem {
+        item: "Store::lifecycle_policy",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn lifecycle_policy(&self) -> crate::fiber::LifecyclePolicy",
+    },
+    PublicItem {
+        item: "Store::pending_background_cleanups",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn pending_background_cleanups(&self) -> usize",
+    },
+    PublicItem {
+        item: "Store::wait_background_cleanups",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub async fn wait_background_cleanups(&self)",
+    },
+    PublicItem {
         item: "Store::record_trace",
         kind: "fn",
         source: "crates/core/src/store.rs",
@@ -191,6 +233,90 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         kind: "struct",
         source: "crates/core/src/fiber.rs",
         marker: "pub struct ReloadDeferred",
+    },
+    PublicItem {
+        item: "LifecyclePolicy",
+        kind: "struct",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub struct LifecyclePolicy",
+    },
+    PublicItem {
+        item: "LifecyclePolicy::new",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn new(\n        apply_timeout_ms: Option<u64>,",
+    },
+    PublicItem {
+        item: "CleanupErrorKind",
+        kind: "enum",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub enum CleanupErrorKind",
+    },
+    PublicItem {
+        item: "CleanupError",
+        kind: "struct",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub struct CleanupError",
+    },
+    PublicItem {
+        item: "CloseStatus",
+        kind: "enum",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub enum CloseStatus",
+    },
+    PublicItem {
+        item: "CloseReport",
+        kind: "struct",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub struct CloseReport",
+    },
+    PublicItem {
+        item: "BackgroundCleanupGuard",
+        kind: "struct",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub struct BackgroundCleanupGuard",
+    },
+    PublicItem {
+        item: "Fiber::cleanup_errors",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn cleanup_errors(&self) -> Vec<CleanupError>",
+    },
+    PublicItem {
+        item: "Fiber::record_cleanup_error",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn record_cleanup_error(&self, kind: CleanupErrorKind, message: impl Into<String>)",
+    },
+    PublicItem {
+        item: "Fiber::defer_background_cleanup",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn defer_background_cleanup(&self) -> BackgroundCleanupGuard",
+    },
+    PublicItem {
+        item: "Fiber::pending_background_cleanups",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn pending_background_cleanups(&self) -> usize",
+    },
+    PublicItem {
+        item: "Fiber::wait_background_cleanups",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub async fn wait_background_cleanups(&self)",
+    },
+    PublicItem {
+        item: "Fiber::should_offload_dispose",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn should_offload_dispose(&self) -> bool",
+    },
+    PublicItem {
+        item: "Fiber::dispose_with_report",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn dispose_with_report(",
     },
     PublicItem {
         item: "FiberState",
@@ -395,6 +521,18 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         kind: "fn",
         source: "crates/host/src/policy.rs",
         marker: "pub fn set_default_host_limits",
+    },
+    PublicItem {
+        item: "set_lifecycle_policy_for",
+        kind: "fn",
+        source: "crates/host/src/policy.rs",
+        marker: "pub fn set_lifecycle_policy_for(",
+    },
+    PublicItem {
+        item: "lifecycle_policy_for",
+        kind: "fn",
+        source: "crates/host/src/policy.rs",
+        marker: "pub fn lifecycle_policy_for(",
     },
     PublicItem {
         item: "open_verified",
@@ -683,6 +821,36 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         kind: "fn",
         source: "crates/host/src/loader.rs",
         marker: "pub fn new(path: impl Into<String>) -> Self",
+    },
+    PublicItem {
+        item: "ReloadStatus",
+        kind: "enum",
+        source: "crates/host/src/loader.rs",
+        marker: "pub enum ReloadStatus",
+    },
+    PublicItem {
+        item: "ReloadReport",
+        kind: "struct",
+        source: "crates/host/src/loader.rs",
+        marker: "pub struct ReloadReport",
+    },
+    PublicItem {
+        item: "LoaderState::last_reload",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub fn last_reload(&self) -> Option<ReloadReport>",
+    },
+    PublicItem {
+        item: "reload_one_report",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub async fn reload_one_report(",
+    },
+    PublicItem {
+        item: "reload_one_with_plugin",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub async fn reload_one_with_plugin(",
     },
     PublicItem {
         item: "Entry",
@@ -1317,7 +1485,7 @@ pub struct Q {
             42,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 109, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 137, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 33, "载荷清单数量漂移");
     }
 
@@ -1337,6 +1505,9 @@ pub struct Q {
             "`Context`",
             "`Context::spawn_scoped`",
             "`ReloadDeferred`",
+            "`LifecyclePolicy`",
+            "`CloseReport`",
+            "`ReloadReport`",
             "`StreamSink::fail_error`",
             "`Ctx::stream_fail_payload`",
             "`DERIVED_HANDLE_TAG`",

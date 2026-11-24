@@ -34,6 +34,8 @@ CI run 记录，只有本地执行记录。
 | 撞名的 `provide` 失败后不增长恢复栈 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/weak_audit.rs` |
 | 手动释放的 effect 不留在恢复栈 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/weak_audit.rs` |
 | 丢弃 `dispose` Future 后剩余恢复栈仍执行 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/lifecycle_races.rs` |
+| 结构化关闭报告汇总清理错误并按三段预算约束等待（超时仍保活同进程动态库） | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/close_report.rs` / `crates/host/tests/lifecycle_observability.rs` |
+| 热重载报告显式区分 Active 与 Pending 并汇总旧实例清理错误 | 通过 | 待验证 | 待验证 | 待验证 | `crates/host/tests/lifecycle_observability.rs` |
 | 提供者先等直接消费者拆完再关资源 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/lifecycle_races.rs` |
 | 卸载行后宿主拆除时不残留插件对象 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/loader_release.rs` |
 | 流式失败端到端保留结构化错误类型（含跨 ABI 独立能力协商） | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/stream.rs` / `crates/abi/src/sdk.rs` / `crates/host/tests/abi_stream.rs` / `crates/host/tests/abi_stream_timeout.rs` |

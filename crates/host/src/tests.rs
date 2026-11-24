@@ -644,6 +644,8 @@ fn dummy_instance(name: &str) -> Instance {
         dispatches: Arc::new(Mutex::new(HashMap::new())),
         keepalive: None,
         closed: Arc::new(AtomicBool::new(false)),
+        apply_timed_out: Arc::new(AtomicBool::new(false)),
+        deferred_cleanups: Arc::new(Mutex::new(Vec::new())),
         lifecycle: Arc::new(Mutex::new(0)),
         calls_changed: Arc::new(tokio::sync::Notify::new()),
         credits: Arc::new(Mutex::new(HashMap::new())),
