@@ -31,7 +31,8 @@ use crate::{
 use cordis_core::{
     equal_except_volatile, split_path, values_at, BoxFuture, Call, CloseReport, CloseStatus,
     Config, Ctx, Disposable, Dyn, ExternValue, Fiber, FiberState, FnPlugin, Inject, Level, Mode,
-    PendingInject, Plugin, RealmId, Result, Ret, UpdateOutcome, ValidationError, UID_DISPOSED,
+    PendingInject, Plugin, RealmId, Result, Ret, Scope, UpdateOutcome, ValidationError,
+    UID_DISPOSED,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -543,15 +544,13 @@ fn append_atomically(path: &Path, text: &str) -> std::result::Result<(), String>
 fn read_files(
     files: &ConfigFiles,
     read: &mut (dyn FnMut(&Path) -> std::io::Result<String> + Send),
-) -> std::io::Result<FileSnapshot> {
-    Ok(FileSnapshot {
-        main: read(&files.main)?,
-        patches: files
-            .patches
-            .iter()
-            .map(|path| read(path))
-            .collect::<std::io::Result<Vec<String>>>()?,
-    })
+) -> std::result::Result<FileSnapshot, (PathBuf, std::io::Error)> {
+    let main = read(&files.main).map_err(|err| (files.main.clone(), err))?;
+    let mut patches = Vec::with_capacity(files.patches.len());
+    for path in &files.patches {
+        patches.push(read(path).map_err(|err| (path.clone(), err))?);
+    }
+    Ok(FileSnapshot { main, patches })
 }
 
 /// **稳读**：同一组文件读两遍、内容一致才采纳。
@@ -563,7 +562,7 @@ async fn read_settled_with(
     files: &ConfigFiles,
     settle: Duration,
     read: &mut (dyn FnMut(&Path) -> std::io::Result<String> + Send),
-) -> std::io::Result<Option<FileSnapshot>> {
+) -> std::result::Result<Option<FileSnapshot>, (PathBuf, std::io::Error)> {
     let first = read_files(files, read)?;
     tokio::time::sleep(settle).await;
     let second = read_files(files, read)?;
@@ -636,6 +635,17 @@ impl FailedRow {
             "message": self.message,
         })
     }
+}
+
+/// 行的隔离域链类型别名（只读，不分配新 realm）。
+type IsolateScope = Arc<Scope<Box<str>, RealmId>>;
+
+/// 失败行内部台账项：保留公开 [`FailedRow`] 及该行隔离域链（只读，不分配新 realm），
+/// 供 [`LoaderState::correlated_pending_report`] 按精确同域可见性过滤上游候选。
+#[derive(Clone)]
+struct FailedRowRecord {
+    row: FailedRow,
+    isolate: Option<IsolateScope>,
 }
 
 /// 单个下游缺失依赖键关联到的已知失败上游行。
@@ -729,6 +739,27 @@ fn matches_declared_provide(provided: &str, missing_key: &str) -> bool {
     let (p_base, p_major) = split_service_major(provided);
     let (m_base, m_major) = split_service_major(missing_key);
     p_base == m_base && (p_major.is_none() || m_major.is_none() || p_major == m_major)
+}
+
+/// 校验失败上游行与下游 `Pending` 消费者在同一服务键上是否落入同一个隔离域（零分配只读检查）。
+fn same_realm_visibility(
+    upstream: Option<&Scope<Box<str>, RealmId>>,
+    consumer: &Scope<Box<str>, RealmId>,
+    provided_key: &str,
+    missing_key: &str,
+) -> bool {
+    let Some(upstream) = upstream else {
+        return true;
+    };
+    let u_realm = upstream
+        .get(provided_key)
+        .or_else(|| upstream.get(missing_key))
+        .copied();
+    let c_realm = consumer
+        .get(missing_key)
+        .or_else(|| consumer.get(provided_key))
+        .copied();
+    u_realm == c_realm
 }
 
 /// 一次对账的产物（M4-2 的 `SyncOutcome` 在 M4-3 长成了动作表）。
@@ -1066,12 +1097,16 @@ pub struct LoaderState {
     writeback: AtomicU64,
     /// 装载器**有意**卸载中的行：`internal/plugin` 观察者据此把它与"插件自我卸载"区分开。
     disposing: Mutex<HashSet<String>>,
+    /// 卸载超时后仍在后台清理中的旧实例（`label -> Arc<Fiber>`）：
+    /// 在 `pending_background_cleanups()` 归零之前拒绝 `Action::Mount` 旁路重挂，
+    /// 后台清理完成时由弱引用监听任务自动摘除并释放 `Arc<Fiber>`。
+    draining: Mutex<HashMap<String, Arc<Fiber>>>,
     /// 最近一次真正执行过的对账产物（`report.reconcile` 与测试用）。
     last: Mutex<Option<ReconcileOutcome>>,
     /// 最近一次热重载的结构化报告（`report.lastReload` 与 [`LoaderState::last_reload`]）。
     last_reload: Mutex<Option<ReloadReport>>,
-    /// 已知失败行的结构化台账（`label -> FailedRow`），用于 `loader.report` 与下游 Pending 关联。
-    failed_rows: Mutex<HashMap<String, FailedRow>>,
+    /// 已知失败行的结构化台账（`label -> FailedRowRecord`），用于 `loader.report` 与同域下游 Pending 关联。
+    failed_rows: Mutex<HashMap<String, FailedRowRecord>>,
     /// 持久化状态错误台账（配置/patch 读取解析降级、回写冲突/落盘失败等）。
     persisted_errors: Mutex<Vec<FailedRow>>,
     /// 最近一次声明预检中从已验证 sidecar manifest 收集到的每行 `provides` 声明（`label -> keys`）。
@@ -1462,6 +1497,7 @@ impl LoaderState {
             adopted_gen: AtomicU64::new(0),
             writeback: AtomicU64::new(0),
             disposing: Mutex::new(HashSet::new()),
+            draining: Mutex::new(HashMap::new()),
             last: Mutex::new(None),
             last_reload: Mutex::new(None),
             failed_rows: Mutex::new(HashMap::new()),
@@ -1915,7 +1951,13 @@ impl LoaderState {
 
     /// 当前已知失败行的结构化列表（按行标升序）。
     pub fn failed_rows(&self) -> Vec<FailedRow> {
-        let mut rows: Vec<FailedRow> = self.failed_rows.lock().unwrap().values().cloned().collect();
+        let mut rows: Vec<FailedRow> = self
+            .failed_rows
+            .lock()
+            .unwrap()
+            .values()
+            .map(|record| record.row.clone())
+            .collect();
         rows.sort_by(|a, b| a.label.cmp(&b.label));
         rows
     }
@@ -1983,15 +2025,58 @@ impl LoaderState {
         keys
     }
 
-    fn record_failed_row(&self, row: FailedRow) {
+    fn record_failed_row(&self, row: FailedRow, isolate: Option<IsolateScope>) {
         self.failed_rows
             .lock()
             .unwrap()
-            .insert(row.label.clone(), row);
+            .insert(row.label.clone(), FailedRowRecord { row, isolate });
     }
 
     fn clear_failed_row(&self, label: &str) {
         self.failed_rows.lock().unwrap().remove(label);
+    }
+
+    /// 登记一条卸载超时后仍在后台清理的旧实例，防止后续 `reconcile` 在清理完成前旁路重挂。
+    ///
+    /// 同时派发一个仅持 `Weak<LoaderState>` 的收尾任务：后台清理归零后立即摘表并释放 `Arc<Fiber>`。
+    fn mark_row_draining(self: &Arc<Self>, label: &str, fiber: Arc<Fiber>) {
+        if fiber.pending_background_cleanups() == 0 {
+            return;
+        }
+        let label_owned = label.to_string();
+        self.draining
+            .lock()
+            .unwrap()
+            .insert(label_owned.clone(), fiber.clone());
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let weak_state = Arc::downgrade(self);
+            rt.spawn(async move {
+                fiber.wait_background_cleanups().await;
+                if let Some(state) = weak_state.upgrade() {
+                    let mut table = state.draining.lock().unwrap();
+                    if table
+                        .get(&label_owned)
+                        .is_some_and(|stored| Arc::ptr_eq(stored, &fiber))
+                    {
+                        table.remove(&label_owned);
+                    }
+                }
+            });
+        }
+    }
+
+    /// 检查指定行是否仍有旧实例在后台清理未完成（若已完成则当场摘除）。
+    fn is_row_draining(&self, label: &str) -> bool {
+        let mut table = self.draining.lock().unwrap();
+        let Some(fiber) = table.get(label) else {
+            return false;
+        };
+        if fiber.pending_background_cleanups() > 0 {
+            true
+        } else {
+            table.remove(label);
+            false
+        }
     }
 
     fn record_persisted_error(&self, label: &str, plugin: &str, message: String) {
@@ -2071,58 +2156,91 @@ impl LoaderState {
         pending
     }
 
-    /// 当前未就绪的行及其精确缺失键，并将缺失键关联到已知声明提供该键的失败上游行。
+    /// 当前未就绪的行及其精确缺失键，并将缺失键关联到同一隔离域内已知声明提供该键的失败上游行。
     ///
     /// 若某行当前已重新挂载且处于 `FiberState::Active`（例如热重载回滚后旧实例仍在服务），
-    /// 不将其误报为下游 `Pending` 的阻塞上游。
+    /// 不将其误报为下游 `Pending` 的阻塞上游；跨不同 `isolate` 域的失败行亦不会误关联。
     pub fn correlated_pending_report(&self) -> Vec<CorrelatedPendingRow> {
-        let active_labels: HashSet<String> = self
+        let mounted_rows: Vec<(String, String, Weak<Fiber>, IsolateScope)> = self
             .mounted
             .lock()
             .unwrap()
             .values()
-            .filter(|record| {
-                record
-                    .fiber
-                    .upgrade()
-                    .is_some_and(|fiber| fiber.state() == FiberState::Active)
+            .map(|record| {
+                (
+                    record.label.clone(),
+                    record.plugin.name().to_string(),
+                    record.fiber.clone(),
+                    record.scope.isolate.clone(),
+                )
             })
-            .map(|record| record.label.clone())
             .collect();
-        let failed: Vec<FailedRow> = self
+        let mut active_labels: HashSet<String> = HashSet::new();
+        let mut pending_rows: Vec<(PendingRow, IsolateScope)> = Vec::new();
+        for (label, plugin, weak_fiber, isolate) in mounted_rows {
+            let Some(fiber) = weak_fiber.upgrade() else {
+                continue;
+            };
+            if fiber.state() == FiberState::Active {
+                active_labels.insert(label);
+                continue;
+            }
+            let missing = fiber.pending_injects();
+            if missing.is_empty() {
+                continue;
+            }
+            pending_rows.push((
+                PendingRow {
+                    label,
+                    plugin,
+                    missing,
+                },
+                isolate,
+            ));
+        }
+        pending_rows.sort_by(|a, b| a.0.label.cmp(&b.0.label));
+
+        let failed: Vec<FailedRowRecord> = self
             .failed_rows
             .lock()
             .unwrap()
             .values()
-            .filter(|row| !active_labels.contains(&row.label) && !row.provides.is_empty())
+            .filter(|rec| !active_labels.contains(&rec.row.label) && !rec.row.provides.is_empty())
             .cloned()
             .collect();
 
-        self.pending_report()
+        pending_rows
             .into_iter()
-            .map(|row| {
+            .map(|(row, consumer_isolate)| {
                 let missing = row
                     .missing
                     .into_iter()
                     .map(|inject| {
                         let mut failed_upstream: Vec<PendingUpstreamFailure> = failed
                             .iter()
-                            .filter(|candidate| candidate.label != row.label)
+                            .filter(|candidate| candidate.row.label != row.label)
                             .filter_map(|candidate| {
                                 candidate
+                                    .row
                                     .provides
                                     .iter()
                                     .find(|provided| {
                                         matches_declared_provide(provided, &inject.key)
+                                            && same_realm_visibility(
+                                                candidate.isolate.as_deref(),
+                                                &consumer_isolate,
+                                                provided,
+                                                &inject.key,
+                                            )
                                     })
                                     .map(|matched_key| PendingUpstreamFailure {
-                                        label: candidate.label.clone(),
-                                        plugin: candidate.plugin.clone(),
-                                        category: candidate.category,
-                                        startup: candidate.startup,
-                                        degraded: candidate.degraded,
+                                        label: candidate.row.label.clone(),
+                                        plugin: candidate.row.plugin.clone(),
+                                        category: candidate.row.category,
+                                        startup: candidate.row.startup,
+                                        degraded: candidate.row.degraded,
                                         matched_key: matched_key.clone(),
-                                        message: candidate.message.clone(),
+                                        message: candidate.row.message.clone(),
                                     })
                             })
                             .collect();
@@ -2358,29 +2476,33 @@ impl LoaderState {
         };
         let outcome = self.sync_inner().await;
         if !outcome.failures.is_empty() {
-            {
-                let _gate = self.config_gate.lock().unwrap();
-                if let Some(entry) = find_by_label(&mut self.tree.lock().unwrap(), label) {
-                    entry.disabled = old_disabled;
-                    entry.disabled_expr = old_expr;
+            // 若该行已在本次对账中被实际拆卸（例如停用时触发 `dispose_timeout_ms` 超时），
+            // fiber 已进入不可逆的 Disposed 态且从 `mounted` 摘除，不能把 `tree` 回滚回启用态。
+            if !outcome.disposed.iter().any(|disposed| disposed == label) {
+                {
+                    let _gate = self.config_gate.lock().unwrap();
+                    if let Some(entry) = find_by_label(&mut self.tree.lock().unwrap(), label) {
+                        entry.disabled = old_disabled;
+                        entry.disabled_expr = old_expr;
+                    }
                 }
+                // 回滚后对齐 `disabled`、`failed_rows` 与 `loader.report`，
+                // 避免报告仍残留已被撤回的启停状态或已回滚为禁用行的失败台账。
+                let restored = self.desired(&self.tree_snapshot());
+                *self.disabled.lock().unwrap() = restored.disabled;
+                let enabled_labels: HashSet<String> =
+                    restored.rows.into_iter().map(|row| row.label).collect();
+                let restored_issues = assign_issue_keys(restored.issues);
+                let restored_issue_keys: HashSet<&str> = restored_issues
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect();
+                self.failed_rows.lock().unwrap().retain(|row_label, _| {
+                    enabled_labels.contains(row_label)
+                        || restored_issue_keys.contains(row_label.as_str())
+                });
+                self.publish_report();
             }
-            // 回滚后对齐 `disabled`、`failed_rows` 与 `loader.report`，
-            // 避免报告仍残留已被撤回的启停状态或已回滚为禁用行的失败台账。
-            let restored = self.desired(&self.tree_snapshot());
-            *self.disabled.lock().unwrap() = restored.disabled;
-            let enabled_labels: HashSet<String> =
-                restored.rows.into_iter().map(|row| row.label).collect();
-            let restored_issues = assign_issue_keys(restored.issues);
-            let restored_issue_keys: HashSet<&str> = restored_issues
-                .iter()
-                .map(|(key, _)| key.as_str())
-                .collect();
-            self.failed_rows.lock().unwrap().retain(|row_label, _| {
-                enabled_labels.contains(row_label)
-                    || restored_issue_keys.contains(row_label.as_str())
-            });
-            self.publish_report();
             return Err(format!(
                 "启停 {label} 未生效（对账失败）: {}",
                 outcome.failures.join("；")
@@ -2439,6 +2561,7 @@ impl LoaderState {
         &self,
         label: &str,
         entry: &Entry,
+        isolate: Option<IsolateScope>,
         category: FailureCategory,
         message: String,
         provides: Vec<String>,
@@ -2452,15 +2575,18 @@ impl LoaderState {
         let level = level_override.unwrap_or(if degraded { Level::Warn } else { Level::Error });
         self.ctx
             .log(level, &format!("{label}: {log_prefix}{message}"));
-        self.record_failed_row(FailedRow {
-            label: label.to_string(),
-            plugin: entry.name.clone(),
-            category,
-            startup,
-            degraded,
-            provides,
-            message: message.clone(),
-        });
+        self.record_failed_row(
+            FailedRow {
+                label: label.to_string(),
+                plugin: entry.name.clone(),
+                category,
+                startup,
+                degraded,
+                provides,
+                message: message.clone(),
+            },
+            isolate,
+        );
         let record_in_outcome = !degraded
             || (policy.is_none()
                 && !self.strict
@@ -2575,6 +2701,7 @@ impl LoaderState {
                     self.handle_row_failure(
                         &issue.label,
                         &issue.entry,
+                        issue.isolate,
                         FailureCategory::RuntimeUnavailable,
                         issue.issue,
                         provides,
@@ -2592,15 +2719,18 @@ impl LoaderState {
                     let level = if degraded { Level::Warn } else { Level::Error };
                     self.ctx
                         .log(level, &format!("{}: 对账：{}", issue.label, issue.issue));
-                    self.record_failed_row(FailedRow {
-                        label: issue_key,
-                        plugin: issue.entry.name.clone(),
-                        category: FailureCategory::PersistedState,
-                        startup: RowStartup::Required,
-                        degraded,
-                        provides: Vec::new(),
-                        message: issue.issue.clone(),
-                    });
+                    self.record_failed_row(
+                        FailedRow {
+                            label: issue_key,
+                            plugin: issue.entry.name.clone(),
+                            category: FailureCategory::PersistedState,
+                            startup: RowStartup::Required,
+                            degraded,
+                            provides: Vec::new(),
+                            message: issue.issue.clone(),
+                        },
+                        None,
+                    );
                     if !degraded || (policy.is_none() && !self.strict) {
                         outcome
                             .failures
@@ -2615,16 +2745,54 @@ impl LoaderState {
                     // 移除路径只有 emit（上游 `EntryGroup.remove` 不走 `patch-context`）。
                     self.emit_partial_dispose(rows.get(&label), &label, false)
                         .await;
-                    self.dispose_row(&label).await;
+                    let close_report = self.dispose_row(&label).await;
                     self.clear_failed_row(&label);
-                    self.ctx
-                        .log(Level::Info, &format!("{label}: 已卸载（不再期望挂载）"));
+                    if let Some(report) = close_report {
+                        if report.still_running {
+                            let msg = format!(
+                                "卸载未在预算内完成（状态={}），后台清理仍在进行（清理完成前禁止重挂）",
+                                report.status.as_str()
+                            );
+                            self.ctx.log(Level::Error, &format!("{label}: {msg}"));
+                            outcome.failures.push(format!("{label}: {msg}"));
+                        } else if !report.errors.is_empty() {
+                            self.ctx.log(
+                                Level::Warn,
+                                &format!(
+                                    "{label}: 已卸载（清理产生 {} 条错误）",
+                                    report.errors.len()
+                                ),
+                            );
+                        } else {
+                            self.ctx
+                                .log(Level::Info, &format!("{label}: 已卸载（不再期望挂载）"));
+                        }
+                    } else {
+                        self.ctx
+                            .log(Level::Info, &format!("{label}: 已卸载（不再期望挂载）"));
+                    }
                     outcome.disposed.push(label);
                 }
                 Action::Mount(label) => {
                     let Some(row) = rows.remove(&label) else {
                         continue;
                     };
+                    // 旧实例仍在后台排空/清理时绝不允许旁路重挂，防止新旧实例在同一行上并发冲突。
+                    if self.is_row_draining(&label) {
+                        let provides = self.declared_provides_for(&label, &row.entry, None, None);
+                        self.handle_row_failure(
+                            &label,
+                            &row.entry,
+                            Some(row.scope.isolate.clone()),
+                            FailureCategory::RuntimeUnavailable,
+                            "旧实例后台清理尚未完成，拒绝重新挂载新实例".to_string(),
+                            provides,
+                            &mut outcome,
+                            "挂载被阻断：",
+                            None,
+                        );
+                        continue;
+                    }
                     match self.patch_context(&row, PatchWork::Mount, None).await {
                         Some(ActionOutcome::Done) => {
                             self.clear_failed_row(&label);
@@ -2636,6 +2804,7 @@ impl LoaderState {
                             self.handle_row_failure(
                                 &label,
                                 &row.entry,
+                                Some(row.scope.isolate.clone()),
                                 failure.category,
                                 failure.message,
                                 provides,
@@ -2679,6 +2848,7 @@ impl LoaderState {
                             self.handle_row_failure(
                                 &label,
                                 &row.entry,
+                                Some(row.scope.isolate.clone()),
                                 err.category,
                                 issue,
                                 provides,
@@ -2691,7 +2861,35 @@ impl LoaderState {
                     };
                     // 先卸后装：同一隔离域里一个服务名只能有一个实现（内核不变量）。
                     self.emit_partial_dispose(Some(&row), &label, true).await;
-                    self.dispose_row(&label).await;
+                    let close_report = self.dispose_row(&label).await;
+                    if let Some(report) = &close_report {
+                        if report.still_running {
+                            // 丢弃预加载的 artifact（立即回收暂存副本），绝不在旧实例尚未清完时挂入新实例。
+                            drop(loaded);
+                            let provides = self.declared_provides_for(
+                                &label,
+                                &row.entry,
+                                None,
+                                previous_plugin.as_ref(),
+                            );
+                            let issue = format!(
+                                "换实例失败（旧实例卸载未在预算内完成，状态={}，后台清理仍在进行，拒绝挂载新实例）",
+                                report.status.as_str()
+                            );
+                            self.handle_row_failure(
+                                &label,
+                                &row.entry,
+                                Some(row.scope.isolate.clone()),
+                                FailureCategory::RuntimeUnavailable,
+                                issue,
+                                provides,
+                                &mut outcome,
+                                "",
+                                None,
+                            );
+                            continue;
+                        }
+                    }
                     // 预检拿到的 artifact 交给尾链**复用**：绝不二次 `load`（那会再跑一次
                     // stage/open/ping，把前移的收益抵消掉）。
                     match self
@@ -2724,6 +2922,7 @@ impl LoaderState {
                             self.handle_row_failure(
                                 &label,
                                 &row.entry,
+                                Some(row.scope.isolate.clone()),
                                 FailureCategory::RuntimeUnavailable,
                                 issue,
                                 provides,
@@ -2749,6 +2948,7 @@ impl LoaderState {
                             self.handle_row_failure(
                                 &label,
                                 &row.entry,
+                                Some(row.scope.isolate.clone()),
                                 failure.category,
                                 message,
                                 provides,
@@ -2781,6 +2981,7 @@ impl LoaderState {
                             self.handle_row_failure(
                                 &label,
                                 &row.entry,
+                                Some(row.scope.isolate.clone()),
                                 failure.category,
                                 failure.message,
                                 provides,
@@ -2831,6 +3032,7 @@ impl LoaderState {
                                     self.handle_row_failure(
                                         &label,
                                         &row.entry,
+                                        Some(row.scope.isolate.clone()),
                                         failure.category,
                                         failure.message,
                                         provides,
@@ -3263,8 +3465,8 @@ impl LoaderState {
         let snapshot = match self.read_settled().await {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => return Ok(None),
-            Err(err) => {
-                let label = self.files.main.display().to_string();
+            Err((path, err)) => {
+                let label = path.display().to_string();
                 return Err(BuildCandidateError::Persisted {
                     message: format!("读取 {label} 失败: {err}"),
                     label,
@@ -3582,20 +3784,28 @@ impl LoaderState {
             .await;
     }
 
-    /// 有意卸载一行：**先摘记录**（表不撒谎），再 dispose（清理逻辑可能回调宿主）。
+    /// 有意卸载一行：**先摘记录**（表不撒谎），再按 App 生命周期预算执行 `dispose_with_report`。
     ///
-    /// `disposing` 是给 `internal/plugin` 观察者看的：有意的卸载不该被误判成
-    /// "插件自我卸载"。上游靠 `fiber.entry.disabled` 区分，这里用显式标记——
-    /// 更稳，因为"禁用"只是有意卸载的一种原因（还有移除与换实例）。
-    async fn dispose_row(&self, label: &str) {
+    /// 若卸载超时（`report.still_running == true`），将旧实例登记到 `draining`，
+    /// 在后台清理归零前阻止后续 `Action::Mount` / `Action::Replace` 旁路重挂。
+    async fn dispose_row(self: &Arc<Self>, label: &str) -> Option<CloseReport> {
         self.disposing.lock().unwrap().insert(label.to_string());
         let record = self.mounted.lock().unwrap().remove(label);
-        if let Some(record) = record {
+        let report = if let Some(record) = record {
             if let Some(fiber) = record.fiber.upgrade() {
-                fiber.dispose().await;
+                let report = fiber.dispose_with_report(None).await;
+                if report.still_running {
+                    self.mark_row_draining(label, fiber);
+                }
+                Some(report)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         self.disposing.lock().unwrap().remove(label);
+        report
     }
 
     /// 插件**自己**把这一行卸载了（上游 `loader/src/index.ts:137-145` 的 case 7）。
@@ -3789,7 +3999,9 @@ impl LoaderState {
     }
 
     /// **稳读**：同一组文件读两遍、内容一致才采纳（编辑中的半截文件不采纳）。
-    async fn read_settled(&self) -> std::io::Result<Option<FileSnapshot>> {
+    async fn read_settled(
+        &self,
+    ) -> std::result::Result<Option<FileSnapshot>, (PathBuf, std::io::Error)> {
         let mut read = |path: &Path| std::fs::read_to_string(path);
         read_settled_with(&self.files, self.settle, &mut read).await
     }
@@ -5641,6 +5853,8 @@ enum SwapOutcome {
         error: String,
         rollback_error: String,
         dispose_report: Option<CloseReport>,
+        /// 若因清理超时仍未完成而放弃换入，携带正在后台排空的 fiber 供 `LoaderState::draining` 阻断旁路重挂。
+        draining_fiber: Option<Arc<Fiber>>,
     },
 }
 
@@ -5790,7 +6004,8 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
     // 卸载旧实例（带结构化报告，并遵守 App 的 LifecyclePolicy 等待预算）。
     // 这一步无法与安装合并：同一隔离域里一个服务名只能有一个实现，
     // 旧实例还在时新实例的 `provide` 必然冲突。
-    let dispose_report = if let Some(fiber) = record.fiber.upgrade() {
+    let old_fiber = record.fiber.upgrade();
+    let dispose_report = if let Some(fiber) = &old_fiber {
         Some(fiber.dispose_with_report(None).await)
     } else {
         None
@@ -5805,6 +6020,7 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
                 error: reason.clone(),
                 rollback_error: reason,
                 dispose_report,
+                draining_fiber: old_fiber,
             };
         }
     }
@@ -5848,6 +6064,7 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
             error: format!("{error}；且无法安全回滚：{rollback_error}"),
             rollback_error,
             dispose_report,
+            draining_fiber: Some(fiber),
         };
     }
 
@@ -5883,6 +6100,7 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
             ),
             rollback_error,
             dispose_report,
+            draining_fiber: None,
         },
     }
 }
@@ -5929,29 +6147,40 @@ async fn finish_reload_swap(
     state.disposing.lock().unwrap().remove(label);
 
     let report = outcome.to_report(label);
-    let lost_reason = match &outcome {
-        SwapOutcome::Lost { rollback_error, .. } => Some(rollback_error.clone()),
-        _ => None,
+    let (lost_reason, draining_fiber) = match &outcome {
+        SwapOutcome::Lost {
+            rollback_error,
+            draining_fiber,
+            ..
+        } => (Some(rollback_error.clone()), draining_fiber.clone()),
+        _ => (None, None),
     };
     let old_plugin = record.plugin.clone();
     let old_declared = record.declared.clone();
+    let old_isolate = record.scope.isolate.clone();
     let remove_entry = record.commit_outcome(outcome, staged);
     if remove_entry {
+        if let Some(draining) = draining_fiber {
+            state.mark_row_draining(label, draining);
+        }
         let provides = state.declared_provides_for(label, &old_declared, None, Some(&old_plugin));
         let startup = state.effective_row_startup(label, old_declared.id.as_deref());
         let error_msg = report
             .error
             .clone()
             .unwrap_or_else(|| lost_reason.clone().unwrap_or_else(|| "未知".to_string()));
-        state.record_failed_row(FailedRow {
-            label: label.to_string(),
-            plugin: old_declared.name.clone(),
-            category: FailureCategory::RuntimeUnavailable,
-            startup,
-            degraded: false,
-            provides,
-            message: error_msg,
-        });
+        state.record_failed_row(
+            FailedRow {
+                label: label.to_string(),
+                plugin: old_declared.name.clone(),
+                category: FailureCategory::RuntimeUnavailable,
+                startup,
+                degraded: false,
+                provides,
+                message: error_msg,
+            },
+            Some(old_isolate),
+        );
         ctx.log(
             Level::Error,
             &format!(
@@ -6277,12 +6506,24 @@ enum DesiredIssueKind {
 }
 
 /// 期望态计算阶段发现的一条行级决策问题。
-#[derive(Debug)]
 struct DesiredIssue {
     label: String,
     entry: Entry,
     kind: DesiredIssueKind,
+    isolate: Option<IsolateScope>,
     issue: String,
+}
+
+impl std::fmt::Debug for DesiredIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DesiredIssue")
+            .field("label", &self.label)
+            .field("entry", &self.entry)
+            .field("kind", &self.kind)
+            .field("has_isolate", &self.isolate.is_some())
+            .field("issue", &self.issue)
+            .finish()
+    }
 }
 
 /// 为决策问题分配稳定的 `failed_rows` 台账键（重复 label 使用独立键避免被首行 Mount 误清）。
@@ -6373,6 +6614,7 @@ impl DesiredWalk<'_, '_> {
                     label,
                     entry: entry.clone(),
                     kind: DesiredIssueKind::DuplicateLabel,
+                    isolate: None,
                     issue: "重复 label（两行解析成同一个行标识；请给它们不同的 id），已跳过该行"
                         .to_string(),
                 });
@@ -6406,6 +6648,7 @@ impl DesiredWalk<'_, '_> {
                         label,
                         entry: entry.clone(),
                         kind: DesiredIssueKind::Interpolation,
+                        isolate: Some(scope.isolate.clone()),
                         issue,
                     });
                     continue;
@@ -6427,6 +6670,7 @@ impl DesiredWalk<'_, '_> {
                         label,
                         entry: entry.clone(),
                         kind: DesiredIssueKind::Interpolation,
+                        isolate: Some(scope.isolate.clone()),
                         issue,
                     });
                     continue;

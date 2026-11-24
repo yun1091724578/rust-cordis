@@ -7,8 +7,9 @@ use cordis_abi::{
     Blob, ErrorPayload, Out, ERROR_FORMAT_V1, OP_APPLY, OP_CALLBACK, STATUS_ERR, STATUS_OK,
 };
 use cordis_core::{
-    plugin_fn, with_provision, App, BoxFuture, Config, Ctx, Dyn, ExternService, FiberState, Inject,
-    MethodUnauthorized, Outcome, Plugin, Result, StreamSink, TraceRecord, TraceSink,
+    plugin_fn, with_provision, App, BoxFuture, Config, Ctx, Disposable, Dyn, ExternService,
+    FiberState, Inject, LifecyclePolicy, MethodUnauthorized, Outcome, Plugin, Result, StreamSink,
+    TraceRecord, TraceSink,
 };
 use cordis_host::loader::{
     load_with_source, reload_one_with_plugin, DiskPluginSource, LoadFailure, LoadedFile,
@@ -19,9 +20,9 @@ use cordis_host::plan::PlanEntrySpec;
 use cordis_host::source::{AllowedPlugin, PluginSourcePolicy, SourceAdmission};
 use cordis_host::{
     apply_via_with_error_format, dispatches_len, host_api, method_allow_list_for,
-    set_method_allow_list_for, set_native_registry, set_startup_policy_for, staged_leaked,
-    startup_policy_for, FailureCategory, FailureDisposition, MethodAllowList, NativeRegistry,
-    StartupPolicy,
+    set_lifecycle_policy_for, set_method_allow_list_for, set_native_registry,
+    set_startup_policy_for, staged_leaked, startup_policy_for, FailureCategory, FailureDisposition,
+    MethodAllowList, NativeRegistry, StartupPolicy,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -2053,4 +2054,490 @@ async fn loader_mounted_t2_rows_enforce_per_row_allow_list_and_ctx_use_child_doe
     assert_eq!(T2_VAULT_CALLS.load(Ordering::SeqCst), 3);
 
     app.close().await;
+}
+
+// ============================================================================
+// 二轮评审加固回归用例（P1-1 / P1-3 / P2-5 / P2-6）
+// ============================================================================
+
+#[tokio::test]
+async fn pending_report_correlates_upstream_only_within_matching_realm() {
+    struct RealmSource;
+    impl PluginSource for RealmSource {
+        fn load(
+            &self,
+            entry: &Entry,
+            _search: &[PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            let plugin: Arc<dyn Plugin> = match entry.name.as_str() {
+                "db-fail" => with_provision(
+                    plugin_fn("db-fail", Inject::default(), |_ctx, _| {
+                        Box::pin(async { Err("db init failed".into()) })
+                    }),
+                    vec!["db".into()],
+                ),
+                "db-consumer" => plugin_fn("db-consumer", Inject::of(&["db"]), |_ctx, _| {
+                    Box::pin(async { Ok(()) })
+                }),
+                other => return Err(format!("unknown {other}")),
+            };
+            Ok(loaded_memory(&entry.name, plugin))
+        }
+    }
+
+    let dir = TempDir::new("pending-realm-filter");
+    let cfg_path = dir.write(
+        "cordis.yml",
+        "\
+- id: db-priv
+  name: db-fail
+  optional: true
+  isolate:
+    db: true
+- id: db-tenant-a
+  name: db-fail
+  optional: true
+  isolate:
+    db: tenant-a
+- id: cons-default
+  name: db-consumer
+- id: cons-tenant-a
+  name: db-consumer
+  isolate:
+    db: tenant-a
+- id: cons-tenant-b
+  name: db-consumer
+  isolate:
+    db: tenant-b
+",
+    );
+
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(RealmSource),
+    )
+    .await
+    .expect("可选上游失败应降级启动");
+
+    let default_realms_before = app.store.default_realm_count();
+    let report = state.report();
+    assert_eq!(
+        app.store.default_realm_count(),
+        default_realms_before,
+        "correlated_pending_report 必须保持零域分配只读不变量"
+    );
+
+    let pending = report["pending"].as_array().expect("pending array");
+    let find = |label: &str| {
+        pending
+            .iter()
+            .find(|row| row["label"] == label)
+            .expect("pending row")
+    };
+
+    // 默认域与 tenant-b 不可见 db-priv / db-tenant-a，绝不得跨隔离域误关联。
+    assert!(
+        find("cons-default")["missing"][0]
+            .get("failedUpstream")
+            .is_none(),
+        "默认域不得误关联私有域或 tenant-a 的失败上游: {}",
+        find("cons-default")
+    );
+    assert!(
+        find("cons-tenant-b")["missing"][0]
+            .get("failedUpstream")
+            .is_none(),
+        "tenant-b 不得误关联 tenant-a 或私有域的失败上游: {}",
+        find("cons-tenant-b")
+    );
+
+    // tenant-a 只应精确关联同属 tenant-a 的 db-tenant-a，绝不混入 db-priv。
+    let tenant_a_up = find("cons-tenant-a")["missing"][0]["failedUpstream"]
+        .as_array()
+        .expect("tenant-a 必须关联到同域失败上游");
+    assert_eq!(tenant_a_up.len(), 1, "{tenant_a_up:?}");
+    assert_eq!(tenant_a_up[0]["label"], "db-tenant-a");
+
+    app.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_dispose_and_replace_respect_dispose_budget_and_block_remount_while_draining() {
+    struct StuckReconcileSource {
+        release: Arc<tokio::sync::Notify>,
+        v2_applies: Arc<AtomicUsize>,
+    }
+
+    impl PluginSource for StuckReconcileSource {
+        fn load(
+            &self,
+            entry: &Entry,
+            _search: &[PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            let plugin: Arc<dyn Plugin> = match entry.name.as_str() {
+                "stuck-v1" => {
+                    let release = self.release.clone();
+                    plugin_fn("stuck-v1", Inject::default(), move |ctx: Ctx, _| {
+                        let release = release.clone();
+                        Box::pin(async move {
+                            ctx.effect(move |_| {
+                                Disposable::new(move || {
+                                    Box::pin(async move {
+                                        release.notified().await;
+                                    })
+                                })
+                            });
+                            Ok(())
+                        })
+                    })
+                }
+                "clean-v2" => {
+                    let applies = self.v2_applies.clone();
+                    plugin_fn("clean-v2", Inject::default(), move |_ctx: Ctx, _| {
+                        applies.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(()) })
+                    })
+                }
+                other => return Err(format!("unknown {other}")),
+            };
+            Ok(loaded_memory(&entry.name, plugin))
+        }
+    }
+
+    let dir = TempDir::new("draining-reconcile");
+    let cfg_path = dir.write("cordis.yml", "- id: svc\n  name: stuck-v1\n");
+
+    let app = App::new();
+    set_lifecycle_policy_for(
+        &app.root,
+        LifecyclePolicy::new(None, None, Some(50)).unwrap(),
+    )
+    .unwrap();
+
+    let release_a = Arc::new(tokio::sync::Notify::new());
+    let v2_applies = Arc::new(AtomicUsize::new(0));
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(StuckReconcileSource {
+            release: release_a.clone(),
+            v2_applies: v2_applies.clone(),
+        }),
+    )
+    .await
+    .expect("initial mount");
+    assert_eq!(state.mounted_labels(), vec!["svc".to_string()]);
+
+    // 1) Action::Replace 卸载卡住的旧实例：必须受 dispose_timeout_ms 约束及时返回，
+    //    且在后台清理未完成时拒绝挂载 clean-v2。
+    let replace_entries = parse_entries("- id: svc\n  name: clean-v2\n").unwrap();
+    let replace_outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.reconcile_once(replace_entries),
+    )
+    .await
+    .expect("Action::Replace 必须受 dispose_timeout_ms 约束不得无限挂死");
+    assert!(!replace_outcome.failures.is_empty(), "{replace_outcome:?}");
+    assert!(
+        state.mounted_labels().is_empty(),
+        "超时后旧实例已摘表且新实例不得挂载"
+    );
+    assert_eq!(v2_applies.load(Ordering::SeqCst), 0);
+
+    // 2) 后台清理未完时再次 sync()（Action::Mount）：必须继续被 draining 阻断，不得旁路重挂。
+    let blocked_mount = state.sync().await;
+    assert!(
+        blocked_mount
+            .failures
+            .iter()
+            .any(|msg| msg.contains("后台清理尚未完成")),
+        "后台清理未完时必须阻断重挂: {blocked_mount:?}"
+    );
+    assert_eq!(v2_applies.load(Ordering::SeqCst), 0);
+    assert!(state.mounted_labels().is_empty());
+
+    // 3) 放行旧实例 disposer 并等待后台清理归零后，再次 sync() 自动恢复挂载 clean-v2。
+    release_a.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        app.store.wait_background_cleanups(),
+    )
+    .await
+    .expect("后台清理收敛");
+    let recovered = state.sync().await;
+    assert!(recovered.failures.is_empty(), "{recovered:?}");
+    assert_eq!(recovered.mounted, vec!["svc".to_string()]);
+    assert_eq!(v2_applies.load(Ordering::SeqCst), 1);
+    assert!(state.failed_rows().is_empty());
+
+    // 4) HMR reload_one_with_plugin 触发旧实例超时（Lost）后，同样阻断后续 sync() 旁路重挂，
+    //    待清理结束后恢复。
+    let release_b = Arc::new(tokio::sync::Notify::new());
+    let release_b_d = release_b.clone();
+    let stuck_for_reload = plugin_fn("stuck-hmr", Inject::default(), move |ctx: Ctx, _| {
+        let rel = release_b_d.clone();
+        Box::pin(async move {
+            ctx.effect(move |_| {
+                Disposable::new(move || {
+                    Box::pin(async move {
+                        rel.notified().await;
+                    })
+                })
+            });
+            Ok(())
+        })
+    });
+    let r_install = reload_one_with_plugin(&app.root, &state, "svc", stuck_for_reload).await;
+    assert_eq!(r_install.status, ReloadStatus::Active);
+
+    let dummy_next = plugin_fn("dummy-next", Inject::default(), |_ctx, _| {
+        Box::pin(async { Ok(()) })
+    });
+    let r_lost = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        reload_one_with_plugin(&app.root, &state, "svc", dummy_next),
+    )
+    .await
+    .expect("reload_one_with_plugin 应按 dispose_timeout_ms 及时返回");
+    assert_eq!(r_lost.status, ReloadStatus::Lost);
+
+    let blocked_after_lost = state.sync().await;
+    assert!(
+        blocked_after_lost
+            .failures
+            .iter()
+            .any(|msg| msg.contains("后台清理尚未完成")),
+        "ReloadStatus::Lost 后后台清理未完时 sync() 不得旁路重挂: {blocked_after_lost:?}"
+    );
+    assert_eq!(v2_applies.load(Ordering::SeqCst), 1);
+
+    release_b.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        app.store.wait_background_cleanups(),
+    )
+    .await
+    .expect("HMR 后台清理收敛");
+    let recovered2 = state.sync().await;
+    assert!(recovered2.failures.is_empty(), "{recovered2:?}");
+    assert_eq!(v2_applies.load(Ordering::SeqCst), 2);
+
+    // 5) set_disabled("svc", Some(true)) 触发 Action::Dispose 超时：及时返回 Err，
+    //    且因为旧实例已实际摘表处置，不把树错误回滚回 disabled=false。
+    let release_c = Arc::new(tokio::sync::Notify::new());
+    let release_c_d = release_c.clone();
+    let stuck_for_disable = plugin_fn("stuck-disable", Inject::default(), move |ctx: Ctx, _| {
+        let rel = release_c_d.clone();
+        Box::pin(async move {
+            ctx.effect(move |_| {
+                Disposable::new(move || {
+                    Box::pin(async move {
+                        rel.notified().await;
+                    })
+                })
+            });
+            Ok(())
+        })
+    });
+    assert_eq!(
+        reload_one_with_plugin(&app.root, &state, "svc", stuck_for_disable)
+            .await
+            .status,
+        ReloadStatus::Active
+    );
+    let disable_err = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.set_disabled("svc", Some(true)),
+    )
+    .await
+    .expect("set_disabled 禁用卡死行必须受 dispose_timeout_ms 约束")
+    .expect_err("卸载超时应向调用方报出错误");
+    assert!(disable_err.contains("后台清理仍在进行"), "{disable_err}");
+    assert!(
+        state.tree_snapshot()[0].disabled,
+        "已摘表处置的行不得被回滚回 disabled=false"
+    );
+    assert!(state.mounted_labels().is_empty());
+
+    release_c.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        app.store.wait_background_cleanups(),
+    )
+    .await
+    .expect("禁用后台清理收敛");
+    app.close().await;
+}
+
+#[tokio::test]
+async fn reload_patch_io_error_attributes_exact_path_and_t2_auth_race_stays_status_err() {
+    // 1) P2-6：运行期删除 patch 文件触发 I/O 失败，persisted_state_errors 必须归属到精确的 patch 路径而非主配置。
+    let dir = TempDir::new("patch-io-attribution");
+    let main_path = dir.write("cordis.yml", "- id: core\n  name: core\n");
+    let patch_path = dir.write("cordis.patch.yml", "[]\n");
+
+    let app = App::new();
+    let mut cfg = LoaderConfig::new(main_path.to_string_lossy().into_owned());
+    cfg.patches = vec![patch_path.to_string_lossy().into_owned()];
+    let state = load_with_source(
+        app.root.clone(),
+        cfg,
+        Arc::new(ClassifiedTestSource::new([("core", Ok(()))])),
+    )
+    .await
+    .expect("initial load");
+
+    std::fs::remove_file(&patch_path).expect("remove patch file");
+    let missing_reload = state.reload().await;
+    match &missing_reload {
+        ReloadOutcome::Failed(msg) => assert!(
+            msg.contains("cordis.patch.yml"),
+            "I/O 失败消息必须指向缺失的 patch 文件: {msg}"
+        ),
+        other => panic!("expected Failed on missing patch, got {other:?}"),
+    }
+    let errs = state.persisted_state_errors();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert_eq!(
+        errs[0].label,
+        patch_path.display().to_string(),
+        "persisted_state_errors 必须归属到精确的 patch 路径而非 cordis.yml"
+    );
+
+    dir.write("cordis.patch.yml", "[]\n");
+    assert!(matches!(state.reload().await, ReloadOutcome::Reconciled(_)));
+    assert!(state.persisted_state_errors().is_empty());
+    app.close().await;
+
+    // 2) P2-5：确定性复现并发收紧白名单（第一次前置检查放行、第二次 call_iface 复检拒绝）——
+    //    T2 ctx_call_iface 必须依然返回 STATUS_ERR + ErrorPayload(host_unauthorized)，不得漂移为 STATUS_OK 内联错。
+    static RACE_PROVIDER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RACE_CALLER_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    unsafe extern "C" fn race_provider(
+        handle: u64,
+        op: u32,
+        _input: Blob,
+        _reserved: Blob,
+        _out: *mut Out,
+    ) -> i32 {
+        match op {
+            OP_APPLY => {
+                let mut buf = vec![0u8; 512];
+                let mut host_out = Out {
+                    ptr: buf.as_mut_ptr(),
+                    cap: buf.len(),
+                    len: 0,
+                };
+                let provide = host_api().ctx_provide_iface.expect("ctx_provide_iface");
+                provide(
+                    handle,
+                    Blob::new(b"race_svc"),
+                    1,
+                    Blob::new(br#"["ping"]"#),
+                    1,
+                    &mut host_out,
+                )
+            }
+            OP_CALLBACK => {
+                RACE_PROVIDER_CALLS.fetch_add(1, Ordering::SeqCst);
+                STATUS_OK
+            }
+            _ => STATUS_OK,
+        }
+    }
+
+    unsafe extern "C" fn race_caller(
+        handle: u64,
+        op: u32,
+        _a: Blob,
+        _b: Blob,
+        _out: *mut Out,
+    ) -> i32 {
+        if op == OP_APPLY {
+            RACE_CALLER_HANDLE.store(handle, Ordering::SeqCst);
+        }
+        STATUS_OK
+    }
+
+    RACE_PROVIDER_CALLS.store(0, Ordering::SeqCst);
+    RACE_CALLER_HANDLE.store(0, Ordering::SeqCst);
+
+    let app2 = App::new();
+    let f_prov = app2.root.plugin(
+        plugin_fn("race-prov", Inject::default(), |ctx: Ctx, _| {
+            apply_via_with_error_format(
+                race_provider,
+                ctx,
+                Config::Null,
+                "race-prov",
+                ERROR_FORMAT_V1,
+            )
+        }),
+        Config::Null,
+    );
+    f_prov.settle().await;
+    let f_caller = app2.root.plugin(
+        plugin_fn("race-caller", Inject::of(&["race_svc"]), |ctx: Ctx, _| {
+            apply_via_with_error_format(
+                race_caller,
+                ctx,
+                Config::Null,
+                "race-caller",
+                ERROR_FORMAT_V1,
+            )
+        }),
+        Config::Null,
+    );
+    f_caller.settle().await;
+
+    // 模拟宿主在两次授权检查之间收紧白名单：第 1 次检查放行，第 2 次拒绝。
+    let checks = Arc::new(AtomicUsize::new(0));
+    let checks_c = checks.clone();
+    app2.store
+        .set_call_auth_hook(Some(Arc::new(move |_caller, _service, _method| {
+            if checks_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err("concurrently tightened policy".to_string())
+            }
+        })));
+
+    let handle = RACE_CALLER_HANDLE.load(Ordering::SeqCst);
+    assert_ne!(handle, 0);
+    let call = host_api().ctx_call_iface.expect("ctx_call_iface");
+    let mut buf = vec![0u8; 4096];
+    let mut out = Out {
+        ptr: buf.as_mut_ptr(),
+        cap: buf.len(),
+        len: 0,
+    };
+    let status = unsafe {
+        call(
+            handle,
+            Blob::new(b"race_svc"),
+            1,
+            Blob::new(b"ping"),
+            Blob::new(b"{}"),
+            7,
+            &mut out,
+        )
+    };
+    let body = String::from_utf8_lossy(&buf[..out.len.min(buf.len())]).into_owned();
+    assert_eq!(
+        status, STATUS_ERR,
+        "并发收紧白名单时也必须统一返回 STATUS_ERR 而非 STATUS_OK 内联错: {body}"
+    );
+    let payload = ErrorPayload::from_json(&body).expect("structured ErrorPayload");
+    assert_eq!(payload.code, "host_unauthorized");
+    assert_eq!(payload.category, "authorization");
+    assert_eq!(payload.certainty, "not_executed");
+    assert_eq!(RACE_PROVIDER_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(dispatches_len(handle), 0);
+
+    app2.close().await;
 }

@@ -305,6 +305,12 @@ impl RowStartup {
 /// 装载器故障分类。
 ///
 /// 区分「可由行级 `Optional` 降级的运行不可用」与「必须拥有独立处置策略的来源 / 完整性 / 持久化状态错误」。
+///
+/// 归类边界：
+/// - `RuntimeUnavailable`：解析不到插件路径、开发模式下 `DynLib::open` 失败、探活失败、`apply`/`validate`/`!!js` 失败、超时或后台清理未结束阻断重挂；
+/// - `Source`：未配置来源策略（默认拒绝）、artifact 不在 allow-list、allow-list 身份字段（`id`/`version`/`source_revision`/`abi_version`）不匹配；
+/// - `Integrity`：启用来源策略时缺失/损坏/非法 sidecar manifest、artifact 或暂存副本 SHA-256 不匹配、ABI 入口/前缀/版本/`PluginDesc` 字段校验失败、`PluginDesc.id` 与 manifest 不一致；
+/// - `PersistedState`：主配置/patch 文件读取或解析失败、重复行 `id` 冲突、运行期配置回写基线冲突或 patch 层落盘失败。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCategory {
@@ -312,9 +318,9 @@ pub enum FailureCategory {
     RuntimeUnavailable,
     /// 来源准入错误（未配置来源策略、不在 allow-list、allow-list 身份不匹配等）。
     Source,
-    /// 完整性 / 契约校验错误（SHA-256 不匹配、sidecar manifest 损坏/非法、ABI 前缀/版本不匹配等）。
+    /// 完整性 / 契约校验错误（SHA-256 不匹配、sidecar manifest 缺失/损坏/非法、ABI 前缀/版本不匹配等）。
     Integrity,
-    /// 持久化状态错误（主配置/patch 读取与解析失败、回写基线冲突、patch 层落盘失败等）。
+    /// 持久化状态错误（主配置/patch 读取与解析失败、重复行 `id`、回写基线冲突、patch 层落盘失败等）。
     PersistedState,
 }
 
@@ -354,6 +360,12 @@ impl FailureDisposition {
 /// 三类敏感错误（`source` / `integrity` / `persisted_state`）拥有彼此独立的处置开关，
 /// 默认全部为 [`FailureDisposition::Fail`]（fail-closed）；显式安装本策略后，
 /// 这三类错误不再受行级 `Optional` 或 `LoaderConfig::strict = false` 影响，仅服从各自开关。
+///
+/// 注意：
+/// - `with_persisted_state(Degrade)` 控制**初始启动**对损坏主配置/patch 层的降级；运行期 `reload()`
+///   遇到读取/解析错误始终保留上一份有效快照（防止编辑半截的 patch 静默撤销既有覆写），并按精确文件路径
+///   记录到 `persistedStateErrors`；
+/// - `LoaderConfig::strict_sidecars = true` 属于先于行级挂载与 `StartupPolicy` 的全局依赖预检门禁。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StartupPolicy {
     source: FailureDisposition,
@@ -491,7 +503,11 @@ struct AllowRule {
 /// - **身份来源**：由宿主/内核直接从调用点 `Context` 所属 `Fiber` 绑定的 [`CallerIdentity`]
 ///   （`fiber_uid` / `plugin` / 不可变 `row_label` / `is_root`），完全不依赖 `TraceSink`
 ///   或 `current_caller_uid()`；
-/// - **不覆盖**：同进程原生 `Ctx::get` / `Ctx::require` 类型向下转型直调、以及事件派发
+/// - **身份强度提示**：`allow_row_*` 匹配装载器在挂载前绑定的配置行标（插件无法自报篡改）；
+///   `allow_plugin_*` 匹配 `fiber.name()`（即插件自报 `Plugin::name()` / `PluginDesc.id`），
+///   对 T2 插件应优先使用 `allow_row_*` 或配合 `PluginSourcePolicy`（校验 manifest `id` + SHA-256）使用；
+/// - **不覆盖**：同进程原生 `Ctx::get` / `Ctx::require` / `Ctx::require_as` / `Ctx::iface`
+///   （含 `#[cordis::service]` 生成的 `<Trait>Service::of` 类型直调）、以及事件派发
 ///   （`emit` / `parallel` / `serial` / `bail` / `waterfall`）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MethodAllowList {

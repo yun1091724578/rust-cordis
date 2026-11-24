@@ -2979,8 +2979,17 @@ unsafe extern "C" fn host_ctx_call_iface(
             // 内联完成：把结果直接带回，插件侧自己消费掉它的续延（零额外跨边界往返）。
             Ok(Some(result)) => {
                 unregister_dispatch_node(consumer, iface_id);
-                Ok(match result {
-                    Ok(value) => json!({ "pending": false, "result": value }).to_string(),
+                match result {
+                    Ok(value) => Ok(json!({ "pending": false, "result": value }).to_string()),
+                    // 并发收紧白名单时，内核 `call_iface` 复检仍可能返回 `MethodUnauthorized`：
+                    // 统一收口为 `STATUS_ERR` + 结构化 `ErrorPayload`，避免协议形态漂移为 `STATUS_OK` 内联错。
+                    Err(err)
+                        if err
+                            .downcast_ref::<cordis_core::MethodUnauthorized>()
+                            .is_some() =>
+                    {
+                        Err(payload_of(err.as_ref()))
+                    }
                     Err(err) => {
                         let mut response = json!({ "pending": false });
                         if let Value::Object(map) = &mut response {
@@ -2990,9 +2999,9 @@ unsafe extern "C" fn host_ctx_call_iface(
                                 map.extend(error);
                             }
                         }
-                        response.to_string()
+                        Ok(response.to_string())
                     }
-                })
+                }
             }
             // 未就绪：结果会通过 `OP_CALLBACK` 送到同一个续延 id 上。
             Ok(None) => Ok(json!({ "pending": true }).to_string()),
