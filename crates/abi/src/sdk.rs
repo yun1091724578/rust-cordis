@@ -603,6 +603,24 @@ impl Ctx {
         }
     }
 
+    /// 失败收尾这条流（#22，结构化错误载荷）：消费者**立刻**收到错误（缓冲丢弃）。
+    ///
+    /// 宿主声明 `ERROR_FORMAT_V1` 时经同一 C ABI 通道以 JSON 线格式传输完整
+    /// [`crate::ErrorPayload`]（保留 `code`/`category`/`certainty`/`retry`/`detail`）；
+    /// 旧宿主自动降级为纯文本 `payload.error`。与 [`Ctx::stream_fail`] 同样幂等。
+    pub fn stream_fail_payload(
+        &self,
+        dispatch_id: u64,
+        payload: &crate::ErrorPayload,
+    ) -> PluginResult {
+        if self.host.error_format() >= crate::ERROR_FORMAT_V1 {
+            let wire = payload.to_json();
+            self.stream_fail(dispatch_id, &wire)
+        } else {
+            self.stream_fail(dispatch_id, &payload.error)
+        }
+    }
+
     /// 续跑 waterfall 的**剩余链**（#18，M2b）：在 `mode:"waterfall"` 的回调**内部**调用。
     ///
     /// 语义与 JS `await next(args)` 对应：`args` **替换**下游实参；下游完成后
@@ -3485,5 +3503,71 @@ mod tests {
             "pending 响应必须等 OP_CALLBACK，而不是提前结算"
         );
         registry().forget(id);
+    }
+
+    #[test]
+    fn stream_fail_payload_uses_structured_json_when_host_supports_it() {
+        static CAPTURED: Mutex<Option<String>> = Mutex::new(None);
+        unsafe extern "C" fn capture_fail(_: u64, _: u64, reason: Blob, _: *mut Out) -> i32 {
+            *CAPTURED.lock().unwrap() =
+                Some(String::from_utf8_lossy(reason.as_bytes()).into_owned());
+            STATUS_OK
+        }
+        let host = Box::leak(Box::new(HostApi {
+            abi_version: crate::ABI_VERSION,
+            size: std::mem::size_of::<HostApi>() as u32,
+            ctx_stream_fail: Some(capture_fail),
+            error_format: crate::ERROR_FORMAT_V1,
+            ..HostApi::default()
+        }));
+        let ctx = Ctx { host, handle: 1 };
+        let payload = crate::ErrorPayload::new("rate limited")
+            .with_code("provider.rate_limited")
+            .with_category("business")
+            .with_certainty("reported")
+            .with_retry("safe")
+            .with_detail(serde_json::json!({ "status": 429 }));
+
+        ctx.stream_fail_payload(99, &payload)
+            .expect("结构化宿主上 stream_fail_payload 必须成功");
+        let wire = CAPTURED
+            .lock()
+            .unwrap()
+            .take()
+            .expect("宿主必须收到线格式载荷");
+        let decoded = crate::ErrorPayload::from_json(&wire)
+            .expect("支持能力位的宿主必须收到可解析的 ErrorPayload JSON");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn stream_fail_payload_degrades_to_plain_text_for_legacy_host() {
+        static CAPTURED: Mutex<Option<String>> = Mutex::new(None);
+        unsafe extern "C" fn capture_fail(_: u64, _: u64, reason: Blob, _: *mut Out) -> i32 {
+            *CAPTURED.lock().unwrap() =
+                Some(String::from_utf8_lossy(reason.as_bytes()).into_owned());
+            STATUS_OK
+        }
+        let legacy_size = std::mem::offset_of!(HostApi, error_format) as u32;
+        let host = Box::leak(Box::new(HostApi {
+            abi_version: crate::ABI_VERSION,
+            size: legacy_size,
+            ctx_stream_fail: Some(capture_fail),
+            error_format: crate::ERROR_FORMAT_V1,
+            ..HostApi::default()
+        }));
+        let ctx = Ctx { host, handle: 1 };
+        let payload = crate::ErrorPayload::new("plain human error")
+            .with_code("provider.rate_limited")
+            .with_category("business");
+
+        ctx.stream_fail_payload(99, &payload)
+            .expect("旧宿主降级路径必须成功");
+        let wire = CAPTURED
+            .lock()
+            .unwrap()
+            .take()
+            .expect("旧宿主必须收到纯文本错误");
+        assert_eq!(wire, "plain human error");
     }
 }

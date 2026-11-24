@@ -152,7 +152,30 @@ struct EffectHandle {
     id: u64,
 }
 
-/// 一条由 fiber 拥有的原生后台任务（目前是 `call_iface_stream` 的提供者任务）。
+/// [`Ctx::spawn_scoped`](crate::Context::spawn_scoped) / [`Fiber::spawn_scoped`] 拒绝启动后台任务的原因。
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SpawnScopedError {
+    /// 当前线程未处于 Tokio 运行时内。
+    NoRuntime,
+    /// 上下文没有绑定 fiber，或所属 fiber 已经离开 / 正在卸载 / 已失败 / 已处置。
+    InactiveFiber,
+}
+
+impl std::fmt::Display for SpawnScopedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRuntime => f.write_str("受管后台任务必须在 Tokio 运行时内启动"),
+            Self::InactiveFiber => {
+                f.write_str("无法在未绑定或已关闭/正在卸载的 fiber 上启动受管后台任务")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpawnScopedError {}
+
+/// 一条由 fiber 拥有的原生后台任务（`call_iface_stream` 提供者任务与 `Ctx::spawn_scoped` 任务）。
 ///
 /// effect 栈能保证"卸载时执行 disposer"，但它不适合承载**可提前完成**的任务：
 /// 每条流都往恢复栈里留一条空壳，长期存活的 fiber 会线性增长。这里用独立表：
@@ -1236,6 +1259,80 @@ impl Fiber {
         self.disposables.lock().unwrap().len()
     }
 
+    /// 当前仍由本 fiber 跟踪的在飞受管后台任务数（完成即自动摘除）。
+    pub fn scoped_task_count(&self) -> usize {
+        self.native_tasks.lock().unwrap().len()
+    }
+
+    /// 在本 fiber 的生命周期内启动一条受管后台任务。
+    ///
+    /// - fiber 卸载、装载失败或 `App::close()` 时会先关闭闸门，再取消全部任务并等待它们退出；
+    /// - 任务结束（含 panic）时自行从表里摘除，长期运行的 fiber 不会线性累积；
+    /// - 如需自动继承当前上下文或调用作用域的 `correlation_id`（ADR 0011），请优先使用
+    ///   [`Context::spawn_scoped`](crate::Context::spawn_scoped)。
+    pub fn spawn_scoped<F, Fut>(
+        self: &Arc<Self>,
+        task: F,
+    ) -> std::result::Result<CancelToken, SpawnScopedError>
+    where
+        F: FnOnce(CancelToken) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_scoped_inner(None, task)
+    }
+
+    pub(crate) fn spawn_scoped_inner<F, Fut>(
+        self: &Arc<Self>,
+        correlation_id: Option<Arc<str>>,
+        task: F,
+    ) -> std::result::Result<CancelToken, SpawnScopedError>
+    where
+        F: FnOnce(CancelToken) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| SpawnScopedError::NoRuntime)?;
+        let _registration = self
+            .begin_effect()
+            .map_err(|_| SpawnScopedError::InactiveFiber)?;
+        if self.is_disposed()
+            || matches!(self.state(), FiberState::Disposed | FiberState::Unloading)
+        {
+            return Err(SpawnScopedError::InactiveFiber);
+        }
+        let cancel = CancelToken::new();
+        // 先在未持 `native_tasks` 锁的情况下构造 future：允许同步阶段重入登记，
+        // 且若闭包 panic 不会留下空槽位，`_registration` Drop 也会唤醒卸载等待者。
+        let future = {
+            let _guard = correlation_id
+                .as_ref()
+                .map(|cid| crate::trace::enter_correlation(Some(cid.clone())));
+            task(cancel.clone())
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let id = self.native_task_sn.fetch_add(1, Ordering::SeqCst);
+        self.native_tasks.lock().unwrap().insert(
+            id,
+            Arc::new(NativeTaskSlot {
+                cancel: cancel.clone(),
+                done: Mutex::new(Some(done_rx)),
+            }),
+        );
+        let fiber = Arc::downgrade(self);
+        handle.spawn(async move {
+            let _done = NativeTaskDone {
+                fiber,
+                id,
+                done: Some(done_tx),
+            };
+            match correlation_id {
+                Some(cid) => crate::trace::scope_correlation(cid, future).await,
+                None => future.await,
+            }
+        });
+        Ok(cancel)
+    }
+
     /// 登记一条**原生后台任务**：fiber 卸载时取消并等待，任务完成时自行摘除。
     ///
     /// 用 `begin_effect` 的闸门而不是另起一个：`close_effects()` 返回后
@@ -1252,6 +1349,11 @@ impl Fiber {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| "原生后台任务必须在 tokio 运行时里启动".to_string())?;
         let _registration = self.begin_effect()?;
+        if self.is_disposed()
+            || matches!(self.state(), FiberState::Disposed | FiberState::Unloading)
+        {
+            return Err("cannot create effect on inactive context".into());
+        }
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let id = self.native_task_sn.fetch_add(1, Ordering::SeqCst);
         self.native_tasks.lock().unwrap().insert(
@@ -1429,6 +1531,7 @@ impl Fiber {
                         *this.error.lock().unwrap() = Some(reason.into());
                         *this.running.lock().unwrap() = None;
                         this.close_effects().await;
+                        this.dispose_native_tasks().await;
                         this.dispose_effects().await;
                         *this.committed.lock().unwrap() = None;
                         this.set_state(FiberState::Failed);

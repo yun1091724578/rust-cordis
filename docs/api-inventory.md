@@ -99,8 +99,12 @@
 | `Context::with_correlation` | fn | `crates/core/src/context.rs` |
 | `Context::correlation_id` | fn | `crates/core/src/context.rs` |
 | `Context::correlation_id_arc` | fn | `crates/core/src/context.rs` |
+| `Context::spawn_scoped` | fn | `crates/core/src/context.rs` |
 | `Ctx` | type alias | `crates/core/src/context.rs` |
 | `Fiber` | struct | `crates/core/src/fiber.rs` |
+| `Fiber::spawn_scoped` | fn | `crates/core/src/fiber.rs` |
+| `Fiber::scoped_task_count` | fn | `crates/core/src/fiber.rs` |
+| `SpawnScopedError` | enum | `crates/core/src/fiber.rs` |
 | `FiberState` | enum | `crates/core/src/fiber.rs` |
 | `Plugin` | trait | `crates/core/src/store.rs` |
 | `ExternService` | trait | `crates/core/src/dyn_value.rs` |
@@ -120,7 +124,9 @@
 | `Ctx::call_iface_detailed` | fn | `crates/abi/src/sdk.rs` |
 | `Ctx::dispatch_detailed` | fn | `crates/abi/src/sdk.rs` |
 | `Ctx::next_detailed` | fn | `crates/abi/src/sdk.rs` |
+| `Ctx::stream_fail_payload` | fn | `crates/abi/src/sdk.rs` |
 | `STREAM_WINDOW` | const | `crates/core/src/stream.rs` |
+| `StreamSink::fail_error` | fn | `crates/core/src/stream.rs` |
 | `host_api` | fn | `crates/host/src/lib.rs` |
 | `call_plugin_detailed` | unsafe fn | `crates/host/src/ffi_buf.rs` |
 | `DERIVED_HANDLE_TAG` | const | `crates/host/src/lib.rs` |
@@ -217,7 +223,7 @@
 | `ctx_abort` | dispatch_id + reason | STATUS_OK / STATUS_ERR | `crates/host/src/lib.rs` |
 | `ctx_stream_push` | dispatch_id + chunk + on_credit | STATUS_OK / STATUS_PENDING / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段） | `crates/host/src/lib.rs` |
 | `ctx_stream_close` | dispatch_id | STATUS_OK / STATUS_STREAM_GONE | `crates/host/src/lib.rs` |
-| `ctx_stream_fail` | dispatch_id + reason | STATUS_OK / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段） | `crates/host/src/lib.rs` |
+| `ctx_stream_fail` | dispatch_id + reason（文本或 ErrorPayload JSON，按插件能力位解析） | STATUS_OK / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段） | `crates/host/src/lib.rs` |
 | `error_format` | 能力位：HostApi.error_format = 1；PluginDesc.error_format = 1 | STATUS_ERR 的 out：{"error": ..., "code": ..., "category": ..., "certainty": ..., "retry": ..., "detail": ...}；缺失/0 = 纯文本 | `crates/abi/src/lib.rs` |
 | `reserved` | HostApi 尾部保留字，必须为 0；不参与能力协商 | 0 | `crates/abi/src/lib.rs` |
 | `plugin_error_format` | PluginDesc.error_format = 1（provision 后的尾字段） | 0 / ERROR_FORMAT_V1；宿主按 PluginDesc.size 判界 | `crates/abi/src/lib.rs` |

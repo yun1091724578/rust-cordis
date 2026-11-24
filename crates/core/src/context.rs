@@ -644,7 +644,7 @@ impl Context {
                         }
                         result = future => {
                             if let Err(err) = result {
-                                task_sink.fail(err.to_string());
+                                task_sink.fail_error(err);
                             }
                         }
                     }
@@ -866,6 +866,31 @@ impl Context {
         F: FnOnce(Ctx) -> Disposable + Send + 'static,
     {
         self.fiber().effect(setup)
+    }
+
+    /// 在本上下文所属 fiber 的生命周期内启动一条受管后台任务。
+    ///
+    /// - 任务收到一个 [`crate::CancelToken`]；所属 fiber 卸载、装载失败或 `App::close()` 时，
+    ///   内核会先关闭新任务闸门，再取消全部在飞任务并等待它们退出，然后才卸载依赖者与恢复栈。
+    /// - 任务正常结束或 panic 后会自动摘除，不会在长期存活的 fiber 上线性累积。
+    /// - 遵循 ADR 0011：自动继承当前上下文或宿主调用作用域的 `correlation_id`。
+    /// - 返回的 [`crate::CancelToken`] 与任务内收到的令牌共享状态，可用于提前取消单条任务。
+    pub fn spawn_scoped<F, Fut>(
+        self: &Ctx,
+        task: F,
+    ) -> std::result::Result<crate::CancelToken, crate::SpawnScopedError>
+    where
+        F: FnOnce(crate::CancelToken) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let Some(fiber) = self.fiber_opt() else {
+            return Err(crate::SpawnScopedError::InactiveFiber);
+        };
+        let correlation_id = self
+            .correlation_id
+            .clone()
+            .or_else(crate::trace::current_correlation_id);
+        fiber.spawn_scoped_inner(correlation_id, task)
     }
 
     /// 挂一个插件实例；已处置/脱离的上下文返回可读错误，而不是 panic。

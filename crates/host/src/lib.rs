@@ -51,7 +51,6 @@ pub use policy::{
 };
 pub use staging::{describe, mount, resolve_plugin_path, stage_plugin, staged_leaked, StagedFile};
 
-#[cfg(test)]
 use cordis_abi::ERROR_FORMAT_V1;
 use ffi_buf::{
     args_to_json, call_op, call_op_read, call_plugin, decode_plugin_error, error_arg, fail,
@@ -1056,6 +1055,9 @@ unsafe extern "C" fn host_stream_close(handle: u64, dispatch_id: u64, out: *mut 
 }
 
 /// #22（ADR 0001 §5）：失败收尾——`reason` 直达消费者（缓冲丢弃）。
+///
+/// 当插件声明 `ERROR_FORMAT_V1` 且 `reason` 是合法的 [`ErrorPayload`] JSON 线格式时，
+/// 通过 [`StreamSink::fail_error`] 保留完整结构化载荷；其余按纯文本透传（向后兼容旧插件）。
 #[allow(clippy::result_large_err)]
 unsafe extern "C" fn host_stream_fail(
     handle: u64,
@@ -1070,10 +1072,20 @@ unsafe extern "C" fn host_stream_fail(
             Some(None) => Err(stream_protocol_error(format!(
                 "dispatch {dispatch_id} 不是流：失败收尾只对 ctx.call_iface_stream 开的流有意义"
             ))),
-            Some(Some(sink)) => Ok(match sink.fail(reason) {
-                PushOutcome::Sent => STATUS_OK,
-                _ => STATUS_STREAM_GONE,
-            }),
+            Some(Some(sink)) => {
+                let outcome = if instance.error_format >= ERROR_FORMAT_V1 {
+                    match ErrorPayload::from_json(&reason) {
+                        Some(payload) => sink.fail_error(payload),
+                        None => sink.fail(reason),
+                    }
+                } else {
+                    sink.fail(reason)
+                };
+                Ok(match outcome {
+                    PushOutcome::Sent => STATUS_OK,
+                    _ => STATUS_STREAM_GONE,
+                })
+            }
         }
     })
 }
@@ -1156,7 +1168,7 @@ fn drain_dispatch_tree(instance: &Instance, root: u64, payload: &ErrorPayload) -
     let count = removed.len();
     for mut record in removed {
         if let Some(sink) = &record.stream {
-            sink.fail(payload.error.clone());
+            sink.fail_error(payload.clone());
         }
         if let Some(tx) = record.sink.take() {
             let _ = tx.send(Err(payload.clone()));
@@ -2691,7 +2703,7 @@ impl ExternService for PluginIface {
                     Ok(())
                 }
                 Err(message) => {
-                    sink.fail(message.payload.error.clone());
+                    sink.fail_error(message.payload.clone());
                     Err(message.into())
                 }
             }
@@ -4076,7 +4088,12 @@ fn apply_via_with_keepalive_and_format(
                                 // **等待中的 credit 回调在这里被驳回**（跨 ABI 的提供者
                                 // 只有这条路能知道"别推了"），然后才 OP_DISPOSE。
                                 if let Some(sink) = &record.stream {
-                                    sink.fail("插件已卸载：这条流没有收尾就被收回");
+                                    sink.fail_error(
+                                        ErrorPayload::new("插件已卸载：这条流没有收尾就被收回")
+                                            .with_code("host_lifecycle")
+                                            .with_category("lifecycle")
+                                            .with_certainty("unknown"),
+                                    );
                                 }
                                 if let Some(tx) = record.sink.take() {
                                     let _ = tx.send(Err(ErrorPayload::new(

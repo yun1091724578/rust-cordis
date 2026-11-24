@@ -12,6 +12,7 @@
 
 ## 当前版本
 
+- **`0.1.6`**（开发中，待发布）：新增 `StreamSink::fail_error` 与 `abi::sdk::Ctx::stream_fail_payload`（流式调用端到端保留结构化 `ErrorPayload`，零 C ABI 布局变更）及 `Ctx::spawn_scoped` / `Fiber::spawn_scoped` / `SpawnScopedError`（归属 fiber 生命周期的受管后台任务，自动取消等待与 ADR 0011 `correlation_id` 透传）。
 - **`0.1.5`**（tag `v0.1.5`）：为公开 `cordis_abi::ErrorPayload` 实现 `Display + Error`，宿主 `payload_of` 优先保留其结构化 `code` / `category` / `certainty` / `retry` / `detail`。
 - **`0.1.4`**（tag `v0.1.4`）：`Ctx::call_iface_stream` 透传 `correlation_id`。
 - **`0.1.3`**（tag `v0.1.3`）：首次发布门面 crate `rust-cordis-sdk`，引入 ADR 0011 跨 ABI `correlation_id` 传播。

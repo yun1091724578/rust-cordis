@@ -735,3 +735,115 @@ async fn stream_calls_enforce_the_same_contract_as_value_calls() {
         .expect("请求版本高于提供版本必须失败");
     assert!(version.to_string().contains("版本"), "{version}");
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructuredStreamErr {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl std::fmt::Display for StructuredStreamErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for StructuredStreamErr {}
+
+#[tokio::test]
+async fn fail_error_preserves_concrete_error_type_and_drops_buffer() {
+    let (sink, mut stream) = StreamSink::new(1);
+    let recorder = recorder(&sink);
+    assert_eq!(sink.send(json!(1)).await, PushOutcome::Sent);
+
+    let sender = sink.clone();
+    let blocked = tokio::spawn(async move { sender.send(json!(2)).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let typed_err = StructuredStreamErr {
+        code: "E_RATE_LIMITED",
+        message: "upstream 429",
+    };
+    assert_eq!(sink.fail_error(typed_err.clone()), PushOutcome::Sent);
+    assert_eq!(
+        sink.fail_error(StructuredStreamErr {
+            code: "E_SECOND",
+            message: "ignored",
+        }),
+        PushOutcome::Gone,
+        "收尾恰好一次，二次 fail_error 返回 Gone"
+    );
+
+    let blocked_outcome = tokio::time::timeout(Duration::from_secs(1), blocked)
+        .await
+        .expect("fail_error 必须唤醒阻塞中的 send")
+        .unwrap();
+    assert_eq!(blocked_outcome, PushOutcome::Gone);
+
+    let err = stream.next().await.expect_err("必须立刻收到结构化错误");
+    assert_eq!(err.to_string(), "upstream 429");
+    let recovered = err
+        .downcast_ref::<StructuredStreamErr>()
+        .expect("首次 next() 必须能直接 downcast 到原始错误类型");
+    assert_eq!(recovered, &typed_err);
+
+    // 再次轮询仍返回可读错误，不能静默变成 Ok(None)。
+    let second = stream.next().await.expect_err("再次轮询仍须返回错误");
+    assert_eq!(second.to_string(), "upstream 429");
+    assert_eq!(recorder.finished.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn call_iface_stream_async_failure_preserves_concrete_error_type() {
+    struct AsyncFailProvider;
+    impl ExternService for AsyncFailProvider {
+        fn service(&self) -> &str {
+            "svc"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["fail_async".to_string()]
+        }
+        fn call(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> BoxFuture<Result<Config>> {
+            Box::pin(async move { Err("unused".into()) })
+        }
+        fn call_stream(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+            _sink: StreamSink,
+        ) -> BoxFuture<Result<()>> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                Err(Box::new(StructuredStreamErr {
+                    code: "E_ASYNC_FAIL",
+                    message: "failed after pending",
+                }) as cordis_core::Error)
+            })
+        }
+    }
+
+    let app = app_with("async-fail", Arc::new(AsyncFailProvider)).await;
+    let mut stream = app
+        .root
+        .call_iface_stream("svc", 1, "fail_async", json!([]))
+        .expect("异步挂起流应先返回 AsyncStream");
+    let err = stream
+        .next()
+        .await
+        .expect_err("异步 call_stream 失败必须传递到流消费者");
+    assert_eq!(err.to_string(), "failed after pending");
+    let recovered = err
+        .downcast_ref::<StructuredStreamErr>()
+        .expect("异步 call_stream 失败必须保留具体错误类型");
+    assert_eq!(recovered.code, "E_ASYNC_FAIL");
+    app.close().await;
+}

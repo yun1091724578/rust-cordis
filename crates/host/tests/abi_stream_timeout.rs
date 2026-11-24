@@ -114,6 +114,12 @@ async fn stream_dispatch_policy_timeout_fails_the_stream_and_removes_the_record(
         error.to_string().contains("超时"),
         "错误必须说明是超时：{error}"
     );
+    let payload = error
+        .downcast_ref::<cordis_abi::ErrorPayload>()
+        .expect("流超时错误必须保留结构化 ErrorPayload");
+    assert_eq!(payload.code, "HOST_TIMEOUT");
+    assert_eq!(payload.category, "timeout");
+    assert_eq!(payload.certainty, "unknown");
 
     assert_eq!(pending_len(handle), 0, "超时后挂起条目必须撤销");
     assert_eq!(streams_len(handle), 0, "超时后流记录必须撤销");

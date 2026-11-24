@@ -151,6 +151,12 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub fn correlation_id_arc(&self)",
     },
     PublicItem {
+        item: "Context::spawn_scoped",
+        kind: "fn",
+        source: "crates/core/src/context.rs",
+        marker: "pub fn spawn_scoped<",
+    },
+    PublicItem {
         item: "Ctx",
         kind: "type alias",
         source: "crates/core/src/context.rs",
@@ -161,6 +167,24 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         kind: "struct",
         source: "crates/core/src/fiber.rs",
         marker: "pub struct Fiber",
+    },
+    PublicItem {
+        item: "Fiber::spawn_scoped",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn spawn_scoped<",
+    },
+    PublicItem {
+        item: "Fiber::scoped_task_count",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn scoped_task_count(&self) -> usize",
+    },
+    PublicItem {
+        item: "SpawnScopedError",
+        kind: "enum",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub enum SpawnScopedError",
     },
     PublicItem {
         item: "FiberState",
@@ -277,10 +301,22 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub fn next_detailed<",
     },
     PublicItem {
+        item: "Ctx::stream_fail_payload",
+        kind: "fn",
+        source: "crates/abi/src/sdk.rs",
+        marker: "pub fn stream_fail_payload(",
+    },
+    PublicItem {
         item: "STREAM_WINDOW",
         kind: "const",
         source: "crates/core/src/stream.rs",
         marker: "pub const STREAM_WINDOW",
+    },
+    PublicItem {
+        item: "StreamSink::fail_error",
+        kind: "fn",
+        source: "crates/core/src/stream.rs",
+        marker: "pub fn fail_error(",
     },
     PublicItem {
         item: "host_api",
@@ -862,7 +898,7 @@ const PAYLOADS: &[Payload] = &[
     },
     Payload {
         entry: "ctx_stream_fail",
-        request: "dispatch_id + reason",
+        request: "dispatch_id + reason（文本或 ErrorPayload JSON，按插件能力位解析）",
         response: "STATUS_OK / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段）",
         source: "crates/host/src/lib.rs",
         marker: "fn host_stream_fail(",
@@ -1268,7 +1304,7 @@ pub struct Q {
             41,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 102, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 108, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
     }
 
@@ -1286,6 +1322,9 @@ pub struct Q {
             "`service`",
             "`service_impl`",
             "`Context`",
+            "`Context::spawn_scoped`",
+            "`StreamSink::fail_error`",
+            "`Ctx::stream_fail_payload`",
             "`DERIVED_HANDLE_TAG`",
             "`ErrorPayload`",
             "`call_plugin_detailed`",

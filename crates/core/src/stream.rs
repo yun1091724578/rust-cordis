@@ -83,17 +83,48 @@ struct StreamState {
     window: usize,
 }
 
+struct StreamFault {
+    /// 首次读取时交付的完整错误对象（保留具体类型，使调用方能 `downcast_ref::<T>()`，
+    /// 例如 `cordis_abi::ErrorPayload`）。
+    error: Option<crate::Error>,
+    /// 保留可读消息：若消费者在首次 `Err` 后再次轮询 `next()`，仍返回等价文本错误。
+    message: String,
+}
+
+impl StreamFault {
+    fn from_message(message: String) -> Self {
+        Self {
+            error: None,
+            message,
+        }
+    }
+
+    fn from_error(err: crate::Error) -> Self {
+        let message = err.to_string();
+        Self {
+            error: Some(err),
+            message,
+        }
+    }
+
+    fn take(&mut self) -> crate::Error {
+        self.error
+            .take()
+            .unwrap_or_else(|| self.message.clone().into())
+    }
+}
+
 struct Life {
     outcome: Option<StreamOutcome>,
-    /// 失败/放弃时给消费者看的理由。
-    fault: Option<String>,
+    /// 失败/放弃时给消费者看的错误（保留首次读取的具体错误类型）。
+    fault: Option<StreamFault>,
     /// 等待中的 credit 回调 id（"满了 ⇒ 记下它 ⇒ 每取走一块唤醒一个"）。
     waiting: VecDeque<u64>,
 }
 
 impl StreamState {
     /// 收尾（恰好一次）。返回 `true` = 这次调用是首次收尾。
-    fn finish(&self, outcome: StreamOutcome, fault: Option<String>) -> bool {
+    fn finish(&self, outcome: StreamOutcome, fault: Option<StreamFault>) -> bool {
         let waiting = {
             let mut life = self.life.lock().unwrap();
             if life.outcome.is_some() {
@@ -118,8 +149,13 @@ impl StreamState {
         self.life.lock().unwrap().outcome.is_some()
     }
 
-    fn fault(&self) -> Option<String> {
-        self.life.lock().unwrap().fault.clone()
+    fn take_fault(&self) -> Option<crate::Error> {
+        self.life
+            .lock()
+            .unwrap()
+            .fault
+            .as_mut()
+            .map(StreamFault::take)
     }
 }
 
@@ -283,10 +319,29 @@ impl StreamSink {
     /// 失败收尾：消费者**立刻**读到这条理由（缓冲丢弃）。
     pub fn fail(&self, reason: impl Into<String>) -> PushOutcome {
         let reason = reason.into();
-        if self
-            .state
-            .finish(StreamOutcome::Failed(reason.clone()), Some(reason))
-        {
+        if self.state.finish(
+            StreamOutcome::Failed(reason.clone()),
+            Some(StreamFault::from_message(reason)),
+        ) {
+            PushOutcome::Sent
+        } else {
+            PushOutcome::Gone
+        }
+    }
+
+    /// 失败收尾（保留具体错误类型）：消费者**立刻**在 [`AsyncStream::next`] 收到这条
+    /// 错误（缓冲丢弃），并可直接通过 `err.downcast_ref::<T>()` 取回原始错误对象
+    /// （例如跨 ABI 的 `cordis_abi::ErrorPayload`）。
+    ///
+    /// 与 [`StreamSink::fail`] 共享同一套“收尾恰好一次”语义：流已经收尾或消费者
+    /// 已离场时返回 [`PushOutcome::Gone`]。
+    pub fn fail_error(&self, err: impl Into<crate::Error>) -> PushOutcome {
+        let err = err.into();
+        let message = err.to_string();
+        if self.state.finish(
+            StreamOutcome::Failed(message),
+            Some(StreamFault::from_error(err)),
+        ) {
             PushOutcome::Sent
         } else {
             PushOutcome::Gone
@@ -325,13 +380,13 @@ impl AsyncStream {
             enum Step {
                 Data(Value),
                 End,
-                Fault(String),
+                Fault(crate::Error),
                 Wait,
             }
             let step = {
-                let life = self.state.life.lock().unwrap();
-                if let Some(fault) = &life.fault {
-                    Step::Fault(fault.clone())
+                let mut life = self.state.life.lock().unwrap();
+                if let Some(fault) = life.fault.as_mut() {
+                    Step::Fault(fault.take())
                 } else {
                     match self.rx.try_recv() {
                         Ok(chunk) => Step::Data(chunk),
@@ -352,7 +407,7 @@ impl AsyncStream {
                     return Ok(Some(chunk));
                 }
                 Step::End => return self.end(),
-                Step::Fault(fault) => return Err(fault.into()),
+                Step::Fault(fault) => return Err(fault),
                 Step::Wait => {}
             }
             // ④ 等新块或收尾通知（`watch` 保存收尾值，所以不会丢唤醒）。
@@ -361,9 +416,8 @@ impl AsyncStream {
                     Some(chunk) => {
                         // `select!` 可能同时看到"有块"与"已失败"。交付前再复查
                         // 一次 fault；`close` 仍按契约交付收尾前的缓冲。
-                        let fault = self.state.life.lock().unwrap().fault.clone();
-                        if let Some(fault) = fault {
-                            return Err(fault.into());
+                        if let Some(fault) = self.state.take_fault() {
+                            return Err(fault);
                         }
                         self.credit();
                         return Ok(Some(chunk));
@@ -376,8 +430,8 @@ impl AsyncStream {
     }
 
     fn end(&self) -> Result<Option<Value>> {
-        match self.state.fault() {
-            Some(fault) => Err(fault.into()),
+        match self.state.take_fault() {
+            Some(fault) => Err(fault),
             None => Ok(None),
         }
     }
@@ -402,7 +456,9 @@ impl Drop for AsyncStream {
         self.state.gone.store(true, Ordering::SeqCst);
         self.state.finish(
             StreamOutcome::Abandoned,
-            Some("消费者已经不再读这条流".to_string()),
+            Some(StreamFault::from_message(
+                "消费者已经不再读这条流".to_string(),
+            )),
         );
         // 再取消提供者任务：它可能正卡在一次与流无关的 await 上，单靠
         // `gone` 标记永远不会醒来。取消是同步的；等待在 fiber 卸载路径。
