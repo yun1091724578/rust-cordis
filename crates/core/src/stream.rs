@@ -333,6 +333,10 @@ impl StreamSink {
     /// 错误（缓冲丢弃），并可直接通过 `err.downcast_ref::<T>()` 取回原始错误对象
     /// （例如跨 ABI 的 `cordis_abi::ErrorPayload`）。
     ///
+    /// 注意：请传入具体错误值 `E`（如 `ErrorPayload`）或已擦除的 [`crate::Error`]，
+    /// 避免传入具体类型的 `Box<E>`——否则 `Into<Error>` 会双重装箱为 `Box<Box<E>>`，
+    /// 导致调用方 `downcast_ref::<E>()` 返回 `None`。
+    ///
     /// 与 [`StreamSink::fail`] 共享同一套“收尾恰好一次”语义：流已经收尾或消费者
     /// 已离场时返回 [`PushOutcome::Gone`]。
     pub fn fail_error(&self, err: impl Into<crate::Error>) -> PushOutcome {

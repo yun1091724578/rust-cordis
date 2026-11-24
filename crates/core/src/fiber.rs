@@ -527,6 +527,7 @@ impl Fiber {
                         *fiber.parent_effect.lock().unwrap() = Some(registered);
                     }
                     Err(err) => {
+                        fiber.mark_effects_closed();
                         *fiber.error.lock().unwrap() = Some(err);
                         fiber.set_state(FiberState::Failed);
                         return fiber;
@@ -1266,10 +1267,10 @@ impl Fiber {
 
     /// 在本 fiber 的生命周期内启动一条受管后台任务。
     ///
-    /// - fiber 卸载、装载失败或 `App::close()` 时会先关闭闸门，再取消全部任务并等待它们退出；
-    /// - 任务结束（含 panic）时自行从表里摘除，长期运行的 fiber 不会线性累积；
-    /// - 如需自动继承当前上下文或调用作用域的 `correlation_id`（ADR 0011），请优先使用
-    ///   [`Context::spawn_scoped`](crate::Context::spawn_scoped)。
+    /// - fiber 卸载、装载失败、重载或 `App::close()` 时会先关闭闸门，再取消全部任务并等待它们退出；
+    /// - 任务结束（含 panic 或未首次 poll 即被丢弃）时自行从表里摘除，长期运行的 fiber 不会线性累积；
+    /// - 遵循 ADR 0011：自动继承当前宿主调用作用域的 `current_correlation_id()`；若还需优先
+    ///   继承某个 `Ctx` 上绑定的 `with_correlation`，请使用 [`Context::spawn_scoped`](crate::Context::spawn_scoped)。
     pub fn spawn_scoped<F, Fut>(
         self: &Arc<Self>,
         task: F,
@@ -1278,7 +1279,7 @@ impl Fiber {
         F: FnOnce(CancelToken) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.spawn_scoped_inner(None, task)
+        self.spawn_scoped_inner(crate::trace::current_correlation_id(), task)
     }
 
     pub(crate) fn spawn_scoped_inner<F, Fut>(
@@ -1296,7 +1297,10 @@ impl Fiber {
             .begin_effect()
             .map_err(|_| SpawnScopedError::InactiveFiber)?;
         if self.is_disposed()
-            || matches!(self.state(), FiberState::Disposed | FiberState::Unloading)
+            || matches!(
+                self.state(),
+                FiberState::Disposed | FiberState::Unloading | FiberState::Failed
+            )
         {
             return Err(SpawnScopedError::InactiveFiber);
         }
@@ -1318,13 +1322,16 @@ impl Fiber {
                 done: Mutex::new(Some(done_rx)),
             }),
         );
-        let fiber = Arc::downgrade(self);
+        // 在 `async move` 之外构造完成守卫：即使任务尚未首次 poll 即被运行时丢弃，
+        // `NativeTaskDone::drop` 也会立即执行并摘除槽位；正常完成或 panic 展开时
+        // 块首 `let _done = done;` 仍严格保证 `future` 先于 `_done` 释放。
+        let done = NativeTaskDone {
+            fiber: Arc::downgrade(self),
+            id,
+            done: Some(done_tx),
+        };
         handle.spawn(async move {
-            let _done = NativeTaskDone {
-                fiber,
-                id,
-                done: Some(done_tx),
-            };
+            let _done = done;
             match correlation_id {
                 Some(cid) => crate::trace::scope_correlation(cid, future).await,
                 None => future.await,
@@ -1350,7 +1357,10 @@ impl Fiber {
             .map_err(|_| "原生后台任务必须在 tokio 运行时里启动".to_string())?;
         let _registration = self.begin_effect()?;
         if self.is_disposed()
-            || matches!(self.state(), FiberState::Disposed | FiberState::Unloading)
+            || matches!(
+                self.state(),
+                FiberState::Disposed | FiberState::Unloading | FiberState::Failed
+            )
         {
             return Err("cannot create effect on inactive context".into());
         }
@@ -1363,13 +1373,13 @@ impl Fiber {
                 done: Mutex::new(Some(done_rx)),
             }),
         );
-        let fiber = Arc::downgrade(self);
+        let done = NativeTaskDone {
+            fiber: Arc::downgrade(self),
+            id,
+            done: Some(done_tx),
+        };
         handle.spawn(async move {
-            let _done = NativeTaskDone {
-                fiber,
-                id,
-                done: Some(done_tx),
-            };
+            let _done = done;
             future.await;
         });
         Ok(())

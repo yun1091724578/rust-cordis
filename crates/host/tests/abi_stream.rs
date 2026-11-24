@@ -725,3 +725,103 @@ async fn stream_fail_decodes_structured_error_payload_only_when_plugin_has_capab
     assert!(err_legacy.to_string().contains("provider.rate_limited"));
     app_legacy.close().await;
 }
+
+#[tokio::test]
+async fn sync_status_err_on_t2_call_and_call_stream_preserves_error_payload() {
+    use cordis_abi::{ErrorPayload, ERROR_FORMAT_V1, STATUS_ERR};
+    use cordis_host::apply_via_with_error_format;
+
+    const SYNC_ERR_IFACE: u64 = 92;
+
+    unsafe extern "C" fn sync_err_plugin(
+        handle: u64,
+        op: u32,
+        _: Blob,
+        _: Blob,
+        out: *mut Out,
+    ) -> i32 {
+        match op {
+            OP_APPLY => {
+                let mut raw = [0u8; 256];
+                let mut probe = Out {
+                    ptr: raw.as_mut_ptr(),
+                    cap: raw.len(),
+                    len: 0,
+                };
+                match host_api().ctx_provide_iface {
+                    Some(provide) => provide(
+                        handle,
+                        Blob::new(b"se@1"),
+                        1,
+                        Blob::new(br#"["boom"]"#),
+                        SYNC_ERR_IFACE,
+                        &mut probe,
+                    ),
+                    None => STATUS_UNSUPPORTED,
+                }
+            }
+            OP_CALLBACK => {
+                let wire = ErrorPayload::new("bad parameter")
+                    .with_code("E_BAD_PARAM")
+                    .with_category("business")
+                    .with_certainty("reported")
+                    .with_retry("never")
+                    .with_detail(json!({ "field": "model" }))
+                    .to_json();
+                let _ = (*out).write(wire.as_bytes());
+                STATUS_ERR
+            }
+            OP_DISPOSE => (*out).write(b""),
+            _ => STATUS_UNSUPPORTED,
+        }
+    }
+
+    let app = App::new();
+    let plugin: Arc<dyn Plugin> = Arc::new(cordis_core::FnPlugin {
+        name: "sync-err-t2",
+        key: cordis_core::unique_key("sync-err-t2"),
+        inject: Inject::default(),
+        validator: None,
+        f: Arc::new(|ctx: Ctx, config: Config| {
+            apply_via_with_error_format(
+                sync_err_plugin,
+                ctx,
+                config,
+                "sync-err-t2",
+                ERROR_FORMAT_V1,
+            )
+        }),
+    });
+    let fiber = app.root.plugin(plugin, Config::Null);
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    // 1. T1 -> T2 call_iface 同步 STATUS_ERR：必须可直接 downcast 到公开 ErrorPayload。
+    let call_err = app
+        .root
+        .call_iface("se@1", 1, "boom", json!([]))
+        .await
+        .expect_err("call_iface 必须返回错误");
+    let call_payload = call_err
+        .downcast_ref::<ErrorPayload>()
+        .expect("call_iface 同步失败必须返回公开 ErrorPayload（而非内部 CallFailure）");
+    assert_eq!(call_payload.error, "bad parameter");
+    assert_eq!(call_payload.code, "E_BAD_PARAM");
+    assert_eq!(call_payload.category, "business");
+    assert_eq!(call_payload.certainty, "reported");
+    assert_eq!(call_payload.retry, "never");
+    assert_eq!(call_payload.detail["field"], "model");
+
+    // 2. T1 -> T2 call_iface_stream 同步 STATUS_ERR：同样可直接 downcast 到公开 ErrorPayload。
+    let stream_err = app
+        .root
+        .call_iface_stream("se@1", 1, "boom", json!([]))
+        .err()
+        .expect("call_iface_stream 同步失败必须立刻返回 Err");
+    let stream_payload = stream_err
+        .downcast_ref::<ErrorPayload>()
+        .expect("call_iface_stream 同步失败必须返回公开 ErrorPayload（而非内部 CallFailure）");
+    assert_eq!(stream_payload, call_payload);
+
+    app.close().await;
+}

@@ -2630,10 +2630,11 @@ impl ExternService for PluginIface {
                 )
             } {
                 Ok(Inbound::Ready(value)) => Ok(value),
-                Ok(Inbound::Pending(pending)) => {
-                    (*pending).settle("接口方法").await.map_err(Error::from)
-                }
-                Err(message) => Err(message.into()),
+                Ok(Inbound::Pending(pending)) => (*pending)
+                    .settle("接口方法")
+                    .await
+                    .map_err(|failure| Error::from(failure.payload)),
+                Err(message) => Err(Error::from(message.payload)),
             }
         })
     }
@@ -2697,14 +2698,14 @@ impl ExternService for PluginIface {
                     if provider.dispatch_policy.timeout_ms.is_some()
                         && tokio::runtime::Handle::try_current().is_ok()
                     {
-                        spawn_stream_settle(&provider, pending)
-                            .map_err(|payload| Error::from(CallFailure::from_payload(payload)))?;
+                        spawn_stream_settle(&provider, pending).map_err(Error::from)?;
                     }
                     Ok(())
                 }
                 Err(message) => {
-                    sink.fail_error(message.payload.clone());
-                    Err(message.into())
+                    let payload = message.payload;
+                    sink.fail_error(payload.clone());
+                    Err(Error::from(payload))
                 }
             }
         })
