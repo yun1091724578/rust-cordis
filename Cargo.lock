@@ -505,6 +505,7 @@ version = "0.1.5"
 dependencies = [
  "rust-cordis-abi",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

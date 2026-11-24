@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
+mod arch;
 mod contract;
 mod inventory;
 mod matrix;
@@ -24,8 +25,9 @@ cargo xtask <命令>
   build-plugins    构建 greeting / hello / harness-tool 三个 cdylib
   demo             构建插件并运行 demo
   e2e              构建插件并运行 harness-spike
-  ci               fmt + inventory + docs + matrix + clippy(--all-features)
+  ci               fmt + inventory + docs + matrix + arch + clippy(--all-features)
                    + check(--all-features) + test + doctest + consumer + demo + e2e
+  arch             检查架构分层 DAG、工具链锁版与 GitHub Actions SHA/权限门禁
   docs [path]      检查支持契约的保证索引（默认 docs/support-contract.md）
   inventory [--write|--check] [path]
                    检查/写入公开 API 清单（默认 docs/api-inventory.md）
@@ -86,6 +88,7 @@ fn main() -> ExitCode {
         "demo" => demo_check(),
         "e2e" => build_then(&["run", "--locked", "-p", "harness-spike"]),
         "ci" => ci(),
+        "arch" => arch_check(),
         "docs" => docs_check(std::env::args().nth(2)),
         "inventory" => inventory_command(std::env::args().skip(2).collect()),
         "matrix" => matrix_command(std::env::args().skip(2).collect()),
@@ -147,6 +150,10 @@ fn ci() -> i32 {
     if code != 0 {
         return code;
     }
+    let code = arch_check();
+    if code != 0 {
+        return code;
+    }
     for args in [
         &[
             "clippy",
@@ -194,6 +201,21 @@ fn resolve_repo_path(path: PathBuf) -> PathBuf {
         path
     } else {
         inventory::repo_root().join(path)
+    }
+}
+
+fn arch_check() -> i32 {
+    let root = workspace_root();
+    let violations = arch::check_repo(&root);
+    if violations.is_empty() {
+        println!("架构与供应链守卫通过：{}", root.display());
+        0
+    } else {
+        eprintln!("架构与供应链守卫失败（{} 条）：", violations.len());
+        for violation in &violations {
+            eprintln!("  - {violation}");
+        }
+        1
     }
 }
 

@@ -24,11 +24,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Run soak
         timeout-minutes: 170
         shell: bash
@@ -62,7 +62,7 @@ jobs:
           cargo test -p rust-cordis-host --features dhat-heap --test dhat_profile -- --ignored --nocapture | tee dhat.log
       - name: Upload soak log
         if: ${{ always() && hashFiles('soak.log') != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: soak-log-${{ github.run_id }}-c${{ github.event.inputs.cycles || '1000000' }}
           path: soak.log

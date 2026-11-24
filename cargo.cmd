@@ -31,6 +31,32 @@ rem self-contained 路径注入旧工具链，链接时找不到它自己的运�
 set "CORDIS_TOOLCHAIN="
 set "CORDIS_ARG=%~1"
 if "%CORDIS_ARG:~0,1%"=="+" set "CORDIS_TOOLCHAIN=%CORDIS_ARG:~1%"
+if not defined CORDIS_TOOLCHAIN if not defined RUSTUP_TOOLCHAIN (
+  set "CORDIS_PINNED_CH="
+  if exist "%~dp0rust-toolchain.toml" (
+    for /f "usebackq tokens=2 delims==" %%a in (`findstr /r /c:"^[ 	]*channel[ 	]*=" "%~dp0rust-toolchain.toml"`) do set "CORDIS_PINNED_CH=%%a"
+  )
+  if defined CORDIS_PINNED_CH (
+    setlocal enabledelayedexpansion
+    set "CH=!CORDIS_PINNED_CH:"=!"
+    set "CH=!CH: =!"
+    set "RESOLVED_TC="
+    set "RHOME=!RUSTUP_HOME!"
+    if not defined RHOME set "RHOME=!USERPROFILE!\.rustup"
+    if exist "!RHOME!\toolchains\!CH!-x86_64-pc-windows-gnu" (
+      set "RESOLVED_TC=!CH!-x86_64-pc-windows-gnu"
+    ) else if exist "!RHOME!\toolchains\stable-x86_64-pc-windows-gnu" (
+      for /f "usebackq tokens=2" %%v in (`rustup run stable-x86_64-pc-windows-gnu rustc --version 2^>nul`) do (
+        if "%%v"=="!CH!" set "RESOLVED_TC=stable-x86_64-pc-windows-gnu"
+      )
+    )
+    for /f "delims=" %%t in ("!RESOLVED_TC!") do (
+      endlocal
+      set "RUSTUP_TOOLCHAIN=%%t"
+    )
+    if errorlevel 1 endlocal
+  )
+)
 if defined CORDIS_TOOLCHAIN (
   for /f "usebackq delims=" %%i in (`rustup run %CORDIS_TOOLCHAIN% rustc --print sysroot 2^>nul`) do set "CORDIS_SYSROOT=%%i"
 ) else (

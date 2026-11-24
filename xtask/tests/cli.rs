@@ -1073,3 +1073,18 @@ fn reuse_dir_flags_a_broken_unpacked_artifact() {
         "失败原因必须可读（来自产物侧断言的原文）：stderr={stderr}"
     );
 }
+
+#[test]
+fn arch_passes_on_the_real_repo() {
+    let output = Command::new(bin())
+        .arg("arch")
+        .output()
+        .expect("spawn xtask");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
