@@ -235,6 +235,7 @@
 | `PluginSource::admission` | method | `crates/host/src/loader.rs` |
 | `PluginSource::load_admitted` | method | `crates/host/src/loader.rs` |
 | `PluginSource::plan_entry_admitted` | method | `crates/host/src/loader.rs` |
+| `PluginSource::plan_entry_classified` | method | `crates/host/src/loader.rs` |
 | `PolicyPluginSource` | struct | `crates/host/src/loader.rs` |
 | `PolicyPluginSource::strict` | fn | `crates/host/src/loader.rs` |
 | `LoadedFile` | struct | `crates/host/src/loader.rs` |

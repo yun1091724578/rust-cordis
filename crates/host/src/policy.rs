@@ -365,7 +365,8 @@ impl FailureDisposition {
 /// - `with_persisted_state(Degrade)` 控制**初始启动**对损坏主配置/patch 层的降级；运行期 `reload()`
 ///   遇到读取/解析错误始终保留上一份有效快照（防止编辑半截的 patch 静默撤销既有覆写），并按精确文件路径
 ///   记录到 `persistedStateErrors`；
-/// - `LoaderConfig::strict_sidecars = true` 属于先于行级挂载与 `StartupPolicy` 的全局依赖预检门禁。
+/// - `LoaderConfig::strict_sidecars = true` 依赖预检同样感知行级 `Optional`（仅降级 `RuntimeUnavailable`）
+///   与本策略对 `Source` / `Integrity` 的独立开关，不会与策略语义冲突。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StartupPolicy {
     source: FailureDisposition,

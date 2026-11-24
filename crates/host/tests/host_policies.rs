@@ -2541,3 +2541,175 @@ async fn reload_patch_io_error_attributes_exact_path_and_t2_auth_race_stays_stat
 
     app2.close().await;
 }
+
+// ============================================================================
+// P1-2：strict_sidecars = true 依赖预检与行级 Optional / StartupPolicy 一致性
+// ============================================================================
+
+#[tokio::test]
+async fn strict_sidecars_preflight_honors_optional_runtime_and_independent_startup_policy() {
+    // 1) 真实 DiskPluginSource + PolicyPluginSource + strict_sidecars = true：
+    //    sidecar 的 Source 与 Integrity 错误同样按 StartupPolicy 独立裁决，且默认 fail-closed。
+    let dir = TempDir::new("strict-sidecars-policy");
+    let dll_name = artifact_filename("opt_sidecar");
+    let dll_path = dir.write(&dll_name, "fake-artifact-bytes-v1");
+    let actual_sha = cordis_host::source::sha256_file(&dll_path).expect("sha256");
+    let manifest_path = cordis_host::source::manifest_path(&dll_path);
+    let manifest_json = json!({
+        "id": "opt_sidecar",
+        "version": "1.0.0",
+        "source_revision": "rev-1",
+        "abi_version": cordis_abi::ABI_VERSION,
+        "sha256": actual_sha,
+        "provides": { "opt.svc": "1.0.0" },
+        "requires": {}
+    })
+    .to_string();
+    std::fs::write(&manifest_path, &manifest_json).expect("write manifest");
+
+    let cfg_path = dir.write(
+        "cordis.yml",
+        "- id: opt\n  name: opt_sidecar\n  optional: true\n",
+    );
+
+    // 1a) artifact 不在 allow-list（Source 错误）+ strict_sidecars = true + 无 StartupPolicy ⇒ 必须 fail-closed。
+    let empty_allow_source = Arc::new(PolicyPluginSource::strict(
+        Arc::new(DiskPluginSource),
+        PluginSourcePolicy::new(vec![]),
+    ));
+    let mut cfg = LoaderConfig::new(cfg_path.to_string_lossy().into_owned());
+    cfg.strict_sidecars = true;
+
+    let app1 = App::new();
+    let err1 = load_with_source(app1.root.clone(), cfg.clone(), empty_allow_source.clone())
+        .await
+        .expect_err("无 StartupPolicy 时 strict_sidecars 必须 fail-closed 拦截 Source 错误");
+    assert!(err1.to_string().contains("allow-list"), "{err1}");
+    app1.close().await;
+
+    // 1b) 安装 StartupPolicy::with_source(Degrade)：strict_sidecars = true 应放行 Source 降级并记入 report。
+    let app2 = App::new();
+    set_startup_policy_for(
+        &app2.root,
+        Some(StartupPolicy::new().with_source(FailureDisposition::Degrade)),
+    );
+    let state2 = load_with_source(app2.root.clone(), cfg.clone(), empty_allow_source.clone())
+        .await
+        .expect("Source=Degrade 时 strict_sidecars 预检与装载均应按策略降级");
+    assert!(state2.mounted_labels().is_empty());
+    assert_eq!(state2.degraded_rows().len(), 1);
+    assert_eq!(state2.degraded_rows()[0].category, FailureCategory::Source);
+    assert_eq!(state2.report()["preflight"]["verdict"], "downgraded");
+    app2.close().await;
+
+    // 1c) 篡改 artifact 制造 Integrity（SHA256 不匹配）错误：仅 Source=Degrade 仍必须 fail-closed！
+    std::fs::write(&dll_path, "tampered-artifact-bytes").expect("tamper artifact");
+    let allow_original_source = Arc::new(PolicyPluginSource::strict(
+        Arc::new(DiskPluginSource),
+        PluginSourcePolicy::new(vec![AllowedPlugin {
+            id: "opt_sidecar".into(),
+            version: "1.0.0".into(),
+            source_revision: "rev-1".into(),
+            abi_version: cordis_abi::ABI_VERSION,
+            sha256: actual_sha,
+        }]),
+    ));
+    let app3 = App::new();
+    set_startup_policy_for(
+        &app3.root,
+        Some(StartupPolicy::new().with_source(FailureDisposition::Degrade)),
+    );
+    let err3 = load_with_source(
+        app3.root.clone(),
+        cfg.clone(),
+        allow_original_source.clone(),
+    )
+    .await
+    .expect_err("Source=Degrade 绝不得放行 strict_sidecars 下的 Integrity 篡改错误");
+    assert!(err3.to_string().contains("SHA256"), "{err3}");
+    app3.close().await;
+
+    // 1d) 显式开启 Integrity=Degrade 后，strict_sidecars 预检与装载按 Integrity 策略降级。
+    let app4 = App::new();
+    set_startup_policy_for(
+        &app4.root,
+        Some(StartupPolicy::new().with_integrity(FailureDisposition::Degrade)),
+    );
+    let state4 = load_with_source(app4.root.clone(), cfg.clone(), allow_original_source)
+        .await
+        .expect("Integrity=Degrade 时 strict_sidecars 应按策略降级");
+    assert_eq!(state4.degraded_rows().len(), 1);
+    assert_eq!(
+        state4.degraded_rows()[0].category,
+        FailureCategory::Integrity
+    );
+    app4.close().await;
+
+    // 2) 自定义来源 plan_entry 报错（默认归类 RuntimeUnavailable）+ strict_sidecars = true：
+    //    required 行必须阻断启动；optional 行降级通过并让健康行正常挂载。
+    struct FlakyPlanSource;
+    impl PluginSource for FlakyPlanSource {
+        fn load(
+            &self,
+            entry: &Entry,
+            _search: &[PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            match entry.name.as_str() {
+                "core" => Ok(loaded_memory(
+                    "core",
+                    plugin_fn("core", Inject::default(), |_ctx, _| {
+                        Box::pin(async { Ok(()) })
+                    }),
+                )),
+                "flaky" => Err("transient registry unavailable".into()),
+                other => Err(format!("unknown {other}")),
+            }
+        }
+
+        fn plan_entry(
+            &self,
+            entry: &Entry,
+            _search: &[PathBuf],
+        ) -> std::result::Result<Option<PlanEntrySpec>, String> {
+            if entry.name == "flaky" {
+                return Err("transient sidecar read error".into());
+            }
+            Ok(Some(PlanEntrySpec {
+                id: entry.name.clone(),
+                version: "1.0.0".into(),
+                provides: BTreeMap::new(),
+                requires: BTreeMap::new(),
+            }))
+        }
+    }
+
+    let req_cfg_path = dir.write(
+        "req.yml",
+        "- id: core\n  name: core\n- id: f\n  name: flaky\n",
+    );
+    let mut req_cfg = LoaderConfig::new(req_cfg_path.to_string_lossy().into_owned());
+    req_cfg.strict_sidecars = true;
+    let app5 = App::new();
+    let err5 = load_with_source(app5.root.clone(), req_cfg, Arc::new(FlakyPlanSource))
+        .await
+        .expect_err("required 行在 strict_sidecars=true 下必须阻断启动");
+    assert!(err5.to_string().contains("transient sidecar"), "{err5}");
+    app5.close().await;
+
+    let opt_cfg_path = dir.write(
+        "opt.yml",
+        "- id: core\n  name: core\n- id: f\n  name: flaky\n  optional: true\n",
+    );
+    let mut opt_cfg = LoaderConfig::new(opt_cfg_path.to_string_lossy().into_owned());
+    opt_cfg.strict_sidecars = true;
+    let app6 = App::new();
+    let state6 = load_with_source(app6.root.clone(), opt_cfg, Arc::new(FlakyPlanSource))
+        .await
+        .expect("optional 行在 strict_sidecars=true 遇到 RuntimeUnavailable 时应降级通过");
+    assert_eq!(state6.mounted_labels(), vec!["core".to_string()]);
+    assert_eq!(state6.degraded_rows().len(), 1);
+    assert_eq!(state6.degraded_rows()[0].label, "f");
+    assert_eq!(state6.report()["preflight"]["verdict"], "downgraded");
+    app6.close().await;
+}

@@ -123,3 +123,63 @@ fn json_is_not_accepted_by_run() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn zero_or_invalid_lifecycle_timeout_flags_are_usage_errors() {
+    for args in [
+        &["status", "config.yml", "--dispose-timeout-ms", "0"][..],
+        &["run", "config.yml", "--apply-timeout-ms", "not-a-number"][..],
+        &["status", "config.yml", "--drain-timeout-ms"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "非法超时参数必须返回用法错误码 2: {args:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn status_cli_degrade_persisted_state_flag_surfaces_broken_patch_in_json() {
+    let dir = std::env::temp_dir().join(format!(
+        "cordis-cli-degrade-persisted-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("cordis.yml");
+    let bad_patch = dir.join("broken.patch.yml");
+    std::fs::write(&cfg, "[]\n").unwrap();
+    std::fs::write(&bad_patch, "not: [valid: yaml").unwrap();
+
+    let output = run(&[
+        "status",
+        cfg.to_str().unwrap(),
+        "--patch",
+        bad_patch.to_str().unwrap(),
+        "--degrade-persisted-state",
+        "--allow-unverified",
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status --json 输出合法 JSON");
+    assert_eq!(json["close"]["status"], "completed");
+    assert_eq!(
+        json["persisted_state_errors"].as_array().map(Vec::len),
+        Some(1),
+        "{json}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

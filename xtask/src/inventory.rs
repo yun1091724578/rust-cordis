@@ -961,6 +961,12 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "fn plan_entry_admitted(\n        &self,\n        entry: &Entry,\n        search: &[PathBuf],\n        _admission: &SourceAdmission,",
     },
     PublicItem {
+        item: "PluginSource::plan_entry_classified",
+        kind: "method",
+        source: "crates/host/src/loader.rs",
+        marker: "fn plan_entry_classified(\n        &self,\n        entry: &Entry,\n        search: &[PathBuf],\n        admission: &SourceAdmission,\n    ) -> std::result::Result<Option<PlanEntrySpec>, LoadFailure> {\n        self.plan_entry_admitted",
+    },
+    PublicItem {
         item: "PolicyPluginSource",
         kind: "struct",
         source: "crates/host/src/loader.rs",
@@ -1653,7 +1659,7 @@ pub struct Q {
             42,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 165, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 166, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 33, "载荷清单数量漂移");
     }
 

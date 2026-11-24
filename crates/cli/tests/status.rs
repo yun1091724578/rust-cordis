@@ -1,10 +1,12 @@
 //! `cordis status`：装载后解释未就绪原因（独立测试二进制，假插件源）。
 
 use cordis_core::{
-    BoxFuture, Config, Ctx, ExternService, Inject, PendingReason, Plugin, PluginKey,
+    BoxFuture, CloseStatus, Config, Ctx, Disposable, ExternService, Inject, PendingReason, Plugin,
+    PluginKey,
 };
 use cordis_host::loader::{LoadedFile, PluginSource};
 use cordis_host::patch::Entry;
+use cordis_host::{FailureDisposition, StartupPolicy};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,6 +77,12 @@ impl PluginSource for PendingSource {
                 if self.fail {
                     return Box::pin(async { Err("boom".into()) });
                 }
+                if self.name == "panic-dispose" {
+                    return Box::pin(async move {
+                        ctx.effect(|_| Disposable::sync(|| panic!("cli-status-disposer-boom")));
+                        Ok(())
+                    });
+                }
                 if self.iface {
                     return Box::pin(async move {
                         ctx.provide_iface("status.svc", Arc::new(StatusService))?;
@@ -88,6 +96,8 @@ impl PluginSource for PendingSource {
         let (inject, provision, fail, iface) = match name.as_str() {
             "needs" => (vec!["missing@1"], vec![], false, false),
             "broken" => (vec![], vec![], true, false),
+            "broken-provider" => (vec![], vec!["missing@1".to_string()], true, false),
+            "panic-dispose" => (vec![], vec![], false, false),
             "iface" => (vec![], vec!["status.svc".to_string()], false, true),
             "a" => (vec!["b"], vec!["a".to_string()], false, false),
             "b" => (vec!["a"], vec!["b".to_string()], false, false),
@@ -363,5 +373,111 @@ fn cli_status_exits_nonzero_when_a_row_fails_under_no_strict() {
         "stdout 应列出失败行：{}",
         String::from_utf8_lossy(&output.stdout)
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn status_surfaces_failed_upstream_degraded_persisted_errors_and_close_report() {
+    let dir = std::env::temp_dir().join(format!(
+        "cordis-status-p24-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+
+    // 1) 可选提供者失败 + 下游 Pending：status 必须展示 failedUpstream 与 degraded，且 is_healthy()=true。
+    let cfg_opt = dir.join("opt.yml");
+    std::fs::write(
+        &cfg_opt,
+        "- id: prov\n  name: broken-provider\n  optional: true\n- id: cons\n  name: needs\n",
+    )
+    .expect("写配置");
+    let report = cordis_cli::status_with_source(
+        &cfg_opt,
+        cordis_cli::RunOptions::default(),
+        Arc::new(PendingSource),
+    )
+    .await
+    .expect("可选上游失败应降级返回 status");
+    assert!(
+        report.is_healthy(),
+        "仅可选行降级且清理正常时应健康: {report:?}"
+    );
+    assert!(report.has_degraded(), "必须标记 has_degraded: {report:?}");
+    assert_eq!(report.degraded.len(), 1);
+    assert_eq!(report.degraded[0].label, "prov");
+    assert_eq!(report.correlated_pending.len(), 1);
+    assert_eq!(
+        report.correlated_pending[0].missing[0].failed_upstream[0].label,
+        "prov"
+    );
+    assert_eq!(report.close_report.status, CloseStatus::Completed);
+
+    let text = report.render();
+    assert!(text.contains("failed upstream: prov"), "{text}");
+    assert!(text.contains("degraded:"), "{text}");
+    let json = report.to_json();
+    assert_eq!(
+        json["pending"][0]["missing"][0]["failedUpstream"][0]["label"],
+        "prov"
+    );
+    assert_eq!(json["degraded"][0]["label"], "prov");
+    assert_eq!(json["close"]["status"], "completed");
+
+    // 2) 损坏 patch + StartupPolicy::with_persisted_state(Degrade)：status 不被 precheck 误拦并上报 persisted_state_errors。
+    let bad_patch = dir.join("broken.patch.yml");
+    std::fs::write(&bad_patch, "not: [valid: yaml").expect("写坏 patch");
+    let cfg_ok = dir.join("ok.yml");
+    std::fs::write(&cfg_ok, "- id: iface\n  name: iface\n").expect("写主配置");
+    let report_p = cordis_cli::status_with_source(
+        &cfg_ok,
+        cordis_cli::RunOptions {
+            patches: vec![bad_patch.clone()],
+            startup_policy: Some(
+                StartupPolicy::new().with_persisted_state(FailureDisposition::Degrade),
+            ),
+            ..cordis_cli::RunOptions::default()
+        },
+        Arc::new(PendingSource),
+    )
+    .await
+    .expect("PersistedState=Degrade 应跳过坏 patch 启动");
+    assert!(report_p.is_healthy());
+    assert!(report_p.has_degraded());
+    assert_eq!(report_p.persisted_state_errors.len(), 1);
+    assert_eq!(
+        report_p.persisted_state_errors[0].label,
+        bad_patch.display().to_string()
+    );
+    assert!(report_p.render().contains("persisted_state_errors:"));
+    assert_eq!(
+        report_p.to_json()["persisted_state_errors"][0]["degraded"],
+        true
+    );
+
+    // 3) 卸载期 disposer panic：status 必须捕获 close_report 错误并判为不健康。
+    let cfg_panic = dir.join("panic.yml");
+    std::fs::write(&cfg_panic, "- id: bad-close\n  name: panic-dispose\n").expect("写配置");
+    let report_c = cordis_cli::status_with_source(
+        &cfg_panic,
+        cordis_cli::RunOptions::default(),
+        Arc::new(PendingSource),
+    )
+    .await
+    .expect("装载成功、关闭时 disposer panic");
+    assert!(!report_c.is_healthy(), "关闭产生清理错误不得判为健康");
+    assert_eq!(
+        report_c.close_report.status,
+        CloseStatus::CompletedWithErrors
+    );
+    assert!(report_c.render().contains("close: completed_with_errors"));
+    assert_eq!(
+        report_c.to_json()["close"]["status"],
+        "completed_with_errors"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

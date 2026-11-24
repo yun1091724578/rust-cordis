@@ -8,7 +8,9 @@
 //!
 //! `dev`/HMR 监听仍留给后续里程碑：生命周期与跨平台构建稳定后再做。
 
+use cordis_core::{CloseStatus, LifecyclePolicy};
 use cordis_host::source::{set_active_policy, set_allow_unverified, PluginSourcePolicy};
+use cordis_host::{FailureDisposition, StartupPolicy};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -21,16 +23,22 @@ cordis <子命令> [参数]
       [--source-policy <allow-list.json>] [--allow-unverified]
                                                  打印装载前能力清单
   status <config.yml> [--patch <file>]...       短暂挂载后打印诊断并关闭
-      [--plugin-dir <dir>] [--no-strict] [--json]
+      [--plugin-dir <dir>] [--no-strict] [--strict-sidecars] [--json]
+      [--degrade-source] [--degrade-integrity] [--degrade-persisted-state]
+      [--apply-timeout-ms <ms>] [--drain-timeout-ms <ms>] [--dispose-timeout-ms <ms>]
       [--source-policy <allow-list.json>] [--allow-unverified]
                                                  （会执行插件 apply/cleanup）
   validate <config.yml> [--patch <file>]...     校验主配置 + patch 层（不挂载）
       [--plugin-dir <dir>] [--source-policy <allow-list.json>] [--allow-unverified]
   run <config.yml> [--patch <file>]...          装载并运行，按 Enter / Ctrl-C 优雅关闭
-      [--plugin-dir <dir>] [--no-strict]
+      [--plugin-dir <dir>] [--no-strict] [--strict-sidecars]
+      [--degrade-source] [--degrade-integrity] [--degrade-persisted-state]
+      [--apply-timeout-ms <ms>] [--drain-timeout-ms <ms>] [--dispose-timeout-ms <ms>]
       [--source-policy <allow-list.json>] [--allow-unverified]
   service <config.yml> --name <service-name>    Windows SCM 服务入口
-      [--patch <file>]... [--plugin-dir <dir>] [--no-strict]
+      [--patch <file>]... [--plugin-dir <dir>] [--no-strict] [--strict-sidecars]
+      [--degrade-source] [--degrade-integrity] [--degrade-persisted-state]
+      [--apply-timeout-ms <ms>] [--drain-timeout-ms <ms>] [--dispose-timeout-ms <ms>]
       [--source-policy <allow-list.json>] [--allow-unverified]
 
 退出码: 0 成功 / 2 用法错误 / 3 配置错误 / 4 运行时错误";
@@ -129,6 +137,10 @@ fn status(args: &[String]) -> ExitCode {
         patches: parsed.patches,
         plugin_dir: parsed.plugin_dir,
         strict: parsed.strict,
+        strict_sidecars: parsed.strict_sidecars,
+        startup_policy: parsed.startup_policy,
+        lifecycle_policy: parsed.lifecycle_policy,
+        method_allow_list: None,
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -150,8 +162,8 @@ fn status(args: &[String]) -> ExitCode {
             if report.is_healthy() {
                 ExitCode::SUCCESS
             } else {
-                // `--no-strict` 下装载器会降级继续；诊断命令仍要把失败
-                // 反映到退出码，避免 CI 把“有行没装上”当成健康。
+                // `--no-strict` 下装载器会降级继续；诊断命令仍要把失败或清理异常
+                // 反映到退出码，避免 CI 把“有行没装上/关闭失败”当成健康。
                 ExitCode::from(4)
             }
         }
@@ -175,6 +187,10 @@ fn run(args: &[String]) -> ExitCode {
         patches: parsed.patches,
         plugin_dir: parsed.plugin_dir,
         strict: parsed.strict,
+        strict_sidecars: parsed.strict_sidecars,
+        startup_policy: parsed.startup_policy,
+        lifecycle_policy: parsed.lifecycle_policy,
+        method_allow_list: None,
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -191,6 +207,24 @@ fn run(args: &[String]) -> ExitCode {
             println!("mounted = {}", report.mounted.len());
             for label in &report.mounted {
                 println!("- {label}");
+            }
+            if report.close_report.status != CloseStatus::Completed {
+                eprintln!(
+                    "关闭状态: {} (errors={}, still_running={})",
+                    report.close_report.status.as_str(),
+                    report.close_report.errors.len(),
+                    report.close_report.still_running
+                );
+                for err in &report.close_report.errors {
+                    eprintln!(
+                        "  - {}#{} [{}]: {}",
+                        err.fiber,
+                        err.uid,
+                        err.kind.as_str(),
+                        err.message
+                    );
+                }
+                return ExitCode::from(4);
             }
             ExitCode::SUCCESS
         }
@@ -209,6 +243,13 @@ fn service(args: &[String]) -> ExitCode {
     let mut source_policy = None;
     let mut allow_unverified = false;
     let mut strict = true;
+    let mut strict_sidecars = false;
+    let mut degrade_source = false;
+    let mut degrade_integrity = false;
+    let mut degrade_persisted = false;
+    let mut apply_timeout_ms = None;
+    let mut drain_timeout_ms = None;
+    let mut dispose_timeout_ms = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -230,6 +271,22 @@ fn service(args: &[String]) -> ExitCode {
             },
             "--allow-unverified" => allow_unverified = true,
             "--no-strict" => strict = false,
+            "--strict-sidecars" => strict_sidecars = true,
+            "--degrade-source" => degrade_source = true,
+            "--degrade-integrity" => degrade_integrity = true,
+            "--degrade-persisted-state" => degrade_persisted = true,
+            "--apply-timeout-ms" => match parse_positive_u64(&mut iter, "--apply-timeout-ms") {
+                Ok(value) => apply_timeout_ms = Some(value),
+                Err(message) => return usage_error("service", &message),
+            },
+            "--drain-timeout-ms" => match parse_positive_u64(&mut iter, "--drain-timeout-ms") {
+                Ok(value) => drain_timeout_ms = Some(value),
+                Err(message) => return usage_error("service", &message),
+            },
+            "--dispose-timeout-ms" => match parse_positive_u64(&mut iter, "--dispose-timeout-ms") {
+                Ok(value) => dispose_timeout_ms = Some(value),
+                Err(message) => return usage_error("service", &message),
+            },
             other if other.starts_with('-') => return usage_error("service", other),
             other => {
                 if path.is_some() {
@@ -245,6 +302,12 @@ fn service(args: &[String]) -> ExitCode {
     let Some(name) = name else {
         return usage_error("service", "缺少 --name <service-name>");
     };
+    let startup_policy = build_startup_policy(degrade_source, degrade_integrity, degrade_persisted);
+    let lifecycle_policy =
+        match build_lifecycle_policy(apply_timeout_ms, drain_timeout_ms, dispose_timeout_ms) {
+            Ok(policy) => policy,
+            Err(message) => return usage_error("service", &message),
+        };
     if let Err(err) = activate_source_policy(&source_policy, allow_unverified) {
         eprintln!("service 失败: {err}");
         return ExitCode::from(3);
@@ -254,6 +317,10 @@ fn service(args: &[String]) -> ExitCode {
         patches,
         plugin_dir,
         strict,
+        strict_sidecars,
+        startup_policy,
+        lifecycle_policy,
+        method_allow_list: None,
     };
     match cordis_cli::service::run(Path::new(&path), &name, options) {
         Ok(()) => ExitCode::SUCCESS,
@@ -271,17 +338,20 @@ struct ConfigArgs {
     source_policy: Option<PathBuf>,
     allow_unverified: bool,
     strict: bool,
+    strict_sidecars: bool,
+    startup_policy: Option<StartupPolicy>,
+    lifecycle_policy: Option<LifecyclePolicy>,
     json: bool,
 }
 
 /// 解析 config 子命令的公共参数：位置参数、`--patch`、`--plugin-dir`、
-/// `--source-policy`、`--no-strict`、`--json`。缺值、重复位置参数和未知 flag
-/// 都是用法错误。
+/// `--source-policy`、`--no-strict`、`--strict-sidecars`、启动/生命周期策略参数与 `--json`。
+/// 缺值、重复位置参数和未知 flag 都是用法错误。
 fn parse_config_args(
     args: &[String],
     allow_patch: bool,
     allow_plugin_dir: bool,
-    allow_strict: bool,
+    allow_runtime_policies: bool,
     allow_json: bool,
 ) -> Result<ConfigArgs, String> {
     let mut path = None;
@@ -290,6 +360,13 @@ fn parse_config_args(
     let mut source_policy = None;
     let mut allow_unverified = false;
     let mut strict = true;
+    let mut strict_sidecars = false;
+    let mut degrade_source = false;
+    let mut degrade_integrity = false;
+    let mut degrade_persisted = false;
+    let mut apply_timeout_ms = None;
+    let mut drain_timeout_ms = None;
+    let mut dispose_timeout_ms = None;
     let mut json = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -304,7 +381,20 @@ fn parse_config_args(
                 source_policy = Some(PathBuf::from(next_value(&mut iter, "--source-policy")?));
             }
             "--allow-unverified" => allow_unverified = true,
-            "--no-strict" if allow_strict => strict = false,
+            "--no-strict" if allow_runtime_policies => strict = false,
+            "--strict-sidecars" if allow_runtime_policies => strict_sidecars = true,
+            "--degrade-source" if allow_runtime_policies => degrade_source = true,
+            "--degrade-integrity" if allow_runtime_policies => degrade_integrity = true,
+            "--degrade-persisted-state" if allow_runtime_policies => degrade_persisted = true,
+            "--apply-timeout-ms" if allow_runtime_policies => {
+                apply_timeout_ms = Some(parse_positive_u64(&mut iter, "--apply-timeout-ms")?);
+            }
+            "--drain-timeout-ms" if allow_runtime_policies => {
+                drain_timeout_ms = Some(parse_positive_u64(&mut iter, "--drain-timeout-ms")?);
+            }
+            "--dispose-timeout-ms" if allow_runtime_policies => {
+                dispose_timeout_ms = Some(parse_positive_u64(&mut iter, "--dispose-timeout-ms")?);
+            }
             "--json" if allow_json => json = true,
             other if other.starts_with('-') => return Err(format!("未知参数 {other}")),
             other => {
@@ -315,6 +405,9 @@ fn parse_config_args(
             }
         }
     }
+    let startup_policy = build_startup_policy(degrade_source, degrade_integrity, degrade_persisted);
+    let lifecycle_policy =
+        build_lifecycle_policy(apply_timeout_ms, drain_timeout_ms, dispose_timeout_ms)?;
     Ok(ConfigArgs {
         path: path.ok_or_else(|| "缺少配置文件".to_string())?,
         patches,
@@ -322,8 +415,54 @@ fn parse_config_args(
         source_policy,
         allow_unverified,
         strict,
+        strict_sidecars,
+        startup_policy,
+        lifecycle_policy,
         json,
     })
+}
+
+fn build_startup_policy(
+    degrade_source: bool,
+    degrade_integrity: bool,
+    degrade_persisted: bool,
+) -> Option<StartupPolicy> {
+    if !degrade_source && !degrade_integrity && !degrade_persisted {
+        return None;
+    }
+    let mut policy = StartupPolicy::new();
+    if degrade_source {
+        policy = policy.with_source(FailureDisposition::Degrade);
+    }
+    if degrade_integrity {
+        policy = policy.with_integrity(FailureDisposition::Degrade);
+    }
+    if degrade_persisted {
+        policy = policy.with_persisted_state(FailureDisposition::Degrade);
+    }
+    Some(policy)
+}
+
+fn build_lifecycle_policy(
+    apply_timeout_ms: Option<u64>,
+    drain_timeout_ms: Option<u64>,
+    dispose_timeout_ms: Option<u64>,
+) -> Result<Option<LifecyclePolicy>, String> {
+    if apply_timeout_ms.is_none() && drain_timeout_ms.is_none() && dispose_timeout_ms.is_none() {
+        return Ok(None);
+    }
+    LifecyclePolicy::new(apply_timeout_ms, drain_timeout_ms, dispose_timeout_ms).map(Some)
+}
+
+fn parse_positive_u64(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<u64, String> {
+    let raw = next_value(iter, flag)?;
+    let value: u64 = raw
+        .parse()
+        .map_err(|_| format!("{flag} 需要正整数毫秒值（收到 {raw:?}）"))?;
+    if value == 0 {
+        return Err(format!("{flag} 不能为 0（0 不是无限）"));
+    }
+    Ok(value)
 }
 
 /// 读取 `--source-policy` 并设为进程级生效策略；缺省时明确复位为 `None`。

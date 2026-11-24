@@ -189,9 +189,28 @@ mod windows {
                             set_status(SERVICE_RUNNING, 0, 0, 0);
                         }
                         crate::shutdown::wait_service().await;
-                        let _ = session.shutdown().await;
+                        let report = session.shutdown().await;
                         crate::shutdown::complete();
-                        0
+                        if report.close_report.status != cordis_core::CloseStatus::Completed {
+                            eprintln!(
+                                "cordis service: 关闭状态 {} (errors={}, still_running={})",
+                                report.close_report.status.as_str(),
+                                report.close_report.errors.len(),
+                                report.close_report.still_running
+                            );
+                            for err in &report.close_report.errors {
+                                eprintln!(
+                                    "  - {}#{} [{}]: {}",
+                                    err.fiber,
+                                    err.uid,
+                                    err.kind.as_str(),
+                                    err.message
+                                );
+                            }
+                            4
+                        } else {
+                            0
+                        }
                     }
                     Err(err) => {
                         eprintln!("cordis service: {err}");

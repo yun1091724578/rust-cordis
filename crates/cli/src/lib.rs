@@ -11,11 +11,16 @@
 //! 2. 每行给全 **inject / provision / volatile** 三项，未声明 provision 的行
 //!    单独列进 `undeclared`（"这行的权限面没人声明过"，装载前就该看得见）。
 
-use cordis_core::{App, ServiceInfo, UID_DISPOSED};
+use cordis_core::{App, CloseReport, CloseStatus, LifecyclePolicy, ServiceInfo, UID_DISPOSED};
 use cordis_host::loader::{
-    load_with_source, InterpolationMode, LoaderConfig, LoaderState, PendingRow, PluginSource,
+    load_with_source, CorrelatedPendingRow, FailedRow, InterpolationMode, LoaderConfig,
+    LoaderState, PendingRow, PluginSource,
 };
 use cordis_host::patch::{apply_entry_patches, parse_entries, parse_inject, parse_patches, Entry};
+use cordis_host::{
+    set_lifecycle_policy_for, set_method_allow_list_for, set_startup_policy_for,
+    FailureDisposition, MethodAllowList, StartupPolicy,
+};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -622,12 +627,20 @@ fn precheck_config(config_path: &Path, patches: &[PathBuf]) -> Result<(), RunErr
     Ok(())
 }
 
-/// `run` 的启动参数。
+/// `run` / `status` 的启动参数。
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub patches: Vec<PathBuf>,
     pub plugin_dir: Option<PathBuf>,
     pub strict: bool,
+    /// `plan_entry` 报错时是否按严格预检失败（同时遵循行级 `Optional` 与 `StartupPolicy`）。
+    pub strict_sidecars: bool,
+    /// 可选启动策略：独立控制 `Source` / `Integrity` / `PersistedState` 处置与程序化行级覆盖。
+    pub startup_policy: Option<StartupPolicy>,
+    /// 可选生命周期三段等待预算（`apply` / `drain` / `dispose`）。
+    pub lifecycle_policy: Option<LifecyclePolicy>,
+    /// 可选宿主方法白名单（默认拒绝）。
+    pub method_allow_list: Option<MethodAllowList>,
 }
 
 impl Default for RunOptions {
@@ -636,6 +649,10 @@ impl Default for RunOptions {
             patches: Vec::new(),
             plugin_dir: None,
             strict: true,
+            strict_sidecars: false,
+            startup_policy: None,
+            lifecycle_policy: None,
+            method_allow_list: None,
         }
     }
 }
@@ -645,6 +662,8 @@ impl Default for RunOptions {
 pub struct RunReport {
     /// 关闭前装载表里的行标（排序）。
     pub mounted: Vec<String>,
+    /// 优雅关闭整棵 App 树的结构化报告（区分 `Completed` / `CompletedWithErrors` / `TimedOut` / `Deferred`）。
+    pub close_report: CloseReport,
 }
 
 /// 装载后的诊断快照（`status` 命令）。
@@ -654,10 +673,20 @@ pub struct StatusReport {
     /// 因 `disabled`（自身或祖先）而休眠的行标。
     pub disabled: Vec<String>,
     pub pending: Vec<PendingRow>,
+    /// 带同隔离域失败上游关联的未就绪诊断。
+    pub correlated_pending: Vec<CorrelatedPendingRow>,
     /// 声明级依赖环路径（首尾同名）。
     pub cycles: Vec<Vec<String>>,
     /// 最近一次对账的逐行失败消息（`--no-strict` 下仍会返回）。
     pub failed: Vec<String>,
+    /// 结构化已知失败行（含故障分类、行启动级别、是否降级与声明 provides）。
+    pub failed_rows: Vec<FailedRow>,
+    /// 被行级 `Optional` 或 `StartupPolicy` 降级的行列表。
+    pub degraded: Vec<FailedRow>,
+    /// 持久化状态错误列表（损坏配置/patch 启动降级或运行期回写/重载失败）。
+    pub persisted_state_errors: Vec<FailedRow>,
+    /// `status` 退出前关闭装载树的结构化关闭报告。
+    pub close_report: CloseReport,
     /// 每个已挂载行的 artifact / SHA256 / sidecar manifest 来源摘要。
     pub provenance: Vec<RowProvenance>,
     /// 每个已挂载行的契约面（声明 + 服务方法名），按 label 升序。
@@ -665,9 +694,18 @@ pub struct StatusReport {
 }
 
 impl StatusReport {
-    /// 失败行为空才算健康；`disabled` / `pending` / 声明级环是诊断信息，不是失败。
+    /// 无阻断失败、无未降级持久化错误且关闭清理干净才算健康；
+    /// `disabled` / `pending` / 声明级环 / 已显式降级行是诊断信息，不是失败。
     pub fn is_healthy(&self) -> bool {
         self.failed.is_empty()
+            && self.failed_rows.iter().all(|row| row.degraded)
+            && self.persisted_state_errors.iter().all(|err| err.degraded)
+            && self.close_report.status == CloseStatus::Completed
+    }
+
+    /// 是否存在策略降级的行或持久化状态错误（便于运维识别“可运行但已降级”）。
+    pub fn has_degraded(&self) -> bool {
+        !self.degraded.is_empty() || self.persisted_state_errors.iter().any(|err| err.degraded)
     }
 
     pub fn render(&self) -> String {
@@ -709,18 +747,34 @@ impl StatusReport {
                 out.push_str(&format!("- {}\n", cycle.join(" -> ")));
             }
         }
-        if self.pending.is_empty() {
+        if self.correlated_pending.is_empty() {
             out.push_str("pending = (none)\n");
         } else {
             out.push_str("pending:\n");
-            for row in &self.pending {
+            for row in &self.correlated_pending {
                 out.push_str(&format!("- {} (plugin: {})\n", row.label, row.plugin));
                 for item in &row.missing {
-                    out.push_str(&format!("  missing {}: {}", item.key, item.reason.as_str()));
-                    if !item.related.is_empty() {
-                        out.push_str(&format!(" (related: {})", item.related.join(", ")));
+                    out.push_str(&format!(
+                        "  missing {}: {}",
+                        item.inject.key,
+                        item.inject.reason.as_str()
+                    ));
+                    if !item.inject.related.is_empty() {
+                        out.push_str(&format!(" (related: {})", item.inject.related.join(", ")));
                     }
                     out.push('\n');
+                    for up in &item.failed_upstream {
+                        out.push_str(&format!(
+                            "    failed upstream: {} (plugin: {}, category: {}, startup: {}, degraded: {}, matched: {}): {}\n",
+                            up.label,
+                            up.plugin,
+                            up.category.as_str(),
+                            up.startup.as_str(),
+                            up.degraded,
+                            up.matched_key,
+                            up.message
+                        ));
+                    }
                 }
             }
         }
@@ -732,10 +786,59 @@ impl StatusReport {
                 out.push_str(&format!("- {failure}\n"));
             }
         }
+        if !self.degraded.is_empty() {
+            out.push_str("degraded:\n");
+            for row in &self.degraded {
+                out.push_str(&format!(
+                    "- {} [category={}, startup={}]: {}\n",
+                    row.label,
+                    row.category.as_str(),
+                    row.startup.as_str(),
+                    row.message
+                ));
+            }
+        }
+        if !self.persisted_state_errors.is_empty() {
+            out.push_str("persisted_state_errors:\n");
+            for row in &self.persisted_state_errors {
+                out.push_str(&format!(
+                    "- {} [degraded={}]: {}\n",
+                    row.label, row.degraded, row.message
+                ));
+            }
+        }
+        if self.close_report.status != CloseStatus::Completed {
+            out.push_str(&format!(
+                "close: {} (errors: {}, still_running: {})\n",
+                self.close_report.status.as_str(),
+                self.close_report.errors.len(),
+                self.close_report.still_running
+            ));
+            for err in &self.close_report.errors {
+                out.push_str(&format!(
+                    "  - {}#{} [{}]: {}\n",
+                    err.fiber,
+                    err.uid,
+                    err.kind.as_str(),
+                    err.message
+                ));
+            }
+        }
         out
     }
 
     pub fn to_json(&self) -> serde_json::Value {
+        let failed_row_json = |row: &FailedRow| {
+            serde_json::json!({
+                "label": row.label,
+                "plugin": row.plugin,
+                "category": row.category.as_str(),
+                "startup": row.startup.as_str(),
+                "degraded": row.degraded,
+                "provides": row.provides,
+                "message": row.message,
+            })
+        };
         serde_json::json!({
             // 与 `LoaderState::report()` 对齐：mounted 是计数，行标另列。
             "mounted": self.mounted.len(),
@@ -750,16 +853,44 @@ impl StatusReport {
                 value
             }).collect::<Vec<_>>(),
             "capabilities": self.capabilities.iter().map(CapabilityRow::to_json).collect::<Vec<_>>(),
-            "pending": self.pending.iter().map(|row| serde_json::json!({
+            "pending": self.correlated_pending.iter().map(|row| serde_json::json!({
                 "label": row.label,
                 "plugin": row.plugin,
-                "missing": row.missing.iter().map(|item| serde_json::json!({
-                    "key": item.key,
-                    "reason": item.reason.as_str(),
-                    "related": item.related,
-                })).collect::<Vec<_>>(),
+                "missing": row.missing.iter().map(|item| {
+                    let mut obj = serde_json::json!({
+                        "key": item.inject.key,
+                        "reason": item.inject.reason.as_str(),
+                        "related": item.inject.related,
+                    });
+                    if !item.failed_upstream.is_empty() {
+                        obj["failedUpstream"] = serde_json::json!(item.failed_upstream.iter().map(|up| serde_json::json!({
+                            "label": up.label,
+                            "plugin": up.plugin,
+                            "category": up.category.as_str(),
+                            "startup": up.startup.as_str(),
+                            "degraded": up.degraded,
+                            "matchedKey": up.matched_key,
+                            "message": up.message,
+                        })).collect::<Vec<_>>());
+                    }
+                    obj
+                }).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
             "failed": self.failed,
+            "failed_rows": self.failed_rows.iter().map(failed_row_json).collect::<Vec<_>>(),
+            "degraded": self.degraded.iter().map(failed_row_json).collect::<Vec<_>>(),
+            "persisted_state_errors": self.persisted_state_errors.iter().map(failed_row_json).collect::<Vec<_>>(),
+            "close": {
+                "status": self.close_report.status.as_str(),
+                "still_running": self.close_report.still_running,
+                "elapsed_ms": u64::try_from(self.close_report.elapsed.as_millis()).unwrap_or(u64::MAX),
+                "errors": self.close_report.errors.iter().map(|err| serde_json::json!({
+                    "fiber": err.fiber,
+                    "uid": err.uid,
+                    "kind": err.kind.as_str(),
+                    "message": err.message,
+                })).collect::<Vec<_>>(),
+            },
         })
     }
 }
@@ -776,8 +907,23 @@ impl RunSession {
         options: RunOptions,
         source: Arc<dyn PluginSource>,
     ) -> Result<Self, RunError> {
-        precheck_config(config_path, &options.patches)?;
+        let degrade_persisted = options
+            .startup_policy
+            .as_ref()
+            .is_some_and(|policy| policy.persisted_state() == FailureDisposition::Degrade);
+        if !degrade_persisted {
+            precheck_config(config_path, &options.patches)?;
+        }
         let app = App::new();
+        if let Some(policy) = options.lifecycle_policy {
+            set_lifecycle_policy_for(&app.root, policy).map_err(RunError::config)?;
+        }
+        if let Some(policy) = options.startup_policy {
+            set_startup_policy_for(&app.root, Some(policy));
+        }
+        if let Some(allow_list) = options.method_allow_list {
+            set_method_allow_list_for(&app.root, Some(allow_list));
+        }
         let config = LoaderConfig {
             path: config_path.to_string_lossy().into_owned(),
             patches: options
@@ -790,7 +936,7 @@ impl RunSession {
                 .map(|path| path.to_string_lossy().into_owned()),
             strict: options.strict,
             strict_cycles: false,
-            strict_sidecars: false,
+            strict_sidecars: options.strict_sidecars,
             hmr: None,
             js_evaluator: None,
             interpolation: InterpolationMode::Builtin,
@@ -801,8 +947,17 @@ impl RunSession {
         match load_with_source(app.root.clone(), config, source).await {
             Ok(state) => Ok(Self { app, state }),
             Err(err) => {
-                app.close().await;
-                Err(RunError::runtime(err.to_string()))
+                let close_report = app.close_with_report(None).await;
+                if close_report.status != CloseStatus::Completed {
+                    Err(RunError::runtime(format!(
+                        "{err}（失败回滚关闭状态: {}，errors={}，still_running={}）",
+                        close_report.status.as_str(),
+                        close_report.errors.len(),
+                        close_report.still_running
+                    )))
+                } else {
+                    Err(RunError::runtime(err.to_string()))
+                }
             }
         }
     }
@@ -814,6 +969,26 @@ impl RunSession {
     /// 装载后的未就绪诊断（只读；不改变装载状态）。
     pub fn pending_report(&self) -> Vec<PendingRow> {
         self.state.pending_report()
+    }
+
+    /// 装载后的未就绪诊断，带同域失败上游关联（只读）。
+    pub fn correlated_pending_report(&self) -> Vec<CorrelatedPendingRow> {
+        self.state.correlated_pending_report()
+    }
+
+    /// 已知失败行结构化列表（只读）。
+    pub fn failed_rows(&self) -> Vec<FailedRow> {
+        self.state.failed_rows()
+    }
+
+    /// 被行级 `Optional` 或 `StartupPolicy` 降级的行列表（只读）。
+    pub fn degraded_rows(&self) -> Vec<FailedRow> {
+        self.state.degraded_rows()
+    }
+
+    /// 持久化状态错误列表（只读）。
+    pub fn persisted_state_errors(&self) -> Vec<FailedRow> {
+        self.state.persisted_state_errors()
     }
 
     /// 声明级依赖环路径（只读）。
@@ -863,13 +1038,16 @@ impl RunSession {
             .collect()
     }
 
-    /// 关闭整棵 App 树，返回关闭前的装载面。
+    /// 关闭整棵 App 树，返回关闭前的装载面与结构化关闭报告。
     pub async fn shutdown(self) -> RunReport {
         let Self { app, state } = self;
         let mounted = state.mounted_labels();
-        app.close().await;
+        let close_report = app.close_with_report(None).await;
         drop(state);
-        RunReport { mounted }
+        RunReport {
+            mounted,
+            close_report,
+        }
     }
 }
 
@@ -899,8 +1077,12 @@ pub async fn status_with_source(
     let mounted = session.mounted_labels();
     let disabled = string_list(&snapshot["disabled"]);
     let pending = session.pending_report();
+    let correlated_pending = session.correlated_pending_report();
     let cycles = session.cycles();
     let failed = string_list(&snapshot["failed"]);
+    let failed_rows = session.failed_rows();
+    let degraded = session.degraded_rows();
+    let persisted_state_errors = session.persisted_state_errors();
     // 用挂载记录的**原始 artifact** 路径读 sidecar：暂存副本的 `.rN` 文件名旁边
     // 没有发布方写的 manifest。sidecar 缺失时保留 `missing/manifest` 状态。
     let provenance: Vec<RowProvenance> = session
@@ -924,13 +1106,18 @@ pub async fn status_with_source(
             .unwrap_or(&[]),
         &iface_specs,
     );
-    session.shutdown().await;
+    let run_report = session.shutdown().await;
     Ok(StatusReport {
         mounted,
         disabled,
         pending,
+        correlated_pending,
         cycles,
         failed,
+        failed_rows,
+        degraded,
+        persisted_state_errors,
+        close_report: run_report.close_report,
         provenance,
         capabilities,
     })

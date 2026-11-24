@@ -1639,12 +1639,24 @@ impl LoaderState {
         &self,
         entries: &[Entry],
     ) -> std::result::Result<(PreflightReport, HashMap<String, Vec<String>>), String> {
+        let row_startup = self.row_startup.lock().unwrap().clone();
+        self.preflight_dependencies_with(entries, &row_startup)
+    }
+
+    fn preflight_dependencies_with(
+        &self,
+        entries: &[Entry],
+        row_startup: &HashMap<String, RowStartup>,
+    ) -> std::result::Result<(PreflightReport, HashMap<String, Vec<String>>), String> {
         if self.dependency_plan.is_empty() {
+            let startup_policy = startup_policy_for(&self.ctx);
             preflight_source_dependency_plan(
                 entries,
                 &self.search,
                 self.source.as_ref(),
                 self.strict_sidecars,
+                startup_policy.as_ref(),
+                row_startup,
             )
         } else {
             Ok((
@@ -2606,7 +2618,12 @@ impl LoaderState {
         // 报告里"声明走到了哪一步"与 `mounted`/`disabled`（当前树）描述两棵不同的树。
         let mut accepted_preflight = None;
         if !self.skip_next_preflight.swap(false, Ordering::SeqCst) {
-            match self.preflight_dependencies(&candidate.entries) {
+            let row_startup = if candidate.adopt_metadata {
+                candidate.row_startup.clone()
+            } else {
+                self.row_startup.lock().unwrap().clone()
+            };
+            match self.preflight_dependencies_with(&candidate.entries, &row_startup) {
                 Ok(pair) => accepted_preflight = Some(pair),
                 Err(err) => {
                     // 与"采纳被拒"同构：门禁失败也要进 `last` 并刷新报告，
@@ -3479,7 +3496,7 @@ impl LoaderState {
         self.hooks.pass_after_parse().await;
         // 预检是候选的第一道关：失败时连登记都不做，已采纳的元数据一个字节不动。
         // 结论**不进报告**：候选还没被采纳（可能被判过期拒绝），报告只能描述当前树。
-        if let Err(err) = self.preflight_dependencies(&parsed.entries) {
+        if let Err(err) = self.preflight_dependencies_with(&parsed.entries, &parsed.row_startup) {
             return Err(BuildCandidateError::Preflight(format!(
                 "依赖预检失败: {err}"
             )));
@@ -4313,6 +4330,22 @@ pub trait PluginSource: Send + Sync {
     ) -> std::result::Result<Option<PlanEntrySpec>, String> {
         self.plan_entry(entry, search)
     }
+
+    /// 带故障分类的依赖声明读取入口：默认将 [`Self::plan_entry_admitted`] 的错误归类为
+    /// [`FailureCategory::RuntimeUnavailable`]。
+    ///
+    /// [`DiskPluginSource`] 与 [`PolicyPluginSource`] 覆写本方法以保留精确的
+    /// `Source` / `Integrity` / `RuntimeUnavailable` 分类，使 `strict_sidecars = true`
+    /// 依赖预检与行级 `Optional` 及 [`StartupPolicy`] 的独立处置开关保持一致。
+    fn plan_entry_classified(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        admission: &SourceAdmission,
+    ) -> std::result::Result<Option<PlanEntrySpec>, LoadFailure> {
+        self.plan_entry_admitted(entry, search, admission)
+            .map_err(LoadFailure::runtime)
+    }
 }
 
 /// 给一个来源对象套上**局部准入结论**（O9）。
@@ -4407,6 +4440,15 @@ impl PluginSource for PolicyPluginSource {
         admission: &SourceAdmission,
     ) -> std::result::Result<Option<PlanEntrySpec>, String> {
         self.inner.plan_entry_admitted(entry, search, admission)
+    }
+
+    fn plan_entry_classified(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        admission: &SourceAdmission,
+    ) -> std::result::Result<Option<PlanEntrySpec>, LoadFailure> {
+        self.inner.plan_entry_classified(entry, search, admission)
     }
 
     fn admission(&self) -> SourceAdmission {
@@ -4504,6 +4546,16 @@ impl DiskPluginSource {
         search: &[PathBuf],
         admission: &SourceAdmission,
     ) -> std::result::Result<Option<PlanEntrySpec>, String> {
+        self.plan_entry_with_classified(entry, search, admission)
+            .map_err(|err| err.message)
+    }
+
+    fn plan_entry_with_classified(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        admission: &SourceAdmission,
+    ) -> std::result::Result<Option<PlanEntrySpec>, LoadFailure> {
         let Ok(path) = resolve_plugin_path(&entry.name, search) else {
             return Ok(None);
         };
@@ -4517,30 +4569,34 @@ impl DiskPluginSource {
         //
         // 与 [`Self::load_with`] 共用**同一个读口**（同一份 `SourceAdmission`），
         // 否则"依赖预检按一种准入、真正装载按另一种"会让结论互相矛盾。
-        let active_policy = admission.resolve()?;
+        let active_policy = admission.resolve().map_err(LoadFailure::source)?;
         let manifest = crate::source::read_manifest(&path).map_err(|err| {
-            format!(
+            LoadFailure::integrity(format!(
                 "插件 {} (id={}) 的 sidecar manifest {} 无效: {err}",
                 entry.name,
                 entry.id.as_deref().unwrap_or("<无 id>"),
                 manifest_path.display()
-            )
+            ))
         })?;
         crate::source::validate_manifest(&manifest).map_err(|err| {
-            format!(
+            LoadFailure::integrity(format!(
                 "插件 {} (id={}) 的 sidecar manifest 身份无效: {err}",
                 entry.name,
                 entry.id.as_deref().unwrap_or("<无 id>")
-            )
+            ))
         })?;
         // 有生效来源策略时，依赖声明也必须先过 artifact/manifest 准入，
         // 不能从未验证的 sidecar 直接做依赖决策。
         if let Some(policy) = &active_policy {
-            policy.verify(&path).map_err(|err| {
-                format!(
-                    "插件 {} (id={}) 的 sidecar manifest 未通过来源准入: {err}",
-                    entry.name,
-                    entry.id.as_deref().unwrap_or("<无 id>")
+            policy.verify_classified(&path).map_err(|err| {
+                LoadFailure::new(
+                    err.category,
+                    format!(
+                        "插件 {} (id={}) 的 sidecar manifest 未通过来源准入: {}",
+                        entry.name,
+                        entry.id.as_deref().unwrap_or("<无 id>"),
+                        err.message
+                    ),
                 )
             })?;
         }
@@ -4598,6 +4654,15 @@ impl PluginSource for DiskPluginSource {
         admission: &SourceAdmission,
     ) -> std::result::Result<Option<PlanEntrySpec>, String> {
         self.plan_entry_with(entry, search, admission)
+    }
+
+    fn plan_entry_classified(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        admission: &SourceAdmission,
+    ) -> std::result::Result<Option<PlanEntrySpec>, LoadFailure> {
+        self.plan_entry_with_classified(entry, search, admission)
     }
 }
 
@@ -4794,8 +4859,11 @@ fn preflight_source_dependency_plan(
     search: &[PathBuf],
     source: &dyn PluginSource,
     strict_sidecars: bool,
+    startup_policy: Option<&StartupPolicy>,
+    row_startup: &HashMap<String, RowStartup>,
 ) -> std::result::Result<(PreflightReport, HashMap<String, Vec<String>>), String> {
-    let mut collector = PlanCollector::new(search, source, strict_sidecars);
+    let mut collector =
+        PlanCollector::new(search, source, strict_sidecars, startup_policy, row_startup);
     collector.walk(entries, false)?;
     let mut declared_provides: HashMap<String, Vec<String>> = HashMap::new();
     for row in &collector.entries {
@@ -4891,6 +4959,8 @@ struct PlanCollector<'a> {
     search: &'a [PathBuf],
     source: &'a dyn PluginSource,
     strict_sidecars: bool,
+    startup_policy: Option<&'a StartupPolicy>,
+    row_startup: &'a HashMap<String, RowStartup>,
     /// 非 group 行的遍历序号（与跳过/收集无关，便于错误定位）。
     next_row: usize,
     /// 与 [`DesiredWalk`] / [`find_by_label`] 保持同一走法的 DFS 匿名行序号表。
@@ -4902,15 +4972,51 @@ struct PlanCollector<'a> {
 }
 
 impl<'a> PlanCollector<'a> {
-    fn new(search: &'a [PathBuf], source: &'a dyn PluginSource, strict_sidecars: bool) -> Self {
+    fn new(
+        search: &'a [PathBuf],
+        source: &'a dyn PluginSource,
+        strict_sidecars: bool,
+        startup_policy: Option<&'a StartupPolicy>,
+        row_startup: &'a HashMap<String, RowStartup>,
+    ) -> Self {
         Self {
             search,
             source,
             strict_sidecars,
+            startup_policy,
+            row_startup,
             next_row: 0,
             ordinals: HashMap::new(),
             entries: Vec::new(),
             collection: PreflightCollection::default(),
+        }
+    }
+
+    fn allow_preflight_degrade(
+        &self,
+        row_stable_label: &str,
+        entry_id: Option<&str>,
+        category: FailureCategory,
+    ) -> bool {
+        if !self.strict_sidecars {
+            return true;
+        }
+        let effective_startup = self
+            .startup_policy
+            .and_then(|policy| policy.row_startup(row_stable_label, entry_id))
+            .or_else(|| self.row_startup.get(row_stable_label).copied())
+            .unwrap_or(RowStartup::Required);
+        match category {
+            FailureCategory::RuntimeUnavailable => effective_startup == RowStartup::Optional,
+            FailureCategory::Source => self
+                .startup_policy
+                .is_some_and(|policy| policy.source() == FailureDisposition::Degrade),
+            FailureCategory::Integrity => self
+                .startup_policy
+                .is_some_and(|policy| policy.integrity() == FailureDisposition::Degrade),
+            FailureCategory::PersistedState => self
+                .startup_policy
+                .is_some_and(|policy| policy.persisted_state() == FailureDisposition::Degrade),
         }
     }
 
@@ -4919,6 +5025,7 @@ impl<'a> PlanCollector<'a> {
         entries: &[Entry],
         disabled_by_ancestor: bool,
     ) -> std::result::Result<(), String> {
+        let admission = self.source.admission();
         for entry in entries {
             // 先按整棵树的结构走法计算稳定行标，保证即使存在组行或静态 disabled 行，
             // 匿名行的 `name#N` 编号也与 `LoaderState` 完全一致。
@@ -4936,7 +5043,10 @@ impl<'a> PlanCollector<'a> {
                 continue;
             }
             let label = entry.id.clone().unwrap_or_else(|| entry.name.clone());
-            let verdict = match self.source.plan_entry(entry, self.search) {
+            let verdict = match self
+                .source
+                .plan_entry_classified(entry, self.search, &admission)
+            {
                 Ok(Some(spec)) => {
                     self.entries.push(CollectedPlanEntry {
                         index,
@@ -4950,19 +5060,26 @@ impl<'a> PlanCollector<'a> {
                     self.collection.missing_plan = true;
                     PreflightRowVerdict::NoDeclaration
                 }
-                Err(err) if self.strict_sidecars => {
+                Err(failure)
+                    if !self.allow_preflight_degrade(
+                        &row_stable_label,
+                        entry.id.as_deref(),
+                        failure.category,
+                    ) =>
+                {
                     return Err(format!(
-                        "第 {index} 行 {label}（插件 {}）的依赖声明不可用: {err}",
-                        entry.name
+                        "第 {index} 行 {label}（插件 {}）的依赖声明不可用: {}",
+                        entry.name, failure.message
                     ));
                 }
-                // 非严格：把损坏/不可用的 sidecar 当成"没有计划"，整次预检保守跳过。
-                // 门禁结论与严格模式不同，但**原始错误**必须进报告——否则用户只能从
-                // 日志里猜"为什么这次预检什么都没检查"。
-                Err(err) => {
+                // 宽松模式或已按行级 Optional / StartupPolicy 允许降级：把该行记为降级并跳过全局预检，
+                // 留待对账装载期落入 `failedRows`/`degraded` 并保留原始错误文本。
+                Err(failure) => {
                     self.collection.missing_plan = true;
                     self.collection.downgraded = true;
-                    PreflightRowVerdict::Downgraded { reason: err }
+                    PreflightRowVerdict::Downgraded {
+                        reason: failure.message,
+                    }
                 }
             };
             self.collection.rows.push(PreflightRow {
@@ -5151,6 +5268,8 @@ pub async fn load_with_source(
             &search,
             source.as_ref(),
             config.strict_sidecars,
+            startup_policy.as_ref(),
+            &row_startup,
         )?
     } else {
         (
