@@ -137,6 +137,8 @@ pub fn check_repo(repo_root: &Path) -> Vec<String> {
     ));
     violations.extend(check_toolchain_pin_and_ci_sync(repo_root, &workflows_dir));
     violations.extend(check_workspace_crate_dag(repo_root));
+    violations.extend(check_consumer_lockfile_sync(repo_root));
+    violations.extend(check_markdown_doc_links(repo_root));
     violations
 }
 
@@ -533,6 +535,24 @@ fn normalize_msrv(raw: &str) -> String {
     }
 }
 
+fn yaml_str<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a str> {
+    map.get(YamlValue::String(key.to_string()))
+        .and_then(YamlValue::as_str)
+}
+
+fn yaml_env_var<'a>(map: &'a serde_yaml::Mapping, var: &str) -> Option<&'a str> {
+    map.get(YamlValue::String("env".to_string()))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|env| yaml_str(env, var))
+}
+
+fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool {
+    let escaped = expected_version.replace('.', "\\.");
+    run_script.contains("rustc --version")
+        && (run_script.contains(&format!("rustc {expected_version}"))
+            || run_script.contains(&format!("rustc {escaped}")))
+}
+
 pub(crate) fn check_toolchain_pin_and_ci_sync(
     repo_root: &Path,
     workflows_dir: &Path,
@@ -588,7 +608,6 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
             continue;
         };
         let scanned = scanned_uses(&text);
-        let mut non_pinned_versions: BTreeSet<String> = BTreeSet::new();
         for (line_no, action_ref, comment) in &scanned {
             if !action_ref.starts_with("dtolnay/rust-toolchain@") {
                 continue;
@@ -597,54 +616,116 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                 problems.push(format!(
                     "{name}:{line_no}: dtolnay/rust-toolchain 尾注 `{comment}` 必须与 rust-toolchain.toml (`{pinned_channel}`) 或 workspace rust-version ({msrv_version:?}) 一致"
                 ));
-            } else if comment != &pinned_channel {
-                non_pinned_versions.insert(comment.clone());
             }
         }
 
-        // 如果 workflow 中有 MSRV job 使用与 rust-toolchain.toml 不同的版本，该 job 必须显式设置
-        // env.RUSTUP_TOOLCHAIN，否则 rust-toolchain.toml 会静默覆盖 dtolnay/rust-toolchain！
-        if !non_pinned_versions.is_empty() {
-            if let Some(jobs) = doc
-                .as_mapping()
-                .and_then(|m| m.get(YamlValue::String("jobs".to_string())))
-                .and_then(YamlValue::as_mapping)
-            {
-                for (job_key, job_val) in jobs {
-                    let (Some(job_name), Some(job_map)) = (job_key.as_str(), job_val.as_mapping())
-                    else {
+        let Some(root_map) = doc.as_mapping() else {
+            continue;
+        };
+        // Rustup 优先级：env.RUSTUP_TOOLCHAIN 高于 rust-toolchain.toml 与 rustup default。
+        // 顶层 env 若声明 RUSTUP_TOOLCHAIN，不得偏离 pinned_channel。
+        if let Some(top_tc) = yaml_env_var(root_map, "RUSTUP_TOOLCHAIN") {
+            if top_tc != pinned_channel {
+                problems.push(format!(
+                    "{name}: workflow 顶层 `env.RUSTUP_TOOLCHAIN` 为 `{top_tc}`，会覆盖精确锁版 `{pinned_channel}`"
+                ));
+            }
+        }
+
+        let Some(jobs) = root_map
+            .get(YamlValue::String("jobs".to_string()))
+            .and_then(YamlValue::as_mapping)
+        else {
+            continue;
+        };
+
+        for (job_key, job_val) in jobs {
+            let (Some(job_name), Some(job_map)) = (job_key.as_str(), job_val.as_mapping()) else {
+                continue;
+            };
+            let steps = job_map
+                .get(YamlValue::String("steps".to_string()))
+                .and_then(YamlValue::as_sequence);
+
+            let mut job_toolchain_from_action: Option<String> = None;
+            let mut has_rustc_version_check = false;
+
+            if let Some(steps) = steps {
+                for step in steps {
+                    let Some(step_map) = step.as_mapping() else {
                         continue;
                     };
-                    let matched_msrv = job_map
-                        .get(YamlValue::String("steps".to_string()))
-                        .and_then(YamlValue::as_sequence)
-                        .and_then(|steps| {
-                            steps.iter().find_map(|step| {
-                                let u = step
-                                    .as_mapping()?
-                                    .get(YamlValue::String("uses".to_string()))?
-                                    .as_str()?;
-                                if !u.starts_with("dtolnay/rust-toolchain@") {
-                                    return None;
+                    if let Some(uses_val) = yaml_str(step_map, "uses") {
+                        if uses_val.starts_with("dtolnay/rust-toolchain@") {
+                            let comment = scanned
+                                .iter()
+                                .find(|(_, r, _)| r == uses_val)
+                                .map(|(_, _, c)| c.clone())
+                                .unwrap_or_default();
+                            if !comment.is_empty() {
+                                job_toolchain_from_action = Some(comment.clone());
+                            }
+                            if let Some(with_tc) = step_map
+                                .get(YamlValue::String("with".to_string()))
+                                .and_then(YamlValue::as_mapping)
+                                .and_then(|w| yaml_str(w, "toolchain"))
+                            {
+                                let expected = if comment.is_empty() {
+                                    pinned_channel.as_str()
+                                } else {
+                                    comment.as_str()
+                                };
+                                if with_tc != expected {
+                                    problems.push(format!(
+                                        "{name}:{job_name}: dtolnay/rust-toolchain 的 `with.toolchain` 为 `{with_tc}`，与预期锁版 `{expected}` 不一致"
+                                    ));
                                 }
-                                scanned.iter().find_map(|(_, r, c)| {
-                                    (r == u && non_pinned_versions.contains(c)).then(|| c.clone())
-                                })
-                            })
-                        });
-                    let Some(expected_msrv) = matched_msrv else {
-                        continue;
-                    };
-                    let env_tc = job_map
-                        .get(YamlValue::String("env".to_string()))
-                        .and_then(YamlValue::as_mapping)
-                        .and_then(|e| e.get(YamlValue::String("RUSTUP_TOOLCHAIN".to_string())))
-                        .and_then(YamlValue::as_str);
-                    if env_tc != Some(expected_msrv.as_str()) {
+                            }
+                        }
+                    }
+                }
+
+                let expected_job_tc = job_toolchain_from_action
+                    .as_deref()
+                    .unwrap_or(pinned_channel.as_str());
+
+                if let Some(job_env_tc) = yaml_env_var(job_map, "RUSTUP_TOOLCHAIN") {
+                    if job_env_tc != expected_job_tc {
                         problems.push(format!(
-                            "{name}:{job_name}: 使用非默认工具链 `{expected_msrv}` 的 job 必须设置 `env.RUSTUP_TOOLCHAIN: {expected_msrv}`，防止被根目录 rust-toolchain.toml (`{pinned_channel}`) 静默覆盖"
+                            "{name}:{job_name}: job 级 `env.RUSTUP_TOOLCHAIN` 为 `{job_env_tc}`，与预期工具链 `{expected_job_tc}` 不一致"
                         ));
                     }
+                } else if expected_job_tc != pinned_channel {
+                    problems.push(format!(
+                        "{name}:{job_name}: 使用非默认工具链 `{expected_job_tc}` 的 job 必须设置 `env.RUSTUP_TOOLCHAIN: {expected_job_tc}`，防止被根目录 rust-toolchain.toml (`{pinned_channel}`) 静默覆盖"
+                    ));
+                }
+
+                for step in steps {
+                    let Some(step_map) = step.as_mapping() else {
+                        continue;
+                    };
+                    if let Some(step_env_tc) = yaml_env_var(step_map, "RUSTUP_TOOLCHAIN") {
+                        if step_env_tc != expected_job_tc {
+                            problems.push(format!(
+                                "{name}:{job_name}: step 级 `env.RUSTUP_TOOLCHAIN` 为 `{step_env_tc}`，会覆盖预期工具链 `{expected_job_tc}`"
+                            ));
+                        }
+                    }
+                    if let Some(run_script) = yaml_str(step_map, "run") {
+                        if step_verifies_rustc_version(run_script, expected_job_tc) {
+                            has_rustc_version_check = true;
+                        }
+                    }
+                }
+
+                if name == "ci.yml"
+                    && job_toolchain_from_action.is_some()
+                    && !has_rustc_version_check
+                {
+                    problems.push(format!(
+                        "{name}:{job_name}: ci.yml 中安装 Rust 工具链的 job 必须显式校验实际生效的 `rustc --version` 为 `{expected_job_tc}`"
+                    ));
                 }
             }
         }
@@ -718,42 +799,67 @@ fn check_metadata_dag(metadata: &JsonValue, repo_root: &Path, rules: &[CrateRule
             ));
             continue;
         };
-        let Some(deps) = pkg.get("dependencies").and_then(JsonValue::as_array) else {
-            continue;
-        };
-        for dep in deps {
-            // 只约束常规与构建依赖（kind == null 或 "build"）；dev-dependencies 允许测试用 tokio 等。
-            let kind = dep.get("kind").and_then(JsonValue::as_str);
-            if kind == Some("dev") {
-                continue;
+        let mut tokio_dep_keys: BTreeSet<String> = BTreeSet::from(["tokio".to_string()]);
+        if let Some(deps) = pkg.get("dependencies").and_then(JsonValue::as_array) {
+            for dep in deps {
+                // 只约束常规与构建依赖（kind == null 或 "build"）；dev-dependencies 允许测试用 tokio 等。
+                let kind = dep.get("kind").and_then(JsonValue::as_str);
+                if kind == Some("dev") {
+                    continue;
+                }
+                let Some(dep_name) = dep.get("name").and_then(JsonValue::as_str) else {
+                    continue;
+                };
+                if rule.forbidden_deps.contains(&dep_name) {
+                    violations.push(format!("{name} (tier {}) 禁止依赖 `{dep_name}`", rule.tier));
+                }
+                if dep_name == "tokio" {
+                    if let Some(rename) = dep.get("rename").and_then(JsonValue::as_str) {
+                        tokio_dep_keys.insert(rename.to_string());
+                    }
+                    if let Some(features) = dep.get("features").and_then(JsonValue::as_array) {
+                        for feat in features.iter().filter_map(JsonValue::as_str) {
+                            if rule.forbidden_tokio_features.contains(&feat) {
+                                violations.push(format!(
+                                    "{name} (tier {}) 禁止开启 tokio 的 `{feat}` feature",
+                                    rule.tier
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(target_rule) = rule_map.get(dep_name) {
+                    adj.entry(name.to_string())
+                        .or_default()
+                        .push(dep_name.to_string());
+                    if target_rule.tier > rule.tier {
+                        violations.push(format!(
+                            "逆向跨层依赖：{name} (tier {}) 不得依赖 {dep_name} (tier {})",
+                            rule.tier, target_rule.tier
+                        ));
+                    }
+                }
             }
-            let Some(dep_name) = dep.get("name").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            if rule.forbidden_deps.contains(&dep_name) {
-                violations.push(format!("{name} (tier {}) 禁止依赖 `{dep_name}`", rule.tier));
-            }
-            if dep_name == "tokio" {
-                if let Some(features) = dep.get("features").and_then(JsonValue::as_array) {
-                    for feat in features.iter().filter_map(JsonValue::as_str) {
-                        if rule.forbidden_tokio_features.contains(&feat) {
+        }
+
+        // 检查 Cargo `[features]` 转发（如 `feat = ["tokio/full"]`、`["tokio?/full"]` 或重命名别名转发）。
+        if let Some(pkg_features) = pkg.get("features").and_then(JsonValue::as_object) {
+            for (feat_name, entries) in pkg_features {
+                let Some(list) = entries.as_array() else {
+                    continue;
+                };
+                for entry in list.iter().filter_map(JsonValue::as_str) {
+                    if let Some((raw_dep, forwarded_feat)) = entry.split_once('/') {
+                        let dep_key = raw_dep.strip_suffix('?').unwrap_or(raw_dep);
+                        if tokio_dep_keys.contains(dep_key)
+                            && rule.forbidden_tokio_features.contains(&forwarded_feat)
+                        {
                             violations.push(format!(
-                                "{name} (tier {}) 禁止开启 tokio 的 `{feat}` feature",
+                                "{name} (tier {}) 的 Cargo feature `{feat_name}` 转发开启了禁止的 tokio feature `{forwarded_feat}`（`{entry}`）",
                                 rule.tier
                             ));
                         }
                     }
-                }
-            }
-            if let Some(target_rule) = rule_map.get(dep_name) {
-                adj.entry(name.to_string())
-                    .or_default()
-                    .push(dep_name.to_string());
-                if target_rule.tier > rule.tier {
-                    violations.push(format!(
-                        "逆向跨层依赖：{name} (tier {}) 不得依赖 {dep_name} (tier {})",
-                        rule.tier, target_rule.tier
-                    ));
                 }
             }
         }
@@ -798,6 +904,189 @@ fn detect_cycle(
     }
     visiting.remove(node);
     visited.insert(node.to_string());
+}
+
+fn check_consumer_lockfile_sync(repo_root: &Path) -> Vec<String> {
+    let root_manifest = match std::fs::read_to_string(repo_root.join("Cargo.toml")) {
+        Ok(t) => t,
+        Err(err) => return vec![format!("读取根 Cargo.toml 失败: {err}")],
+    };
+    let expected_version =
+        match parse_toml_string_field(&root_manifest, "workspace.package", "version") {
+            Ok(Some(v)) => v,
+            Ok(None) => return vec!["根 Cargo.toml 缺少 [workspace.package].version".to_string()],
+            Err(err) => return vec![format!("解析根 Cargo.toml version 失败: {err}")],
+        };
+    let lock_path = repo_root
+        .join("tests")
+        .join("consumer-service")
+        .join("Cargo.lock");
+    let lock_text = match std::fs::read_to_string(&lock_path) {
+        Ok(t) => t,
+        Err(err) => {
+            return vec![format!(
+                "缺少或无法读取独立消费者锁文件（{}）: {err}",
+                lock_path.display()
+            )];
+        }
+    };
+    check_consumer_lockfile_str(&lock_text, &expected_version)
+}
+
+fn check_consumer_lockfile_str(lock_text: &str, expected_version: &str) -> Vec<String> {
+    const TRACKED: &[&str] = &["rust-cordis-abi", "rust-cordis-core", "rust-cordis-host"];
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    let mut in_pkg = false;
+    let mut cur_name: Option<String> = None;
+    let mut cur_ver: Option<String> = None;
+
+    let mut flush = |name: &mut Option<String>, ver: &mut Option<String>| {
+        if let (Some(n), Some(v)) = (name.take(), ver.take()) {
+            if TRACKED.contains(&n.as_str()) {
+                found.insert(n, v);
+            }
+        } else {
+            *name = None;
+            *ver = None;
+        }
+    };
+
+    for raw in lock_text.lines() {
+        let line = raw.trim();
+        if line == "[[package]]" {
+            flush(&mut cur_name, &mut cur_ver);
+            in_pkg = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            flush(&mut cur_name, &mut cur_ver);
+            in_pkg = false;
+            continue;
+        }
+        if !in_pkg {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let val = v.trim().trim_matches('"').to_string();
+            match k.trim() {
+                "name" => cur_name = Some(val),
+                "version" => cur_ver = Some(val),
+                _ => {}
+            }
+        }
+    }
+    flush(&mut cur_name, &mut cur_ver);
+
+    let mut violations = Vec::new();
+    for pkg in TRACKED {
+        match found.get(*pkg) {
+            Some(ver) if ver == expected_version => {}
+            Some(ver) => violations.push(format!(
+                "tests/consumer-service/Cargo.lock 中 `{pkg}` 锁定版本为 `{ver}`，落后于 workspace 版本 `{expected_version}`（`cargo xtask consumer` 的 `--locked` 将失败）"
+            )),
+            None => violations.push(format!(
+                "tests/consumer-service/Cargo.lock 中缺少 `{pkg}` 条目"
+            )),
+        }
+    }
+    violations
+}
+
+fn collect_markdown_files(repo_root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(repo_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                files.push(path);
+            }
+        }
+    }
+    let mut stack = vec![repo_root.join("docs")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn extract_docs_md_refs(text: &str) -> Vec<(usize, String)> {
+    let mut refs = Vec::new();
+    let mut in_fence = false;
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut cursor = 0usize;
+        while let Some(pos) = line[cursor..].find("docs/") {
+            let start = cursor + pos;
+            // 仅接受词边界后的 `docs/...`，避免命中 URL 路径片段如 `https://example.com/docs/a.md`。
+            let prev_ok = start == 0
+                || matches!(
+                    line.as_bytes()[start - 1],
+                    b' ' | b'\t' | b'`' | b'(' | b'[' | b'"' | b'\'' | b':'
+                )
+                || !line.as_bytes()[start - 1].is_ascii();
+            let rest = &line[start..];
+            let end_rel = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_')))
+                .unwrap_or(rest.len());
+            let candidate = &rest[..end_rel];
+            if prev_ok
+                && candidate.ends_with(".md")
+                && !candidate.contains('*')
+                && !candidate.contains("..")
+            {
+                let entry = (idx + 1, candidate.to_string());
+                if !refs.contains(&entry) {
+                    refs.push(entry);
+                }
+            }
+            cursor = start + end_rel.max(5);
+        }
+    }
+    refs
+}
+
+fn check_markdown_doc_links(repo_root: &Path) -> Vec<String> {
+    let files = collect_markdown_files(repo_root);
+    if files.is_empty() {
+        return vec!["未在仓库中发现任何 Markdown 文档（fail closed）".to_string()];
+    }
+    let mut violations = Vec::new();
+    for path in files {
+        let rel = path
+            .strip_prefix(repo_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (line_no, target) in extract_docs_md_refs(&text) {
+            if !repo_root.join(&target).is_file() {
+                violations.push(format!(
+                    "{rel}:{line_no}: 引用了不存在的文档路径 `{target}`"
+                ));
+            }
+        }
+    }
+    violations
 }
 
 #[cfg(test)]
@@ -1040,6 +1329,111 @@ mod tests {
             problems.iter().any(|p| p.contains("env.RUSTUP_TOOLCHAIN")),
             "{problems:?}"
         );
+
+        // 顶层 env.RUSTUP_TOOLCHAIN: stable 与缺少 rustc --version 校验必须判红。
+        let tmp3 = TempDir::new("tc-top-env-override");
+        let wf_dir3 = tmp3.path.join(".github").join("workflows");
+        std::fs::create_dir_all(&wf_dir3).unwrap();
+        std::fs::write(
+            tmp3.path.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.98.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf_dir3.join("ci.yml"),
+            "permissions:\n  contents: read\nenv:\n  RUSTUP_TOOLCHAIN: stable\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n",
+        )
+        .unwrap();
+        let problems3 = check_toolchain_pin_and_ci_sync(&tmp3.path, &wf_dir3);
+        assert!(
+            problems3
+                .iter()
+                .any(|p| p.contains("顶层 `env.RUSTUP_TOOLCHAIN`")),
+            "{problems3:?}"
+        );
+        assert!(
+            problems3.iter().any(|p| p.contains("rustc --version")),
+            "{problems3:?}"
+        );
+    }
+
+    #[test]
+    fn crate_dag_guard_rejects_feature_forwarded_tokio_full() {
+        let root = PathBuf::from("/repo");
+        let manifest = |sub: &str| format!("/repo/crates/{sub}/Cargo.toml");
+        let forwarded_metadata = json!({
+            "packages": [
+                { "name": "rust-cordis-abi", "manifest_path": manifest("abi"), "dependencies": [] },
+                { "name": "rust-cordis-macros", "manifest_path": manifest("macros"), "dependencies": [] },
+                {
+                    "name": "rust-cordis-core",
+                    "manifest_path": manifest("core"),
+                    "dependencies": [
+                        { "name": "tokio", "rename": "tk", "kind": null, "features": ["rt"] }
+                    ],
+                    "features": {
+                        "stealth": ["tokio/full"],
+                        "stealth_opt": ["tk?/full"]
+                    }
+                },
+                { "name": "rust-cordis-sdk", "manifest_path": manifest("sdk"), "dependencies": [] },
+                { "name": "rust-cordis-host", "manifest_path": manifest("host"), "dependencies": [] },
+                { "name": "cordis-components", "manifest_path": manifest("components"), "dependencies": [] },
+                { "name": "cordis-cli", "manifest_path": manifest("cli"), "dependencies": [] }
+            ]
+        });
+        let violations = check_metadata_dag(&forwarded_metadata, &root, CRATE_RULES);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("stealth") && v.contains("tokio/full")),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("stealth_opt") && v.contains("tk?/full")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn consumer_lockfile_and_markdown_link_guards_catch_drift_and_dead_links() {
+        let stale_lock = r#"
+[[package]]
+name = "rust-cordis-abi"
+version = "0.1.3"
+[[package]]
+name = "rust-cordis-core"
+version = "0.1.5"
+[[package]]
+name = "rust-cordis-host"
+version = "0.1.3"
+"#;
+        let lock_v = check_consumer_lockfile_str(stale_lock, "0.1.5");
+        assert!(
+            lock_v
+                .iter()
+                .any(|v| v.contains("rust-cordis-abi") && v.contains("0.1.3")),
+            "{lock_v:?}"
+        );
+        assert!(
+            lock_v
+                .iter()
+                .any(|v| v.contains("rust-cordis-host") && v.contains("0.1.3")),
+            "{lock_v:?}"
+        );
+
+        let tmp = TempDir::new("dead-doc");
+        std::fs::create_dir_all(tmp.path.join("docs")).unwrap();
+        std::fs::write(
+            tmp.path.join("README.md"),
+            "见 [`docs/deleted.md`](docs/deleted.md)\n```\ndocs/ignored_in_fence.md\n```\n",
+        )
+        .unwrap();
+        let doc_v = check_markdown_doc_links(&tmp.path);
+        assert_eq!(doc_v.len(), 1, "{doc_v:?}");
+        assert!(doc_v[0].contains("docs/deleted.md"), "{doc_v:?}");
     }
 
     #[test]

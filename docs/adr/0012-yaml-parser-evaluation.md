@@ -1,7 +1,7 @@
 # ADR 0012：YAML 语料基线与 `serde_yaml` 替代库评估（O12）
 
 - 状态：已采纳（2026-11-23）
-- 关联：`docs/runtime-optimization-plan.md` O12、`crates/host/src/patch.rs`、`crates/host/tests/yaml_corpus.rs`
+- 关联：`crates/host/src/patch.rs`、`crates/host/tests/yaml_corpus.rs`
 
 ## 1. 背景与现状
 

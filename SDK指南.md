@@ -391,8 +391,7 @@ mode 下的真实超时仍按 `Err(elapsed)` 记为 `timed_out/unknown`，不是
 解释；`tool_error` / `model_start_error` 验证普通失败也会形成唯一终止并释放
 资源。每次运行还写
 `reports/*.events.jsonl`，终止事件带按消息保存的部分快照和独立的
-`status` / `certainty`。报告见 `../desolate/AGENT-REPORT.md`，事件协议见
-[`docs/agent-stream-protocol.md`](docs/agent-stream-protocol.md)。
+`status` / `certainty`。报告见 `../desolate/AGENT-REPORT.md`。
 
 接入结论：失败流只带文本原因，已经消费的 token 可见，未读缓冲会被丢弃；需要
 保留全部部分输出时要单独改流错误协议。`DispatchPolicy` 不是宿主调用的通用截止

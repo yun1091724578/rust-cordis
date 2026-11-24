@@ -25,6 +25,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - shell: bash
+        run: rustc --version | grep -q '^rustc 1\.98\.1 '
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path tests/consumer-service/Cargo.toml -- --check
       - run: cargo xtask inventory --check
@@ -45,6 +47,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - shell: bash
+        run: rustc --version | grep -q '^rustc 1\.98\.1 '
       - run: cargo test --workspace --all-targets --locked
       - run: cargo test --workspace --doc --locked
       - run: cargo xtask consumer
@@ -71,4 +75,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - shell: bash
+        run: rustc --version | grep -q '^rustc 1\.98\.1 '
       - run: cargo package -p rust-cordis-core -p rust-cordis-abi -p rust-cordis-host -p rust-cordis-macros -p rust-cordis-sdk --no-verify --locked

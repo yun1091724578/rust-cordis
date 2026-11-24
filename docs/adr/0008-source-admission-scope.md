@@ -141,4 +141,4 @@ App-A 的裸源读的是同一个 cell，于是 A 的本地未登记插件被拒
   ——探测的校验与打开共用一份快照。
 - `crates/host/src/loader/source_admission_tests.rs::reload_one_rejects_a_staged_copy_with_different_bytes`
   ——暂存副本在打开前被换掉时按已校验 hash 拒绝。
-- 记录与边界：`docs/roadmap.md` 的 O9 条目。
+- 记录与边界：`docs/support-contract.md` 的插件来源准入条目。

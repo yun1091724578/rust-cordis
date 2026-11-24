@@ -2,7 +2,7 @@
 
 - **状态**：已接受（0.1 约束）；0.2 暂缓（2026-11-15）
 - **日期**：2026-11-13
-- **依据**：`docs/api-inventory.md`、`docs/roadmap.md`、`crates/host/tests/embedding_contract.rs`
+- **依据**：`docs/api-inventory.md`、`docs/support-contract.md`、`crates/host/tests/embedding_contract.rs`
 
 ## 1. 背景
 

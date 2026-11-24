@@ -3,7 +3,7 @@
 - **状态**：已接受（2026-11-07；2026-11-18 修订：新增 §2.3 受审流水线签发）
 - **日期**：2026-11-07（修订 2026-11-18）
 - **依据**：`README.md`《定位与边界》；`docs/support-contract.md` 非目标；
-  `docs/adr/0001-second-carrier.md`；`docs/architecture-review.md`；
+  `docs/adr/0001-second-carrier.md`；
   `docs/adr/0009-rsi-deployment-substrate.md`；
   `docs/release.md` 的 0.1.0/0.1.1 发布记录
 - **决定摘要**：本仓只承诺承载**第一方、可审查、随宿主发布**的 T1/T2 插件；

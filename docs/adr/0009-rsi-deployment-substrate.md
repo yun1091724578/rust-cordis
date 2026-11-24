@@ -1,6 +1,6 @@
 # ADR 0009：RSI 部署与观测底座的位置
 
-- **状态**：已接受（2026-11-18；设计决策，实现见 `docs/roadmap.md` 的对应条目）
+- **状态**：已接受（2026-11-18；设计决策，保证与证据索引见 `docs/support-contract.md`）
 - **日期**：2026-11-18
 - **依据**：`docs/adr/0005-trust-model-and-plugin-source-boundary.md`（§2.3、§I1）、
   `docs/adr/0001-second-carrier.md`、`docs/adr/0006-public-api-stability.md`、
@@ -261,11 +261,11 @@ ADR 0005 的信任模型冲突：循环产物是模型生成代码，逐个人�
 - 新增 §4 表中的公开项，须按 ADR 0006 登记，并在 0.2 时统一评估；
 - 单实例宿主意味着金丝雀期间新旧变体不同时在线，回滚是“换回上一版”而非
   “按比例切流”；
-- 若没有真实消费者（见 roadmap 的接入门），本 ADR 的实施投入会沉没。
+- 若没有真实消费者，本 ADR 的实施投入会沉没。
 
 ## 6. 验收与证据
 
-本 ADR 是设计决策，验收落在 roadmap 的对应任务条目：
+本 ADR 是设计决策，验收证据登记在 `docs/support-contract.md`：
 
 - 逐跳事实：A→B→C 中 C 失败时产出三条记录（若 A 是根则两条），
   `parent_call_id` 串成链；按叶子 Err 聚合能把失败归到 C（细节见 ADR 0010 §6）；
