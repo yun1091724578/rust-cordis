@@ -676,6 +676,54 @@ fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool
     false
 }
 
+fn yaml_is_explicit_false(val: &YamlValue) -> bool {
+    matches!(val, YamlValue::Bool(false))
+}
+
+fn yaml_is_const_false_condition(val: &YamlValue) -> bool {
+    match val {
+        YamlValue::Bool(false) => true,
+        YamlValue::String(s) => {
+            let trimmed = s.trim();
+            let inner = trimmed
+                .strip_prefix("${{")
+                .and_then(|rest| rest.strip_suffix("}}"))
+                .map(str::trim)
+                .unwrap_or(trimmed);
+            inner.eq_ignore_ascii_case("false")
+        }
+        _ => false,
+    }
+}
+
+fn job_is_blocking_ci(job_map: &serde_yaml::Mapping) -> bool {
+    if let Some(cond) = job_map.get(YamlValue::String("if".to_string())) {
+        if yaml_is_const_false_condition(cond) {
+            return false;
+        }
+    }
+    job_map
+        .get(YamlValue::String("continue-on-error".to_string()))
+        .map(yaml_is_explicit_false)
+        .unwrap_or(true)
+}
+
+fn step_is_unconditional_and_blocking(step_map: &serde_yaml::Mapping) -> bool {
+    // 任何 `if:` 条件（如 `if: false` / `if: ${{ false }}` / 仅限部分事件或平台）
+    // 都可能跳过版本校验，因此一律不计入阻断 CI 的版本断言（fail closed）。
+    if step_map.contains_key(YamlValue::String("if".to_string())) {
+        return false;
+    }
+    // `continue-on-error` 缺失或显式为布尔 `false` 才可阻断 CI；
+    // `true`、`${{ true }}` 或任何表达式都可能放行失败。
+    if let Some(coe) = step_map.get(YamlValue::String("continue-on-error".to_string())) {
+        if !yaml_is_explicit_false(coe) {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn check_toolchain_pin_and_ci_sync(
     repo_root: &Path,
     workflows_dir: &Path,
@@ -840,7 +888,10 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                         }
                     }
                     if let Some(run_script) = yaml_str(step_map, "run") {
-                        if step_verifies_rustc_version(run_script, expected_job_tc) {
+                        if job_is_blocking_ci(job_map)
+                            && step_is_unconditional_and_blocking(step_map)
+                            && step_verifies_rustc_version(run_script, expected_job_tc)
+                        {
                             has_rustc_version_check = true;
                         }
                     }
@@ -1703,6 +1754,66 @@ version = "0.1.3"
         assert!(
             problems.iter().any(|p| p.contains("rustc --version")),
             "仅含 echo 提示的 workflow 必须触发版本校验缺失告警：{problems:?}"
+        );
+
+        // 带 `if: false`、`if: ${{ false }}`、条件 `if:`、`continue-on-error: true`、
+        // `continue-on-error: ${{ true }}` 或 job 级 `continue-on-error: true` 的版本断言
+        // 不能阻断 CI，必须全部拒绝。
+        for (label, job_extra, step_extra) in [
+            ("step-if-false", "", "        if: false\n"),
+            ("step-if-expr-false", "", "        if: ${{ false }}\n"),
+            (
+                "step-if-cond",
+                "",
+                "        if: github.event_name == 'release'\n",
+            ),
+            ("step-coe-true", "", "        continue-on-error: true\n"),
+            (
+                "step-coe-expr",
+                "",
+                "        continue-on-error: ${{ true }}\n",
+            ),
+            ("job-coe-true", "    continue-on-error: true\n", ""),
+            ("job-if-false", "    if: false\n", ""),
+            ("job-if-expr-false", "    if: ${{ false }}\n", ""),
+        ] {
+            let tmp_nb = TempDir::new(label);
+            let wf_nb = tmp_nb.path.join(".github").join("workflows");
+            std::fs::create_dir_all(&wf_nb).unwrap();
+            std::fs::write(
+                tmp_nb.path.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"1.98.1\"\n",
+            )
+            .unwrap();
+            let yaml = format!(
+                "permissions:\n  contents: read\njobs:\n  lint:\n    runs-on: ubuntu-latest\n{job_extra}    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n{step_extra}"
+            );
+            std::fs::write(wf_nb.join("ci.yml"), yaml).unwrap();
+            let nb_problems = check_toolchain_pin_and_ci_sync(&tmp_nb.path, &wf_nb);
+            assert!(
+                nb_problems.iter().any(|p| p.contains("rustc --version")),
+                "非阻断版本断言夹具 `{label}` 必须被拒绝：{nb_problems:?}"
+            );
+        }
+
+        // 显式 `continue-on-error: false` 且无 `if:` 的版本断言可阻断 CI，应放行。
+        let tmp_ok = TempDir::new("step-coe-false");
+        let wf_ok = tmp_ok.path.join(".github").join("workflows");
+        std::fs::create_dir_all(&wf_ok).unwrap();
+        std::fs::write(
+            tmp_ok.path.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.98.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf_ok.join("ci.yml"),
+            "permissions:\n  contents: read\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - continue-on-error: false\n        run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+        )
+        .unwrap();
+        let ok_problems = check_toolchain_pin_and_ci_sync(&tmp_ok.path, &wf_ok);
+        assert!(
+            ok_problems.is_empty(),
+            "显式 continue-on-error: false 的阻断断言应放行：{ok_problems:?}"
         );
     }
 }

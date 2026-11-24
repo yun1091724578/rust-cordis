@@ -106,6 +106,7 @@
 | `Fiber::spawn_scoped` | fn | `crates/core/src/fiber.rs` |
 | `Fiber::scoped_task_count` | fn | `crates/core/src/fiber.rs` |
 | `SpawnScopedError` | enum | `crates/core/src/fiber.rs` |
+| `ReloadDeferred` | struct | `crates/core/src/fiber.rs` |
 | `FiberState` | enum | `crates/core/src/fiber.rs` |
 | `Plugin` | trait | `crates/core/src/store.rs` |
 | `ExternService` | trait | `crates/core/src/dyn_value.rs` |

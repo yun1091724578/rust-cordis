@@ -187,6 +187,12 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub enum SpawnScopedError",
     },
     PublicItem {
+        item: "ReloadDeferred",
+        kind: "struct",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub struct ReloadDeferred",
+    },
+    PublicItem {
         item: "FiberState",
         kind: "enum",
         source: "crates/core/src/fiber.rs",
@@ -1311,7 +1317,7 @@ pub struct Q {
             42,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 108, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 109, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 33, "载荷清单数量漂移");
     }
 
@@ -1330,6 +1336,7 @@ pub struct Q {
             "`service_impl`",
             "`Context`",
             "`Context::spawn_scoped`",
+            "`ReloadDeferred`",
             "`StreamSink::fail_error`",
             "`Ctx::stream_fail_payload`",
             "`DERIVED_HANDLE_TAG`",

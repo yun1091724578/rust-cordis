@@ -3,7 +3,7 @@
 
 use cordis_core::{
     current_correlation_id, plugin_fn, scope_correlation, App, Config, Ctx, FiberState, Inject,
-    SpawnScopedError,
+    ReloadDeferred, SpawnScopedError, UpdateOutcome,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -583,24 +583,31 @@ async fn spawn_scoped_reentrant_provider_ancestor_and_restart_do_not_deadlock() 
             .expect("App::close 必须收敛");
     }
 
-    // 3. 受管任务内调用所属 fiber.restart().await 不得自锁且能完成重载。
+    // 3. 受管任务内调用所属 fiber.restart().await 不得自锁，必须显式返回 ReloadDeferred 且后台完成重载。
     {
         let app = App::new();
         let gen = Arc::new(AtomicUsize::new(0));
         let gen_in = gen.clone();
         let second_gen_ready = Arc::new(Notify::new());
         let second_gen_in = second_gen_ready.clone();
+        let (restart_res_tx, restart_res_rx) = oneshot::channel();
+        let restart_res_tx = Arc::new(Mutex::new(Some(restart_res_tx)));
+        let restart_res_in = restart_res_tx.clone();
         let fiber = app
             .plugin(
                 plugin_fn("self-restarter", Inject::default(), move |ctx: Ctx, _| {
                     let gen = gen_in.clone();
                     let second_gen_ready = second_gen_in.clone();
+                    let restart_res_tx = restart_res_in.clone();
                     Box::pin(async move {
                         let current = gen.fetch_add(1, Ordering::SeqCst) + 1;
                         if current == 1 {
                             let owner = ctx.fiber();
                             ctx.spawn_scoped(move |_cancel| async move {
-                                let _ = owner.restart().await;
+                                let res = owner.restart().await;
+                                if let Some(tx) = restart_res_tx.lock().unwrap().take() {
+                                    let _ = tx.send(res);
+                                }
                             })?;
                         } else {
                             second_gen_ready.notify_one();
@@ -613,10 +620,317 @@ async fn spawn_scoped_reentrant_provider_ancestor_and_restart_do_not_deadlock() 
             .await
             .unwrap();
 
+        let err = tokio::time::timeout(Duration::from_secs(2), restart_res_rx)
+            .await
+            .expect("受管任务重入 restart 不得自锁")
+            .unwrap()
+            .expect_err("受管任务重入 restart 不得在重载完成前返回 Ok(())");
+        let deferred = err
+            .downcast_ref::<ReloadDeferred>()
+            .expect("重入 restart 应显式返回 ReloadDeferred");
+        assert!(deferred.is_scheduled(), "Tokio 运行时内后台收敛应已调度");
+        assert_eq!(deferred.fiber_name(), "self-restarter");
+
         tokio::time::timeout(Duration::from_secs(2), second_gen_ready.notified())
             .await
             .expect("受管任务触发 restart 后新一代必须装载完成");
+        fiber.settle().await;
         assert_eq!(gen.load(Ordering::SeqCst), 2);
+        assert_eq!(fiber.state(), FiberState::Active);
+        app.close().await;
+    }
+}
+
+#[tokio::test]
+async fn spawn_scoped_reentrant_restart_reports_deferred_when_next_gen_apply_fails() {
+    use std::sync::atomic::AtomicUsize;
+
+    // 1. 自身受管任务调用 fiber.restart().await，新一代 apply() 明确失败：
+    //    调用方绝不得收到 Ok(())，必须收到 ReloadDeferred，且外部 settle 后看到 Failed。
+    {
+        let app = App::new();
+        let gen = Arc::new(AtomicUsize::new(0));
+        let gen_in = gen.clone();
+        let (res_tx, res_rx) = oneshot::channel();
+        let res_tx = Arc::new(Mutex::new(Some(res_tx)));
+        let res_tx_in = res_tx.clone();
+
+        let fiber = app
+            .plugin(
+                plugin_fn("fail-on-gen2", Inject::default(), move |ctx: Ctx, _| {
+                    let gen = gen_in.clone();
+                    let res_tx = res_tx_in.clone();
+                    Box::pin(async move {
+                        let current = gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        if current == 1 {
+                            let owner = ctx.fiber();
+                            ctx.spawn_scoped(move |_cancel| async move {
+                                let res = owner.restart().await;
+                                if let Some(tx) = res_tx.lock().unwrap().take() {
+                                    let _ = tx.send(res);
+                                }
+                            })?;
+                            Ok(())
+                        } else {
+                            Err("gen2 apply failed intentionally".into())
+                        }
+                    })
+                }),
+                Config::Null,
+            )
+            .await
+            .expect("第一代必须装载成功");
+
+        let err = tokio::time::timeout(Duration::from_secs(2), res_rx)
+            .await
+            .expect("受管任务内调用 restart 不得自锁")
+            .unwrap()
+            .expect_err("新一代 apply 失败时，重入 restart 绝不得返回 Ok(())");
+        let deferred = err
+            .downcast_ref::<ReloadDeferred>()
+            .expect("重入 restart 必须显式区分请求已受理（ReloadDeferred）与重载已完成");
+        assert!(deferred.is_scheduled());
+        assert_eq!(deferred.fiber_name(), "fail-on-gen2");
+
+        // 外部 settle 等待后台重载收敛到最终态。
+        tokio::time::timeout(Duration::from_secs(2), fiber.settle())
+            .await
+            .expect("外部 settle 必须收敛");
+        assert_eq!(gen.load(Ordering::SeqCst), 2);
+        assert_eq!(fiber.state(), FiberState::Failed);
+        assert!(
+            fiber
+                .error()
+                .unwrap_or_default()
+                .contains("gen2 apply failed intentionally"),
+            "实际 error: {:?}",
+            fiber.error()
+        );
+        app.close().await;
+    }
+
+    // 2. 消费者受管任务调用提供者 provider.restart().await，提供者新一代 apply() 失败：
+    //    同样不得返回 Ok(())。
+    {
+        let app = App::new();
+        let prov_gen = Arc::new(AtomicUsize::new(0));
+        let prov_gen_in = prov_gen.clone();
+        let provider = app
+            .plugin(
+                plugin_fn("prov-fail-gen2", Inject::default(), move |ctx: Ctx, _| {
+                    let prov_gen = prov_gen_in.clone();
+                    Box::pin(async move {
+                        let current = prov_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        if current == 1 {
+                            let _ = ctx.provide("svc", cordis_core::Dyn::new(1u32))?;
+                            Ok(())
+                        } else {
+                            Err("provider gen2 boom".into())
+                        }
+                    })
+                }),
+                Config::Null,
+            )
+            .await
+            .unwrap();
+
+        let (res_tx, res_rx) = oneshot::channel();
+        let res_tx = Arc::new(Mutex::new(Some(res_tx)));
+        let res_tx_in = res_tx.clone();
+        let provider_in = provider.clone();
+        let _consumer = app
+            .plugin(
+                plugin_fn(
+                    "cons-restarts-prov",
+                    Inject::of(&["svc"]),
+                    move |ctx: Ctx, _| {
+                        let res_tx = res_tx_in.clone();
+                        let provider = provider_in.clone();
+                        Box::pin(async move {
+                            ctx.spawn_scoped(move |_cancel| async move {
+                                let res = provider.restart().await;
+                                if let Some(tx) = res_tx.lock().unwrap().take() {
+                                    let _ = tx.send(res);
+                                }
+                            })?;
+                            Ok(())
+                        })
+                    },
+                ),
+                Config::Null,
+            )
+            .await
+            .unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(2), res_rx)
+            .await
+            .expect("消费者受管任务重入 restart 提供者不得自锁")
+            .unwrap()
+            .expect_err("提供者新一代失败时，重入 restart 不得返回 Ok(())");
+        let deferred = err
+            .downcast_ref::<ReloadDeferred>()
+            .expect("应返回 ReloadDeferred");
+        assert!(deferred.is_scheduled());
+        assert_eq!(deferred.fiber_name(), "prov-fail-gen2");
+
+        tokio::time::timeout(Duration::from_secs(2), provider.settle())
+            .await
+            .expect("外部 settle 必须收敛");
+        assert_eq!(provider.state(), FiberState::Failed);
+        assert!(provider
+            .error()
+            .unwrap_or_default()
+            .contains("provider gen2 boom"));
+        app.close().await;
+    }
+}
+
+#[tokio::test]
+async fn spawn_scoped_reentrant_update_with_reports_deferred_when_next_gen_apply_fails() {
+    // 1. 重入 update_with() 触发重载且新一代 apply() 失败：不得返回 Ok(UpdateOutcome::Restarted)。
+    {
+        let app = App::new();
+        let (res_tx, res_rx) = oneshot::channel();
+        let res_tx = Arc::new(Mutex::new(Some(res_tx)));
+        let res_tx_in = res_tx.clone();
+
+        let fiber = app
+            .plugin(
+                plugin_fn(
+                    "self-updater",
+                    Inject::default(),
+                    move |ctx: Ctx, cfg: Config| {
+                        let res_tx = res_tx_in.clone();
+                        Box::pin(async move {
+                            if cfg.get("fail").and_then(|v| v.as_bool()) == Some(true) {
+                                return Err("updated config apply failed".into());
+                            }
+                            let owner = ctx.fiber();
+                            ctx.spawn_scoped(move |_cancel| async move {
+                                let res = owner
+                                    .update_with(serde_json::json!({ "fail": true }), false)
+                                    .await;
+                                if let Some(tx) = res_tx.lock().unwrap().take() {
+                                    let _ = tx.send(res);
+                                }
+                            })?;
+                            Ok(())
+                        })
+                    },
+                ),
+                serde_json::json!({ "fail": false }),
+            )
+            .await
+            .expect("首次装载必须成功");
+
+        let err = tokio::time::timeout(Duration::from_secs(2), res_rx)
+            .await
+            .expect("受管任务内调用 update_with 不得自锁")
+            .unwrap()
+            .expect_err("重入 update_with 在重载完成前绝不得返回 Ok(UpdateOutcome::Restarted)");
+        let deferred = err
+            .downcast_ref::<ReloadDeferred>()
+            .expect("重入 update_with 应显式返回 ReloadDeferred");
+        assert!(deferred.is_scheduled());
+        assert_eq!(deferred.fiber_name(), "self-updater");
+
+        tokio::time::timeout(Duration::from_secs(2), fiber.settle())
+            .await
+            .expect("外部 settle 必须收敛");
+        assert_eq!(fiber.state(), FiberState::Failed);
+        assert!(
+            fiber
+                .error()
+                .unwrap_or_default()
+                .contains("updated config apply failed"),
+            "实际 error: {:?}",
+            fiber.error()
+        );
+        app.close().await;
+    }
+
+    // 2. 重入 update() 同样透传 ReloadDeferred，不误报 Ok(())。
+    {
+        let app = App::new();
+        let (res_tx, res_rx) = oneshot::channel();
+        let res_tx = Arc::new(Mutex::new(Some(res_tx)));
+        let res_tx_in = res_tx.clone();
+
+        let fiber = app
+            .plugin(
+                plugin_fn(
+                    "self-update-compat",
+                    Inject::default(),
+                    move |ctx: Ctx, cfg: Config| {
+                        let res_tx = res_tx_in.clone();
+                        Box::pin(async move {
+                            if cfg.get("fail").and_then(|v| v.as_bool()) == Some(true) {
+                                return Err("compat update apply failed".into());
+                            }
+                            let owner = ctx.fiber();
+                            ctx.spawn_scoped(move |_cancel| async move {
+                                let res = owner.update(serde_json::json!({ "fail": true })).await;
+                                if let Some(tx) = res_tx.lock().unwrap().take() {
+                                    let _ = tx.send(res);
+                                }
+                            })?;
+                            Ok(())
+                        })
+                    },
+                ),
+                serde_json::json!({ "fail": false }),
+            )
+            .await
+            .unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(2), res_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("重入 update() 不得误报 Ok(())");
+        assert!(err.downcast_ref::<ReloadDeferred>().is_some());
+
+        fiber.settle().await;
+        assert_eq!(fiber.state(), FiberState::Failed);
+        app.close().await;
+    }
+
+    // 3. 若 internal/update 钩子否决了更新，无需重载，重入 update_with 仍同步返回 Vetoed。
+    {
+        let app = App::new();
+        let (res_tx, res_rx) = oneshot::channel();
+        let res_tx = Arc::new(Mutex::new(Some(res_tx)));
+        let res_tx_in = res_tx.clone();
+
+        let fiber = app
+            .plugin(
+                plugin_fn("veto-in-scoped", Inject::default(), move |ctx: Ctx, _| {
+                    let res_tx = res_tx_in.clone();
+                    Box::pin(async move {
+                        ctx.on("internal/update", |_call| Box::pin(async { None }));
+                        let owner = ctx.fiber();
+                        ctx.spawn_scoped(move |_cancel| async move {
+                            let res = owner
+                                .update_with(serde_json::json!({ "v": 2 }), false)
+                                .await;
+                            if let Some(tx) = res_tx.lock().unwrap().take() {
+                                let _ = tx.send(res);
+                            }
+                        })?;
+                        Ok(())
+                    })
+                }),
+                serde_json::json!({ "v": 1 }),
+            )
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), res_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("被钩子否决的更新不触发重载，应同步返回 Vetoed");
+        assert_eq!(outcome, UpdateOutcome::Vetoed);
         assert_eq!(fiber.state(), FiberState::Active);
         app.close().await;
     }

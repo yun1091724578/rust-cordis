@@ -176,6 +176,81 @@ impl std::fmt::Display for SpawnScopedError {
 
 impl std::error::Error for SpawnScopedError {}
 
+/// 受管后台任务重入调用 [`Fiber::restart`] / [`Fiber::update`] / [`Fiber::update_with`] 时，
+/// 重载请求已被受理并移交后台任务异步执行，但当前任务不能同步等待卸载/重载完成，因此无法
+/// 报告新一代 `apply()` 的最终成败。
+///
+/// 为什么不能返回 `Ok(())` 或 [`UpdateOutcome::Restarted`]：
+/// `unload()` 必须等待当前受管任务退出后才能进入新一代 `load()`；在当前任务退出前读取
+/// `fiber.error()` 只会看到旧一代状态，新一代 `apply()` 随后失败进入 [`FiberState::Failed`]
+/// 时会误报重载成功。调用方可通过 `err.downcast_ref::<ReloadDeferred>()` 明确区分
+/// “重载请求已受理（推迟执行）”与“重载已完成”或“装载已失败”，并在受管任务外部通过
+/// [`Fiber::settle`] / [`Fiber::state`] / [`Fiber::error`] 观测最终收敛结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReloadDeferred {
+    fiber_name: String,
+    scheduled: bool,
+}
+
+impl ReloadDeferred {
+    fn scheduled(fiber_name: String) -> Self {
+        Self {
+            fiber_name,
+            scheduled: true,
+        }
+    }
+
+    fn unscheduled(fiber_name: String) -> Self {
+        Self {
+            fiber_name,
+            scheduled: false,
+        }
+    }
+
+    /// 目标 fiber 名称。
+    pub fn fiber_name(&self) -> &str {
+        &self.fiber_name
+    }
+
+    /// 后台收敛任务是否已成功调度到当前 Tokio 运行时。
+    ///
+    /// 在受管任务正常运行的 Tokio 上下文内为 `true`；若当前线程无活跃运行时则为 `false`
+    /// （此时 `revision`/配置已更新，需外部调用 [`Fiber::settle`] 推进收敛）。
+    pub fn is_scheduled(&self) -> bool {
+        self.scheduled
+    }
+}
+
+impl std::fmt::Display for ReloadDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.scheduled {
+            write!(
+                f,
+                "fiber `{}` 的重入重载请求已受理并移交后台异步执行，无法在当前受管任务内等待新一代 apply() 结果",
+                self.fiber_name
+            )
+        } else {
+            write!(
+                f,
+                "fiber `{}` 的重入重载请求已更新目标状态，但当前线程无 Tokio 运行时，未能调度后台收敛",
+                self.fiber_name
+            )
+        }
+    }
+}
+
+impl std::error::Error for ReloadDeferred {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettleDisposition {
+    /// 本次调用已同步等到状态机收敛。
+    Completed,
+    /// 当前任务会被本 fiber 卸载/清理等待退出，收敛已移交后台任务。
+    Deferred,
+    /// 当前任务会被本 fiber 卸载/清理等待退出，且没有可用的 Tokio 运行时推进后台收敛。
+    DeferredNoRuntime,
+}
+
 /// 一条由 fiber 拥有的原生后台任务（`call_iface_stream` 提供者任务与 `Ctx::spawn_scoped` 任务）。
 ///
 /// effect 栈能保证"卸载时执行 disposer"，但它不适合承载**可提前完成**的任务：
@@ -1638,19 +1713,32 @@ impl Fiber {
     }
 
     /// 收敛：把状态推向 desired 与 running 一致的那个不动点。
+    ///
+    /// 若在“本 fiber 卸载/清理必须等待退出”的受管后台任务内部调用，收敛会移交到独立
+    /// 后台任务并立即返回，避免与 `dispose_native_tasks` 自锁；需要确认重载最终结果
+    /// 的调用方应在受管任务外部等待 [`Fiber::settle`] 或检查 [`ReloadDeferred`]。
     pub fn settle(self: &Arc<Self>) -> crate::dyn_value::BoxFuture<()> {
+        let fut = self.settle_inner();
+        Box::pin(async move {
+            let _ = fut.await;
+        })
+    }
+
+    fn settle_inner(self: &Arc<Self>) -> crate::dyn_value::BoxFuture<SettleDisposition> {
         let this = self.clone();
         Box::pin(async move {
             // 若当前线程正在运行一条会被本 fiber 卸载/清理等待退出的受管后台任务，
             // 不能在当前任务内等待 `driver`/卸载完成（会与 `dispose_native_tasks` 自锁）；
-            // 改为在独立后台任务推进收敛并立即返回，让当前受管任务能够退出。
+            // 改为在独立后台任务推进收敛并显式向调用方报告“已推迟/未完成”。
             if current_task_waited_by(&this) {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                return if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
                         this.settle().await;
                     });
-                }
-                return;
+                    SettleDisposition::Deferred
+                } else {
+                    SettleDisposition::DeferredNoRuntime
+                };
             }
             let _guard = this.driver.lock().await;
             loop {
@@ -1699,6 +1787,7 @@ impl Fiber {
                         .await;
                 }
             }
+            SettleDisposition::Completed
         })
     }
 
@@ -1877,14 +1966,23 @@ impl Fiber {
     // --------------------------------------------------------------- 公开操作
 
     /// 强制重载：递增 revision 让 epoch 必变，然后收敛。
+    ///
+    /// 若在“本 fiber 卸载必须等待退出”的受管后台任务内部重入调用，重载请求会被受理并
+    /// 移交后台任务执行，但本调用返回 `Err`（具体类型为 [`ReloadDeferred`]），绝不把
+    /// 尚未执行的新一代 `apply()` 误报为 `Ok(())`。
     pub async fn restart(self: &Arc<Self>) -> Result<()> {
         self.assert_active();
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.refresh_desired();
-        self.settle().await;
-        match self.error() {
-            Some(err) => Err(err.into()),
-            None => Ok(()),
+        match self.settle_inner().await {
+            SettleDisposition::Completed => match self.error() {
+                Some(err) => Err(err.into()),
+                None => Ok(()),
+            },
+            SettleDisposition::Deferred => Err(Box::new(ReloadDeferred::scheduled(self.name()))),
+            SettleDisposition::DeferredNoRuntime => {
+                Err(Box::new(ReloadDeferred::unscheduled(self.name())))
+            }
         }
     }
 
@@ -2022,10 +2120,15 @@ impl Fiber {
 
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.refresh_desired();
-        self.settle().await;
-        match self.error() {
-            Some(err) => Err(err.into()),
-            None => Ok(UpdateOutcome::Restarted),
+        match self.settle_inner().await {
+            SettleDisposition::Completed => match self.error() {
+                Some(err) => Err(err.into()),
+                None => Ok(UpdateOutcome::Restarted),
+            },
+            SettleDisposition::Deferred => Err(Box::new(ReloadDeferred::scheduled(self.name()))),
+            SettleDisposition::DeferredNoRuntime => {
+                Err(Box::new(ReloadDeferred::unscheduled(self.name())))
+            }
         }
     }
 

@@ -37,8 +37,8 @@ pub use dyn_value::{
 };
 pub use event::{is_bailed, Args, Call, Filter, Handler, Mode, Next, Ret};
 pub use fiber::{
-    Fiber, FiberState, PendingInject, PendingReason, SpawnScopedError, UpdateOutcome, UID_DISPOSED,
-    UID_ROOT,
+    Fiber, FiberState, PendingInject, PendingReason, ReloadDeferred, SpawnScopedError,
+    UpdateOutcome, UID_DISPOSED, UID_ROOT,
 };
 pub use hook_scope::{ScopeAnchor, ScopePredicate};
 pub use iface::Iface;
