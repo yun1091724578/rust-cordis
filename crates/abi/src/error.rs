@@ -129,7 +129,9 @@ mod tests {
             .with_detail(json!({ "status": 429, "retry_after_ms": 5000 }));
         let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(payload.clone());
         assert_eq!(boxed.to_string(), "rate limited");
-        let recovered = boxed.downcast_ref::<ErrorPayload>().expect("downcast works");
+        let recovered = boxed
+            .downcast_ref::<ErrorPayload>()
+            .expect("downcast works");
         assert_eq!(recovered, &payload);
     }
 }

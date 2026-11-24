@@ -1,6 +1,6 @@
 //! O12 YAML 语料回归套件：钉住 `cordis.yml` / `cordis.patch.yml` 的全部保留语义与边界。
 //!
-//! 覆盖项（对照 `docs/runtime-optimization-plan.md` O12）：
+//! 覆盖项：
 //! 1. `!!js` 标签（`disabled` 与嵌套 `config`）及 `dump_entries`/`dump_overlay` 往返；
 //! 2. 引号内字面量（单引号 `''` 转义、双引号 `\"` 转义）与注释、词尾粘连 `note!!js`；
 //! 3. 块标量（`|` / `>`）与非 `!!js` 本地标签（`!other 5` 不误判为 `JsExpr`）；

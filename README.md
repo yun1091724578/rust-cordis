@@ -79,9 +79,7 @@ manifest 示例：
 示例插件写出 `provides` / `requires`；`seal --verify` 校验的是生成器写出的规范
 字节。`PluginDesc` 自述仍不参与求解。
 
-当前执行入口见 [`docs/roadmap.md`](docs/roadmap.md)：仓外真实接入与发布收尾并行。
-已知交付缺口、调用通道边界和维护事项见 [`docs/architecture-review.md`](docs/architecture-review.md)。
-根目录设计长文保留历史背景，不作为当前进度或支持承诺。
+支持契约见 [`docs/support-contract.md`](docs/support-contract.md)，设计决策见 `docs/adr/`。
 
 ## 快速开始
 

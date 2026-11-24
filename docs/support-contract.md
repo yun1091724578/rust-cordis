@@ -7,8 +7,7 @@
 - 本文件回答**这个 SDK 承诺什么、不承诺什么、承诺的东西由哪个测试兜底**。
 
 保证索引检查只验证证据引用的有效性，不能自动证明断言充分或某个平台实际执行。
-平台结果以 `docs/platform-matrix.md` 的 run/commit 快照为准；独立使用与交付缺口见
-`docs/architecture-review.md`，其任务统一在 `docs/roadmap.md`；新增保证在对应工作包中同步登记。
+平台结果以 `docs/platform-matrix.md` 的 run/commit 快照为准；新增保证同步登记到本文件。
 
 ## 定位
 
@@ -134,5 +133,4 @@ T1 = 链进宿主的原生插件；T2 = 同进程动态库插件；T3 = 进程�
 - `tests/fixtures/abi-v1/README.md`：冻结 ABI v1 夹具的 provenance 与冻结纪律
 - `tests/fixtures/abi-error/README.md`：跟随当前布局的结构化错误夹具说明
 - `tests/fixtures/abi-err-v1/README.md`：独立旧 ABI 错误夹具说明
-- `docs/roadmap.md`：分阶段执行计划
 
