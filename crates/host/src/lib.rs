@@ -51,6 +51,7 @@ pub use policy::{
 };
 pub use staging::{describe, mount, resolve_plugin_path, stage_plugin, staged_leaked, StagedFile};
 
+#[cfg(test)]
 use cordis_abi::ERROR_FORMAT_V1;
 use ffi_buf::{
     args_to_json, call_op, call_op_read, call_plugin, decode_plugin_error, error_arg, fail,
@@ -725,6 +726,7 @@ static HOST_API: HostApi = HostApi {
     ctx_stream_fail: Some(host_stream_fail),
     error_format: cordis_abi::ERROR_FORMAT_V1,
     reserved: 0,
+    ctx_stream_fail_payload: Some(host_stream_fail_payload),
 };
 
 /// 宿主函数表（`HostApi`）：插件的 `attach` 收到的就是它。
@@ -1054,10 +1056,11 @@ unsafe extern "C" fn host_stream_close(handle: u64, dispatch_id: u64, out: *mut 
     })
 }
 
-/// #22（ADR 0001 §5）：失败收尾——`reason` 直达消费者（缓冲丢弃）。
+/// #22（ADR 0001 §5）：纯文本失败收尾——`reason` 原样直达消费者（缓冲丢弃）。
 ///
-/// 当插件声明 `ERROR_FORMAT_V1` 且 `reason` 是合法的 [`ErrorPayload`] JSON 线格式时，
-/// 通过 [`StreamSink::fail_error`] 保留完整结构化载荷；其余按纯文本透传（向后兼容旧插件）。
+/// 始终保持纯文本语义，即使插件声明 `ERROR_FORMAT_V1` 且错误文本恰好长得像 JSON
+/// 也不重解释；需要传递结构化 [`ErrorPayload`] 请走独立尾追加入口
+/// `ctx_stream_fail_payload`（#23）。
 #[allow(clippy::result_large_err)]
 unsafe extern "C" fn host_stream_fail(
     handle: u64,
@@ -1072,20 +1075,43 @@ unsafe extern "C" fn host_stream_fail(
             Some(None) => Err(stream_protocol_error(format!(
                 "dispatch {dispatch_id} 不是流：失败收尾只对 ctx.call_iface_stream 开的流有意义"
             ))),
-            Some(Some(sink)) => {
-                let outcome = if instance.error_format >= ERROR_FORMAT_V1 {
-                    match ErrorPayload::from_json(&reason) {
-                        Some(payload) => sink.fail_error(payload),
-                        None => sink.fail(reason),
-                    }
-                } else {
-                    sink.fail(reason)
-                };
-                Ok(match outcome {
-                    PushOutcome::Sent => STATUS_OK,
-                    _ => STATUS_STREAM_GONE,
-                })
-            }
+            Some(Some(sink)) => Ok(match sink.fail(reason) {
+                PushOutcome::Sent => STATUS_OK,
+                _ => STATUS_STREAM_GONE,
+            }),
+        }
+    })
+}
+
+/// #23（ADR 0004 扩展）：结构化错误载荷失败收尾——按 [`ErrorPayload`] JSON 解码后
+/// 经 [`StreamSink::fail_error`] 交付给消费者（缓冲丢弃）。
+///
+/// 与 `ctx_stream_fail`（纯文本）分离，保证：
+/// - `0.1.5` 插件经 `ctx_stream_fail` 传入的普通 JSON 错误文本不被误解析；
+/// - `0.1.6` 插件在 `0.1.5` 宿主（仅声明 `ERROR_FORMAT_V1`、无本字段）上自动降级为纯文本。
+#[allow(clippy::result_large_err)]
+unsafe extern "C" fn host_stream_fail_payload(
+    handle: u64,
+    dispatch_id: u64,
+    payload: Blob,
+    out: *mut Out,
+) -> i32 {
+    let parsed = payload.try_as_str().ok().and_then(ErrorPayload::from_json);
+    with_stream_instance(handle, out, move |instance| {
+        let Some(payload) = parsed else {
+            return Err(stream_protocol_error(
+                "ctx_stream_fail_payload 需要合法的 ErrorPayload JSON 载荷".to_string(),
+            ));
+        };
+        match stream_of(instance, dispatch_id) {
+            None => Ok(STATUS_STREAM_GONE),
+            Some(None) => Err(stream_protocol_error(format!(
+                "dispatch {dispatch_id} 不是流：失败收尾只对 ctx.call_iface_stream 开的流有意义"
+            ))),
+            Some(Some(sink)) => Ok(match sink.fail_error(payload) {
+                PushOutcome::Sent => STATUS_OK,
+                _ => STATUS_STREAM_GONE,
+            }),
         }
     })
 }

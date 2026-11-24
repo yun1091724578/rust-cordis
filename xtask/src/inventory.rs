@@ -898,10 +898,17 @@ const PAYLOADS: &[Payload] = &[
     },
     Payload {
         entry: "ctx_stream_fail",
-        request: "dispatch_id + reason（文本或 ErrorPayload JSON，按插件能力位解析）",
+        request: "dispatch_id + reason（纯文本错误，始终原样交付）",
         response: "STATUS_OK / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段）",
         source: "crates/host/src/lib.rs",
         marker: "fn host_stream_fail(",
+    },
+    Payload {
+        entry: "ctx_stream_fail_payload",
+        request: "dispatch_id + ErrorPayload JSON 线格式（独立尾追加能力；0.1.5 宿主缺失时 SDK 自动降级到 ctx_stream_fail）",
+        response: "STATUS_OK / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（非法 JSON 返回协议错误）",
+        source: "crates/host/src/lib.rs",
+        marker: "fn host_stream_fail_payload(",
     },
     Payload {
         entry: "error_format",
@@ -1301,11 +1308,11 @@ pub struct Q {
         assert_eq!(structs.len(), 4, "ABI 结构体数量漂移");
         assert_eq!(
             structs.iter().map(|item| item.fields.len()).sum::<usize>(),
-            41,
+            42,
             "ABI 字段总数漂移"
         );
         assert_eq!(PUBLIC_ITEMS.len(), 108, "受控公开入口数量漂移");
-        assert_eq!(PAYLOADS.len(), 32, "载荷清单数量漂移");
+        assert_eq!(PAYLOADS.len(), 33, "载荷清单数量漂移");
     }
 
     #[test]

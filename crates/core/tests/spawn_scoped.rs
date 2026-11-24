@@ -434,3 +434,398 @@ async fn fiber_spawn_scoped_inherits_ambient_correlation_and_rejects_failed_fibe
 
     app.close().await;
 }
+
+#[tokio::test]
+async fn spawn_scoped_self_dispose_initiates_shutdown_and_exits_without_deadlock() {
+    let app = App::new();
+    let disposer_ran = Arc::new(AtomicBool::new(false));
+    let disposer_ran_in = disposer_ran.clone();
+    let (task_returned_tx, task_returned_rx) = oneshot::channel();
+    let task_returned_tx = Arc::new(Mutex::new(Some(task_returned_tx)));
+    let task_returned_in = task_returned_tx.clone();
+
+    let fiber = app
+        .plugin(
+            plugin_fn("self-disposer", Inject::default(), move |ctx: Ctx, _| {
+                let disposer_ran = disposer_ran_in.clone();
+                let task_returned_tx = task_returned_in.clone();
+                Box::pin(async move {
+                    let _ = ctx.effect(move |_| {
+                        cordis_core::Disposable::sync(move || {
+                            disposer_ran.store(true, Ordering::SeqCst);
+                        })
+                    });
+                    let owner = ctx.fiber();
+                    ctx.spawn_scoped(move |_cancel| async move {
+                        owner.dispose().await;
+                        if let Some(tx) = task_returned_tx.lock().unwrap().take() {
+                            let _ = tx.send(true);
+                        }
+                    })?;
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        )
+        .await
+        .expect("插件挂载成功");
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), task_returned_rx)
+            .await
+            .expect("受管任务内调用 fiber.dispose().await 不得自锁")
+            .unwrap(),
+        "受管任务应正常返回并退出"
+    );
+
+    // 外部再次 await dispose()，等待后台清理任务彻底完成。
+    tokio::time::timeout(Duration::from_secs(2), fiber.dispose())
+        .await
+        .expect("后台清理必须完成");
+
+    assert_eq!(fiber.state(), FiberState::Disposed);
+    assert!(
+        disposer_ran.load(Ordering::SeqCst),
+        "fiber 的 effect 必须被释放"
+    );
+    assert_eq!(fiber.scoped_task_count(), 0);
+    app.close().await;
+}
+
+#[tokio::test]
+async fn spawn_scoped_reentrant_provider_ancestor_and_restart_do_not_deadlock() {
+    use std::sync::atomic::AtomicUsize;
+
+    // 1. 消费者受管任务调用提供者 fiber.dispose().await 不得自锁。
+    {
+        let app = App::new();
+        let provider = app
+            .plugin(
+                plugin_fn("prov", Inject::default(), |ctx: Ctx, _| {
+                    Box::pin(async move {
+                        let _ = ctx.provide("svc", cordis_core::Dyn::new(1u32))?;
+                        Ok(())
+                    })
+                }),
+                Config::Null,
+            )
+            .await
+            .unwrap();
+
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+        let done_tx_in = done_tx.clone();
+        let provider_in = provider.clone();
+        let _consumer = app
+            .plugin(
+                plugin_fn("cons", Inject::of(&["svc"]), move |ctx: Ctx, _| {
+                    let done_tx = done_tx_in.clone();
+                    let provider = provider_in.clone();
+                    Box::pin(async move {
+                        ctx.spawn_scoped(move |_cancel| async move {
+                            provider.dispose().await;
+                            if let Some(tx) = done_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                        })?;
+                        Ok(())
+                    })
+                }),
+                Config::Null,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), done_rx)
+            .await
+            .expect("消费者受管任务内 dispose 提供者不得自锁")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), provider.dispose())
+            .await
+            .expect("提供者清理必须完成");
+        app.close().await;
+    }
+
+    // 2. 子 fiber 受管任务调用祖先 root_fiber.dispose().await 不得自锁。
+    {
+        let app = App::new();
+        let root = app.root_fiber();
+        let (done_tx, done_rx) = oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+        let done_tx_in = done_tx.clone();
+        let root_in = root.clone();
+        let _child = app
+            .plugin(
+                plugin_fn("child", Inject::default(), move |ctx: Ctx, _| {
+                    let done_tx = done_tx_in.clone();
+                    let root = root_in.clone();
+                    Box::pin(async move {
+                        ctx.spawn_scoped(move |_cancel| async move {
+                            root.dispose().await;
+                            if let Some(tx) = done_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                        })?;
+                        Ok(())
+                    })
+                }),
+                Config::Null,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), done_rx)
+            .await
+            .expect("子 fiber 受管任务内 dispose 祖先不得自锁")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), app.close())
+            .await
+            .expect("App::close 必须收敛");
+    }
+
+    // 3. 受管任务内调用所属 fiber.restart().await 不得自锁且能完成重载。
+    {
+        let app = App::new();
+        let gen = Arc::new(AtomicUsize::new(0));
+        let gen_in = gen.clone();
+        let second_gen_ready = Arc::new(Notify::new());
+        let second_gen_in = second_gen_ready.clone();
+        let fiber = app
+            .plugin(
+                plugin_fn("self-restarter", Inject::default(), move |ctx: Ctx, _| {
+                    let gen = gen_in.clone();
+                    let second_gen_ready = second_gen_in.clone();
+                    Box::pin(async move {
+                        let current = gen.fetch_add(1, Ordering::SeqCst) + 1;
+                        if current == 1 {
+                            let owner = ctx.fiber();
+                            ctx.spawn_scoped(move |_cancel| async move {
+                                let _ = owner.restart().await;
+                            })?;
+                        } else {
+                            second_gen_ready.notify_one();
+                        }
+                        Ok(())
+                    })
+                }),
+                Config::Null,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), second_gen_ready.notified())
+            .await
+            .expect("受管任务触发 restart 后新一代必须装载完成");
+        assert_eq!(gen.load(Ordering::SeqCst), 2);
+        assert_eq!(fiber.state(), FiberState::Active);
+        app.close().await;
+    }
+}
+
+#[tokio::test]
+async fn spawn_scoped_unpolled_drop_releases_resources_before_signaling_close() {
+    struct BlockingResource {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for BlockingResource {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            if let Some(rx) = self.release.lock().unwrap().take() {
+                let _ = rx.recv();
+            }
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let app = App::new();
+    let root_fiber = app.root_fiber();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let resource = BlockingResource {
+        entered: entered_tx,
+        release: Arc::new(Mutex::new(Some(release_rx))),
+        dropped: dropped.clone(),
+    };
+
+    // 独立单线程运行时：不驱动其事件循环，从而保证任务在首次 poll 之前就被 drop。
+    let other_rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("构建独立运行时");
+    {
+        let _enter = other_rt.enter();
+        app.root
+            .spawn_scoped(move |_cancel| async move {
+                let _hold = resource;
+                std::future::pending::<()>().await;
+            })
+            .expect("spawn_scoped 应成功");
+    }
+    assert_eq!(root_fiber.scoped_task_count(), 1);
+
+    // 在后台 OS 线程上销毁 other_rt，触发未首次 poll 任务的析构。
+    let drop_thread = std::thread::spawn(move || {
+        drop(other_rt);
+    });
+
+    // 等到资源进入 Drop 并阻塞在 release_rx 上。
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("未首次 poll 的任务必须开始析构其捕获资源");
+
+    assert!(!dropped.load(Ordering::SeqCst), "资源析构此时仍被阻塞");
+    assert_eq!(
+        root_fiber.scoped_task_count(),
+        1,
+        "资源析构未完成前不得提前摘除任务槽位"
+    );
+
+    // 并发发起 App::close()：在资源完成释放前绝不得提前返回。
+    let close_done = Arc::new(AtomicBool::new(false));
+    let close_done_in = close_done.clone();
+    let close_handle = tokio::spawn(async move {
+        app.close().await;
+        close_done_in.store(true, Ordering::SeqCst);
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        !close_done.load(Ordering::SeqCst),
+        "任务资源析构尚未结束时，App::close() 不得提前返回"
+    );
+
+    // 放行资源析构；之后任务完成信号才可发出，App::close() 应立即完成。
+    release_tx.send(()).unwrap();
+    drop_thread.join().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), close_handle)
+        .await
+        .expect("资源释放后 App::close() 必须及时返回")
+        .expect("close 任务不得 panic");
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(root_fiber.scoped_task_count(), 0);
+}
+
+#[tokio::test]
+async fn native_stream_unpolled_drop_releases_resources_before_signaling_close() {
+    use cordis_core::{AsyncStream, BoxFuture, ExternService, Result, StreamSink};
+
+    struct BlockingResource {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for BlockingResource {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            if let Some(rx) = self.release.lock().unwrap().take() {
+                let _ = rx.recv();
+            }
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct StreamSvc {
+        resource: Mutex<Option<BlockingResource>>,
+    }
+    impl ExternService for StreamSvc {
+        fn service(&self) -> &str {
+            "stream-svc"
+        }
+
+        fn version(&self) -> u32 {
+            1
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["open".to_string()]
+        }
+
+        fn call(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> BoxFuture<Result<Config>> {
+            Box::pin(async { Ok(Config::Null) })
+        }
+
+        fn call_stream(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+            _sink: StreamSink,
+        ) -> BoxFuture<Result<()>> {
+            let res = self.resource.lock().unwrap().take();
+            Box::pin(async move {
+                let _hold = res;
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        }
+    }
+
+    let app = App::new();
+    let root_fiber = app.root_fiber();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let svc = Arc::new(StreamSvc {
+        resource: Mutex::new(Some(BlockingResource {
+            entered: entered_tx,
+            release: Arc::new(Mutex::new(Some(release_rx))),
+            dropped: dropped.clone(),
+        })),
+    });
+    let _provide = app.root.provide_iface("stream-svc", svc).unwrap();
+
+    let other_rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("构建独立运行时");
+    let _stream: AsyncStream = {
+        let _enter = other_rt.enter();
+        app.root
+            .call_iface_stream("stream-svc", 1, "open", Config::Null)
+            .expect("call_iface_stream 应成功")
+    };
+    assert_eq!(root_fiber.scoped_task_count(), 1);
+
+    let drop_thread = std::thread::spawn(move || {
+        drop(other_rt);
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("原生流任务未首次 poll 被丢弃时必须先析构资源");
+    assert_eq!(
+        root_fiber.scoped_task_count(),
+        1,
+        "原生流任务资源释放完成前不得摘除任务槽位"
+    );
+
+    let close_done = Arc::new(AtomicBool::new(false));
+    let close_done_in = close_done.clone();
+    let close_handle = tokio::spawn(async move {
+        app.close().await;
+        close_done_in.store(true, Ordering::SeqCst);
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        !close_done.load(Ordering::SeqCst),
+        "原生流任务资源尚未释放完成时，App::close() 不得提前返回"
+    );
+
+    release_tx.send(()).unwrap();
+    drop_thread.join().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), close_handle)
+        .await
+        .expect("资源释放后 App::close() 必须返回")
+        .expect("close 任务不得 panic");
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(root_fiber.scoped_task_count(), 0);
+}

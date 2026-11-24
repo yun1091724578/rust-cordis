@@ -118,11 +118,13 @@ fn host_api_v1_function_fields_are_frozen() {
         "ctx_isolate 必须紧跟 v1 前缀（v2 只许尾追加）"
     );
 
-    // v2 尾追加序（附录 A #12–#22）：isolate → intercept → use → dispose → dispose_self →
-    // fulfill → next → abort → stream_push → stream_close → stream_fail → error_format → reserved。
+    // v2 尾追加序（附录 A #12–#23）：isolate → intercept → use → dispose → dispose_self →
+    // fulfill → next → abort → stream_push → stream_close → stream_fail → error_format →
+    // reserved → stream_fail_payload。
     // （M2b/M2c 追加 `ctx_next`/`ctx_abort`，流（ADR 0001 §5）追加三个 `ctx_stream_*`，
-    //   ADR 0004 追加结构化错误能力位与尾部保留字——v1/v2 前缀部分逐字未动。）
-    let v2_tail: [(&str, usize); 13] = [
+    //   ADR 0004 追加结构化错误能力位与尾部保留字，0.1.6 尾追加独立的结构化流错误入口
+    //   `ctx_stream_fail_payload`——v1/v2 前缀部分逐字未动。）
+    let v2_tail: [(&str, usize); 14] = [
         ("ctx_isolate", offset_of!(HostApi, ctx_isolate)),
         ("ctx_intercept", offset_of!(HostApi, ctx_intercept)),
         ("ctx_use", offset_of!(HostApi, ctx_use)),
@@ -136,6 +138,10 @@ fn host_api_v1_function_fields_are_frozen() {
         ("ctx_stream_fail", offset_of!(HostApi, ctx_stream_fail)),
         ("error_format", offset_of!(HostApi, error_format)),
         ("reserved", offset_of!(HostApi, reserved)),
+        (
+            "ctx_stream_fail_payload",
+            offset_of!(HostApi, ctx_stream_fail_payload),
+        ),
     ];
     for pair in v2_tail.windows(2) {
         assert!(
@@ -155,7 +161,12 @@ fn host_api_v1_function_fields_are_frozen() {
     );
     assert_eq!(
         v2_tail[12].1 + size_of::<u32>(),
+        v2_tail[13].1,
+        "ctx_stream_fail_payload 必须紧跟 reserved（8 字节对齐）"
+    );
+    assert_eq!(
+        v2_tail[13].1 + size_of::<Option<cordis_abi::CtxStreamFailFn>>(),
         size_of::<HostApi>(),
-        "reserved 必须是尾字段（后续里程碑只许再尾追加）"
+        "ctx_stream_fail_payload 必须是尾字段（后续里程碑只许再尾追加）"
     );
 }

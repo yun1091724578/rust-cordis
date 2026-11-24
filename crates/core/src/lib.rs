@@ -134,9 +134,25 @@ impl App {
     ///
     /// 消费 `App`，关闭后不能再挂插件；外层若还持有 `Ctx`/`Store` 克隆，
     /// 只保证这棵 root 树拥有的资源无残留。
+    /// 若在受管后台任务内部调用，则会发起根树关闭并推迟到根树彻底释放后再清空 hook，
+    /// 避免清理与任务互相等待。
     pub async fn close(self) {
-        self.root_fiber().dispose().await;
-        self.store.clear_hooks();
+        let root = self.root_fiber();
+        let reentrant = root.is_current_task_waited_by();
+        root.dispose().await;
+        if reentrant {
+            let store = self.store.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    root.wait_disposed().await;
+                    store.clear_hooks();
+                });
+            } else {
+                self.store.clear_hooks();
+            }
+        } else {
+            self.store.clear_hooks();
+        }
     }
 }
 

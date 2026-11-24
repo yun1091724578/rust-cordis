@@ -30,6 +30,7 @@
 //! - **tracked effect 等价**（最终没有残留注册，代价是中间态多存在一个微任务周期）；
 //! - **emission 不等价**：抢占点之后发出的 `emit` 依然会到达监听者，JS 里不会。
 //!   这条差别的可执行断言在 `core/tests/failure_modes.rs`（P2-13）。
+#![allow(clippy::missing_const_for_thread_local)]
 
 use crate::dyn_value::{BoxFuture, Config, Disposable, Dyn, Error, Result};
 use crate::event::{Args, Handler, Mode, Ret, INTERNAL_UPDATE};
@@ -185,7 +186,7 @@ struct NativeTaskSlot {
     done: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
-/// 任务结束时（包括 panic / 被丢弃）发送完成信号并摘除登记。
+/// 任务结束时（包括 panic / 被丢弃）摘除登记并发送完成信号。
 struct NativeTaskDone {
     fiber: Weak<Fiber>,
     id: u64,
@@ -194,11 +195,144 @@ struct NativeTaskDone {
 
 impl Drop for NativeTaskDone {
     fn drop(&mut self) {
+        if let Some(fiber) = self.fiber.upgrade() {
+            fiber.native_tasks.lock().unwrap().remove(&self.id);
+        }
         if let Some(done) = self.done.take() {
             let _ = done.send(());
         }
-        if let Some(fiber) = self.fiber.upgrade() {
-            fiber.native_tasks.lock().unwrap().remove(&self.id);
+    }
+}
+
+thread_local! {
+    /// 当前 poll 窗口内正在执行的受管原生后台任务所属 fiber（`spawn_scoped` / `spawn_native_task`）。
+    ///
+    /// 公开生命周期入口靠它识别“任务正在等待自己的 fiber（或其祖先/提供者）收敛/关闭”，
+    /// 避免清理等任务、任务等清理的自锁。
+    static CURRENT_NATIVE_TASK_FIBER: std::cell::RefCell<Option<Weak<Fiber>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct NativeTaskGuard {
+    previous: Option<Weak<Fiber>>,
+}
+
+impl Drop for NativeTaskGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CURRENT_NATIVE_TASK_FIBER.with(|cell| {
+            *cell.borrow_mut() = previous;
+        });
+    }
+}
+
+fn enter_native_task(owner: Weak<Fiber>) -> NativeTaskGuard {
+    let previous = CURRENT_NATIVE_TASK_FIBER.with(|cell| cell.borrow_mut().replace(owner));
+    NativeTaskGuard { previous }
+}
+
+fn current_native_task_fiber() -> Option<Arc<Fiber>> {
+    CURRENT_NATIVE_TASK_FIBER.with(|cell| cell.borrow().as_ref().and_then(Weak::upgrade))
+}
+
+/// 当前线程是否正在执行一条由 `target` 卸载/处置时会等待退出的受管原生任务。
+///
+/// 只要当前任务所属 fiber 沿「父链（祖先 dispose 递归 dispose 子 fiber）」或
+/// 「依赖边（提供者 unload/dispose 等待依赖者卸载）」可达 `target`，
+/// `target` 的清理/卸载就必须等当前任务退出；当前任务绝不能反向等待 `target` 收敛。
+fn current_task_waited_by(target: &Arc<Fiber>) -> bool {
+    let Some(owner) = current_native_task_fiber() else {
+        return false;
+    };
+    let target_ptr = Arc::as_ptr(target);
+    let mut stack = vec![owner];
+    let mut seen = HashSet::new();
+    while let Some(fiber) = stack.pop() {
+        let ptr = Arc::as_ptr(&fiber);
+        if ptr == target_ptr {
+            return true;
+        }
+        if !seen.insert(ptr as usize) {
+            continue;
+        }
+        if let Some(parent) = fiber.parent_ctx().and_then(|ctx| ctx.fiber_opt()) {
+            stack.push(parent);
+        }
+        let dep_impls: Vec<(Box<str>, Arc<Impl>)> = fiber
+            .deps
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (name, dep) in dep_impls {
+            if let Some(provider) = dep.fiber.upgrade() {
+                if !fiber.is_cycle_blocked(&name) && !fiber.is_ancestor_of(&provider) {
+                    stack.push(provider);
+                }
+            }
+        }
+        let committed_impls: Vec<(Box<str>, Arc<Impl>)> = fiber
+            .committed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|view| {
+                view.values()
+                    .flat_map(|by_name| by_name.iter().map(|(k, v)| (k.clone(), v.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (name, dep) in committed_impls {
+            if let Some(provider) = dep.fiber.upgrade() {
+                if !Arc::ptr_eq(&provider, &fiber)
+                    && !fiber.is_cycle_blocked(&name)
+                    && !fiber.is_ancestor_of(&provider)
+                {
+                    stack.push(provider);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 受管原生后台任务的 Future 包装（零 `unsafe`）。
+///
+/// 两个硬不变量：
+/// 1. **析构顺序不变量**：`future` 声明在 `_done` 之前，Rust 保证按字段声明顺序析构；
+///    无论正常完成、panic 展开、还是**尚未首次 `poll` 即被运行时丢弃**，`future` 捕获的
+///    全部资源都严格先于 `NativeTaskDone`（摘除槽位 + 发送完成信号）释放。
+/// 2. **poll 级身份追踪**：每次 `poll` 压入所属 fiber（含可选 `correlation_id`），
+///    返回或 unwind 自动恢复，供生命周期入口识别重入自锁。
+struct ScopedTaskFuture {
+    future: Option<BoxFuture<()>>,
+    owner: Weak<Fiber>,
+    correlation_id: Option<Arc<str>>,
+    /// 必须保持为最后一个字段。
+    _done: NativeTaskDone,
+}
+
+impl std::future::Future for ScopedTaskFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let Some(fut) = this.future.as_mut() else {
+            return Poll::Ready(());
+        };
+        let _task_guard = enter_native_task(this.owner.clone());
+        let _corr_guard = this
+            .correlation_id
+            .as_ref()
+            .map(|cid| crate::trace::enter_correlation(Some(cid.clone())));
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                // 在 `_done` 析构前先显式释放内层 future 及其捕获资源。
+                this.future = None;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -1313,6 +1447,7 @@ impl Fiber {
                 .map(|cid| crate::trace::enter_correlation(Some(cid.clone())));
             task(cancel.clone())
         };
+        let future: BoxFuture<()> = Box::pin(future);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let id = self.native_task_sn.fetch_add(1, Ordering::SeqCst);
         self.native_tasks.lock().unwrap().insert(
@@ -1322,20 +1457,19 @@ impl Fiber {
                 done: Mutex::new(Some(done_rx)),
             }),
         );
-        // 在 `async move` 之外构造完成守卫：即使任务尚未首次 poll 即被运行时丢弃，
-        // `NativeTaskDone::drop` 也会立即执行并摘除槽位；正常完成或 panic 展开时
-        // 块首 `let _done = done;` 仍严格保证 `future` 先于 `_done` 释放。
+        // 由 `ScopedTaskFuture` 显式约束字段析构顺序（`future` 先于 `_done`）：
+        // 即使任务尚未首次 poll 即被运行时丢弃，也保证先释放任务捕获的资源，
+        // 再摘除槽位并通知 `dispose()` / `App::close()` 完成。
         let done = NativeTaskDone {
             fiber: Arc::downgrade(self),
             id,
             done: Some(done_tx),
         };
-        handle.spawn(async move {
-            let _done = done;
-            match correlation_id {
-                Some(cid) => crate::trace::scope_correlation(cid, future).await,
-                None => future.await,
-            }
+        handle.spawn(ScopedTaskFuture {
+            future: Some(future),
+            owner: Arc::downgrade(self),
+            correlation_id,
+            _done: done,
         });
         Ok(cancel)
     }
@@ -1364,6 +1498,7 @@ impl Fiber {
         {
             return Err("cannot create effect on inactive context".into());
         }
+        let future: BoxFuture<()> = Box::pin(future);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let id = self.native_task_sn.fetch_add(1, Ordering::SeqCst);
         self.native_tasks.lock().unwrap().insert(
@@ -1378,9 +1513,11 @@ impl Fiber {
             id,
             done: Some(done_tx),
         };
-        handle.spawn(async move {
-            let _done = done;
-            future.await;
+        handle.spawn(ScopedTaskFuture {
+            future: Some(future),
+            owner: Arc::downgrade(self),
+            correlation_id: None,
+            _done: done,
         });
         Ok(())
     }
@@ -1504,6 +1641,17 @@ impl Fiber {
     pub fn settle(self: &Arc<Self>) -> crate::dyn_value::BoxFuture<()> {
         let this = self.clone();
         Box::pin(async move {
+            // 若当前线程正在运行一条会被本 fiber 卸载/清理等待退出的受管后台任务，
+            // 不能在当前任务内等待 `driver`/卸载完成（会与 `dispose_native_tasks` 自锁）；
+            // 改为在独立后台任务推进收敛并立即返回，让当前受管任务能够退出。
+            if current_task_waited_by(&this) {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        this.settle().await;
+                    });
+                }
+                return;
+            }
             let _guard = this.driver.lock().await;
             loop {
                 // 处置是终态：已处置的 fiber 一律收敛到"卸载"。
@@ -2002,9 +2150,13 @@ impl Fiber {
     ///
     /// 清理本身由一条独立的共享任务推进：调用者的 Future 被 timeout 丢弃不会
     /// 取消恢复栈；重复调用则等待同一次清理完成，而不是看到终态就提前返回。
+    ///
+    /// 若在“本 fiber 清理必须等待退出”的受管后台任务（`spawn_scoped` / 原生流任务）
+    /// 内部调用，则只发起关闭而不阻塞等待清理结束，避免清理等任务、任务等清理的自锁。
     pub fn dispose(self: &Arc<Self>) -> crate::dyn_value::BoxFuture<()> {
         let this = self.clone();
         Box::pin(async move {
+            let self_reentrant = current_task_waited_by(&this);
             let first = this.uid.swap(UID_DISPOSED, Ordering::SeqCst) != UID_DISPOSED;
             // 清理任务必须在**任何 await 之前**启动：否则调用者在 `close_effects()`
             // 等待在途 setup 时丢弃 Future，就会留下“uid 已置 DISPOSED、却没有
@@ -2014,8 +2166,14 @@ impl Fiber {
                 let _done = DisposeDone(this.clone());
                 this.finish_dispose().await;
             }
-            this.wait_disposed().await;
+            if !self_reentrant {
+                this.wait_disposed().await;
+            }
         })
+    }
+
+    pub(crate) fn is_current_task_waited_by(self: &Arc<Self>) -> bool {
+        current_task_waited_by(self)
     }
 
     /// 同步完成处置记账并启动共享清理任务；返回是否成功 spawn。
@@ -2116,7 +2274,7 @@ impl Fiber {
         *self.ctx_weak.lock().unwrap() = None;
     }
 
-    async fn wait_disposed(self: &Arc<Self>) {
+    pub(crate) async fn wait_disposed(self: &Arc<Self>) {
         let mut rx = self.dispose_tx.subscribe();
         while !*rx.borrow() {
             if rx.changed().await.is_err() {

@@ -90,7 +90,8 @@ fn truncated_host_api_reads_only_inside_its_own_copy() {
             && api.ctx_stream_close.is_none()
             && api.ctx_stream_fail.is_none()
             && api.error_format == 0
-            && api.reserved == 0,
+            && api.reserved == 0
+            && api.ctx_stream_fail_payload.is_none(),
         "size 之外的字段必须是零初始化的 None / 0（宿主不支持），绝不是越界读来的垃圾指针"
     );
     // size 比较保留作语义区分（`api!` 的探测谓词）：截断之外一律 None。

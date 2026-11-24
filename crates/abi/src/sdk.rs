@@ -313,9 +313,14 @@ impl Ctx {
         api!(self.host, ctx_stream_close, CtxStreamCloseFn)
     }
 
-    /// 流：失败收尾（#22）。
+    /// 流：纯文本失败收尾（#22）。
     fn stream_fail_fn(&self) -> Option<CtxStreamFailFn> {
         api!(self.host, ctx_stream_fail, CtxStreamFailFn)
+    }
+
+    /// 流：结构化错误载荷失败收尾（#23，`ErrorPayload` JSON 线格式）。
+    fn stream_fail_payload_fn(&self) -> Option<CtxStreamFailFn> {
+        api!(self.host, ctx_stream_fail_payload, CtxStreamFailFn)
     }
 
     /// 读服务（`ctx.get(name)` 的可选探测语义）。
@@ -603,19 +608,28 @@ impl Ctx {
         }
     }
 
-    /// 失败收尾这条流（#22，结构化错误载荷）：消费者**立刻**收到错误（缓冲丢弃）。
+    /// 失败收尾这条流（#23，结构化错误载荷）：消费者**立刻**收到错误（缓冲丢弃）。
     ///
-    /// 宿主声明 `ERROR_FORMAT_V1` 时经同一 C ABI 通道以 JSON 线格式传输完整
-    /// [`crate::ErrorPayload`]（保留 `code`/`category`/`certainty`/`retry`/`detail`）；
-    /// 旧宿主自动降级为纯文本 `payload.error`。与 [`Ctx::stream_fail`] 同样幂等。
+    /// 仅当宿主显式提供尾追加入口 [`HostApi::ctx_stream_fail_payload`] 时才传输完整
+    /// [`crate::ErrorPayload`] JSON（保留 `code`/`category`/`certainty`/`retry`/`detail`）；
+    /// 不提供该字段的旧宿主（包括仅声明 `ERROR_FORMAT_V1` 的 `0.1.5` 宿主）自动降级为
+    /// [`Ctx::stream_fail`] 纯文本 `payload.error`。与 [`Ctx::stream_fail`] 同样幂等。
     pub fn stream_fail_payload(
         &self,
         dispatch_id: u64,
         payload: &crate::ErrorPayload,
     ) -> PluginResult {
-        if self.host.error_format() >= crate::ERROR_FORMAT_V1 {
+        if let Some(api) = self.stream_fail_payload_fn() {
             let wire = payload.to_json();
-            self.stream_fail(dispatch_id, &wire)
+            match self.invoke_statused_safe(|out| unsafe {
+                api(self.handle, dispatch_id, Blob::new(wire.as_bytes()), out)
+            }) {
+                Ok((STATUS_OK, _)) | Ok((STATUS_STREAM_GONE, _)) => Ok(()),
+                Ok((other, _)) => Err(format!(
+                    "ctx_stream_fail_payload 返回了意料之外的状态码 {other}"
+                )),
+                Err(message) => Err(message),
+            }
         } else {
             self.stream_fail(dispatch_id, &payload.error)
         }
@@ -3507,16 +3521,23 @@ mod tests {
 
     #[test]
     fn stream_fail_payload_uses_structured_json_when_host_supports_it() {
-        static CAPTURED: Mutex<Option<String>> = Mutex::new(None);
-        unsafe extern "C" fn capture_fail(_: u64, _: u64, reason: Blob, _: *mut Out) -> i32 {
-            *CAPTURED.lock().unwrap() =
+        static CAPTURED_STRUCTURED: Mutex<Option<String>> = Mutex::new(None);
+        static TEXT_CALLED: Mutex<bool> = Mutex::new(false);
+        unsafe extern "C" fn capture_text(_: u64, _: u64, _: Blob, _: *mut Out) -> i32 {
+            *TEXT_CALLED.lock().unwrap() = true;
+            STATUS_OK
+        }
+        unsafe extern "C" fn capture_structured(_: u64, _: u64, reason: Blob, _: *mut Out) -> i32 {
+            *CAPTURED_STRUCTURED.lock().unwrap() =
                 Some(String::from_utf8_lossy(reason.as_bytes()).into_owned());
             STATUS_OK
         }
+        *TEXT_CALLED.lock().unwrap() = false;
         let host = Box::leak(Box::new(HostApi {
             abi_version: crate::ABI_VERSION,
             size: std::mem::size_of::<HostApi>() as u32,
-            ctx_stream_fail: Some(capture_fail),
+            ctx_stream_fail: Some(capture_text),
+            ctx_stream_fail_payload: Some(capture_structured),
             error_format: crate::ERROR_FORMAT_V1,
             ..HostApi::default()
         }));
@@ -3529,14 +3550,18 @@ mod tests {
             .with_detail(serde_json::json!({ "status": 429 }));
 
         ctx.stream_fail_payload(99, &payload)
-            .expect("结构化宿主上 stream_fail_payload 必须成功");
-        let wire = CAPTURED
+            .expect("提供 ctx_stream_fail_payload 的宿主上必须成功");
+        assert!(
+            !*TEXT_CALLED.lock().unwrap(),
+            "新宿主应走 ctx_stream_fail_payload，而非纯文本 ctx_stream_fail"
+        );
+        let wire = CAPTURED_STRUCTURED
             .lock()
             .unwrap()
             .take()
             .expect("宿主必须收到线格式载荷");
         let decoded = crate::ErrorPayload::from_json(&wire)
-            .expect("支持能力位的宿主必须收到可解析的 ErrorPayload JSON");
+            .expect("支持独立流错误能力的宿主必须收到可解析的 ErrorPayload JSON");
         assert_eq!(decoded, payload);
     }
 
@@ -3548,11 +3573,14 @@ mod tests {
                 Some(String::from_utf8_lossy(reason.as_bytes()).into_owned());
             STATUS_OK
         }
-        let legacy_size = std::mem::offset_of!(HostApi, error_format) as u32;
+        // 精确模拟 0.1.5 宿主：已经声明 ERROR_FORMAT_V1，但 size 截断在
+        // ctx_stream_fail_payload 之前（没有该独立流错误入口）。
+        let host_0_1_5_size = std::mem::offset_of!(HostApi, ctx_stream_fail_payload) as u32;
         let host = Box::leak(Box::new(HostApi {
             abi_version: crate::ABI_VERSION,
-            size: legacy_size,
+            size: host_0_1_5_size,
             ctx_stream_fail: Some(capture_fail),
+            ctx_stream_fail_payload: Some(capture_fail),
             error_format: crate::ERROR_FORMAT_V1,
             ..HostApi::default()
         }));
@@ -3562,12 +3590,15 @@ mod tests {
             .with_category("business");
 
         ctx.stream_fail_payload(99, &payload)
-            .expect("旧宿主降级路径必须成功");
+            .expect("0.1.5 宿主降级路径必须成功");
         let wire = CAPTURED
             .lock()
             .unwrap()
             .take()
-            .expect("旧宿主必须收到纯文本错误");
-        assert_eq!(wire, "plain human error");
+            .expect("0.1.5 宿主必须收到纯文本错误");
+        assert_eq!(
+            wire, "plain human error",
+            "0.1.5 宿主即使声明 ERROR_FORMAT_V1，也必须收到纯文本而非 JSON"
+        );
     }
 }

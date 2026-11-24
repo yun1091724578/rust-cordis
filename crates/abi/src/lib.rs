@@ -396,6 +396,14 @@ pub struct HostApi {
     /// 尾追加后的保留字：占住结构体尾部填充，保证后续字段从下一个 8 字节边界开始。
     /// 当前必须为 0；宿主与插件都不读取它。
     pub reserved: u32,
+    /// #23（ADR 0004 扩展）：带结构化 [`ErrorPayload`] JSON 线格式的流失败收尾。
+    ///
+    /// 与 [`HostApi::ctx_stream_fail`]（始终保持纯文本语义）独立协商：
+    /// - 仅声明 `ERROR_FORMAT_V1` 但无本字段的旧宿主（如 `0.1.5`）上，插件按 `size` 探测不到本字段，
+    ///   自动降级为 `ctx_stream_fail(payload.error)` 纯文本；
+    /// - 声明 `ERROR_FORMAT_V1` 的旧插件调用 `ctx_stream_fail` 传入普通 JSON 错误文本时，
+    ///   新宿主仍按纯文本原样交付，不会误解释为结构化载荷。
+    pub ctx_stream_fail_payload: Option<CtxStreamFailFn>,
 }
 
 impl HostApi {

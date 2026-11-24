@@ -36,8 +36,8 @@ CI run 记录，只有本地执行记录。
 | 丢弃 `dispose` Future 后剩余恢复栈仍执行 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/lifecycle_races.rs` |
 | 提供者先等直接消费者拆完再关资源 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/lifecycle_races.rs` |
 | 卸载行后宿主拆除时不残留插件对象 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/loader_release.rs` |
-| 流式失败端到端保留结构化错误类型（含跨 ABI 能力协商） | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/stream.rs` / `crates/abi/src/sdk.rs` / `crates/host/tests/abi_stream.rs` / `crates/host/tests/abi_stream_timeout.rs` |
-| 受管后台任务归属 fiber 生命周期（卸载取消并等待、完成摘除、透传 correlation） | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/spawn_scoped.rs` |
+| 流式失败端到端保留结构化错误类型（含跨 ABI 独立能力协商） | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/stream.rs` / `crates/abi/src/sdk.rs` / `crates/host/tests/abi_stream.rs` / `crates/host/tests/abi_stream_timeout.rs` |
+| 受管后台任务归属 fiber 生命周期（卸载取消并等待、完成摘除、防自锁与释放保序、透传 correlation） | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/spawn_scoped.rs` |
 | 取消后迟到的 `fulfill` 被拒绝 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/abi_m2c.rs` |
 | 未知 dispatch 的 abort 是可读错误 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/abi_m2c.rs` |
 | 同一键原地换值不重挂消费者 | 通过 | 通过 | 通过 | 通过 | `crates/components/tests/registry.rs` |

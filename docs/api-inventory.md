@@ -67,6 +67,7 @@
 | `HostApi` | `ctx_stream_fail` | `Option<CtxStreamFailFn>` | `crates/abi/src/lib.rs` |
 | `HostApi` | `error_format` | `u32` | `crates/abi/src/lib.rs` |
 | `HostApi` | `reserved` | `u32` | `crates/abi/src/lib.rs` |
+| `HostApi` | `ctx_stream_fail_payload` | `Option<CtxStreamFailFn>` | `crates/abi/src/lib.rs` |
 | `PluginDesc` | `abi_version` | `u32` | `crates/abi/src/lib.rs` |
 | `PluginDesc` | `size` | `u32` | `crates/abi/src/lib.rs` |
 | `PluginDesc` | `id` | `Blob` | `crates/abi/src/lib.rs` |
@@ -223,7 +224,8 @@
 | `ctx_abort` | dispatch_id + reason | STATUS_OK / STATUS_ERR | `crates/host/src/lib.rs` |
 | `ctx_stream_push` | dispatch_id + chunk + on_credit | STATUS_OK / STATUS_PENDING / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段） | `crates/host/src/lib.rs` |
 | `ctx_stream_close` | dispatch_id | STATUS_OK / STATUS_STREAM_GONE | `crates/host/src/lib.rs` |
-| `ctx_stream_fail` | dispatch_id + reason（文本或 ErrorPayload JSON，按插件能力位解析） | STATUS_OK / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段） | `crates/host/src/lib.rs` |
+| `ctx_stream_fail` | dispatch_id + reason（纯文本错误，始终原样交付） | STATUS_OK / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段） | `crates/host/src/lib.rs` |
+| `ctx_stream_fail_payload` | dispatch_id + ErrorPayload JSON 线格式（独立尾追加能力；0.1.5 宿主缺失时 SDK 自动降级到 ctx_stream_fail） | STATUS_OK / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（非法 JSON 返回协议错误） | `crates/host/src/lib.rs` |
 | `error_format` | 能力位：HostApi.error_format = 1；PluginDesc.error_format = 1 | STATUS_ERR 的 out：{"error": ..., "code": ..., "category": ..., "certainty": ..., "retry": ..., "detail": ...}；缺失/0 = 纯文本 | `crates/abi/src/lib.rs` |
 | `reserved` | HostApi 尾部保留字，必须为 0；不参与能力协商 | 0 | `crates/abi/src/lib.rs` |
 | `plugin_error_format` | PluginDesc.error_format = 1（provision 后的尾字段） | 0 / ERROR_FORMAT_V1；宿主按 PluginDesc.size 判界 | `crates/abi/src/lib.rs` |

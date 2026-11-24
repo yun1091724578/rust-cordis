@@ -546,11 +546,134 @@ fn yaml_env_var<'a>(map: &'a serde_yaml::Mapping, var: &str) -> Option<&'a str> 
         .and_then(|env| yaml_str(env, var))
 }
 
-fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool {
+fn contains_version_token(haystack: &str, expected_version: &str) -> bool {
     let escaped = expected_version.replace('.', "\\.");
-    run_script.contains("rustc --version")
-        && (run_script.contains(&format!("rustc {expected_version}"))
-            || run_script.contains(&format!("rustc {escaped}")))
+    let needles = [
+        format!("rustc {expected_version}"),
+        format!("rustc {escaped}"),
+    ];
+    for needle in &needles {
+        let mut rest = haystack;
+        while let Some(idx) = rest.find(needle.as_str()) {
+            let after = &rest[idx + needle.len()..];
+            // 禁止前缀误匹配（例如 1.98.1 误匹配 1.98.10）。
+            if !after.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                return true;
+            }
+            rest = after;
+        }
+    }
+    false
+}
+
+fn suppresses_failure(line: &str) -> bool {
+    if let Some((_, rhs)) = line.split_once("||") {
+        let rhs = rhs.trim();
+        if rhs == "true"
+            || rhs == ":"
+            || rhs.starts_with("true ")
+            || rhs.starts_with(": ")
+            || rhs.starts_with("echo ")
+            || rhs.starts_with("printf ")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_inline_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if !in_single && !in_double && (i == 0 || bytes[i - 1].is_ascii_whitespace()) => {
+                return &line[..i];
+            }
+            _ => {}
+        }
+    }
+    line
+}
+
+fn is_grep_assertion(rhs: &str, expected_version: &str) -> bool {
+    let rhs = rhs.trim();
+    let Some(rest) = rhs
+        .strip_prefix("grep")
+        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    else {
+        return false;
+    };
+    for token in rest.split_whitespace() {
+        if token == "--invert-match" {
+            return false;
+        }
+        if token.starts_with('-') && !token.starts_with("--") && token[1..].contains('v') {
+            return false;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+    }
+    contains_version_token(rest, expected_version)
+}
+
+fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool {
+    let mut captured_vars: Vec<String> = Vec::new();
+    for raw_line in run_script.lines() {
+        let line = strip_inline_comment(raw_line).trim();
+        if line.is_empty() || suppresses_failure(line) {
+            continue;
+        }
+        // 记录 `VAR=$(rustc --version)` 或 `VAR="$(rustc --version)"` 赋值。
+        if let Some((lhs, rhs)) = line.split_once('=') {
+            let var = lhs.trim();
+            let rhs_trimmed = rhs.trim().trim_matches('"').trim_matches('\'');
+            if !var.is_empty()
+                && var.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && (rhs_trimmed == "$(rustc --version)" || rhs_trimmed == "`rustc --version`")
+            {
+                captured_vars.push(var.to_string());
+                continue;
+            }
+        }
+        // 形态 1：`rustc --version | grep ... '<expected>'`（禁止多级管道掩盖退出码，拒绝 echo/注释伪造）。
+        if let Some((lhs, rhs)) = line.split_once('|') {
+            if !rhs.starts_with('|') {
+                let lhs = lhs.trim();
+                let grep_stage = rhs.split("||").next().unwrap_or(rhs).trim();
+                if lhs == "rustc --version"
+                    && !grep_stage.contains('|')
+                    && is_grep_assertion(grep_stage, expected_version)
+                {
+                    return true;
+                }
+            }
+        }
+        // 形态 2：shell 条件断言 `[[ "$(rustc --version)" == "rustc <ver>"* ]]` /
+        //        `[[ "$ver" == "rustc <ver>"* ]]`。
+        let expr = line.split("||").next().unwrap_or(line).trim();
+        if (expr.starts_with("[[ ") && expr.ends_with(" ]]"))
+            || (expr.starts_with("[ ") && expr.ends_with(" ]"))
+            || expr.starts_with("test ")
+        {
+            let references_rustc = expr.contains("$(rustc --version)")
+                || expr.contains("`rustc --version`")
+                || captured_vars.iter().any(|v| {
+                    expr.contains(&format!("${v}")) || expr.contains(&format!("${{{v}}}"))
+                });
+            let is_positive_cmp =
+                expr.contains("==") || expr.contains(" = ") || expr.contains("=~");
+            if references_rustc && is_positive_cmp && contains_version_token(expr, expected_version)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn check_toolchain_pin_and_ci_sync(
@@ -604,8 +727,12 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(doc) = serde_yaml::from_str::<YamlValue>(&text) else {
-            continue;
+        let doc = match serde_yaml::from_str::<YamlValue>(&text) {
+            Ok(doc) => doc,
+            Err(err) => {
+                problems.push(format!("{name}: YAML 解析失败（fail closed）: {err}"));
+                continue;
+            }
         };
         let scanned = scanned_uses(&text);
         for (line_no, action_ref, comment) in &scanned {
@@ -1522,6 +1649,60 @@ version = "0.1.3"
                 .iter()
                 .any(|v| v.contains("未登记分层") && v.contains("cordis-rogue")),
             "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn rustc_version_guard_rejects_echo_comments_and_non_failing_steps() {
+        // 真实会失败的断言必须放行。
+        assert!(step_verifies_rustc_version(
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 '",
+            "1.98.1"
+        ));
+        assert!(step_verifies_rustc_version(
+            "[[ \"$(rustc --version)\" == \"rustc 1.98.1 \"* ]]",
+            "1.98.1"
+        ));
+        assert!(step_verifies_rustc_version(
+            "ver=\"$(rustc --version)\"\n[[ \"$ver\" == \"rustc 1.98.1 \"* ]] || exit 1",
+            "1.98.1"
+        ));
+
+        // 任何不会失败的提示、注释、吞错、取反或前缀误匹配都必须拒绝。
+        for bad in [
+            "echo \"hint: rustc --version should be rustc 1.98.1\"",
+            "printf 'rustc --version | grep -q \"^rustc 1.98.1 \"\\n'",
+            "# rustc --version | grep -q '^rustc 1\\.98\\.1 '",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || true",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' | cat",
+            "rustc --version | grep -qv '^rustc 1\\.98\\.1 '",
+            "rustc --version | grep -q '^rustc 1\\.98\\.10 '",
+            "rustc --version; echo \"expected rustc 1.98.1\"",
+        ] {
+            assert!(
+                !step_verifies_rustc_version(bad, "1.98.1"),
+                "非失败断言 `{bad}` 必须被工具链守卫拒绝"
+            );
+        }
+
+        // 端到端 workflow 级反例：ci.yml 仅含 echo 提示必须判红。
+        let tmp = TempDir::new("echo-rustc-guard");
+        let wf_dir = tmp.path.join(".github").join("workflows");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            tmp.path.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.98.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf_dir.join("ci.yml"),
+            "permissions:\n  contents: read\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: 'echo \"hint: rustc --version should be rustc 1.98.1\"'\n",
+        )
+        .unwrap();
+        let problems = check_toolchain_pin_and_ci_sync(&tmp.path, &wf_dir);
+        assert!(
+            problems.iter().any(|p| p.contains("rustc --version")),
+            "仅含 echo 提示的 workflow 必须触发版本校验缺失告警：{problems:?}"
         );
     }
 }

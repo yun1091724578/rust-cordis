@@ -601,13 +601,15 @@ async fn dropping_the_stream_notifies_the_provider_and_settles_the_dispatch() {
 // ---------------------------------------------------------------- 跨 ABI 结构化流错误
 
 #[tokio::test]
-async fn stream_fail_decodes_structured_error_payload_only_when_plugin_has_capability() {
-    use cordis_abi::{ErrorPayload, ERROR_FORMAT_V1};
+async fn stream_fail_payload_is_separate_from_plain_text_stream_fail() {
+    use cordis_abi::{ErrorPayload, ERROR_FORMAT_V1, STATUS_ERR};
     use cordis_host::apply_via_with_error_format;
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     const STRUCTURED_IFACE: u64 = 91;
+    static INVALID_STATUS: AtomicI32 = AtomicI32::new(0);
 
-    unsafe extern "C" fn fail_with_json_payload(
+    unsafe extern "C" fn fail_with_dedicated_entry(
         handle: u64,
         op: u32,
         a: Blob,
@@ -627,7 +629,7 @@ async fn stream_fail_decodes_structured_error_payload_only_when_plugin_has_capab
                         handle,
                         Blob::new(b"sf@1"),
                         1,
-                        Blob::new(br#"["fail_structured"]"#),
+                        Blob::new(br#"["fail_structured","fail_plain_json","fail_malformed"]"#),
                         STRUCTURED_IFACE,
                         &mut probe,
                     ),
@@ -637,6 +639,7 @@ async fn stream_fail_decodes_structured_error_payload_only_when_plugin_has_capab
             OP_CALLBACK => {
                 let payload: Value = serde_json::from_slice(a.as_bytes()).unwrap_or(Value::Null);
                 let dispatch = payload["dispatch_id"].as_u64().unwrap_or(0);
+                let method = payload["method"].as_str().unwrap_or("");
                 let wire = ErrorPayload::new("upstream throttled")
                     .with_code("provider.rate_limited")
                     .with_category("business")
@@ -650,8 +653,29 @@ async fn stream_fail_decodes_structured_error_payload_only_when_plugin_has_capab
                     cap: raw.len(),
                     len: 0,
                 };
-                if let Some(fail) = host_api().ctx_stream_fail {
-                    let _ = fail(handle, dispatch, Blob::new(wire.as_bytes()), &mut probe);
+                match method {
+                    "fail_structured" => {
+                        if let Some(fail) = host_api().ctx_stream_fail_payload {
+                            let _ = fail(handle, dispatch, Blob::new(wire.as_bytes()), &mut probe);
+                        }
+                    }
+                    "fail_plain_json" => {
+                        // 0.1.5 风格插件：声明了 ERROR_FORMAT_V1，但经原 ctx_stream_fail
+                        // 传入长得像 ErrorPayload JSON 的普通错误文本。
+                        if let Some(fail) = host_api().ctx_stream_fail {
+                            let _ = fail(handle, dispatch, Blob::new(wire.as_bytes()), &mut probe);
+                        }
+                    }
+                    "fail_malformed" => {
+                        if let Some(fail) = host_api().ctx_stream_fail_payload {
+                            let st = fail(handle, dispatch, Blob::new(b"not json"), &mut probe);
+                            INVALID_STATUS.store(st, Ordering::SeqCst);
+                        }
+                        if let Some(fail) = host_api().ctx_stream_fail {
+                            let _ = fail(handle, dispatch, Blob::new(b"fallback text"), &mut probe);
+                        }
+                    }
+                    _ => {}
                 }
                 (*out).write(br#"{"ret":null}"#)
             }
@@ -660,16 +684,15 @@ async fn stream_fail_decodes_structured_error_payload_only_when_plugin_has_capab
         }
     }
 
-    // 1. 声明 ERROR_FORMAT_V1 的插件：宿主解码为结构化 ErrorPayload 传给 AsyncStream 消费者。
-    let app_v1 = App::new();
-    let plugin_v1: Arc<dyn Plugin> = Arc::new(cordis_core::FnPlugin {
+    let app = App::new();
+    let plugin: Arc<dyn Plugin> = Arc::new(cordis_core::FnPlugin {
         name: "sf-v1",
         key: cordis_core::unique_key("sf-v1"),
         inject: Inject::default(),
         validator: None,
         f: Arc::new(|ctx: Ctx, config: Config| {
             apply_via_with_error_format(
-                fail_with_json_payload,
+                fail_with_dedicated_entry,
                 ctx,
                 config,
                 "sf-v1",
@@ -677,53 +700,57 @@ async fn stream_fail_decodes_structured_error_payload_only_when_plugin_has_capab
             )
         }),
     });
-    let fiber_v1 = app_v1.root.plugin(plugin_v1, Config::Null);
-    fiber_v1.settle().await;
-    assert_eq!(fiber_v1.state(), FiberState::Active);
+    let fiber = app.root.plugin(plugin, Config::Null);
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Active);
 
-    let mut stream_v1 = app_v1
+    // 1. 独立入口 `ctx_stream_fail_payload`：宿主解码为结构化 ErrorPayload。
+    let mut stream_structured = app
         .root
         .call_iface_stream("sf@1", 1, "fail_structured", json!([]))
         .expect("开流");
-    let err_v1 = stream_v1.next().await.expect_err("必须返回结构化错误");
-    assert_eq!(err_v1.to_string(), "upstream throttled");
-    let decoded = err_v1
+    let err_structured = stream_structured
+        .next()
+        .await
+        .expect_err("必须返回结构化错误");
+    assert_eq!(err_structured.to_string(), "upstream throttled");
+    let decoded = err_structured
         .downcast_ref::<ErrorPayload>()
-        .expect("能力位为 ERROR_FORMAT_V1 的流失败必须保留 ErrorPayload");
+        .expect("ctx_stream_fail_payload 必须保留 ErrorPayload");
     assert_eq!(decoded.code, "provider.rate_limited");
     assert_eq!(decoded.category, "business");
     assert_eq!(decoded.certainty, "reported");
     assert_eq!(decoded.retry, "safe");
     assert_eq!(decoded.detail["status"], 429);
     assert_eq!(decoded.detail["retry_after_ms"], 5000);
-    app_v1.close().await;
 
-    // 2. 旧插件（error_format = 0）：即使发出长得像 JSON 的字符串，也按纯文本保留、不解析。
-    let app_legacy = App::new();
-    let plugin_legacy: Arc<dyn Plugin> = Arc::new(cordis_core::FnPlugin {
-        name: "sf-legacy",
-        key: cordis_core::unique_key("sf-legacy"),
-        inject: Inject::default(),
-        validator: None,
-        f: Arc::new(|ctx: Ctx, config: Config| {
-            apply_via_with_error_format(fail_with_json_payload, ctx, config, "sf-legacy", 0)
-        }),
-    });
-    let fiber_legacy = app_legacy.root.plugin(plugin_legacy, Config::Null);
-    fiber_legacy.settle().await;
-    assert_eq!(fiber_legacy.state(), FiberState::Active);
-
-    let mut stream_legacy = app_legacy
+    // 2. 即使插件已声明 ERROR_FORMAT_V1，原 `ctx_stream_fail` 仍保持纯文本语义，
+    //    绝不把普通 JSON 错误文本重解释为结构化 ErrorPayload（兼容 0.1.5 插件）。
+    let mut stream_plain = app
         .root
-        .call_iface_stream("sf@1", 1, "fail_structured", json!([]))
+        .call_iface_stream("sf@1", 1, "fail_plain_json", json!([]))
         .expect("开流");
-    let err_legacy = stream_legacy.next().await.expect_err("必须返回文本错误");
+    let err_plain = stream_plain.next().await.expect_err("必须返回纯文本错误");
     assert!(
-        err_legacy.downcast_ref::<ErrorPayload>().is_none(),
-        "未声明能力位的旧插件流错误不得被解析为 ErrorPayload"
+        err_plain.downcast_ref::<ErrorPayload>().is_none(),
+        "ctx_stream_fail 必须始终保留纯文本语义，不得解析为 ErrorPayload"
     );
-    assert!(err_legacy.to_string().contains("provider.rate_limited"));
-    app_legacy.close().await;
+    assert!(err_plain.to_string().contains("provider.rate_limited"));
+
+    // 3. `ctx_stream_fail_payload` 收到非法 JSON 时必须拒绝并返回 STATUS_ERR。
+    let mut stream_malformed = app
+        .root
+        .call_iface_stream("sf@1", 1, "fail_malformed", json!([]))
+        .expect("开流");
+    let err_fallback = stream_malformed.next().await.expect_err("应以回落文本失败");
+    assert_eq!(err_fallback.to_string(), "fallback text");
+    assert_eq!(
+        INVALID_STATUS.load(Ordering::SeqCst),
+        STATUS_ERR,
+        "ctx_stream_fail_payload 收到非 ErrorPayload JSON 必须返回 STATUS_ERR"
+    );
+
+    app.close().await;
 }
 
 #[tokio::test]
