@@ -17,12 +17,16 @@
 //!    在 Linux 上覆盖已映射的 `.so` 会让进程进入未定义状态。
 //!    所以新库落到 `<name>.r<修订号>.<ext>`，旧句柄继续指向旧文件。
 
-use crate::patch::{apply_entry_patches_tracked, parse_entries, parse_patches, Entry, PatchOwners};
+use crate::patch::{
+    apply_entry_patches_full, flatten_startup_table, parse_entries_with_startup,
+    parse_patches_with_startup, Entry, PatchOwners, StartupNode,
+};
 use crate::plan::PlanEntrySpec;
 use crate::source::{PluginSourcePolicy, SourceAdmission};
 use crate::{
-    mount, resolve_plugin_path, set_dispatch_policy_for, set_host_limits_for, stage_plugin,
-    DispatchPolicy, HostLimits, LoadedPlugin, StagedFile,
+    mount_with_label, resolve_plugin_path, set_dispatch_policy_for, set_host_limits_for,
+    stage_plugin, startup_policy_for, DispatchPolicy, FailureCategory, FailureDisposition,
+    HostLimits, LoadedPlugin, RowStartup, StagedFile, StartupPolicy,
 };
 use cordis_core::{
     equal_except_volatile, split_path, values_at, BoxFuture, Call, CloseReport, CloseStatus,
@@ -574,6 +578,159 @@ pub struct PendingRow {
     pub missing: Vec<cordis_core::PendingInject>,
 }
 
+/// 带故障分类的装载失败（供 [`PluginSource::load_classified`] 与装载器按类别独立处置）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadFailure {
+    pub category: FailureCategory,
+    pub message: String,
+}
+
+impl LoadFailure {
+    pub fn new(category: FailureCategory, message: impl Into<String>) -> Self {
+        Self {
+            category,
+            message: message.into(),
+        }
+    }
+
+    pub fn runtime(message: impl Into<String>) -> Self {
+        Self::new(FailureCategory::RuntimeUnavailable, message)
+    }
+
+    pub fn source(message: impl Into<String>) -> Self {
+        Self::new(FailureCategory::Source, message)
+    }
+
+    pub fn integrity(message: impl Into<String>) -> Self {
+        Self::new(FailureCategory::Integrity, message)
+    }
+}
+
+impl std::fmt::Display for LoadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// 一条结构化的已知失败行记录（供 `loader.report`、启动策略审计与下游 Pending 关联使用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedRow {
+    pub label: String,
+    pub plugin: String,
+    pub category: FailureCategory,
+    pub startup: RowStartup,
+    pub degraded: bool,
+    pub provides: Vec<String>,
+    pub message: String,
+}
+
+impl FailedRow {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "label": self.label,
+            "plugin": self.plugin,
+            "category": self.category.as_str(),
+            "startup": self.startup.as_str(),
+            "degraded": self.degraded,
+            "provides": self.provides,
+            "message": self.message,
+        })
+    }
+}
+
+/// 单个下游缺失依赖键关联到的已知失败上游行。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingUpstreamFailure {
+    pub label: String,
+    pub plugin: String,
+    pub category: FailureCategory,
+    pub startup: RowStartup,
+    pub degraded: bool,
+    pub matched_key: String,
+    pub message: String,
+}
+
+impl PendingUpstreamFailure {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "label": self.label,
+            "plugin": self.plugin,
+            "category": self.category.as_str(),
+            "startup": self.startup.as_str(),
+            "degraded": self.degraded,
+            "matchedKey": self.matched_key,
+            "message": self.message,
+        })
+    }
+}
+
+/// 单个缺失依赖及其关联到的上游失败行列表。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorrelatedPendingInject {
+    pub inject: PendingInject,
+    pub failed_upstream: Vec<PendingUpstreamFailure>,
+}
+
+/// 带上游失败关联诊断的 Pending 行（保留 0.1 [`PendingRow`] 字段不变，见 ADR 0006）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorrelatedPendingRow {
+    pub label: String,
+    pub plugin: String,
+    pub missing: Vec<CorrelatedPendingInject>,
+}
+
+/// 判断单条故障是否应按策略降级（不阻断启动）。
+///
+/// - `RuntimeUnavailable`：行级 `Optional` 或 `strict = false` 时降级；
+/// - `Source` / `Integrity`：安装 [`StartupPolicy`] 时严格服从各自独立处置开关（忽略 `Optional` 与 `strict`）；
+///   未安装时 `strict = true` 一律 fail-closed（含 `Optional` 行），`strict = false` 保留 0.1 诊断降级兼容；
+/// - `PersistedState`：未安装 [`StartupPolicy`] 时始终 fail-closed；安装后服从 `policy.persisted_state()`。
+fn should_degrade_failure(
+    policy: Option<&StartupPolicy>,
+    strict: bool,
+    category: FailureCategory,
+    startup: RowStartup,
+) -> bool {
+    match category {
+        FailureCategory::RuntimeUnavailable => startup == RowStartup::Optional || !strict,
+        FailureCategory::Source => match policy {
+            Some(policy) => policy.source() == FailureDisposition::Degrade,
+            None => !strict,
+        },
+        FailureCategory::Integrity => match policy {
+            Some(policy) => policy.integrity() == FailureDisposition::Degrade,
+            None => !strict,
+        },
+        FailureCategory::PersistedState => match policy {
+            Some(policy) => policy.persisted_state() == FailureDisposition::Degrade,
+            None => false,
+        },
+    }
+}
+
+/// 把服务键拆为 `(base, Option<major>)`（仅当 `@` 后为纯 ASCII 数字时视为版本后缀）。
+fn split_service_major(key: &str) -> (&str, Option<&str>) {
+    if let Some((base, suffix)) = key.rsplit_once('@') {
+        if !base.is_empty() && !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return (base, Some(suffix));
+        }
+    }
+    (key, None)
+}
+
+/// 匹配失败上游声明的 `provided` 键与下游缺失的 `missing_key`。
+///
+/// 精确匹配优先；若一侧带 `@<major>` 而另一侧为裸名则按同 base 匹配；
+/// 两侧均显式带 `@<major>` 且主版本不同（如 `db@2` vs `db@1`）时不误关联。
+fn matches_declared_provide(provided: &str, missing_key: &str) -> bool {
+    if provided == missing_key {
+        return true;
+    }
+    let (p_base, p_major) = split_service_major(provided);
+    let (m_base, m_major) = split_service_major(missing_key);
+    p_base == m_base && (p_major.is_none() || m_major.is_none() || p_major == m_major)
+}
+
 /// 一次对账的产物（M4-2 的 `SyncOutcome` 在 M4-3 长成了动作表）。
 ///
 /// 每个字段都是**行标**列表：谁被挂了、谁被卸了、谁被换了实例、谁的配置被推进了、
@@ -659,7 +816,10 @@ enum ActionOutcome {
     Done,
     /// `internal/update` 否决了这次更新。
     Vetoed,
-    Failed(String),
+    Failed {
+        failure: LoadFailure,
+        provides: Vec<String>,
+    },
 }
 
 /// 一次"文件 → 对账"的结局。
@@ -699,8 +859,25 @@ struct FileSnapshot {
 struct ParsedSnapshot {
     entries: Vec<Entry>,
     main: Vec<Entry>,
+    main_startup: Vec<StartupNode>,
+    row_startup: HashMap<String, RowStartup>,
     owners: PatchOwners,
     baseline: String,
+}
+
+/// 磁盘候选构造失败的强类型分类：区分持久化状态错误（保留精确失败文件路径）与依赖预检失败。
+#[derive(Debug)]
+enum BuildCandidateError {
+    Persisted { label: String, message: String },
+    Preflight(String),
+}
+
+impl BuildCandidateError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Persisted { message, .. } | Self::Preflight(message) => message,
+        }
+    }
 }
 
 /// 一份**待采纳**的配置候选：目标树与回写元数据一起排队、一起校验、一起提交。
@@ -729,6 +906,10 @@ struct Candidate {
     adopt_metadata: bool,
     /// 主配置自己的条目树（`adopt_metadata` 时生效）。
     main: Vec<Entry>,
+    /// 主配置自己的行级启动策略树（`adopt_metadata` 时生效）。
+    main_startup: Vec<StartupNode>,
+    /// 合并树展平后的行级启动策略表（`adopt_metadata` 时生效）。
+    row_startup: HashMap<String, RowStartup>,
     /// `config` / `disabled` 的字段归属（决定回写落到哪一层 patch）。
     owners: PatchOwners,
     /// 候选对应的主配置原文（回写前的"未改动"比较基线）。
@@ -744,6 +925,8 @@ impl Candidate {
             entries,
             adopt_metadata: false,
             main: Vec::new(),
+            main_startup: Vec::new(),
+            row_startup: HashMap::new(),
             owners: PatchOwners::default(),
             baseline: String::new(),
         }
@@ -836,6 +1019,13 @@ pub struct LoaderState {
     /// `tree` 是合并结果，绝不能写回主配置（P1：否则 patch 插入的行被固化、
     /// 下次又插一遍 ⇒ 重复 / 禁用行复活）。热重载时随新主配置刷新。
     main_only: Mutex<Vec<Entry>>,
+    /// 与 `main_only` 一一对应的行级启动策略树（`persist` 回写主配置时保真）。
+    main_startup: Mutex<Vec<StartupNode>>,
+    /// 当前已采纳树展平后的行级启动策略（`label -> RowStartup`）。
+    row_startup: Mutex<HashMap<String, RowStartup>>,
+    /// 主配置初始基线是否有效（仅当主配置损坏且 `StartupPolicy.persisted_state == Degrade` 时为 `false`，
+    /// 防止运行时回写覆盖磁盘上尚未修复的原始配置文件）。
+    main_baseline_valid: AtomicBool,
     /// 装载表：label → 记录。
     mounted: Mutex<HashMap<String, Mounted>>,
     /// 变更序列的**互斥闸门**（对账、同步、启停、单行重载共用）。
@@ -880,6 +1070,12 @@ pub struct LoaderState {
     last: Mutex<Option<ReconcileOutcome>>,
     /// 最近一次热重载的结构化报告（`report.lastReload` 与 [`LoaderState::last_reload`]）。
     last_reload: Mutex<Option<ReloadReport>>,
+    /// 已知失败行的结构化台账（`label -> FailedRow`），用于 `loader.report` 与下游 Pending 关联。
+    failed_rows: Mutex<HashMap<String, FailedRow>>,
+    /// 持久化状态错误台账（配置/patch 读取解析降级、回写冲突/落盘失败等）。
+    persisted_errors: Mutex<Vec<FailedRow>>,
+    /// 最近一次声明预检中从已验证 sidecar manifest 收集到的每行 `provides` 声明（`label -> keys`）。
+    preflight_provides: Mutex<HashMap<String, Vec<String>>>,
     /// 最近一次声明预检的分类结论（O7，`report.preflight`）。
     ///
     /// 与 `last` 同构：**只做诊断**，不参与任何门禁。`None` 只可能出现在"还没跑过
@@ -919,6 +1115,8 @@ pub struct LoaderState {
     host_limits: Option<HostLimits>,
     /// 显式依赖计划（P1-1）。非空时覆盖 sidecar 收集；对账/重载前重新预检。
     dependency_plan: Vec<PlanEntrySpec>,
+    /// `LoaderConfig.strict` 快照（与行级 `RowStartup` 和 [`StartupPolicy`] 共同决定降级）。
+    strict: bool,
     /// `plan_entry` 报错时的策略（`LoaderConfig.strict_sidecars`）：对账/重载沿用同一份。
     strict_sidecars: bool,
     /// 初装已经预检过；第一次 reconcile 不再重复问 source。
@@ -1223,6 +1421,9 @@ impl LoaderState {
         ctx: Ctx,
         tree: Vec<Entry>,
         main_only: Vec<Entry>,
+        main_startup: Vec<StartupNode>,
+        row_startup: HashMap<String, RowStartup>,
+        main_baseline_valid: bool,
         files: ConfigFiles,
         search: Vec<PathBuf>,
         settle: Duration,
@@ -1235,6 +1436,7 @@ impl LoaderState {
         dispatch_policy: Option<DispatchPolicy>,
         host_limits: Option<HostLimits>,
         dependency_plan: Vec<PlanEntrySpec>,
+        strict: bool,
         strict_sidecars: bool,
     ) -> Self {
         let fingerprint = config_fingerprint(&files);
@@ -1242,6 +1444,9 @@ impl LoaderState {
             ctx,
             tree: Mutex::new(tree),
             main_only: Mutex::new(main_only),
+            main_startup: Mutex::new(main_startup),
+            row_startup: Mutex::new(row_startup),
+            main_baseline_valid: AtomicBool::new(main_baseline_valid),
             mounted: Mutex::new(HashMap::new()),
             mutation: tokio::sync::Mutex::new(()),
             scopes: Mutex::new(RowScopes::default()),
@@ -1259,6 +1464,9 @@ impl LoaderState {
             disposing: Mutex::new(HashSet::new()),
             last: Mutex::new(None),
             last_reload: Mutex::new(None),
+            failed_rows: Mutex::new(HashMap::new()),
+            persisted_errors: Mutex::new(Vec::new()),
+            preflight_provides: Mutex::new(HashMap::new()),
             preflight: Mutex::new(None),
             disabled: Mutex::new(Vec::new()),
             published: AtomicBool::new(false),
@@ -1271,6 +1479,7 @@ impl LoaderState {
             dispatch_policy,
             host_limits,
             dependency_plan,
+            strict,
             strict_sidecars,
             skip_next_preflight: AtomicBool::new(false),
             #[cfg(test)]
@@ -1393,7 +1602,7 @@ impl LoaderState {
     fn preflight_dependencies(
         &self,
         entries: &[Entry],
-    ) -> std::result::Result<PreflightReport, String> {
+    ) -> std::result::Result<(PreflightReport, HashMap<String, Vec<String>>), String> {
         if self.dependency_plan.is_empty() {
             preflight_source_dependency_plan(
                 entries,
@@ -1402,18 +1611,22 @@ impl LoaderState {
                 self.strict_sidecars,
             )
         } else {
-            Ok(PreflightReport::NotApplicable {
-                reason: PreflightNotApplicable::ExplicitPlan,
-            })
+            Ok((
+                PreflightReport::NotApplicable {
+                    reason: PreflightNotApplicable::ExplicitPlan,
+                },
+                HashMap::new(),
+            ))
         }
     }
 
-    /// 记下最近一次**已采纳**树的声明预检结论（O7，纯诊断）。
+    /// 记下最近一次**已采纳**树的声明预检结论（O7，纯诊断）以及已校验 sidecar 的 `provides` 声明。
     ///
     /// 调用点必须保证"这棵树是当前树"：初装（`load_with_source` 建状态时）、
     /// 对账 `adopt` 成功之后、`reload_one` 对当前树重跑预检之后。
-    fn record_preflight(&self, report: PreflightReport) {
+    fn record_preflight(&self, report: PreflightReport, provides: HashMap<String, Vec<String>>) {
         *self.preflight.lock().unwrap() = Some(report);
+        *self.preflight_provides.lock().unwrap() = provides;
     }
 
     /// 当前装载表里的行标（排序）。诊断与断言都在用它——加载器不该只有日志这一种观测面。
@@ -1700,6 +1913,127 @@ impl LoaderState {
         rows
     }
 
+    /// 当前已知失败行的结构化列表（按行标升序）。
+    pub fn failed_rows(&self) -> Vec<FailedRow> {
+        let mut rows: Vec<FailedRow> = self.failed_rows.lock().unwrap().values().cloned().collect();
+        rows.sort_by(|a, b| a.label.cmp(&b.label));
+        rows
+    }
+
+    /// 当前被策略降级的失败行列表（按行标升序）。
+    pub fn degraded_rows(&self) -> Vec<FailedRow> {
+        self.failed_rows()
+            .into_iter()
+            .filter(|row| row.degraded)
+            .collect()
+    }
+
+    /// 当前记录的持久化状态错误（配置/patch 读取解析降级、回写冲突/落盘失败等）。
+    pub fn persisted_state_errors(&self) -> Vec<FailedRow> {
+        self.persisted_errors.lock().unwrap().clone()
+    }
+
+    fn effective_row_startup(&self, label: &str, entry_id: Option<&str>) -> RowStartup {
+        if let Some(policy) = startup_policy_for(&self.ctx) {
+            if let Some(startup) = policy.row_startup(label, entry_id) {
+                return startup;
+            }
+        }
+        self.row_startup
+            .lock()
+            .unwrap()
+            .get(label)
+            .copied()
+            .unwrap_or(RowStartup::Required)
+    }
+
+    fn declared_provides_for(
+        &self,
+        label: &str,
+        entry: &Entry,
+        plugin: Option<&Arc<dyn Plugin>>,
+        previous: Option<&Arc<dyn Plugin>>,
+    ) -> Vec<String> {
+        let mut keys = Vec::new();
+        if let Some(plugin) = plugin {
+            keys.extend(plugin.provision());
+        }
+        if let Some(previous) = previous {
+            keys.extend(previous.provision());
+        }
+        if let Some(cached) = self.preflight_provides.lock().unwrap().get(label) {
+            keys.extend(cached.iter().cloned());
+        }
+        for spec in &self.dependency_plan {
+            if spec.id == entry.name
+                || entry.id.as_deref() == Some(spec.id.as_str())
+                || spec.id == label
+            {
+                keys.extend(spec.provides.keys().cloned());
+            }
+        }
+        // 显式 `dependency_plan` 是覆盖模式：非空时绝不回查 sidecar manifest。
+        if keys.is_empty() && self.dependency_plan.is_empty() {
+            if let Ok(Some(spec)) = self.source.plan_entry(entry, &self.search) {
+                keys.extend(spec.provides.keys().cloned());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    fn record_failed_row(&self, row: FailedRow) {
+        self.failed_rows
+            .lock()
+            .unwrap()
+            .insert(row.label.clone(), row);
+    }
+
+    fn clear_failed_row(&self, label: &str) {
+        self.failed_rows.lock().unwrap().remove(label);
+    }
+
+    fn record_persisted_error(&self, label: &str, plugin: &str, message: String) {
+        let policy = startup_policy_for(&self.ctx);
+        let degraded = should_degrade_failure(
+            policy.as_ref(),
+            self.strict,
+            FailureCategory::PersistedState,
+            RowStartup::Required,
+        );
+        let entry = FailedRow {
+            label: label.to_string(),
+            plugin: plugin.to_string(),
+            category: FailureCategory::PersistedState,
+            startup: RowStartup::Required,
+            degraded,
+            provides: Vec::new(),
+            message: message.clone(),
+        };
+        {
+            let mut list = self.persisted_errors.lock().unwrap();
+            list.retain(|existing| existing.label != label);
+            list.push(entry);
+        }
+        let level = if degraded { Level::Warn } else { Level::Error };
+        self.ctx
+            .log(level, &format!("{label}: 持久化状态错误: {message}"));
+        self.publish_report();
+    }
+
+    fn clear_persisted_error(&self, label: &str) {
+        let changed = {
+            let mut list = self.persisted_errors.lock().unwrap();
+            let before = list.len();
+            list.retain(|existing| existing.label != label);
+            list.len() != before
+        };
+        if changed {
+            self.publish_report();
+        }
+    }
+
     /// 当前未就绪的行及其精确缺失键（阶段 3 诊断面）。
     ///
     /// 只读、不建 fiber、不分配 realm；`related` 是全局注册表候选，
@@ -1735,6 +2069,77 @@ impl LoaderState {
         }
         pending.sort_by(|a, b| a.label.cmp(&b.label));
         pending
+    }
+
+    /// 当前未就绪的行及其精确缺失键，并将缺失键关联到已知声明提供该键的失败上游行。
+    ///
+    /// 若某行当前已重新挂载且处于 `FiberState::Active`（例如热重载回滚后旧实例仍在服务），
+    /// 不将其误报为下游 `Pending` 的阻塞上游。
+    pub fn correlated_pending_report(&self) -> Vec<CorrelatedPendingRow> {
+        let active_labels: HashSet<String> = self
+            .mounted
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|record| {
+                record
+                    .fiber
+                    .upgrade()
+                    .is_some_and(|fiber| fiber.state() == FiberState::Active)
+            })
+            .map(|record| record.label.clone())
+            .collect();
+        let failed: Vec<FailedRow> = self
+            .failed_rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|row| !active_labels.contains(&row.label) && !row.provides.is_empty())
+            .cloned()
+            .collect();
+
+        self.pending_report()
+            .into_iter()
+            .map(|row| {
+                let missing = row
+                    .missing
+                    .into_iter()
+                    .map(|inject| {
+                        let mut failed_upstream: Vec<PendingUpstreamFailure> = failed
+                            .iter()
+                            .filter(|candidate| candidate.label != row.label)
+                            .filter_map(|candidate| {
+                                candidate
+                                    .provides
+                                    .iter()
+                                    .find(|provided| {
+                                        matches_declared_provide(provided, &inject.key)
+                                    })
+                                    .map(|matched_key| PendingUpstreamFailure {
+                                        label: candidate.label.clone(),
+                                        plugin: candidate.plugin.clone(),
+                                        category: candidate.category,
+                                        startup: candidate.startup,
+                                        degraded: candidate.degraded,
+                                        matched_key: matched_key.clone(),
+                                        message: candidate.message.clone(),
+                                    })
+                            })
+                            .collect();
+                        failed_upstream.sort_by(|a, b| a.label.cmp(&b.label));
+                        CorrelatedPendingInject {
+                            inject,
+                            failed_upstream,
+                        }
+                    })
+                    .collect();
+                CorrelatedPendingRow {
+                    label: row.label,
+                    plugin: row.plugin,
+                    missing,
+                }
+            })
+            .collect()
     }
 
     /// **装载诊断面**（M4-6）：`loader.report` 的值，**每次调用都现算**。
@@ -1775,6 +2180,36 @@ impl LoaderState {
                 }
                 .to_json()
             });
+        let pending_json: Vec<serde_json::Value> = self
+            .correlated_pending_report()
+            .into_iter()
+            .map(|row| {
+                let missing = row
+                    .missing
+                    .into_iter()
+                    .map(|item| {
+                        let mut obj = json!({
+                            "key": item.inject.key,
+                            "reason": item.inject.reason.as_str(),
+                            "related": item.inject.related,
+                        });
+                        if !item.failed_upstream.is_empty() {
+                            obj["failedUpstream"] = json!(item
+                                .failed_upstream
+                                .iter()
+                                .map(PendingUpstreamFailure::to_json)
+                                .collect::<Vec<_>>());
+                        }
+                        obj
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "label": row.label,
+                    "plugin": row.plugin,
+                    "missing": missing,
+                })
+            })
+            .collect();
         let mut report = json!({
             "mounted": self.mounted_labels().len(),
             "disabled": self.disabled.lock().unwrap().clone(),
@@ -1794,19 +2229,33 @@ impl LoaderState {
             },
             "stagedLeaked": crate::staged_leaked(),
             "cycles": self.cycle_paths(),
-            "pending": self.pending_report().into_iter().map(|row| json!({
-                "label": row.label,
-                "plugin": row.plugin,
-                "missing": row.missing.into_iter().map(|item| json!({
-                    "key": item.key,
-                    "reason": item.reason.as_str(),
-                    "related": item.related,
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
+            "pending": pending_json,
             "capabilities": self.capabilities(),
             "failed": outcome.failures,
             "preflight": preflight,
         });
+        let failed_rows = self.failed_rows();
+        if !failed_rows.is_empty() {
+            report["failedRows"] = json!(failed_rows
+                .iter()
+                .map(FailedRow::to_json)
+                .collect::<Vec<_>>());
+            let degraded: Vec<String> = failed_rows
+                .iter()
+                .filter(|row| row.degraded)
+                .map(|row| format!("{}: {}", row.label, row.message))
+                .collect();
+            if !degraded.is_empty() {
+                report["degraded"] = json!(degraded);
+            }
+        }
+        let persisted_errors = self.persisted_state_errors();
+        if !persisted_errors.is_empty() {
+            report["persistedStateErrors"] = json!(persisted_errors
+                .iter()
+                .map(FailedRow::to_json)
+                .collect::<Vec<_>>());
+        }
         if let Some(last_reload) = self.last_reload.lock().unwrap().as_ref() {
             report["lastReload"] = last_reload.to_json();
         }
@@ -1909,10 +2358,29 @@ impl LoaderState {
         };
         let outcome = self.sync_inner().await;
         if !outcome.failures.is_empty() {
-            if let Some(entry) = find_by_label(&mut self.tree.lock().unwrap(), label) {
-                entry.disabled = old_disabled;
-                entry.disabled_expr = old_expr;
+            {
+                let _gate = self.config_gate.lock().unwrap();
+                if let Some(entry) = find_by_label(&mut self.tree.lock().unwrap(), label) {
+                    entry.disabled = old_disabled;
+                    entry.disabled_expr = old_expr;
+                }
             }
+            // 回滚后对齐 `disabled`、`failed_rows` 与 `loader.report`，
+            // 避免报告仍残留已被撤回的启停状态或已回滚为禁用行的失败台账。
+            let restored = self.desired(&self.tree_snapshot());
+            *self.disabled.lock().unwrap() = restored.disabled;
+            let enabled_labels: HashSet<String> =
+                restored.rows.into_iter().map(|row| row.label).collect();
+            let restored_issues = assign_issue_keys(restored.issues);
+            let restored_issue_keys: HashSet<&str> = restored_issues
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect();
+            self.failed_rows.lock().unwrap().retain(|row_label, _| {
+                enabled_labels.contains(row_label)
+                    || restored_issue_keys.contains(row_label.as_str())
+            });
+            self.publish_report();
             return Err(format!(
                 "启停 {label} 未生效（对账失败）: {}",
                 outcome.failures.join("；")
@@ -1966,6 +2434,43 @@ impl LoaderState {
     ///
     /// 只有驱动器需要它——"代次过期"直接丢弃，而"回写版本过期"要重建候选，
     /// 光看 `ReconcileOutcome` 里那条失败消息无法可靠地区分两者（字符串不是契约）。
+    #[allow(clippy::too_many_arguments)]
+    fn handle_row_failure(
+        &self,
+        label: &str,
+        entry: &Entry,
+        category: FailureCategory,
+        message: String,
+        provides: Vec<String>,
+        outcome: &mut ReconcileOutcome,
+        log_prefix: &str,
+        level_override: Option<Level>,
+    ) {
+        let startup = self.effective_row_startup(label, entry.id.as_deref());
+        let policy = startup_policy_for(&self.ctx);
+        let degraded = should_degrade_failure(policy.as_ref(), self.strict, category, startup);
+        let level = level_override.unwrap_or(if degraded { Level::Warn } else { Level::Error });
+        self.ctx
+            .log(level, &format!("{label}: {log_prefix}{message}"));
+        self.record_failed_row(FailedRow {
+            label: label.to_string(),
+            plugin: entry.name.clone(),
+            category,
+            startup,
+            degraded,
+            provides,
+            message: message.clone(),
+        });
+        let record_in_outcome = !degraded
+            || (policy.is_none()
+                && !self.strict
+                && (startup == RowStartup::Required
+                    || category != FailureCategory::RuntimeUnavailable));
+        if record_in_outcome {
+            outcome.failures.push(format!("{label}: {message}"));
+        }
+    }
+
     async fn reconcile_attempt(self: &Arc<Self>, candidate: &Candidate) -> ReconcileAttempt {
         // P1-1：HMR/patch/启停触发的对账也要在挂载前重跑依赖预检。
         // 初装已经在创建状态前预检过，第一次 reconcile 用标记跳过，避免重复访问 source。
@@ -1976,7 +2481,7 @@ impl LoaderState {
         let mut accepted_preflight = None;
         if !self.skip_next_preflight.swap(false, Ordering::SeqCst) {
             match self.preflight_dependencies(&candidate.entries) {
-                Ok(report) => accepted_preflight = Some(report),
+                Ok(pair) => accepted_preflight = Some(pair),
                 Err(err) => {
                     // 与"采纳被拒"同构：门禁失败也要进 `last` 并刷新报告，
                     // 否则 `report.failed` 只表现为"什么都没有"，答案只剩日志里一句。
@@ -2020,27 +2525,89 @@ impl LoaderState {
             };
         }
         // 采纳成功：这一刻候选才成为当前树，这一轮的预检结论才配进报告（O7）。
-        if let Some(report) = accepted_preflight {
-            self.record_preflight(report);
+        if let Some((report, provides)) = accepted_preflight {
+            self.record_preflight(report, provides);
         }
         let mut rows: HashMap<String, FlatRow> = desired
             .rows
             .into_iter()
             .map(|row| (row.label.clone(), row))
             .collect();
+        let issue_items = assign_issue_keys(desired.issues);
+        // 清理过期的失败台账：
+        // 1) 已从配置移除或已被禁用的行；
+        // 2) 本轮已与期望态完全收敛且无变更动作的已挂载行（例如上轮 Replace/Update 失败后配置回退）。
+        {
+            let active_issue_keys: HashSet<&str> =
+                issue_items.iter().map(|(key, _)| key.as_str()).collect();
+            let action_labels: HashSet<&str> = actions
+                .iter()
+                .map(|action| match action {
+                    Action::Dispose(label)
+                    | Action::Mount(label)
+                    | Action::Replace(label)
+                    | Action::Update { label, .. }
+                    | Action::Volatile { label, .. } => label.as_str(),
+                })
+                .collect();
+            let mounted_labels: HashSet<String> =
+                self.mounted.lock().unwrap().keys().cloned().collect();
+            self.failed_rows.lock().unwrap().retain(|label, _| {
+                if active_issue_keys.contains(label.as_str()) {
+                    return true;
+                }
+                if !rows.contains_key(label) {
+                    return false;
+                }
+                !(mounted_labels.contains(label) && !action_labels.contains(label.as_str()))
+            });
+        }
 
-        let mut outcome = ReconcileOutcome {
-            failures: desired
-                .issues
-                .into_iter()
-                .map(|(label, issue)| format!("{label}: {issue}"))
-                .collect(),
-            ..ReconcileOutcome::default()
-        };
-        // 决策失败（没有求值器 / 求值报错 / `config` 位置仍有未求值表达式）要**吵**：
-        // 静默跳过一行等于让配置悄悄撒谎（M1-4 立的红线，这里延续到对账路径）。
-        for failure in &outcome.failures {
-            self.ctx.log(Level::Error, &format!("对账：{failure}"));
+        let mut outcome = ReconcileOutcome::default();
+        // 决策失败（`!!js` 求值失败 / 重复 label）：
+        // - `Interpolation` 属运行不可用，按行级启动策略处置并保留 `provides` 供下游 Pending 关联；
+        // - `DuplicateLabel` 属配置结构冲突，使用独立台账键（不被首行 Mount 误清），且绝不因首行 `optional: true` 被吞掉。
+        for (issue_key, issue) in issue_items {
+            match issue.kind {
+                DesiredIssueKind::Interpolation => {
+                    let provides =
+                        self.declared_provides_for(&issue.label, &issue.entry, None, None);
+                    self.handle_row_failure(
+                        &issue.label,
+                        &issue.entry,
+                        FailureCategory::RuntimeUnavailable,
+                        issue.issue,
+                        provides,
+                        &mut outcome,
+                        "对账：",
+                        None,
+                    );
+                }
+                DesiredIssueKind::DuplicateLabel => {
+                    let policy = startup_policy_for(&self.ctx);
+                    let degraded = match policy.as_ref() {
+                        Some(policy) => policy.persisted_state() == FailureDisposition::Degrade,
+                        None => !self.strict,
+                    };
+                    let level = if degraded { Level::Warn } else { Level::Error };
+                    self.ctx
+                        .log(level, &format!("{}: 对账：{}", issue.label, issue.issue));
+                    self.record_failed_row(FailedRow {
+                        label: issue_key,
+                        plugin: issue.entry.name.clone(),
+                        category: FailureCategory::PersistedState,
+                        startup: RowStartup::Required,
+                        degraded,
+                        provides: Vec::new(),
+                        message: issue.issue.clone(),
+                    });
+                    if !degraded || (policy.is_none() && !self.strict) {
+                        outcome
+                            .failures
+                            .push(format!("{}: {}", issue.label, issue.issue));
+                    }
+                }
+            }
         }
         for action in actions {
             match action {
@@ -2049,6 +2616,7 @@ impl LoaderState {
                     self.emit_partial_dispose(rows.get(&label), &label, false)
                         .await;
                     self.dispose_row(&label).await;
+                    self.clear_failed_row(&label);
                     self.ctx
                         .log(Level::Info, &format!("{label}: 已卸载（不再期望挂载）"));
                     outcome.disposed.push(label);
@@ -2059,14 +2627,22 @@ impl LoaderState {
                     };
                     match self.patch_context(&row, PatchWork::Mount, None).await {
                         Some(ActionOutcome::Done) => {
+                            self.clear_failed_row(&label);
                             self.ctx.log(Level::Info, &format!("{label}: 已挂载"));
                             outcome.mounted.push(label);
                         }
                         Some(ActionOutcome::Vetoed) | None => outcome.skipped.push(label),
-                        Some(ActionOutcome::Failed(err)) => {
-                            self.ctx
-                                .log(Level::Error, &format!("{label}: 挂载失败 {err}"));
-                            outcome.failures.push(format!("{label}: {err}"));
+                        Some(ActionOutcome::Failed { failure, provides }) => {
+                            self.handle_row_failure(
+                                &label,
+                                &row.entry,
+                                failure.category,
+                                failure.message,
+                                provides,
+                                &mut outcome,
+                                "挂载失败 ",
+                                None,
+                            );
                         }
                     }
                 }
@@ -2074,18 +2650,42 @@ impl LoaderState {
                     let Some(row) = rows.remove(&label) else {
                         continue;
                     };
+                    let previous_plugin = self
+                        .mounted
+                        .lock()
+                        .unwrap()
+                        .get(&label)
+                        .map(|record| record.plugin.clone());
                     // O5b-2：**先决策、再前移**——artifact 的预检（resolve → stage → open → ping）
                     // 必须在拆卸之前跑完。写错 `name` / artifact 缺失时旧实例仍在服务：
                     // 这一行本轮到此为止（不拆卸、不回滚、更不重建旧实例）。
-                    let preflight =
-                        self.source
-                            .load(&row.entry, &self.search, self.next_revision());
+                    let admission = self.source.admission();
+                    let preflight = self.source.load_classified(
+                        &row.entry,
+                        &self.search,
+                        self.next_revision(),
+                        &admission,
+                    );
                     let loaded = match preflight {
                         Ok(loaded) => loaded,
                         Err(err) => {
-                            let issue = format!("换实例预检失败（保留当前实例）：{err}");
-                            self.ctx.log(Level::Error, &format!("{label}: {issue}"));
-                            outcome.failures.push(format!("{label}: {issue}"));
+                            let issue = format!("换实例预检失败（保留当前实例）：{}", err.message);
+                            let provides = self.declared_provides_for(
+                                &label,
+                                &row.entry,
+                                None,
+                                previous_plugin.as_ref(),
+                            );
+                            self.handle_row_failure(
+                                &label,
+                                &row.entry,
+                                err.category,
+                                issue,
+                                provides,
+                                &mut outcome,
+                                "",
+                                None,
+                            );
                             continue;
                         }
                     };
@@ -2099,6 +2699,7 @@ impl LoaderState {
                         .await
                     {
                         Some(ActionOutcome::Done) => {
+                            self.clear_failed_row(&label);
                             self.ctx.log(Level::Info, &format!("{label}: 已换实例"));
                             outcome.replaced.push(label);
                         }
@@ -2112,21 +2713,49 @@ impl LoaderState {
                         // 会让"实例已经没了"和"跳过没做"读起来一模一样（O5b 的有意语义修正）。
                         Some(ActionOutcome::Vetoed) | None => {
                             let issue =
-                                "换实例被 loader/patch-context 短路（旧实例已卸下、新实例未挂）";
-                            self.ctx.log(Level::Warn, &format!("{label}: {issue}"));
-                            outcome.failures.push(format!("{label}: {issue}"));
+                                "换实例被 loader/patch-context 短路（旧实例已卸下、新实例未挂）"
+                                    .to_string();
+                            let provides = self.declared_provides_for(
+                                &label,
+                                &row.entry,
+                                None,
+                                previous_plugin.as_ref(),
+                            );
+                            self.handle_row_failure(
+                                &label,
+                                &row.entry,
+                                FailureCategory::RuntimeUnavailable,
+                                issue,
+                                provides,
+                                &mut outcome,
+                                "",
+                                Some(Level::Warn),
+                            );
                         }
-                        Some(ActionOutcome::Failed(err)) => {
+                        Some(ActionOutcome::Failed {
+                            failure,
+                            mut provides,
+                        }) => {
+                            if let Some(prev) = previous_plugin.as_ref() {
+                                provides.extend(prev.provision());
+                                provides.sort();
+                                provides.dedup();
+                            }
                             // 拆卸已经发生且**不回滚**（文件是真相，下一轮对账按同一目标重试），
                             // 所以文案必须写明"旧实例已卸下"——否则它与 HMR 路径上
                             // 同款错误文案（那里的含义是"保留当前实例"）读起来正好相反。
-                            self.ctx.log(
-                                Level::Error,
-                                &format!("{label}: 换实例失败（旧实例已卸下、未恢复）：{err}"),
+                            let message =
+                                format!("换实例失败（旧实例已卸下、未恢复）：{}", failure.message);
+                            self.handle_row_failure(
+                                &label,
+                                &row.entry,
+                                failure.category,
+                                message,
+                                provides,
+                                &mut outcome,
+                                "",
+                                None,
                             );
-                            outcome.failures.push(format!(
-                                "{label}: 换实例失败（旧实例已卸下、未恢复）：{err}"
-                            ));
                         }
                     }
                 }
@@ -2141,14 +2770,24 @@ impl LoaderState {
                         .patch_context(&row, PatchWork::Update(config), None)
                         .await
                     {
-                        Some(ActionOutcome::Done) => outcome.updated.push(label),
+                        Some(ActionOutcome::Done) => {
+                            self.clear_failed_row(&label);
+                            outcome.updated.push(label);
+                        }
                         // 否决：内存记录照旧推进，实例上没落地 ⇒ 记进 lagging（M4-6 报告）。
                         Some(ActionOutcome::Vetoed) => outcome.lagging.push(label),
                         None => outcome.skipped.push(label),
-                        Some(ActionOutcome::Failed(err)) => {
-                            self.ctx
-                                .log(Level::Error, &format!("{label}: 配置更新失败 {err}"));
-                            outcome.failures.push(format!("{label}: {err}"));
+                        Some(ActionOutcome::Failed { failure, provides }) => {
+                            self.handle_row_failure(
+                                &label,
+                                &row.entry,
+                                failure.category,
+                                failure.message,
+                                provides,
+                                &mut outcome,
+                                "配置更新失败 ",
+                                None,
+                            );
                         }
                     }
                 }
@@ -2160,6 +2799,7 @@ impl LoaderState {
                     // （上游 `entry.ts:150-153` 把它整个跳过）——实例不重挂，就没什么"半拆"可言。
                     match self.commit_volatile(&label, &config).await {
                         Ok(Some(changed)) => {
+                            self.clear_failed_row(&label);
                             self.ctx.log(
                                 Level::Info,
                                 &format!(
@@ -2181,13 +2821,23 @@ impl LoaderState {
                                 .patch_context(&row, PatchWork::Update(config), None)
                                 .await
                             {
-                                Some(ActionOutcome::Done) => outcome.updated.push(label),
+                                Some(ActionOutcome::Done) => {
+                                    self.clear_failed_row(&label);
+                                    outcome.updated.push(label);
+                                }
                                 Some(ActionOutcome::Vetoed) => outcome.lagging.push(label),
                                 None => outcome.skipped.push(label),
-                                Some(ActionOutcome::Failed(err)) => {
-                                    self.ctx
-                                        .log(Level::Error, &format!("{label}: 配置更新失败 {err}"));
-                                    outcome.failures.push(format!("{label}: {err}"));
+                                Some(ActionOutcome::Failed { failure, provides }) => {
+                                    self.handle_row_failure(
+                                        &label,
+                                        &row.entry,
+                                        failure.category,
+                                        failure.message,
+                                        provides,
+                                        &mut outcome,
+                                        "配置更新失败 ",
+                                        None,
+                                    );
                                 }
                             }
                         }
@@ -2472,7 +3122,9 @@ impl LoaderState {
                     "配置候选重建未执行：文件正在被写（稳读不通过），等下一轮再看".to_string(),
                 )
             }
-            Err(err) => return StaleRebuild::Stopped(format!("配置候选重建失败: {err}")),
+            Err(err) => {
+                return StaleRebuild::Stopped(format!("配置候选重建失败: {}", err.into_message()))
+            }
         };
         if !self.register_candidate(candidate) {
             // 合并槽里已经有更新的请求（它的代次更大）：重建的这份不覆盖它。
@@ -2530,8 +3182,22 @@ impl LoaderState {
         if candidate.adopt_metadata {
             // 元数据先落地：它决定之后的回写落到哪一层、拿哪份文本做比较。
             self.with_main_only(|main| *main = candidate.main.clone());
+            *self.main_startup.lock().unwrap() = candidate.main_startup.clone();
+            *self.row_startup.lock().unwrap() = candidate.row_startup.clone();
             *self.owners.lock().unwrap() = candidate.owners.clone();
             *self.main_baseline.lock().unwrap() = candidate.baseline.clone();
+            self.main_baseline_valid.store(true, Ordering::SeqCst);
+            let main_label = self.files.main.display().to_string();
+            let patch_labels: HashSet<String> = self
+                .files
+                .patches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            self.persisted_errors
+                .lock()
+                .unwrap()
+                .retain(|err| err.label != main_label && !patch_labels.contains(&err.label));
         }
         // 树随后：对账的目标态。
         *self.tree.lock().unwrap() = candidate.entries.clone();
@@ -2570,7 +3236,13 @@ impl LoaderState {
         let candidate = match self.build_candidate(gen).await {
             Ok(Some(candidate)) => candidate,
             Ok(None) => return ReloadOutcome::Unsettled,
-            Err(err) => return ReloadOutcome::Failed(err),
+            Err(BuildCandidateError::Persisted { label, message }) => {
+                self.record_persisted_error(&label, "", message.clone());
+                return ReloadOutcome::Failed(message);
+            }
+            Err(BuildCandidateError::Preflight(message)) => {
+                return ReloadOutcome::Failed(message);
+            }
         };
         match self.request_candidate(candidate).await {
             Some(outcome) => ReloadOutcome::Reconciled(outcome),
@@ -2584,11 +3256,20 @@ impl LoaderState {
     /// 重建因此不可能绕过任何一道关（稳读、解析、预检、回写版本快照）。
     ///
     /// 返回 `Ok(None)` = 文件正在被写（稳读不通过，这一轮什么都不做）。
-    async fn build_candidate(&self, gen: u64) -> std::result::Result<Option<Candidate>, String> {
+    async fn build_candidate(
+        &self,
+        gen: u64,
+    ) -> std::result::Result<Option<Candidate>, BuildCandidateError> {
         let snapshot = match self.read_settled().await {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => return Ok(None),
-            Err(err) => return Err(format!("读取 {} 失败: {err}", self.files.main.display())),
+            Err(err) => {
+                let label = self.files.main.display().to_string();
+                return Err(BuildCandidateError::Persisted {
+                    message: format!("读取 {label} 失败: {err}"),
+                    label,
+                });
+            }
         };
         // 解析是**纯**的：结果只装进候选，不碰任何共享字段。
         let parsed = self.parse_snapshot(&snapshot)?;
@@ -2597,7 +3278,9 @@ impl LoaderState {
         // 预检是候选的第一道关：失败时连登记都不做，已采纳的元数据一个字节不动。
         // 结论**不进报告**：候选还没被采纳（可能被判过期拒绝），报告只能描述当前树。
         if let Err(err) = self.preflight_dependencies(&parsed.entries) {
-            return Err(format!("依赖预检失败: {err}"));
+            return Err(BuildCandidateError::Preflight(format!(
+                "依赖预检失败: {err}"
+            )));
         }
         Ok(Some(Candidate {
             gen,
@@ -2606,6 +3289,8 @@ impl LoaderState {
             entries: parsed.entries,
             adopt_metadata: true,
             main: parsed.main,
+            main_startup: parsed.main_startup,
+            row_startup: parsed.row_startup,
             owners: parsed.owners,
             baseline: parsed.baseline,
         }))
@@ -2737,7 +3422,7 @@ impl LoaderState {
                                 .insert(owned.label.clone(), record);
                             ActionOutcome::Done
                         }
-                        Err(err) => ActionOutcome::Failed(err),
+                        Err((failure, provides)) => ActionOutcome::Failed { failure, provides },
                     }
                 }
                 PatchWork::Update(config) => match state.fiber_of(&owned.label) {
@@ -2755,9 +3440,34 @@ impl LoaderState {
                         Ok(UpdateOutcome::Vetoed | UpdateOutcome::Superseded) => {
                             ActionOutcome::Vetoed
                         }
-                        Err(err) => ActionOutcome::Failed(err.to_string()),
+                        Err(err) => {
+                            let prev = state
+                                .mounted
+                                .lock()
+                                .unwrap()
+                                .get(&owned.label)
+                                .map(|record| record.plugin.clone());
+                            let provides = state.declared_provides_for(
+                                &owned.label,
+                                &owned.entry,
+                                prev.as_ref(),
+                                None,
+                            );
+                            ActionOutcome::Failed {
+                                failure: LoadFailure::runtime(err.to_string()),
+                                provides,
+                            }
+                        }
                     },
-                    None => ActionOutcome::Failed("装载表里没有可用实例".into()),
+                    None => ActionOutcome::Failed {
+                        failure: LoadFailure::runtime("装载表里没有可用实例"),
+                        provides: state.declared_provides_for(
+                            &owned.label,
+                            &owned.entry,
+                            None,
+                            None,
+                        ),
+                    },
                 },
             };
             *tail_slot.lock().unwrap() = Some(outcome);
@@ -2907,6 +3617,10 @@ impl LoaderState {
         // 闸门里**不跑任何用户代码**：`ctx.log` 是宿主/应用注入的 sink（可能 panic），
         // 在这里调它会让 std `Mutex` 中毒、把整个装载器闸门一起带走。所以结果先攒着，
         // 出了这个块再打日志。
+        let plugin_name = record
+            .as_ref()
+            .map(|record| record.declared.name.clone())
+            .unwrap_or_default();
         let result = {
             let gate = self.config_gate.lock().unwrap();
             // 合并树（内存）先标上：下一轮对账不会把它再挂回来。
@@ -2965,13 +3679,17 @@ impl LoaderState {
             }
         };
         match result {
-            Ok(()) => self.ctx.log(
-                Level::Info,
-                &format!("{label}: 插件自我卸载，已在配置里标为 disabled 并回写"),
-            ),
-            Err(err) => self.ctx.log(
-                Level::Error,
-                &format!("{label}: 插件自我卸载，但配置回写失败: {err}"),
+            Ok(()) => {
+                self.clear_persisted_error(label);
+                self.ctx.log(
+                    Level::Info,
+                    &format!("{label}: 插件自我卸载，已在配置里标为 disabled 并回写"),
+                );
+            }
+            Err(err) => self.record_persisted_error(
+                label,
+                &plugin_name,
+                format!("插件自我卸载，但配置回写失败: {err}"),
             ),
         }
     }
@@ -2997,9 +3715,16 @@ impl LoaderState {
     /// 采纳、以及其它 `main_only` 写入落在同一个临界区里，否则采纳可以插在中间，
     /// 把刚写的这一行整份盖回去。
     fn persist(&self) -> std::result::Result<(), String> {
+        if !self.main_baseline_valid.load(Ordering::SeqCst) {
+            return Err(format!(
+                "{} 初始解析已降级，拒绝在未修复前覆写磁盘配置",
+                self.files.main.display()
+            ));
+        }
         let text = {
             let main = self.main_only.lock().unwrap();
-            crate::patch::dump_entries(&main)?
+            let startup = self.main_startup.lock().unwrap();
+            crate::patch::dump_entries_with_startup(&main, &startup)?
         };
         let baseline = self.main_baseline.lock().unwrap().clone();
         write_atomically_if_unchanged(&self.files.main, &text, &baseline)?;
@@ -3078,24 +3803,42 @@ impl LoaderState {
     fn parse_snapshot(
         &self,
         snapshot: &FileSnapshot,
-    ) -> std::result::Result<ParsedSnapshot, String> {
-        let main = parse_entries(&snapshot.main)?;
+    ) -> std::result::Result<ParsedSnapshot, BuildCandidateError> {
+        let (main, main_startup) = parse_entries_with_startup(&snapshot.main).map_err(|err| {
+            BuildCandidateError::Persisted {
+                label: self.files.main.display().to_string(),
+                message: err,
+            }
+        })?;
         let mut entries = main.clone();
+        let mut merged_startup = main_startup.clone();
         let mut owners = PatchOwners::default();
         for (index, text) in snapshot.patches.iter().enumerate() {
-            let patches = parse_patches(text).map_err(|err| {
-                format!(
-                    "解析 patch {} 失败: {err}",
-                    self.files.patches[index].display()
-                )
-            })?;
+            let patch_label = self.files.patches[index].display().to_string();
+            let patches =
+                parse_patches_with_startup(text).map_err(|err| BuildCandidateError::Persisted {
+                    message: format!("解析 patch {patch_label} 失败: {err}"),
+                    label: patch_label,
+                })?;
             let ctx = self.ctx.clone();
             let mut warn = |message: &str| ctx.log(Level::Warn, message);
-            entries = apply_entry_patches_tracked(entries, &patches, index, &mut owners, &mut warn);
+            let (next_entries, next_startup) = apply_entry_patches_full(
+                entries,
+                merged_startup,
+                &patches,
+                index,
+                &mut owners,
+                &mut warn,
+            );
+            entries = next_entries;
+            merged_startup = next_startup;
         }
+        let row_startup = flatten_startup_table(&entries, &merged_startup);
         Ok(ParsedSnapshot {
             entries,
             main,
+            main_startup,
+            row_startup,
             owners,
             baseline: snapshot.main.clone(),
         })
@@ -3108,10 +3851,18 @@ impl LoaderState {
     ///
     /// 这里是**首次挂载**的入口：`load` 与挂载相邻。换实例路径不走这里——
     /// 它先在拆卸之前 `load`（O5b-2），再调 [`Self::mount_loaded`] 复用那份 artifact。
-    async fn mount_row(&self, row: &FlatRow) -> std::result::Result<Mounted, String> {
+    async fn mount_row(
+        &self,
+        row: &FlatRow,
+    ) -> std::result::Result<Mounted, (LoadFailure, Vec<String>)> {
+        let admission = self.source.admission();
         let loaded = self
             .source
-            .load(&row.entry, &self.search, self.next_revision())?;
+            .load_classified(&row.entry, &self.search, self.next_revision(), &admission)
+            .map_err(|failure| {
+                let provides = self.declared_provides_for(&row.label, &row.entry, None, None);
+                (failure, provides)
+            })?;
         self.mount_loaded(row, loaded).await
     }
 
@@ -3124,19 +3875,22 @@ impl LoaderState {
         &self,
         row: &FlatRow,
         loaded: LoadedFile,
-    ) -> std::result::Result<Mounted, String> {
-        let fiber = mount(
+    ) -> std::result::Result<Mounted, (LoadFailure, Vec<String>)> {
+        let fiber = mount_with_label(
             &row.scope,
             loaded.plugin.clone(),
             row.entry.config.clone().unwrap_or(Config::Null),
             row.entry.inject.clone(),
+            &row.label,
         );
         fiber.settle().await;
         if let Some(error) = fiber.error() {
             // `apply` 失败留下的 fiber 仍然占着 runtime 表（`fibers_by_plugin_name` 看得见），
             // 它的 effect 也没跑过清理。不在这里拆掉，每次失败挂载都会漏一条半成品 fiber。
+            let provides =
+                self.declared_provides_for(&row.label, &row.entry, Some(&loaded.plugin), None);
             fiber.dispose().await;
-            return Err(error);
+            return Err((LoadFailure::runtime(error), provides));
         }
         // volatile 声明在**装载成功之后**取（对应 §8 M4-5 的"paths 在挂载成功后查询"）：
         // 对 ABI 插件这是一次跨边界查询，早于 apply 问也可能得到"还没准备好"的答案。
@@ -3310,6 +4064,22 @@ pub trait PluginSource: Send + Sync {
         self.load(entry, search, revision)
     }
 
+    /// 带故障分类的装载入口：默认把 [`Self::load_admitted`] 的错误归类为
+    /// [`FailureCategory::RuntimeUnavailable`]。
+    ///
+    /// [`DiskPluginSource`] 与 [`PolicyPluginSource`] 覆写本方法以保留精确的
+    /// `Source` / `Integrity` / `RuntimeUnavailable` 分类。
+    fn load_classified(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        revision: u64,
+        admission: &SourceAdmission,
+    ) -> std::result::Result<LoadedFile, LoadFailure> {
+        self.load_admitted(entry, search, revision, admission)
+            .map_err(LoadFailure::runtime)
+    }
+
     /// O9：`plan_entry` 的准入版本，语义与 [`Self::load_admitted`] 相同。
     ///
     /// 依赖声明也要过**同一个**准入结论：否则包装源会一边用局部策略装载、
@@ -3399,6 +4169,17 @@ impl PluginSource for PolicyPluginSource {
         self.inner.load_admitted(entry, search, revision, admission)
     }
 
+    fn load_classified(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        revision: u64,
+        admission: &SourceAdmission,
+    ) -> std::result::Result<LoadedFile, LoadFailure> {
+        self.inner
+            .load_classified(entry, search, revision, admission)
+    }
+
     fn plan_entry(
         &self,
         entry: &Entry,
@@ -3439,7 +4220,19 @@ impl DiskPluginSource {
         revision: u64,
         admission: &SourceAdmission,
     ) -> std::result::Result<LoadedFile, String> {
-        let path = resolve_plugin_path(&entry.name, search).map_err(|err| err.to_string())?;
+        self.load_with_classified(entry, search, revision, admission)
+            .map_err(|err| err.message)
+    }
+
+    fn load_with_classified(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        revision: u64,
+        admission: &SourceAdmission,
+    ) -> std::result::Result<LoadedFile, LoadFailure> {
+        let path = resolve_plugin_path(&entry.name, search)
+            .map_err(|err| LoadFailure::runtime(err.to_string()))?;
         // P0-1a：有生效的来源策略时，**暂存之前**先验 sidecar manifest 与
         // allow-list。这样未登记 / 被篡改的 artifact 不会产生暂存副本，更不会
         // 走到 `LoadLibrary`/`dlopen`。
@@ -3447,16 +4240,19 @@ impl DiskPluginSource {
         // O9：结论来自来源对象本身（裸源 ⇒ fallback ⇒ 读进程级全局，行为不变）；
         // 包在 `PolicyPluginSource` 里时则是**这个来源**自己的策略，且只读这一次
         // ——暂存与二次校验共用同一份快照。
-        let active_policy = admission.resolve()?;
+        let active_policy = admission.resolve().map_err(LoadFailure::source)?;
         if let Some(policy) = &active_policy {
-            policy.verify(&path)?;
+            policy
+                .verify_classified(&path)
+                .map_err(|err| LoadFailure::new(err.category, err.message))?;
         }
         let source_fingerprint = fingerprint(&path);
-        let staged = stage_plugin(&path, revision).map_err(|err| err.to_string())?;
+        let staged =
+            stage_plugin(&path, revision).map_err(|err| LoadFailure::runtime(err.to_string()))?;
         // 二次校验 + 暂存副本 hash：防的是 verify 与 stage 之间的替换窗口。
         let opened = match &active_policy {
-            Some(policy) => LoadedPlugin::open_staged_verified(&path, &staged, policy),
-            None => LoadedPlugin::open_staged(&staged),
+            Some(policy) => LoadedPlugin::open_staged_verified_classified(&path, &staged, policy),
+            None => LoadedPlugin::open_staged_classified(&staged),
         };
         let plugin = match opened {
             Ok(plugin) => plugin,
@@ -3465,13 +4261,15 @@ impl DiskPluginSource {
                 // 立刻销账并删除，否则每次坏 artifact 都在泄漏台账里留下一个 `.rN`
                 // （`stagedLeaked` 只增不减）——预检失败必须零副作用。
                 drop(StagedFile::new(&staged));
-                return Err(err.to_string());
+                return Err(LoadFailure::new(err.category, err.message));
             }
         };
         // 预检：ABI 版本、结构尺寸、插件入口可调用性，全在动到正在跑的实例之前完成。
         // （探活失败时 `plugin` 在此 drop：先 FreeLibrary、后删暂存文件——不会泄漏。）
         if !plugin.ping() {
-            return Err("ABI 探活失败（版本不匹配，或入口无法调用）".into());
+            return Err(LoadFailure::runtime(
+                "ABI 探活失败（版本不匹配，或入口无法调用）",
+            ));
         }
         Ok(LoadedFile {
             plugin: Arc::new(plugin),
@@ -3561,6 +4359,16 @@ impl PluginSource for DiskPluginSource {
         admission: &SourceAdmission,
     ) -> std::result::Result<LoadedFile, String> {
         self.load_with(entry, search, revision, admission)
+    }
+
+    fn load_classified(
+        &self,
+        entry: &Entry,
+        search: &[PathBuf],
+        revision: u64,
+        admission: &SourceAdmission,
+    ) -> std::result::Result<LoadedFile, LoadFailure> {
+        self.load_with_classified(entry, search, revision, admission)
     }
 
     fn plan_entry(
@@ -3774,25 +4582,42 @@ fn preflight_source_dependency_plan(
     search: &[PathBuf],
     source: &dyn PluginSource,
     strict_sidecars: bool,
-) -> std::result::Result<PreflightReport, String> {
+) -> std::result::Result<(PreflightReport, HashMap<String, Vec<String>>), String> {
     let mut collector = PlanCollector::new(search, source, strict_sidecars);
     collector.walk(entries, false)?;
+    let mut declared_provides: HashMap<String, Vec<String>> = HashMap::new();
+    for row in &collector.entries {
+        let mut keys: Vec<String> = row.spec.provides.keys().cloned().collect();
+        keys.sort();
+        keys.dedup();
+        if !keys.is_empty() {
+            declared_provides
+                .entry(row.stable_label.clone())
+                .or_insert(keys);
+        }
+    }
     if collector.collection.rows.is_empty() {
         // 一行可检查的都没有：没有声明可谈（全部静态 disabled / 只有组行）。
-        return Ok(PreflightReport::NotApplicable {
-            reason: PreflightNotApplicable::NoEnabledRows,
-        });
+        return Ok((
+            PreflightReport::NotApplicable {
+                reason: PreflightNotApplicable::NoEnabledRows,
+            },
+            declared_provides,
+        ));
     }
     // 混合来源（部分插件没有 sidecar）下 manifest 计划不完整；不能把
     // “没声明”误判成“没有提供者”。此时跳过预检，保留既有运行时语义。
     if collector.collection.missing_plan {
         let downgraded = collector.collection.downgraded;
         let rows = std::mem::take(&mut collector.collection.rows);
-        return Ok(if downgraded {
-            PreflightReport::Downgraded { rows }
-        } else {
-            PreflightReport::Incomplete { rows }
-        });
+        return Ok((
+            if downgraded {
+                PreflightReport::Downgraded { rows }
+            } else {
+                PreflightReport::Incomplete { rows }
+            },
+            declared_provides,
+        ));
     }
 
     let mut plan = Vec::with_capacity(collector.entries.len());
@@ -3830,16 +4655,21 @@ fn preflight_source_dependency_plan(
             version: provider.version.to_string(),
         })
         .collect();
-    Ok(PreflightReport::Checked {
-        entries: plan.len(),
-        providers,
-    })
+    Ok((
+        PreflightReport::Checked {
+            entries: plan.len(),
+            providers,
+        },
+        declared_provides,
+    ))
 }
 
 struct CollectedPlanEntry {
     /// 非 group 行的遍历序号（与跳过/收集无关，便于错误定位）。
     index: usize,
     label: String,
+    /// 与装载器一致的稳定结构行标（`id` 或 `name#N`），用于缓存 `preflight_provides`。
+    stable_label: String,
     spec: PlanEntrySpec,
 }
 
@@ -3851,6 +4681,8 @@ struct PlanCollector<'a> {
     strict_sidecars: bool,
     /// 非 group 行的遍历序号（与跳过/收集无关，便于错误定位）。
     next_row: usize,
+    /// 与 [`DesiredWalk`] / [`find_by_label`] 保持同一走法的 DFS 匿名行序号表。
+    ordinals: HashMap<String, usize>,
     /// 收集到的计划条目（喂 [`crate::plan::resolve`]）。
     entries: Vec<CollectedPlanEntry>,
     /// 逐行判定与"整次跳过"的原因（喂 [`PreflightReport`]）。
@@ -3864,6 +4696,7 @@ impl<'a> PlanCollector<'a> {
             source,
             strict_sidecars,
             next_row: 0,
+            ordinals: HashMap::new(),
             entries: Vec::new(),
             collection: PreflightCollection::default(),
         }
@@ -3875,6 +4708,9 @@ impl<'a> PlanCollector<'a> {
         disabled_by_ancestor: bool,
     ) -> std::result::Result<(), String> {
         for entry in entries {
+            // 先按整棵树的结构走法计算稳定行标，保证即使存在组行或静态 disabled 行，
+            // 匿名行的 `name#N` 编号也与 `LoaderState` 完全一致。
+            let row_stable_label = stable_label(entry, &mut self.ordinals);
             // 静态 disabled 可确定跳过；`disabled: !!js` 的求值需要上下文，
             // 预检阶段保守地把它纳入计划，避免把运行时 false 的提供者误判为缺失。
             let disabled = disabled_by_ancestor || entry.disabled;
@@ -3893,6 +4729,7 @@ impl<'a> PlanCollector<'a> {
                     self.entries.push(CollectedPlanEntry {
                         index,
                         label: label.clone(),
+                        stable_label: row_stable_label,
                         spec,
                     });
                     PreflightRowVerdict::Declared
@@ -3988,12 +4825,48 @@ pub async fn load_with_source(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
+    let startup_policy = startup_policy_for(&ctx);
+    let degrade_persisted = should_degrade_failure(
+        startup_policy.as_ref(),
+        config.strict,
+        FailureCategory::PersistedState,
+        RowStartup::Required,
+    );
+    let mut initial_persisted_errors: Vec<FailedRow> = Vec::new();
+
     // 1) 读主配置。主树单独留一份：配置回写只能写它（patch 合并结果写回主配置会把
     //    patch 插入的行固化下来，见 P1）。
-    let text = std::fs::read_to_string(&main_path)
-        .map_err(|err| format!("读取 {} 失败: {err}", main_path.display()))?;
-    let main_entries = parse_entries(&text)?;
+    //    若主配置读取或解析失败，属于 PersistedState 错误：默认 fail-closed，
+    //    仅在宿主显式配置 `StartupPolicy::with_persisted_state(Degrade)` 时降级为空树
+    //    并标记 `main_baseline_valid = false`（防止运行时回写覆盖损坏的原文件）。
+    let (text, main_entries, main_startup, main_baseline_valid) =
+        match std::fs::read_to_string(&main_path)
+            .map_err(|err| format!("读取 {} 失败: {err}", main_path.display()))
+            .and_then(|text| {
+                parse_entries_with_startup(&text).map(|(entries, startup)| (text, entries, startup))
+            }) {
+            Ok((text, entries, startup)) => (text, entries, startup, true),
+            Err(err) if degrade_persisted => {
+                let label = main_path.display().to_string();
+                ctx.log(
+                    Level::Warn,
+                    &format!("{label}: 持久化状态错误（已按策略降级为空配置）: {err}"),
+                );
+                initial_persisted_errors.push(FailedRow {
+                    label,
+                    plugin: String::new(),
+                    category: FailureCategory::PersistedState,
+                    startup: RowStartup::Required,
+                    degraded: true,
+                    provides: Vec::new(),
+                    message: err,
+                });
+                (String::new(), Vec::new(), Vec::new(), false)
+            }
+            Err(err) => return Err(err.into()),
+        };
     let mut entries = main_entries.clone();
+    let mut merged_startup = main_startup.clone();
 
     // 2) 依次叠加 patch 层。语义与 `applyEntryPatches` 完全一致，纯函数、可单测。
     //    路径在这里就解析成**绝对路径**：watcher 与对账之后每一轮都要按同一份清单读文件。
@@ -4010,12 +4883,46 @@ pub async fn load_with_source(
         .collect();
     let mut owners = PatchOwners::default();
     for (layer, patch_path) in patches.iter().enumerate() {
-        let text = std::fs::read_to_string(patch_path)
-            .map_err(|err| format!("读取 patch {} 失败: {err}", patch_path.display()))?;
-        let patches = parse_patches(&text)?;
+        let parsed_layer = std::fs::read_to_string(patch_path)
+            .map_err(|err| format!("读取 patch {} 失败: {err}", patch_path.display()))
+            .and_then(|text| {
+                parse_patches_with_startup(&text)
+                    .map_err(|err| format!("解析 patch {} 失败: {err}", patch_path.display()))
+            });
+        let layer_patches = match parsed_layer {
+            Ok(patches) => patches,
+            Err(err) if degrade_persisted => {
+                let label = patch_path.display().to_string();
+                ctx.log(
+                    Level::Warn,
+                    &format!("{label}: 持久化状态错误（已按策略跳过该 patch 层）: {err}"),
+                );
+                initial_persisted_errors.push(FailedRow {
+                    label,
+                    plugin: String::new(),
+                    category: FailureCategory::PersistedState,
+                    startup: RowStartup::Required,
+                    degraded: true,
+                    provides: Vec::new(),
+                    message: err,
+                });
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         let mut warn = |message: &str| ctx.log(Level::Warn, message);
-        entries = apply_entry_patches_tracked(entries, &patches, layer, &mut owners, &mut warn);
+        let (next_entries, next_startup) = apply_entry_patches_full(
+            entries,
+            merged_startup,
+            &layer_patches,
+            layer,
+            &mut owners,
+            &mut warn,
+        );
+        entries = next_entries;
+        merged_startup = next_startup;
     }
+    let row_startup = flatten_startup_table(&entries, &merged_startup);
 
     // 3) 运行时状态。插件默认从主配置所在目录解析，可被 pluginDir 覆盖。
     let search: Vec<PathBuf> = match &config.plugin_dir {
@@ -4026,7 +4933,7 @@ pub async fn load_with_source(
     // provides / requires，并在创建 LoaderState、调用 source.load 之前求解。
     // 显式计划是**覆盖**：非空时上面的预检已经跑过，这里既不合并也不读 manifest。
     // 结论进 `LoaderState`（O7 报告）：首轮预检的分类与对账/重载时同一套口径。
-    let preflight = if config.dependency_plan.is_empty() {
+    let (preflight, preflight_provides) = if config.dependency_plan.is_empty() {
         preflight_source_dependency_plan(
             &entries,
             &search,
@@ -4034,9 +4941,12 @@ pub async fn load_with_source(
             config.strict_sidecars,
         )?
     } else {
-        PreflightReport::NotApplicable {
-            reason: PreflightNotApplicable::ExplicitPlan,
-        }
+        (
+            PreflightReport::NotApplicable {
+                reason: PreflightNotApplicable::ExplicitPlan,
+            },
+            HashMap::new(),
+        )
     };
     // 稳读窗口取轮询周期的四分之一（下限 10ms）：编辑器的"写临时文件再 rename"
     // 通常比这快得多，于是既不会误采纳半截文件，也不会让人等一个完整周期。
@@ -4067,6 +4977,9 @@ pub async fn load_with_source(
         ctx.clone(),
         entries,
         main_entries,
+        main_startup,
+        row_startup,
+        main_baseline_valid,
         ConfigFiles {
             main: main_path,
             patches,
@@ -4082,12 +4995,16 @@ pub async fn load_with_source(
         config.dispatch_policy,
         config.host_limits,
         config.dependency_plan.clone(),
+        config.strict,
         config.strict_sidecars,
     ));
+    if !initial_persisted_errors.is_empty() {
+        *state.persisted_errors.lock().unwrap() = initial_persisted_errors;
+    }
     // 初装预检已经跑过：第一次 reconcile 不重复访问 source。
     state.skip_next_preflight.store(true, Ordering::SeqCst);
     // O7：首轮预检的分类结论在 state 建好之后、出版报告之前落位。
-    state.record_preflight(preflight);
+    state.record_preflight(preflight, preflight_provides);
 
     // 4) `!!js` 的插值挂上 `internal/config` 链（M4-4b）——**必须在第一次对账之前**：
     //    首挂那一行的配置解析就要走它，否则原始标记会流进插件。
@@ -4113,11 +5030,33 @@ pub async fn load_with_source(
     ctx.provide("loader.report", Dyn::new(ExternValue(state.report())))?;
     state.mark_report_published();
 
-    // fail loud：静默跳过一行配置，会让人在几小时后才发现某个能力根本没装上。
-    // 错误信息必须带上**每一行的具体失败原因**，否则"fail loud"就退化成了一句口号。
-    //
-    // `strict=false` 的降级不是"闭嘴"：每一行都要有一条警告日志（§8 M4-4 的失败策略），
-    // 报告里的 `failed` 也照旧列着——只是不再把启动整个拖下去。
+    // fail loud：阻断性失败（含必需行失败，以及被独立处置策略判为 Fail 的来源/完整性/持久化错误）
+    // 必须让装载失败；已降级的可选行或策略允许降级的错误只写警告并留在 `loader.report` 中。
+    let blocking: Vec<FailedRow> = state
+        .failed_rows()
+        .into_iter()
+        .filter(|row| !row.degraded)
+        .collect();
+    if !blocking.is_empty() {
+        let lines: Vec<String> = blocking
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} [category={}, startup={}]: {}",
+                    row.label,
+                    row.category.as_str(),
+                    row.startup.as_str(),
+                    row.message
+                )
+            })
+            .collect();
+        return Err(format!(
+            "{} 个条目装载失败:\n  - {}",
+            lines.len(),
+            lines.join("\n  - ")
+        )
+        .into());
+    }
     if !failures.is_empty() {
         if config.strict {
             return Err(format!(
@@ -4130,6 +5069,18 @@ pub async fn load_with_source(
         for failure in &failures {
             ctx.log(Level::Warn, &format!("降级（strict=false）：{failure}"));
         }
+    }
+    for row in state.degraded_rows() {
+        ctx.log(
+            Level::Warn,
+            &format!(
+                "降级（category={}, startup={}）：{}: {}",
+                row.category.as_str(),
+                row.startup.as_str(),
+                row.label,
+                row.message
+            ),
+        );
     }
 
     // 声明级依赖环（M5）：**默认只报告**（环里的行照旧挂上，自然停在 PENDING）；
@@ -4375,9 +5326,17 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
                 table
                     .values()
                     .find(|record| record.fiber.upgrade().map(|f| f.uid()) == Some(fiber.uid()))
-                    .map(|record| (record.label.clone(), record.origin))
+                    .map(|record| {
+                        (
+                            record.label.clone(),
+                            record.origin,
+                            record.declared.name.clone(),
+                        )
+                    })
             };
-            let Some((label, origin)) = found else { return };
+            let Some((label, origin, plugin_name)) = found else {
+                return;
+            };
             // 测试报到点：这一行确实有一次提交进了观察者，**还没**取 `config_gate`。
             // 只报到、不停（观察者没有可以停住的 `.await` 点，也不该阻塞 worker）。
             #[cfg(test)]
@@ -4447,10 +5406,13 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
                     },
                 }
             };
-            if let Err(err) = result {
-                state
-                    .ctx
-                    .log(Level::Error, &format!("{label}: 配置回写失败: {err}"));
+            match result {
+                Ok(()) => state.clear_persisted_error(&label),
+                Err(err) => state.record_persisted_error(
+                    &label,
+                    &plugin_name,
+                    format!("配置回写失败: {err}"),
+                ),
             }
         });
 }
@@ -4850,11 +5812,12 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
     // 挂新实例。**用记录里的派生上下文**（M4-1）：行级 isolate/intercept 挂在它上面，
     // 用根 ctx 重挂等于把行悄悄搬回默认域。
     let scope = &record.scope;
-    let fiber = mount(
+    let fiber = mount_with_label(
         scope,
         new_plugin.clone(),
         record.config.clone(),
         record.inject.clone(),
+        &record.label,
     );
     fiber.settle().await;
     let Some(error) = fiber.error() else {
@@ -4889,11 +5852,12 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
     }
 
     // 用旧插件把旧实例装回来。
-    let restored = mount(
+    let restored = mount_with_label(
         scope,
         record.plugin.clone(),
         record.config.clone(),
         record.inject.clone(),
+        &record.label,
     );
     restored.settle().await;
     match restored.error() {
@@ -4969,8 +5933,25 @@ async fn finish_reload_swap(
         SwapOutcome::Lost { rollback_error, .. } => Some(rollback_error.clone()),
         _ => None,
     };
+    let old_plugin = record.plugin.clone();
+    let old_declared = record.declared.clone();
     let remove_entry = record.commit_outcome(outcome, staged);
     if remove_entry {
+        let provides = state.declared_provides_for(label, &old_declared, None, Some(&old_plugin));
+        let startup = state.effective_row_startup(label, old_declared.id.as_deref());
+        let error_msg = report
+            .error
+            .clone()
+            .unwrap_or_else(|| lost_reason.clone().unwrap_or_else(|| "未知".to_string()));
+        state.record_failed_row(FailedRow {
+            label: label.to_string(),
+            plugin: old_declared.name.clone(),
+            category: FailureCategory::RuntimeUnavailable,
+            startup,
+            degraded: false,
+            provides,
+            message: error_msg,
+        });
         ctx.log(
             Level::Error,
             &format!(
@@ -4979,6 +5960,7 @@ async fn finish_reload_swap(
             ),
         );
     } else {
+        state.clear_failed_row(label);
         state
             .mounted
             .lock()
@@ -5073,7 +6055,7 @@ pub async fn reload_one_report(ctx: &Ctx, state: &Arc<LoaderState>, label: &str)
     // 预检 → 换实例 → 改记录 → 发布报告：整个变更序列与对账/启停互斥。
     let guard = state.mutation.lock().await;
     match state.preflight_dependencies(&state.tree_snapshot()) {
-        Ok(report) => state.record_preflight(report),
+        Ok((report, provides)) => state.record_preflight(report, provides),
         Err(err) => {
             let failure = format!("依赖预检失败（reload 未执行）: {err}");
             advance_fingerprint(state, label);
@@ -5287,11 +6269,50 @@ fn scope_inputs(chain: &[(String, Entry)]) -> Vec<ScopeInput> {
         .collect()
 }
 
+/// 期望态计算阶段发现的一条行级决策问题类别。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesiredIssueKind {
+    DuplicateLabel,
+    Interpolation,
+}
+
+/// 期望态计算阶段发现的一条行级决策问题。
+#[derive(Debug)]
+struct DesiredIssue {
+    label: String,
+    entry: Entry,
+    kind: DesiredIssueKind,
+    issue: String,
+}
+
+/// 为决策问题分配稳定的 `failed_rows` 台账键（重复 label 使用独立键避免被首行 Mount 误清）。
+fn assign_issue_keys(issues: Vec<DesiredIssue>) -> Vec<(String, DesiredIssue)> {
+    let mut dup_counts: HashMap<String, usize> = HashMap::new();
+    issues
+        .into_iter()
+        .map(|issue| {
+            let key = match issue.kind {
+                DesiredIssueKind::Interpolation => issue.label.clone(),
+                DesiredIssueKind::DuplicateLabel => {
+                    let count = dup_counts.entry(issue.label.clone()).or_insert(0);
+                    *count += 1;
+                    if *count == 1 {
+                        format!("{}#duplicate", issue.label)
+                    } else {
+                        format!("{}#duplicate#{}", issue.label, *count)
+                    }
+                }
+            };
+            (key, issue)
+        })
+        .collect()
+}
+
 /// 期望态计算的产物（M4-6 起把"休眠"也记下来：报告要回答"为什么没生效"）。
 struct Desired {
     rows: Vec<FlatRow>,
-    /// 逐行的问题（`<行标>: <原因>`）：不是"禁用"，而是"我们**无法判断**该不该挂"。
-    issues: Vec<(String, String)>,
+    /// 逐行的问题：不是"禁用"，而是"我们**无法判断**该不该挂"（保留行声明以支持启动策略与上游关联）。
+    issues: Vec<DesiredIssue>,
     /// 当前**休眠**的叶子行标（自身或祖先的 `disabled` 求值为真）。组行不是"能挂的行"，不计。
     disabled: Vec<String>,
 }
@@ -5336,7 +6357,7 @@ struct DesiredWalk<'a, 'b> {
     /// 已经出现过的行标：重复 `id` 会撞名（M4-3 之前会静默覆盖装载表记录）。
     seen: HashSet<String>,
     rows: Vec<FlatRow>,
-    issues: Vec<(String, String)>,
+    issues: Vec<DesiredIssue>,
     disabled: Vec<String>,
 }
 
@@ -5348,11 +6369,13 @@ impl DesiredWalk<'_, '_> {
             // 静默覆盖会让其中一行的实例变成无人认领的幽灵。重复出现的行**不挂载**，
             // 语义是"第一行获胜"，且问题进 `failures`/日志（strict 下整体失败）。
             if !self.seen.insert(label.clone()) {
-                self.issues.push((
+                self.issues.push(DesiredIssue {
                     label,
-                    "重复 label（两行解析成同一个行标识；请给它们不同的 id），已跳过该行"
+                    entry: entry.clone(),
+                    kind: DesiredIssueKind::DuplicateLabel,
+                    issue: "重复 label（两行解析成同一个行标识；请给它们不同的 id），已跳过该行"
                         .to_string(),
-                ));
+                });
                 continue;
             }
             let mut chain: Vec<(String, Entry)> = ancestors.to_vec();
@@ -5379,7 +6402,12 @@ impl DesiredWalk<'_, '_> {
                 Ok(false) => {}
                 // 算不出来（子集外 / 语法错）⇒ 不挂载并逐行报出（fail loud 的落点）。
                 Err(issue) => {
-                    self.issues.push((label, issue));
+                    self.issues.push(DesiredIssue {
+                        label,
+                        entry: entry.clone(),
+                        kind: DesiredIssueKind::Interpolation,
+                        issue,
+                    });
                     continue;
                 }
             }
@@ -5395,7 +6423,12 @@ impl DesiredWalk<'_, '_> {
                 if let Err(issue) =
                     interpolate_value(config, &path, &scope, self.decision.evaluator)
                 {
-                    self.issues.push((label, issue));
+                    self.issues.push(DesiredIssue {
+                        label,
+                        entry: entry.clone(),
+                        kind: DesiredIssueKind::Interpolation,
+                        issue,
+                    });
                     continue;
                 }
             }
@@ -5471,6 +6504,7 @@ mod source_admission_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mount;
     use std::sync::atomic::AtomicUsize;
 
     /// 造一个"假插件"：**完全不需要动态库**，用来把"换名重挂 + 回滚"这条链单独测干净。
@@ -5846,12 +6880,15 @@ mod tests {
         );
         assert_eq!(issues.len(), 1, "只有求不出来的那一处报错：{issues:?}");
         assert!(
-            issues[0].1.contains("at inner-bad.config.k"),
+            issues[0].issue.contains("at inner-bad.config.k"),
             "错误必须带路径：{issues:?}"
         );
-        assert!(issues[0].1.contains("1 +"), "错误必须带原文：{issues:?}");
         assert!(
-            !issues.iter().any(|(label, _)| label.contains("alpha#1")),
+            issues[0].issue.contains("1 +"),
+            "错误必须带原文：{issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|item| item.label.contains("alpha#1")),
             "禁用（休眠）的行不该报表达式问题：{issues:?}"
         );
 
@@ -6170,6 +7207,9 @@ mod tests {
             app.root.clone(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            true,
             ConfigFiles {
                 main: PathBuf::from("no-such-cordis.yml"),
                 patches: Vec::new(),
@@ -6185,6 +7225,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            true,
             false,
         );
         state

@@ -167,6 +167,12 @@ pub(crate) fn payload_of(err: &(dyn std::error::Error + 'static)) -> ErrorPayloa
     if let Some(payload) = err.downcast_ref::<ErrorPayload>() {
         return payload.clone();
     }
+    if let Some(unauth) = err.downcast_ref::<cordis_core::MethodUnauthorized>() {
+        return ErrorPayload::new(unauth.to_string())
+            .with_code("host_unauthorized")
+            .with_category("authorization")
+            .with_certainty("not_executed");
+    }
     err.downcast_ref::<CallFailure>()
         .map(|failure| failure.payload.clone())
         .unwrap_or_else(|| ErrorPayload::new(err.to_string()))

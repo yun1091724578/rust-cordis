@@ -103,6 +103,60 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub async fn wait_background_cleanups(&self)",
     },
     PublicItem {
+        item: "CallAuthHook",
+        kind: "type",
+        source: "crates/core/src/store.rs",
+        marker: "pub type CallAuthHook =",
+    },
+    PublicItem {
+        item: "Store::set_call_auth_hook",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn set_call_auth_hook(&self, hook: Option<CallAuthHook>)",
+    },
+    PublicItem {
+        item: "Store::has_call_auth_hook",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn has_call_auth_hook(&self) -> bool",
+    },
+    PublicItem {
+        item: "Store::authorize_call",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn authorize_call(",
+    },
+    PublicItem {
+        item: "Store::plugin_with_host_label",
+        kind: "fn",
+        source: "crates/core/src/store.rs",
+        marker: "pub fn plugin_with_host_label(",
+    },
+    PublicItem {
+        item: "CallerIdentity",
+        kind: "struct",
+        source: "crates/core/src/context.rs",
+        marker: "pub struct CallerIdentity",
+    },
+    PublicItem {
+        item: "MethodUnauthorized",
+        kind: "struct",
+        source: "crates/core/src/context.rs",
+        marker: "pub struct MethodUnauthorized",
+    },
+    PublicItem {
+        item: "Context::caller_identity",
+        kind: "fn",
+        source: "crates/core/src/context.rs",
+        marker: "pub fn caller_identity(&self) -> CallerIdentity",
+    },
+    PublicItem {
+        item: "Fiber::host_label",
+        kind: "fn",
+        source: "crates/core/src/fiber.rs",
+        marker: "pub fn host_label(&self) -> Option<&str>",
+    },
+    PublicItem {
         item: "Store::record_trace",
         kind: "fn",
         source: "crates/core/src/store.rs",
@@ -535,6 +589,60 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub fn lifecycle_policy_for(",
     },
     PublicItem {
+        item: "RowStartup",
+        kind: "enum",
+        source: "crates/host/src/policy.rs",
+        marker: "pub enum RowStartup",
+    },
+    PublicItem {
+        item: "FailureCategory",
+        kind: "enum",
+        source: "crates/host/src/policy.rs",
+        marker: "pub enum FailureCategory",
+    },
+    PublicItem {
+        item: "FailureDisposition",
+        kind: "enum",
+        source: "crates/host/src/policy.rs",
+        marker: "pub enum FailureDisposition",
+    },
+    PublicItem {
+        item: "StartupPolicy",
+        kind: "struct",
+        source: "crates/host/src/policy.rs",
+        marker: "pub struct StartupPolicy",
+    },
+    PublicItem {
+        item: "set_startup_policy_for",
+        kind: "fn",
+        source: "crates/host/src/policy.rs",
+        marker: "pub fn set_startup_policy_for(",
+    },
+    PublicItem {
+        item: "startup_policy_for",
+        kind: "fn",
+        source: "crates/host/src/policy.rs",
+        marker: "pub fn startup_policy_for(",
+    },
+    PublicItem {
+        item: "MethodAllowList",
+        kind: "struct",
+        source: "crates/host/src/policy.rs",
+        marker: "pub struct MethodAllowList",
+    },
+    PublicItem {
+        item: "set_method_allow_list_for",
+        kind: "fn",
+        source: "crates/host/src/policy.rs",
+        marker: "pub fn set_method_allow_list_for(",
+    },
+    PublicItem {
+        item: "method_allow_list_for",
+        kind: "fn",
+        source: "crates/host/src/policy.rs",
+        marker: "pub fn method_allow_list_for(",
+    },
+    PublicItem {
         item: "open_verified",
         kind: "fn",
         source: "crates/host/src/lib.rs",
@@ -761,6 +869,66 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         kind: "fn",
         source: "crates/host/src/loader.rs",
         marker: "pub fn pending_report(&self) -> Vec<PendingRow>",
+    },
+    PublicItem {
+        item: "LoadFailure",
+        kind: "struct",
+        source: "crates/host/src/loader.rs",
+        marker: "pub struct LoadFailure",
+    },
+    PublicItem {
+        item: "FailedRow",
+        kind: "struct",
+        source: "crates/host/src/loader.rs",
+        marker: "pub struct FailedRow",
+    },
+    PublicItem {
+        item: "PendingUpstreamFailure",
+        kind: "struct",
+        source: "crates/host/src/loader.rs",
+        marker: "pub struct PendingUpstreamFailure",
+    },
+    PublicItem {
+        item: "CorrelatedPendingInject",
+        kind: "struct",
+        source: "crates/host/src/loader.rs",
+        marker: "pub struct CorrelatedPendingInject",
+    },
+    PublicItem {
+        item: "CorrelatedPendingRow",
+        kind: "struct",
+        source: "crates/host/src/loader.rs",
+        marker: "pub struct CorrelatedPendingRow",
+    },
+    PublicItem {
+        item: "LoaderState::failed_rows",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub fn failed_rows(&self) -> Vec<FailedRow>",
+    },
+    PublicItem {
+        item: "LoaderState::degraded_rows",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub fn degraded_rows(&self) -> Vec<FailedRow>",
+    },
+    PublicItem {
+        item: "LoaderState::persisted_state_errors",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub fn persisted_state_errors(&self) -> Vec<FailedRow>",
+    },
+    PublicItem {
+        item: "LoaderState::correlated_pending_report",
+        kind: "fn",
+        source: "crates/host/src/loader.rs",
+        marker: "pub fn correlated_pending_report(&self) -> Vec<CorrelatedPendingRow>",
+    },
+    PublicItem {
+        item: "PluginSource::load_classified",
+        kind: "method",
+        source: "crates/host/src/loader.rs",
+        marker: "fn load_classified(\n        &self,\n        entry: &Entry,\n        search: &[PathBuf],\n        revision: u64,\n        admission: &SourceAdmission,\n    ) -> std::result::Result<LoadedFile, LoadFailure> {\n        self.load_admitted(",
     },
     PublicItem {
         item: "DiskPluginSource",
@@ -1485,7 +1653,7 @@ pub struct Q {
             42,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 137, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 165, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 33, "载荷清单数量漂移");
     }
 
@@ -1508,6 +1676,10 @@ pub struct Q {
             "`LifecyclePolicy`",
             "`CloseReport`",
             "`ReloadReport`",
+            "`StartupPolicy`",
+            "`MethodAllowList`",
+            "`CallerIdentity`",
+            "`CorrelatedPendingRow`",
             "`StreamSink::fail_error`",
             "`Ctx::stream_fail_payload`",
             "`DERIVED_HANDLE_TAG`",

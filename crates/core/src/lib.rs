@@ -30,7 +30,7 @@ mod trace;
 mod volatile;
 
 pub use cancel::CancelToken;
-pub use context::{Context, Ctx, ResolvedConfig};
+pub use context::{CallerIdentity, Context, Ctx, MethodUnauthorized, ResolvedConfig};
 pub use dyn_value::{
     group, panic_message, BoxFuture, Config, Disposable, Dyn, Error, ExternService, ExternValue,
     IfaceRef, IfaceVersionMismatch, Result, ServiceFuture,
@@ -45,9 +45,9 @@ pub use hook_scope::{ScopeAnchor, ScopePredicate};
 pub use iface::Iface;
 pub use scope::Scope;
 pub use store::{
-    unique_key, with_provision, Check, FnPlugin, GetHook, Impl, Inject, Level, ListenerHook,
-    LogSink, Plugin, PluginKey, ProvisionReport, RealmId, ResolveError, Runtime, ServiceInfo,
-    SetHook, Store, ValidationError,
+    unique_key, with_provision, CallAuthHook, Check, FnPlugin, GetHook, Impl, Inject, Level,
+    ListenerHook, LogSink, Plugin, PluginKey, ProvisionReport, RealmId, ResolveError, Runtime,
+    ServiceInfo, SetHook, Store, ValidationError,
 };
 pub use stream::{
     AsyncStream, PushOutcome, StreamObserver, StreamOutcome, StreamSink, STREAM_WINDOW,

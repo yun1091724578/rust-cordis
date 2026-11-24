@@ -616,6 +616,9 @@ pub struct Fiber {
     uid: AtomicU64,
     /// 创建时固定的唯一编号（不会被 `dispose()` 覆写成 `UID_DISPOSED`），用于错误归因与收集器路由。
     id: u64,
+    /// 宿主/装载器在挂载时绑定的不可变行标（如配置行 `label`）；非装载器挂载的 fiber 为 `None`。
+    /// 不可变且不向下传递给插件再创建的子 fiber，防止子插件冒用父行身份。
+    host_label: Option<Arc<str>>,
     /// 从自身到根 fiber 的不可变祖先链 `[self.id, parent.id, ..., UID_ROOT]`。
     ancestor_ids: Arc<[u64]>,
     pub store: Arc<Store>,
@@ -747,6 +750,7 @@ impl Fiber {
         let fiber = Arc::new(Self {
             uid: AtomicU64::new(UID_ROOT),
             id: UID_ROOT,
+            host_label: None,
             ancestor_ids: Arc::from([UID_ROOT]),
             store: store.clone(),
             parent: None,
@@ -810,6 +814,7 @@ impl Fiber {
         inject: Inject,
         runtime: Option<Arc<Runtime>>,
         store: &Arc<Store>,
+        host_label: Option<Arc<str>>,
     ) -> Arc<Self> {
         // inject 里的非 null 值进本 fiber 自己的**声明链**（论文的 `d`，M3）：
         // 祖先优先、后代覆盖，但**排在 intercept 链（ι）之下**——提供者侧读到的
@@ -834,6 +839,7 @@ impl Fiber {
         let fiber = Arc::new(Self {
             uid: AtomicU64::new(id),
             id,
+            host_label,
             ancestor_ids: Arc::from(ancestors),
             store: store.clone(),
             parent: Some(parent.clone()),
@@ -939,6 +945,11 @@ impl Fiber {
 
     pub fn uid(&self) -> u64 {
         self.uid.load(Ordering::SeqCst)
+    }
+
+    /// 宿主/装载器在挂载时为该 fiber 绑定的不可变行标（非装载器挂载时为 `None`）。
+    pub fn host_label(&self) -> Option<&str> {
+        self.host_label.as_deref()
     }
 
     pub fn state(&self) -> FiberState {

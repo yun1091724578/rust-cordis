@@ -9,8 +9,10 @@ use cordis_host::loaded_instances;
 use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
 use cordis_host::patch::Entry;
 use cordis_host::{
-    lifecycle_policy_for, set_lifecycle_policy_for, Capabilities, DispatchPolicy, HostLimits,
-    LifecyclePolicy,
+    lifecycle_policy_for, method_allow_list_for, set_lifecycle_policy_for,
+    set_method_allow_list_for, set_startup_policy_for, startup_policy_for, Capabilities,
+    DispatchPolicy, FailureCategory, FailureDisposition, HostLimits, LifecyclePolicy,
+    MethodAllowList, RowStartup, StartupPolicy,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -303,4 +305,42 @@ async fn public_api_can_load_embed_and_close() {
     app.close().await;
     assert_eq!(loaded_instances(), 0, "close must release plugin instances");
     let _ = std::fs::remove_file(Path::new(&path));
+}
+
+#[tokio::test]
+async fn host_startup_and_method_allow_list_public_contract() {
+    // 0.1 兼容性约束：Entry 字面量构造不得被新增字段破坏（ADR 0006）。
+    let entry = Entry {
+        id: Some("demo".into()),
+        name: "demo".into(),
+        config: None,
+        group: false,
+        disabled: false,
+        disabled_expr: None,
+        inject: None,
+        isolate: None,
+        intercept: None,
+        children: Vec::new(),
+    };
+    assert_eq!(entry.name, "demo");
+
+    let app = App::new();
+    let startup = StartupPolicy::new()
+        .with_source(FailureDisposition::Fail)
+        .with_integrity(FailureDisposition::Fail)
+        .with_persisted_state(FailureDisposition::Degrade)
+        .with_optional_row("opt");
+    assert_eq!(startup.source(), FailureDisposition::Fail);
+    assert_eq!(startup.integrity(), FailureDisposition::Fail);
+    assert_eq!(startup.persisted_state(), FailureDisposition::Degrade);
+    assert_eq!(startup.row_startup("opt", None), Some(RowStartup::Optional));
+    assert_eq!(FailureCategory::Source.as_str(), "source");
+    set_startup_policy_for(&app.root, Some(startup.clone()));
+    assert_eq!(startup_policy_for(&app.root), Some(startup));
+
+    let allow = MethodAllowList::new().allow_row_method("demo", "svc", "ping");
+    set_method_allow_list_for(&app.root, Some(allow.clone()));
+    assert_eq!(method_allow_list_for(&app.root), Some(allow));
+
+    app.close().await;
 }

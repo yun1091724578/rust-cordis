@@ -17,13 +17,14 @@
 //! `provide` 的冲突检查直接看 `impls`（与 JS 的 `reflect.ts:189-192` 一致），
 //! `set` 的"没 provide 过就不能写"也直接看 `impls`（与 `reflect.ts:164-169` 一致）。
 
+use crate::context::{CallerIdentity, MethodUnauthorized};
 use crate::dyn_value::{BoxFuture, Config, Disposable, Dyn, Result};
 use crate::event::{self, Args, Filter, Handler, Hook, Mode, Ret};
 use crate::fiber::Fiber;
 use crate::trace::{TraceRecord, TraceSink};
 use crate::{Context, Ctx};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub type RealmId = u32;
@@ -48,6 +49,16 @@ pub type GetHook = Arc<dyn Fn(&Ctx, &str) -> Option<Dyn> + Send + Sync>;
 /// **同步写钩子**（`internal/set` 的 Rust 形态，M3-3）：实参 `(写的 ctx, 服务名, 新值)`；
 /// 返回 `Some(result)` ⇒ 接管这次写入（`Some(Err(..))` 即否决）；`None` ⇒ 走内核的 `set`。
 pub type SetHook = Arc<dyn Fn(&Ctx, &str, &Dyn) -> Option<Result<()>> + Send + Sync>;
+
+/// **同步方法调用授权钩子**：由宿主安装在 `Store` 上，在 `call_iface` / `call_iface_stream`
+/// 解析与执行之前校验由内核/宿主绑定的 [`CallerIdentity`] 与目标 `(service, method)`。
+///
+/// 返回 `Ok(())` 放行；返回 `Err(reason)` 拒绝（提供者代码不执行）。
+///
+/// 实现必须是**纯函数且幂等**的（不应假设单次调用只触发一次钩子：宿主 FFI 入口可能在
+/// 分配派发槽位前预检一次，随后内核 `Context::call_iface` 仍会防御性复检）。
+pub type CallAuthHook =
+    Arc<dyn Fn(&CallerIdentity, &str, &str) -> std::result::Result<(), String> + Send + Sync>;
 
 /// 一个 fiber 注册的**可调用服务**（`provide_iface` 或带 JSON 面的值）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -437,6 +448,10 @@ pub struct Store {
     log_sink: Mutex<LogSink>,
     /// 逐跳记录出口（ADR 0009）：只在 `App` 上安装一次；未安装时一次原子读。
     trace_sink: OnceLock<Arc<dyn TraceSink>>,
+    /// 宿主管理的 `call_iface` / `call_iface_stream` 方法调用授权钩子。
+    /// 未安装时仅需一次 `has_call_auth` 原子读（零锁开销）。
+    has_call_auth: AtomicBool,
+    call_auth_hook: Mutex<Option<CallAuthHook>>,
     /// 生命周期三段等待预算（apply / drain / dispose；缺省全 `None`）。
     lifecycle_policy: Mutex<crate::fiber::LifecyclePolicy>,
     /// 活动中的关闭报告收集器（弱引用，报告返回后自动过期清理）。
@@ -477,6 +492,8 @@ impl Store {
                 eprintln!("[{level:?}] {name}: {msg}");
             })),
             trace_sink: OnceLock::new(),
+            has_call_auth: AtomicBool::new(false),
+            call_auth_hook: Mutex::new(None),
             lifecycle_policy: Mutex::new(crate::fiber::LifecyclePolicy::default()),
             cleanup_collectors: Mutex::new(Vec::new()),
             cleanup_error_sn: AtomicU64::new(1),
@@ -521,6 +538,58 @@ impl Store {
     /// 读取本 `App` / `Store` 当前的生命周期等待预算。
     pub fn lifecycle_policy(&self) -> crate::fiber::LifecyclePolicy {
         *self.lifecycle_policy.lock().unwrap()
+    }
+
+    /// 安装或清除宿主管理的方法调用授权钩子（作用于本 `Store` 上的 `call_iface` 与 `call_iface_stream`）。
+    pub fn set_call_auth_hook(&self, hook: Option<CallAuthHook>) {
+        let mut slot = self.call_auth_hook.lock().unwrap();
+        let enabled = hook.is_some();
+        *slot = hook;
+        self.has_call_auth.store(enabled, Ordering::Release);
+    }
+
+    /// 本 `Store` 当前是否安装了方法调用授权钩子（热路径单次原子读）。
+    pub fn has_call_auth_hook(&self) -> bool {
+        self.has_call_auth.load(Ordering::Acquire)
+    }
+
+    /// 按本 `Store` 当前的授权钩子校验由宿主绑定的调用方身份与 `(service, method)`。
+    ///
+    /// 授权钩子内部 panic 时按 fail-closed 拒绝，绝不放行。
+    pub fn authorize_call(
+        &self,
+        caller: &CallerIdentity,
+        service: &str,
+        method: &str,
+    ) -> std::result::Result<(), Box<MethodUnauthorized>> {
+        if !self.has_call_auth.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let hook = self.call_auth_hook.lock().unwrap().clone();
+        let Some(hook) = hook else {
+            return Ok(());
+        };
+        let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hook(caller, service, method)
+        }));
+        match decision {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(Box::new(MethodUnauthorized {
+                caller: caller.clone(),
+                service: service.to_string(),
+                method: method.to_string(),
+                reason,
+            })),
+            Err(payload) => Err(Box::new(MethodUnauthorized {
+                caller: caller.clone(),
+                service: service.to_string(),
+                method: method.to_string(),
+                reason: format!(
+                    "调用授权策略执行 panic（fail-closed）: {}",
+                    crate::panic_message(&*payload)
+                ),
+            })),
+        }
     }
 
     pub(crate) fn next_cleanup_error_seq(&self) -> u64 {
@@ -1632,8 +1701,31 @@ impl Store {
         inject: Inject,
         optional_inject: &[String],
     ) -> Arc<Fiber> {
+        self.plugin_with_host_label(parent, plugin, config, inject, optional_inject, None)
+    }
+
+    /// 与 [`Store::plugin_with_optional`] 相同，但在 `Fiber` 创建瞬间绑定不可变宿主行标。
+    ///
+    /// 绑定发生在 `apply` 启动之前，因此插件在首次 `apply` 内部发起 `call_iface` 时即可
+    /// 稳定读取到由宿主绑定的 `CallerIdentity::row_label`；该行标不会向下继承给子插件。
+    pub fn plugin_with_host_label(
+        self: &Arc<Self>,
+        parent: &Ctx,
+        plugin: Arc<dyn Plugin>,
+        config: Config,
+        inject: Inject,
+        optional_inject: &[String],
+        host_label: Option<&str>,
+    ) -> Arc<Fiber> {
         let runtime = self.runtime_for(&plugin);
-        let fiber = Fiber::new(parent, config, inject, Some(runtime), self);
+        let fiber = Fiber::new(
+            parent,
+            config,
+            inject,
+            Some(runtime),
+            self,
+            host_label.map(Arc::<str>::from),
+        );
         for name in optional_inject {
             fiber.add_optional_inject(name);
         }

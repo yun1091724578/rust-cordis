@@ -43,6 +43,57 @@ fn merge_layer(acc: &mut Option<Config>, layer: Config) {
     *acc = Some(layer);
 }
 
+/// 宿主/内核绑定的调用方身份（来自调用点 `Context` 所属的 `Fiber`，不依赖 `TraceSink` 或线程局部观测态）。
+///
+/// - 派生 `isolate` / `intercept` / `filter` 上下文继承所属 `Fiber` 的同一身份；
+/// - 由装载器挂载的行 fiber 携带不可变 `row_label`；
+/// - 插件自行创建的子 fiber 拥有独立的 `fiber_uid` / `plugin`，**不会**继承父行的 `row_label`；
+/// - 已处置上下文（fiber 弱引用失效或已 `UID_DISPOSED`）的 `is_root` 恒为 `false`（fail-closed）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallerIdentity {
+    /// 调用点 fiber 的唯一标识（`UID_ROOT` 表示宿主根上下文，`UID_DISPOSED` 表示已处置）。
+    pub fiber_uid: u64,
+    /// 绑定到该 fiber 的插件名（根上下文为 `"root"`）。
+    pub plugin: String,
+    /// 若该 fiber 由装载器挂载，则为宿主绑定的不可变配置行标（否则为 `None`）。
+    pub row_label: Option<String>,
+    /// 是否为存活的宿主根上下文。
+    pub is_root: bool,
+}
+
+impl std::fmt::Display for CallerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(label) = &self.row_label {
+            write!(f, "row={label} ({}#{})", self.plugin, self.fiber_uid)
+        } else {
+            write!(f, "{}#{}", self.plugin, self.fiber_uid)
+        }
+    }
+}
+
+/// 宿主管理的 `call_iface` / `call_iface_stream` 调用被方法白名单策略拒绝。
+///
+/// 拒绝发生在服务解析、接口检查与提供者执行之前，因此提供者代码必然未执行。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodUnauthorized {
+    pub caller: CallerIdentity,
+    pub service: String,
+    pub method: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for MethodUnauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "调用被宿主方法白名单拒绝（caller={}, target={}.{}）: {}",
+            self.caller, self.service, self.method, self.reason
+        )
+    }
+}
+
+impl std::error::Error for MethodUnauthorized {}
+
 /// 引擎便利通道（M3 通道 ②，**明确不是** Def 26 的 d(k)）。
 ///
 /// 「本插件实际拿到的配置」+「每个已声明依赖在调用点上的合并结果」，一次给全。
@@ -492,9 +543,35 @@ impl Context {
             .provide(self, name, Dyn::new(crate::IfaceRef(iface)), None)
     }
 
+    /// 返回由内核/宿主绑定到本上下文的调用方身份。
+    ///
+    /// 直接从本上下文所属的 `Fiber` 读取，完全独立于 `TraceSink` 与线程局部
+    /// `current_caller_uid()`；已处置上下文按 fail-closed 语义返回 `is_root = false`。
+    pub fn caller_identity(&self) -> CallerIdentity {
+        match self.fiber_opt() {
+            Some(fiber) => {
+                let fiber_uid = fiber.uid();
+                CallerIdentity {
+                    fiber_uid,
+                    plugin: fiber.name().to_string(),
+                    row_label: fiber.host_label().map(str::to_string),
+                    is_root: fiber_uid == crate::fiber::UID_ROOT,
+                }
+            }
+            None => CallerIdentity {
+                fiber_uid: crate::fiber::UID_DISPOSED,
+                plugin: "<disposed>".to_string(),
+                row_label: None,
+                is_root: false,
+            },
+        }
+    }
+
     /// 调用一个带方法的服务。
     ///
     /// 逐层校验，且每层的失败原因都可区分（**可降级** vs **不可降级**）：
+    /// 0. 若宿主安装了调用授权策略（[`Store::set_call_auth_hook`]），先校验宿主绑定的
+    ///    [`CallerIdentity`] 与目标 `(service, method)` → 未授权返回 [`MethodUnauthorized`]；
     /// 1. 服务不存在 → `ResolveError`（能力缺失，可降级）；
     /// 2. 服务存在但**没有可调用面孔**（既不是接口，也没挂 JSON 面）→ 明确报错（配置/契约错误）；
     /// 3. 请求版本高于提供版本 → [`crate::IfaceVersionMismatch`]（契约错误）；
@@ -517,19 +594,37 @@ impl Context {
         // ADR 0009 要求“未安装 sink 只多一次原子读”。
         let traced = self.store.has_trace_sink();
         let started = std::time::Instant::now();
-        let caller_uid = if traced {
-            self.fiber_opt()
-                .map(|fiber| fiber.uid())
-                .unwrap_or(crate::fiber::UID_ROOT)
-        } else {
-            crate::fiber::UID_ROOT
-        };
         let correlation_id = if traced || self.correlation_id.is_some() {
             self.correlation_id
                 .clone()
                 .or_else(crate::trace::current_correlation_id)
         } else {
             None
+        };
+        // 宿主方法白名单准入：最先执行，不依赖 `TraceSink`，拒绝时不暴露服务/方法存在性，
+        // 也不执行提供者代码（certainty = not_executed）。
+        if self.store.has_call_auth_hook() {
+            let caller = self.caller_identity();
+            if let Err(err) = self.store.authorize_call(&caller, service, method) {
+                if traced {
+                    self.store.record_trace(crate::trace::failed(
+                        format!("{service}.{method}"),
+                        caller.fiber_uid,
+                        correlation_id,
+                        service,
+                        "host_unauthorized",
+                        started,
+                    ));
+                }
+                return Box::pin(async move { Err(err as crate::Error) });
+            }
+        }
+        let caller_uid = if traced {
+            self.fiber_opt()
+                .map(|fiber| fiber.uid())
+                .unwrap_or(crate::fiber::UID_ROOT)
+        } else {
+            crate::fiber::UID_ROOT
         };
         let (iface, caller_meta) = match self.iface_target(service) {
             Ok(pair) => pair,
@@ -590,6 +685,12 @@ impl Context {
         method: &str,
         args: Config,
     ) -> Result<crate::AsyncStream> {
+        if self.store.has_call_auth_hook() {
+            let caller = self.caller_identity();
+            self.store
+                .authorize_call(&caller, service, method)
+                .map_err(|err| err as crate::Error)?;
+        }
         let (iface, caller_meta) = self.iface_target(service)?;
         Self::check_iface_call(&iface, service, version, method)?;
         let (sink, mut stream) = crate::StreamSink::new(crate::STREAM_WINDOW);

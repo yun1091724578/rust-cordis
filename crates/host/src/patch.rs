@@ -32,6 +32,7 @@
 //!   [`crate::loader::JsEvaluator`]；`config` 位置仍归本清单，M4-4b 才接配置链）；
 //! - 回写时构造 `serde_yaml::Value::Tagged` 再对称还原成 `!!js` 原文。
 
+use crate::RowStartup;
 use cordis_core::Config;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -178,6 +179,131 @@ fn parse_disabled(
     }
 }
 
+/// 解析行级启动策略（`startup` / `required` / `optional`）。
+///
+/// 返回值：
+/// - `Ok(None)`：三个键均未出现（条目默认继承/Required，patch 不修改该字段）；
+/// - `Ok(Some(None))`：显式设为 `null`（条目视为未声明，patch 清除显式覆盖）；
+/// - `Ok(Some(Some(RowStartup)))`：显式声明为 `Required` 或 `Optional`。
+///
+/// 类型非法、含 `!!js` 或同条目内互相冲突（例如同时 `required: true` 与 `optional: true`）
+/// 一律 fail loud 返回可读错误。
+fn parse_row_startup(
+    object: &Map<String, Value>,
+) -> std::result::Result<Option<Option<RowStartup>>, String> {
+    let mut seen_any = false;
+    let mut resolved: Option<RowStartup> = None;
+
+    let mut merge =
+        |field: &str, candidate: Option<RowStartup>| -> std::result::Result<(), String> {
+            seen_any = true;
+            if let Some(next) = candidate {
+                if let Some(prev) = resolved {
+                    if prev != next {
+                        return Err(format!(
+                            "{field} 与同行其它启动策略声明冲突（已声明 {}，又声明 {}）",
+                            prev.as_str(),
+                            next.as_str()
+                        ));
+                    }
+                }
+                resolved = Some(next);
+            }
+            Ok(())
+        };
+
+    if let Some(value) = object.get("startup") {
+        if let Some((path, expr)) = first_js_expr(value, "startup") {
+            return Err(format!(
+                "entry-level startup 的 !!js 尚未支持（at {path}: {expr}）"
+            ));
+        }
+        match value {
+            Value::Null => merge("startup", None)?,
+            Value::String(text) => match text.as_str() {
+                "required" => merge("startup", Some(RowStartup::Required))?,
+                "optional" => merge("startup", Some(RowStartup::Optional))?,
+                other => {
+                    return Err(format!(
+                        "startup 必须是 \"required\" 或 \"optional\"（收到 {other:?}）"
+                    ));
+                }
+            },
+            other => {
+                return Err(format!(
+                    "startup 必须是字符串 \"required\" 或 \"optional\"（收到{}）",
+                    json_kind(other)
+                ));
+            }
+        }
+    }
+
+    if let Some(value) = object.get("required") {
+        if let Some((path, expr)) = first_js_expr(value, "required") {
+            return Err(format!(
+                "entry-level required 的 !!js 尚未支持（at {path}: {expr}）"
+            ));
+        }
+        match value {
+            Value::Null => merge("required", None)?,
+            Value::Bool(flag) => merge(
+                "required",
+                Some(if *flag {
+                    RowStartup::Required
+                } else {
+                    RowStartup::Optional
+                }),
+            )?,
+            other => {
+                return Err(format!("required 必须是布尔值（收到{}）", json_kind(other)));
+            }
+        }
+    }
+
+    if let Some(value) = object.get("optional") {
+        if let Some((path, expr)) = first_js_expr(value, "optional") {
+            return Err(format!(
+                "entry-level optional 的 !!js 尚未支持（at {path}: {expr}）"
+            ));
+        }
+        match value {
+            Value::Null => merge("optional", None)?,
+            Value::Bool(flag) => merge(
+                "optional",
+                Some(if *flag {
+                    RowStartup::Optional
+                } else {
+                    RowStartup::Required
+                }),
+            )?,
+            other => {
+                return Err(format!("optional 必须是布尔值（收到{}）", json_kind(other)));
+            }
+        }
+    }
+
+    if seen_any {
+        Ok(Some(resolved))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 与 `Vec<Entry>` 一一对应的行级启动策略树（不向 0.1 公开 DTO `Entry` 新增字段，见 ADR 0006）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StartupNode {
+    pub explicit: Option<RowStartup>,
+    pub children: Vec<StartupNode>,
+}
+
+/// 与 `Patch` 并行的启动策略变更元数据。
+#[derive(Clone, Debug)]
+pub(crate) struct PatchWithStartup {
+    pub patch: Patch,
+    pub startup: Option<Option<RowStartup>>,
+    pub insert_startup: Option<Vec<StartupNode>>,
+}
+
 /// `isolate` 的合法形态：`{ "<service>": true | "<label>" }`。
 ///
 /// 值不是 `true`/字符串时 loader 现在会静默 `continue`（完全不应用隔离）；
@@ -292,6 +418,8 @@ impl Entry {
         if let Some(value) = &inject {
             parse_inject(value).map_err(|err| format!("{err} (at inject)"))?;
         }
+        // 校验行级启动策略（`startup` / `required` / `optional`）：非法或冲突一律 fail loud。
+        parse_row_startup(object)?;
         Ok(Entry {
             id: object
                 .get("id")
@@ -489,6 +617,7 @@ impl Patch {
         if let Some(value) = isolate.as_ref().filter(|value| !value.is_null()) {
             validate_isolate(value).map_err(|err| format!("{err} (at isolate)"))?;
         }
+        parse_row_startup(object)?;
         Ok(Patch {
             id: object
                 .get("id")
@@ -672,6 +801,189 @@ fn find_mut<'a>(entries: &'a mut [Entry], id: &str) -> Option<&'a mut Entry> {
         }
     }
     None
+}
+
+fn find_mut_with_startup<'a>(
+    entries: &'a mut [Entry],
+    nodes: &'a mut [StartupNode],
+    id: &str,
+) -> Option<(&'a mut Entry, &'a mut StartupNode)> {
+    for (entry, node) in entries.iter_mut().zip(nodes.iter_mut()) {
+        if entry.id.as_deref() == Some(id) {
+            return Some((entry, node));
+        }
+        if let Some(found) = find_mut_with_startup(&mut entry.children, &mut node.children, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn entry_from_value_with_startup(
+    value: &Value,
+) -> std::result::Result<(Entry, StartupNode), String> {
+    let entry = Entry::from_value_checked(value)?;
+    let object = value
+        .as_object()
+        .expect("Entry::from_value_checked 已校验对象");
+    let explicit = parse_row_startup(object)?.flatten();
+    let children = if entry.group {
+        match object.get("config") {
+            Some(Value::Array(list)) => {
+                let mut child_nodes = Vec::with_capacity(list.len());
+                for item in list {
+                    let (_, node) = entry_from_value_with_startup(item)?;
+                    child_nodes.push(node);
+                }
+                child_nodes
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    Ok((entry, StartupNode { explicit, children }))
+}
+
+/// 应用一层 patch（同步维护行级启动策略树与字段归属）。
+pub(crate) fn apply_entry_patches_full(
+    mut root: Vec<Entry>,
+    mut root_startup: Vec<StartupNode>,
+    patches: &[PatchWithStartup],
+    layer: usize,
+    owners: &mut PatchOwners,
+    warn: &mut dyn FnMut(&str),
+) -> (Vec<Entry>, Vec<StartupNode>) {
+    for item in patches {
+        let patch = &item.patch;
+        if let Some(insert) = &patch.insert {
+            let insert_nodes = item
+                .insert_startup
+                .clone()
+                .unwrap_or_else(|| vec![StartupNode::default(); insert.len()]);
+            match patch.id.as_deref() {
+                None => {
+                    root.extend(insert.iter().cloned());
+                    root_startup.extend(insert_nodes);
+                    for entry in insert {
+                        owners.note(entry, layer);
+                    }
+                }
+                Some(group_id) => {
+                    match find_mut_with_startup(&mut root, &mut root_startup, group_id) {
+                        Some((target, target_node)) if target.group => {
+                            target.children.extend(insert.iter().cloned());
+                            target_node.children.extend(insert_nodes);
+                            for entry in insert {
+                                owners.note(entry, layer);
+                            }
+                        }
+                        Some(_) => {
+                            warn(&format!("insert 目标 \"{group_id}\" 不是 group 行，已跳过"))
+                        }
+                        None => warn(&format!("insert 目标 \"{group_id}\" 未找到，已跳过")),
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(id) = patch.id.as_deref() else {
+            warn("非 insert 的 patch 必须带 id，已跳过");
+            continue;
+        };
+        match find_mut_with_startup(&mut root, &mut root_startup, id) {
+            Some((target, target_node)) => {
+                if let Some(name) = patch.name.as_deref().filter(|name| !name.is_empty()) {
+                    if name != target.name {
+                        warn(&format!(
+                            "patch: name mismatch for \"{id}\" (expected \"{}\", got \"{name}\")，已跳过",
+                            target.name
+                        ));
+                        continue;
+                    }
+                }
+                if patch.config.is_some() {
+                    for child in &target.children {
+                        owners.untrack(child);
+                    }
+                }
+                let prev_group = target.group;
+                target.overlay(patch, warn);
+                if let Some(group) = patch.group {
+                    if !group {
+                        target_node.children.clear();
+                    }
+                }
+                if let Some(config) = &patch.config {
+                    if target.group {
+                        if config.is_null() {
+                            target_node.children.clear();
+                        } else if let Some(list) = config.as_array() {
+                            let mut child_nodes = Vec::with_capacity(list.len());
+                            for item_val in list {
+                                if let Ok((_, child_node)) = entry_from_value_with_startup(item_val)
+                                {
+                                    child_nodes.push(child_node);
+                                }
+                            }
+                            target_node.children = child_nodes;
+                        } else if !prev_group {
+                            target_node.children.clear();
+                        }
+                    }
+                }
+                if let Some(startup_override) = item.startup {
+                    target_node.explicit = startup_override;
+                }
+                owners.note_overlay(target, patch, layer);
+            }
+            None => warn(&format!("patch 目标 \"{id}\" 未找到，已跳过")),
+        }
+    }
+    (root, root_startup)
+}
+
+/// 按与装载器完全一致的 DFS 行标与首行获胜规则把 `StartupNode` 树展平成 `label -> RowStartup`（含组行继承）。
+pub(crate) fn flatten_startup_table(
+    entries: &[Entry],
+    nodes: &[StartupNode],
+) -> HashMap<String, RowStartup> {
+    fn walk(
+        entries: &[Entry],
+        nodes: &[StartupNode],
+        inherited: Option<RowStartup>,
+        ordinals: &mut HashMap<String, usize>,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut HashMap<String, RowStartup>,
+    ) {
+        for (index, entry) in entries.iter().enumerate() {
+            let label = if let Some(id) = &entry.id {
+                id.clone()
+            } else {
+                let counter = ordinals.entry(entry.name.clone()).or_insert(0);
+                let label = format!("{}#{}", entry.name, *counter);
+                *counter += 1;
+                label
+            };
+            // 与 `DesiredWalk` 保持同一条“第一行获胜”不变量：重复 label 行绝不覆盖或污染首行的启动策略。
+            if !seen.insert(label.clone()) {
+                continue;
+            }
+            let node = nodes.get(index);
+            let effective = node.and_then(|n| n.explicit).or(inherited);
+            if entry.group {
+                let child_nodes = node.map(|n| n.children.as_slice()).unwrap_or(&[]);
+                walk(&entry.children, child_nodes, effective, ordinals, seen, out);
+            } else if let Some(startup) = effective {
+                out.insert(label, startup);
+            }
+        }
+    }
+    let mut ordinals = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = HashMap::new();
+    walk(entries, nodes, None, &mut ordinals, &mut seen, &mut out);
+    out
 }
 
 /// 内部标记标签：`!!js` 是 YAML 标准标签，serde_yaml 0.9 只把单 `!` 本地标签暴露成
@@ -1062,18 +1374,25 @@ fn collect_config_issues_into(value: &Value, path: &str, issues: &mut Vec<String
 
 /// 把一份 YAML 文档（条目数组）解析成归一化条目树。
 pub fn parse_entries(yaml: &str) -> Result<Vec<Entry>, String> {
+    parse_entries_with_startup(yaml).map(|(entries, _)| entries)
+}
+
+/// 解析主配置条目树，并同步返回一一对应的行级启动策略树。
+pub(crate) fn parse_entries_with_startup(
+    yaml: &str,
+) -> Result<(Vec<Entry>, Vec<StartupNode>), String> {
     let yaml = yaml.strip_prefix('\u{feff}').unwrap_or(yaml);
     let value: serde_yaml::Value =
         serde_yaml::from_str(&mark_js_tags(yaml)).map_err(|e| e.to_string())?;
     let json = serde_json::to_value(value).map_err(|e| e.to_string())?;
     match json {
-        Value::Array(list) => parse_entry_list(&list, ""),
+        Value::Array(list) => parse_entry_list_with_startup(&list, ""),
         // 空文件是合法的"没有任何条目"，不该报错（patch 层经常会从空开始叠）。
-        Value::Null => Ok(Vec::new()),
+        Value::Null => Ok((Vec::new(), Vec::new())),
         Value::Object(object) => {
             // 兼容 `{ plugins: [...] }` 这种包一层容器文件的写法。
             match object.get("plugins").and_then(|v| v.as_array()) {
-                Some(list) => parse_entry_list(list, "plugins "),
+                Some(list) => parse_entry_list_with_startup(list, "plugins "),
                 None => Err("配置文件的顶层既不是数组，也没有 plugins 字段".into()),
             }
         }
@@ -1083,6 +1402,11 @@ pub fn parse_entries(yaml: &str) -> Result<Vec<Entry>, String> {
 
 /// 把一份 YAML 文档（patch 数组）解析成 patch 列表。
 pub fn parse_patches(yaml: &str) -> Result<Vec<Patch>, String> {
+    parse_patches_with_startup(yaml).map(|items| items.into_iter().map(|item| item.patch).collect())
+}
+
+/// 解析 patch 列表，并同步返回行级启动策略覆盖元数据。
+pub(crate) fn parse_patches_with_startup(yaml: &str) -> Result<Vec<PatchWithStartup>, String> {
     let yaml = yaml.strip_prefix('\u{feff}').unwrap_or(yaml);
     let value: serde_yaml::Value =
         serde_yaml::from_str(&mark_js_tags(yaml)).map_err(|e| e.to_string())?;
@@ -1093,7 +1417,27 @@ pub fn parse_patches(yaml: &str) -> Result<Vec<Patch>, String> {
             for (index, item) in list.iter().enumerate() {
                 let patch = Patch::from_value_checked(item)
                     .map_err(|err| format!("patch 第 {} 条不是合法 patch: {err}", index + 1))?;
-                patches.push(patch);
+                let object = item
+                    .as_object()
+                    .expect("Patch::from_value_checked 已校验对象");
+                let startup = parse_row_startup(object)
+                    .map_err(|err| format!("patch 第 {} 条不是合法 patch: {err}", index + 1))?;
+                let insert_startup = match object.get("insert") {
+                    Some(Value::Array(entries)) => {
+                        let mut nodes = Vec::with_capacity(entries.len());
+                        for entry_val in entries {
+                            let (_, node) = entry_from_value_with_startup(entry_val)?;
+                            nodes.push(node);
+                        }
+                        Some(nodes)
+                    }
+                    _ => None,
+                };
+                patches.push(PatchWithStartup {
+                    patch,
+                    startup,
+                    insert_startup,
+                });
             }
             Ok(patches)
         }
@@ -1102,14 +1446,19 @@ pub fn parse_patches(yaml: &str) -> Result<Vec<Patch>, String> {
     }
 }
 
-fn parse_entry_list(list: &[Value], prefix: &str) -> Result<Vec<Entry>, String> {
+fn parse_entry_list_with_startup(
+    list: &[Value],
+    prefix: &str,
+) -> Result<(Vec<Entry>, Vec<StartupNode>), String> {
     let mut entries = Vec::with_capacity(list.len());
+    let mut nodes = Vec::with_capacity(list.len());
     for (index, item) in list.iter().enumerate() {
-        let entry = Entry::from_value_checked(item)
+        let (entry, node) = entry_from_value_with_startup(item)
             .map_err(|err| format!("{prefix}第 {} 行不是合法条目: {err}", index + 1))?;
         entries.push(entry);
+        nodes.push(node);
     }
-    Ok(entries)
+    Ok((entries, nodes))
 }
 
 fn parse_entry_children(list: &[Value]) -> Result<Vec<Entry>, String> {
@@ -1138,7 +1487,42 @@ fn json_kind(value: &Value) -> &'static str {
 /// 表达式标记经 `yaml_with_tags` 变成真标签 `!cordis-js ...` 再还原成 `!!js ...`——
 /// 直接序列化只会得到带引号的键（映射，不是标签）。
 pub fn dump_entries(entries: &[Entry]) -> Result<String, String> {
-    let json = Value::Array(entries.iter().map(Entry::to_value).collect());
+    dump_entries_with_startup(entries, &[])
+}
+
+/// 带行级启动策略树回写 YAML（无显式声明时输出与 [`dump_entries`] 逐字节一致）。
+pub(crate) fn dump_entries_with_startup(
+    entries: &[Entry],
+    nodes: &[StartupNode],
+) -> Result<String, String> {
+    fn entry_to_value_with_startup(entry: &Entry, node: Option<&StartupNode>) -> Value {
+        let mut value = entry.to_value();
+        if let Value::Object(object) = &mut value {
+            if let Some(startup) = node.and_then(|n| n.explicit) {
+                object.insert("startup".into(), Value::String(startup.as_str().into()));
+            }
+            if entry.group {
+                let child_nodes = node.map(|n| n.children.as_slice()).unwrap_or(&[]);
+                let children = entry
+                    .children
+                    .iter()
+                    .enumerate()
+                    .map(|(index, child)| {
+                        entry_to_value_with_startup(child, child_nodes.get(index))
+                    })
+                    .collect();
+                object.insert("config".into(), Value::Array(children));
+            }
+        }
+        value
+    }
+    let json = Value::Array(
+        entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| entry_to_value_with_startup(entry, nodes.get(index)))
+            .collect(),
+    );
     let text = serde_yaml::to_string(&yaml_with_tags(&json)).map_err(|e| e.to_string())?;
     Ok(restore_js_tags(&text))
 }

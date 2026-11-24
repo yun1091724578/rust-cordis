@@ -4,7 +4,7 @@
 //! 缺失时回落到进程级默认值；实例在注册时取一份快照。
 
 pub use cordis_core::LifecyclePolicy;
-use cordis_core::{Ctx, Store};
+use cordis_core::{CallerIdentity, Ctx, Store};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -273,4 +273,474 @@ pub(crate) fn host_limits_for_ctx(ctx: &Ctx) -> HostLimits {
         .get(&key)
         .map(|entry| entry.limits)
         .unwrap_or_else(default_host_limits)
+}
+
+// ------------------------------------------------------------ 启动与故障处置策略（阶段 3）
+
+/// 单条配置行的启动级别。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RowStartup {
+    /// 必需行（缺省）：启动期失败按 `LoaderConfig::strict` 处理（默认 fail loud）。
+    #[default]
+    Required,
+    /// 可选行：仅当错误类别为 [`FailureCategory::RuntimeUnavailable`] 时允许降级
+    /// （记录警告与 `loader.report`，不阻断启动）。
+    ///
+    /// [`FailureCategory::Source`]、[`FailureCategory::Integrity`] 与
+    /// [`FailureCategory::PersistedState`] 不会因行标记为 `Optional` 而静默放行，
+    /// 仍由各自的独立处置策略控制（默认 fail-closed）。
+    Optional,
+}
+
+impl RowStartup {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Optional => "optional",
+        }
+    }
+}
+
+/// 装载器故障分类。
+///
+/// 区分「可由行级 `Optional` 降级的运行不可用」与「必须拥有独立处置策略的来源 / 完整性 / 持久化状态错误」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    /// 运行不可用（找不到插件、探活失败、`apply`/`validate`/`!!js` 失败、超时等）。
+    RuntimeUnavailable,
+    /// 来源准入错误（未配置来源策略、不在 allow-list、allow-list 身份不匹配等）。
+    Source,
+    /// 完整性 / 契约校验错误（SHA-256 不匹配、sidecar manifest 损坏/非法、ABI 前缀/版本不匹配等）。
+    Integrity,
+    /// 持久化状态错误（主配置/patch 读取与解析失败、回写基线冲突、patch 层落盘失败等）。
+    PersistedState,
+}
+
+impl FailureCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::Source => "source",
+            Self::Integrity => "integrity",
+            Self::PersistedState => "persisted_state",
+        }
+    }
+}
+
+/// 宿主对特定故障类别的处置策略。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FailureDisposition {
+    /// 缺省（fail-closed）：该类别错误直接导致启动失败或上报非降级错误。
+    #[default]
+    Fail,
+    /// 显式降级：不挂载失败行 / 跳过损坏层，记录告警与 `loader.report` 诊断而不拖垮启动。
+    Degrade,
+}
+
+impl FailureDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fail => "fail",
+            Self::Degrade => "degrade",
+        }
+    }
+}
+
+/// 单个 App 的启动故障处置策略与行级覆盖。
+///
+/// 三类敏感错误（`source` / `integrity` / `persisted_state`）拥有彼此独立的处置开关，
+/// 默认全部为 [`FailureDisposition::Fail`]（fail-closed）；显式安装本策略后，
+/// 这三类错误不再受行级 `Optional` 或 `LoaderConfig::strict = false` 影响，仅服从各自开关。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartupPolicy {
+    source: FailureDisposition,
+    integrity: FailureDisposition,
+    persisted_state: FailureDisposition,
+    row_overrides: HashMap<String, RowStartup>,
+}
+
+impl StartupPolicy {
+    /// 构造默认 fail-closed 策略（`source` / `integrity` / `persisted_state` 均为 `Fail`）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_source(mut self, disposition: FailureDisposition) -> Self {
+        self.source = disposition;
+        self
+    }
+
+    pub fn with_integrity(mut self, disposition: FailureDisposition) -> Self {
+        self.integrity = disposition;
+        self
+    }
+
+    pub fn with_persisted_state(mut self, disposition: FailureDisposition) -> Self {
+        self.persisted_state = disposition;
+        self
+    }
+
+    /// 按稳定行标或条目 `id` 覆盖行级启动策略（宿主代码级覆盖优先于 YAML 声明）。
+    pub fn with_row_startup(mut self, label_or_id: impl Into<String>, startup: RowStartup) -> Self {
+        self.row_overrides.insert(label_or_id.into(), startup);
+        self
+    }
+
+    /// 便捷入口：将指定行标或 `id` 标为 [`RowStartup::Optional`]。
+    pub fn with_optional_row(self, label_or_id: impl Into<String>) -> Self {
+        self.with_row_startup(label_or_id, RowStartup::Optional)
+    }
+
+    /// 便捷入口：将指定行标或 `id` 标为 [`RowStartup::Required`]。
+    pub fn with_required_row(self, label_or_id: impl Into<String>) -> Self {
+        self.with_row_startup(label_or_id, RowStartup::Required)
+    }
+
+    pub fn source(&self) -> FailureDisposition {
+        self.source
+    }
+
+    pub fn integrity(&self) -> FailureDisposition {
+        self.integrity
+    }
+
+    pub fn persisted_state(&self) -> FailureDisposition {
+        self.persisted_state
+    }
+
+    /// 读取程序化行级覆盖（先精确匹配稳定 `label`，再回落匹配 `entry.id`）。
+    pub fn row_startup(&self, label: &str, entry_id: Option<&str>) -> Option<RowStartup> {
+        self.row_overrides
+            .get(label)
+            .copied()
+            .or_else(|| entry_id.and_then(|id| self.row_overrides.get(id).copied()))
+    }
+}
+
+struct AppStartupPolicy {
+    store: Weak<Store>,
+    policy: StartupPolicy,
+}
+
+fn app_startup_policies() -> &'static Mutex<HashMap<usize, AppStartupPolicy>> {
+    static POLICIES: OnceLock<Mutex<HashMap<usize, AppStartupPolicy>>> = OnceLock::new();
+    POLICIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 为单个 App 安装或清除 [`StartupPolicy`]。
+///
+/// 传 `None` 恢复默认行为（行级 `Optional` 仅降级 `RuntimeUnavailable`，`Source`/`Integrity`/`PersistedState`
+/// 默认 fail-closed，兼容既有 `strict = false` 诊断路径）。
+pub fn set_startup_policy_for(ctx: &Ctx, policy: Option<StartupPolicy>) {
+    let key = Arc::as_ptr(&ctx.store) as usize;
+    let mut registry = app_startup_policies().lock().unwrap();
+    registry.retain(|_, entry| entry.store.strong_count() > 0);
+    match policy {
+        Some(policy) => {
+            registry.insert(
+                key,
+                AppStartupPolicy {
+                    store: Arc::downgrade(&ctx.store),
+                    policy,
+                },
+            );
+        }
+        None => {
+            registry.remove(&key);
+        }
+    }
+}
+
+/// 读取单个 App 当前安装的 [`StartupPolicy`]（未显式安装时为 `None`）。
+pub fn startup_policy_for(ctx: &Ctx) -> Option<StartupPolicy> {
+    let key = Arc::as_ptr(&ctx.store) as usize;
+    let mut registry = app_startup_policies().lock().unwrap();
+    registry.retain(|_, entry| entry.store.strong_count() > 0);
+    registry.get(&key).map(|entry| entry.policy.clone())
+}
+
+// ------------------------------------------------------------ 宿主方法白名单（阶段 3）
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CallerRule {
+    Row(String),
+    Plugin(String),
+    Uid(u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MethodRule {
+    Exact(String),
+    AllMethods,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AllowRule {
+    caller: CallerRule,
+    service: String,
+    method: MethodRule,
+}
+
+/// 宿主管理调用入口的方法白名单策略（默认拒绝）。
+///
+/// 生效范围（写入 `docs/support-contract.md`）：
+/// - **覆盖**：宿主管理的 `call_iface`、`call_iface_stream` 与 T2 `HostApi::ctx_call_iface`；
+/// - **身份来源**：由宿主/内核直接从调用点 `Context` 所属 `Fiber` 绑定的 [`CallerIdentity`]
+///   （`fiber_uid` / `plugin` / 不可变 `row_label` / `is_root`），完全不依赖 `TraceSink`
+///   或 `current_caller_uid()`；
+/// - **不覆盖**：同进程原生 `Ctx::get` / `Ctx::require` 类型向下转型直调、以及事件派发
+///   （`emit` / `parallel` / `serial` / `bail` / `waterfall`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodAllowList {
+    allow_root: bool,
+    rules: Vec<AllowRule>,
+}
+
+impl Default for MethodAllowList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MethodAllowList {
+    /// 构造默认拒绝的白名单（默认放行存活的宿主根上下文 `is_root = true`）。
+    pub fn new() -> Self {
+        Self {
+            allow_root: true,
+            rules: Vec::new(),
+        }
+    }
+
+    /// 构造严格全拒绝白名单（连同宿主根上下文也必须显式放行）。
+    pub fn deny_all() -> Self {
+        Self {
+            allow_root: false,
+            rules: Vec::new(),
+        }
+    }
+
+    /// 设置是否默认放行存活的宿主根上下文（`CallerIdentity::is_root == true`）。
+    pub fn with_allow_root(mut self, allow: bool) -> Self {
+        self.allow_root = allow;
+        self
+    }
+
+    /// 放行指定装载器行标调用 `service.method`。
+    pub fn allow_row_method(
+        mut self,
+        row_label: impl Into<String>,
+        service: impl Into<String>,
+        method: impl Into<String>,
+    ) -> Self {
+        self.rules.push(AllowRule {
+            caller: CallerRule::Row(row_label.into()),
+            service: service.into(),
+            method: MethodRule::Exact(method.into()),
+        });
+        self
+    }
+
+    /// 放行指定装载器行标调用 `service` 的一组方法。
+    pub fn allow_row_methods<I, S>(
+        mut self,
+        row_label: impl Into<String>,
+        service: impl Into<String>,
+        methods: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let row_label = row_label.into();
+        let service = service.into();
+        for method in methods {
+            self.rules.push(AllowRule {
+                caller: CallerRule::Row(row_label.clone()),
+                service: service.clone(),
+                method: MethodRule::Exact(method.into()),
+            });
+        }
+        self
+    }
+
+    /// 放行指定装载器行标调用 `service` 的全部方法。
+    pub fn allow_row_service(
+        mut self,
+        row_label: impl Into<String>,
+        service: impl Into<String>,
+    ) -> Self {
+        self.rules.push(AllowRule {
+            caller: CallerRule::Row(row_label.into()),
+            service: service.into(),
+            method: MethodRule::AllMethods,
+        });
+        self
+    }
+
+    /// 放行指定插件名调用 `service.method`。
+    pub fn allow_plugin_method(
+        mut self,
+        plugin: impl Into<String>,
+        service: impl Into<String>,
+        method: impl Into<String>,
+    ) -> Self {
+        self.rules.push(AllowRule {
+            caller: CallerRule::Plugin(plugin.into()),
+            service: service.into(),
+            method: MethodRule::Exact(method.into()),
+        });
+        self
+    }
+
+    /// 放行指定插件名调用 `service` 的一组方法。
+    pub fn allow_plugin_methods<I, S>(
+        mut self,
+        plugin: impl Into<String>,
+        service: impl Into<String>,
+        methods: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let plugin = plugin.into();
+        let service = service.into();
+        for method in methods {
+            self.rules.push(AllowRule {
+                caller: CallerRule::Plugin(plugin.clone()),
+                service: service.clone(),
+                method: MethodRule::Exact(method.into()),
+            });
+        }
+        self
+    }
+
+    /// 放行指定插件名调用 `service` 的全部方法。
+    pub fn allow_plugin_service(
+        mut self,
+        plugin: impl Into<String>,
+        service: impl Into<String>,
+    ) -> Self {
+        self.rules.push(AllowRule {
+            caller: CallerRule::Plugin(plugin.into()),
+            service: service.into(),
+            method: MethodRule::AllMethods,
+        });
+        self
+    }
+
+    /// 放行指定 fiber uid 调用 `service.method`。
+    pub fn allow_uid_method(
+        mut self,
+        fiber_uid: u64,
+        service: impl Into<String>,
+        method: impl Into<String>,
+    ) -> Self {
+        self.rules.push(AllowRule {
+            caller: CallerRule::Uid(fiber_uid),
+            service: service.into(),
+            method: MethodRule::Exact(method.into()),
+        });
+        self
+    }
+
+    /// 放行指定 fiber uid 调用 `service` 的全部方法。
+    pub fn allow_uid_service(mut self, fiber_uid: u64, service: impl Into<String>) -> Self {
+        self.rules.push(AllowRule {
+            caller: CallerRule::Uid(fiber_uid),
+            service: service.into(),
+            method: MethodRule::AllMethods,
+        });
+        self
+    }
+
+    /// 判定由宿主绑定的 `caller` 是否允许调用 `service.method`。
+    pub fn check(
+        &self,
+        caller: &CallerIdentity,
+        service: &str,
+        method: &str,
+    ) -> std::result::Result<(), String> {
+        if caller.fiber_uid == cordis_core::UID_DISPOSED {
+            return Err("调用方上下文已处置（UID_DISPOSED），拒绝调用".to_string());
+        }
+        if caller.is_root && self.allow_root {
+            return Ok(());
+        }
+        let allowed = self.rules.iter().any(|rule| {
+            if rule.service != service {
+                return false;
+            }
+            let method_ok = match &rule.method {
+                MethodRule::AllMethods => true,
+                MethodRule::Exact(allowed_method) => allowed_method == method,
+            };
+            if !method_ok {
+                return false;
+            }
+            match &rule.caller {
+                CallerRule::Row(label) => caller.row_label.as_deref() == Some(label.as_str()),
+                CallerRule::Plugin(name) => caller.plugin == *name,
+                CallerRule::Uid(uid) => caller.fiber_uid == *uid,
+            }
+        });
+        if allowed {
+            Ok(())
+        } else {
+            Err(format!("白名单未授权 {caller} 调用 {service}.{method}"))
+        }
+    }
+}
+
+struct AppMethodAllowList {
+    store: Weak<Store>,
+    policy: MethodAllowList,
+}
+
+fn app_method_allow_lists() -> &'static Mutex<HashMap<usize, AppMethodAllowList>> {
+    static POLICIES: OnceLock<Mutex<HashMap<usize, AppMethodAllowList>>> = OnceLock::new();
+    POLICIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 为单个 App 安装或清除宿主方法白名单策略。
+///
+/// 传 `Some(policy)` 后，本 `App` 上所有经由 `Context::call_iface`、`Context::call_iface_stream`
+/// 及 T2 `HostApi::ctx_call_iface` 发起的方法调用都会在执行前按宿主绑定的 [`CallerIdentity`]
+/// 校验白名单（默认拒绝）；传 `None` 清除白名单限制。
+pub fn set_method_allow_list_for(ctx: &Ctx, policy: Option<MethodAllowList>) {
+    let key = Arc::as_ptr(&ctx.store) as usize;
+    let mut registry = app_method_allow_lists().lock().unwrap();
+    registry.retain(|_, entry| entry.store.strong_count() > 0);
+    match policy {
+        Some(policy) => {
+            let shared = Arc::new(policy.clone());
+            ctx.store.set_call_auth_hook(Some(Arc::new(
+                move |caller: &CallerIdentity, service: &str, method: &str| {
+                    shared.check(caller, service, method)
+                },
+            )));
+            registry.insert(
+                key,
+                AppMethodAllowList {
+                    store: Arc::downgrade(&ctx.store),
+                    policy,
+                },
+            );
+        }
+        None => {
+            ctx.store.set_call_auth_hook(None);
+            registry.remove(&key);
+        }
+    }
+}
+
+/// 读取单个 App 当前安装的方法白名单策略（未安装时为 `None`）。
+pub fn method_allow_list_for(ctx: &Ctx) -> Option<MethodAllowList> {
+    let key = Arc::as_ptr(&ctx.store) as usize;
+    let mut registry = app_method_allow_lists().lock().unwrap();
+    registry.retain(|_, entry| entry.store.strong_count() > 0);
+    registry.get(&key).map(|entry| entry.policy.clone())
 }

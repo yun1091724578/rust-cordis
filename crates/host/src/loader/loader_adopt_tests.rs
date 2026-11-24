@@ -9,6 +9,7 @@
 //! 同步一律用闸门（[`HookPoint`]）+ `Semaphore`，超时只当看门狗，不靠 sleep 竞态。
 
 use super::*;
+use crate::patch::parse_entries;
 use crate::plan::PlanEntrySpec;
 use cordis_core::App;
 use serde_json::Value;
@@ -1332,6 +1333,8 @@ async fn a_candidate_queued_in_the_release_window_is_still_driven() {
         entries: parsed_c7.entries,
         adopt_metadata: true,
         main: parsed_c7.main,
+        main_startup: parsed_c7.main_startup,
+        row_startup: parsed_c7.row_startup,
         owners: parsed_c7.owners,
         baseline: parsed_c7.baseline,
     };

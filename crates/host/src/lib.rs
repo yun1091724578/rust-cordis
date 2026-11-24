@@ -44,11 +44,16 @@ mod policy;
 pub mod source;
 mod staging;
 
+pub use cordis_core::{CallerIdentity, MethodUnauthorized};
 pub use ffi_buf::call_plugin_detailed;
 pub use policy::{
-    lifecycle_policy_for, set_default_host_limits, set_dispatch_policy, set_dispatch_policy_for,
-    set_host_limits_for, set_lifecycle_policy_for, DispatchPolicy, HostLimits, LifecyclePolicy,
+    lifecycle_policy_for, method_allow_list_for, set_default_host_limits, set_dispatch_policy,
+    set_dispatch_policy_for, set_host_limits_for, set_lifecycle_policy_for,
+    set_method_allow_list_for, set_startup_policy_for, startup_policy_for, DispatchPolicy,
+    FailureCategory, FailureDisposition, HostLimits, LifecyclePolicy, MethodAllowList, RowStartup,
+    StartupPolicy,
 };
+pub(crate) use staging::mount_with_label;
 pub use staging::{describe, mount, resolve_plugin_path, stage_plugin, staged_leaked, StagedFile};
 
 #[cfg(test)]
@@ -2849,10 +2854,6 @@ unsafe extern "C" fn host_ctx_call_iface(
     //
     // 用载荷版是为了让容量拒绝保留 `host_capacity` / `capacity` / `not_executed`。
     with_resolved_payload(handle, out, move |resolved| {
-        let timeout_service = service.clone();
-        let timeout_method = method.clone();
-        let error_format = resolved.instance.error_format;
-        let future = resolved.ctx.call_iface(&service, version, &method, parsed);
         let traced = resolved.instance.ctx.store.has_trace_sink();
         let trace_parent = traced.then(call_scope_top).flatten();
         let trace_correlation = traced
@@ -2863,6 +2864,38 @@ unsafe extern "C" fn host_ctx_call_iface(
                     .or_else(cordis_core::current_correlation_id)
             })
             .flatten();
+        // 宿主方法白名单准入：在服务解析、派发槽位分配与提供者执行之前校验，
+        // 身份直接来自宿主绑定的 `resolved.ctx`（不依赖 TraceSink / current_caller_uid）。
+        if resolved.ctx.store.has_call_auth_hook() {
+            let started = std::time::Instant::now();
+            let caller = resolved.ctx.caller_identity();
+            if let Err(err) = resolved
+                .ctx
+                .store
+                .authorize_call(&caller, &service, &method)
+            {
+                if traced {
+                    IfaceTrace {
+                        store: resolved.instance.ctx.store.clone(),
+                        name: format!("{service}.{method}"),
+                        callee_plugin: service.clone(),
+                        caller_uid: caller.fiber_uid,
+                        parent_call_id: trace_parent.unwrap_or(0),
+                        correlation_id: trace_correlation,
+                        started,
+                    }
+                    .record("host_unauthorized");
+                }
+                return Err(ErrorPayload::new(err.to_string())
+                    .with_code("host_unauthorized")
+                    .with_category("authorization")
+                    .with_certainty("not_executed"));
+            }
+        }
+        let timeout_service = service.clone();
+        let timeout_method = method.clone();
+        let error_format = resolved.instance.error_format;
+        let future = resolved.ctx.call_iface(&service, version, &method, parsed);
         let trace = traced.then(|| {
             Arc::new(IfaceTrace {
                 store: resolved.instance.ctx.store.clone(),
@@ -3782,24 +3815,57 @@ pub fn desc_gate(abi_version: u32, size: usize, expected_prefix: usize) -> Resul
 impl LoadedPlugin {
     /// 打开一个动态库并校验 ABI。
     pub fn open(path: impl AsRef<Path>) -> Result<LoadedPlugin> {
+        Self::open_classified(path).map_err(|err| err.message.into())
+    }
+
+    pub(crate) fn open_classified(
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<LoadedPlugin, crate::source::ClassifiedVerifyError> {
         let path = path.as_ref().to_path_buf();
-        let library = dylib::DynLib::open(&path)?;
-        let entry: EntryFn = unsafe { std::mem::transmute(library.symbol(ENTRY_SYMBOL)?) };
+        let library =
+            dylib::DynLib::open(&path).map_err(|err| crate::source::ClassifiedVerifyError {
+                category: FailureCategory::RuntimeUnavailable,
+                message: err.to_string(),
+            })?;
+        let entry: EntryFn = unsafe {
+            std::mem::transmute(library.symbol(ENTRY_SYMBOL).map_err(|err| {
+                crate::source::ClassifiedVerifyError {
+                    category: FailureCategory::Integrity,
+                    message: err.to_string(),
+                }
+            })?)
+        };
         let desc = unsafe { entry() };
         if desc.is_null() {
-            return Err(format!("{} 的 cordis_plugin_v1 返回了空指针", path.display()).into());
+            return Err(crate::source::ClassifiedVerifyError {
+                category: FailureCategory::Integrity,
+                message: format!("{} 的 cordis_plugin_v1 返回了空指针", path.display()),
+            });
         }
         // **先只读冻结头**：`id`/`inject` 的 offset 在 `size` 覆盖范围之外时，
         // 直接读 `(*desc).id` 会越界。门禁必须发生在任何尾字段读取之前。
         let (abi_version, size) = unsafe { ((*desc).abi_version, (*desc).size as usize) };
-        desc_gate(abi_version, size, cordis_abi::PLUGIN_DESC_PREFIX_SIZE)
-            .map_err(|error| format!("插件文件 {}：{error}", path.display()))?;
+        desc_gate(abi_version, size, cordis_abi::PLUGIN_DESC_PREFIX_SIZE).map_err(|error| {
+            crate::source::ClassifiedVerifyError {
+                category: FailureCategory::Integrity,
+                message: format!("插件文件 {}：{error}", path.display()),
+            }
+        })?;
         let (id, inject_json, provision_json, schema, schema_error, error_format) = unsafe {
             let schema = schema_from_blob((*desc).schema);
-            let id = blob_to_string((*desc).id, "PluginDesc.id")
-                .map_err(|error| format!("插件文件 {}：{error}", path.display()))?;
-            let inject_json = blob_to_string((*desc).inject, "PluginDesc.inject")
-                .map_err(|error| format!("插件文件 {}：{error}", path.display()))?;
+            let id = blob_to_string((*desc).id, "PluginDesc.id").map_err(|error| {
+                crate::source::ClassifiedVerifyError {
+                    category: FailureCategory::Integrity,
+                    message: format!("插件文件 {}：{error}", path.display()),
+                }
+            })?;
+            let inject_json =
+                blob_to_string((*desc).inject, "PluginDesc.inject").map_err(|error| {
+                    crate::source::ClassifiedVerifyError {
+                        category: FailureCategory::Integrity,
+                        message: format!("插件文件 {}：{error}", path.display()),
+                    }
+                })?;
             // provision 是 v2 尾追加字段：v1 插件（size 只到冻结前缀）经
             // `field_at` 读作「未声明」；Blob 指向插件内存，必须立刻拷成 String
             // （附录 A）。
@@ -3807,8 +3873,12 @@ impl LoadedPlugin {
                 desc,
                 std::mem::offset_of!(PluginDesc, provision),
             ) {
-                Some(blob) => blob_to_string(blob, "PluginDesc.provision")
-                    .map_err(|error| format!("插件文件 {}：{error}", path.display()))?,
+                Some(blob) => blob_to_string(blob, "PluginDesc.provision").map_err(|error| {
+                    crate::source::ClassifiedVerifyError {
+                        category: FailureCategory::Integrity,
+                        message: format!("插件文件 {}：{error}", path.display()),
+                    }
+                })?,
                 None => String::new(),
             };
             (
@@ -3846,7 +3916,13 @@ impl LoadedPlugin {
     /// 的生命周期归本插件——drop 时先卸库、后删文件（字段声明序）。
     /// 装载失败则不认领：文件留在泄漏台账里，`stagedLeaked` 会暴露它。
     pub fn open_staged(path: impl AsRef<Path>) -> Result<LoadedPlugin> {
-        let mut plugin = Self::open(path.as_ref())?;
+        Self::open_staged_classified(path).map_err(|err| err.message.into())
+    }
+
+    pub(crate) fn open_staged_classified(
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<LoadedPlugin, crate::source::ClassifiedVerifyError> {
+        let mut plugin = Self::open_classified(path.as_ref())?;
         Arc::get_mut(&mut plugin.library)
             .expect("新打开的 LoadedPlugin 独占 library")
             ._staged = Some(StagedFile::new(path.as_ref()));
@@ -3880,12 +3956,27 @@ impl LoadedPlugin {
         staged: impl AsRef<Path>,
         policy: &PluginSourcePolicy,
     ) -> Result<LoadedPlugin> {
+        Self::open_staged_verified_classified(original, staged, policy)
+            .map_err(|err| err.message.into())
+    }
+
+    pub(crate) fn open_staged_verified_classified(
+        original: impl AsRef<Path>,
+        staged: impl AsRef<Path>,
+        policy: &PluginSourcePolicy,
+    ) -> std::result::Result<LoadedPlugin, crate::source::ClassifiedVerifyError> {
         let original = original.as_ref();
         let staged = staged.as_ref();
-        let original_abs = std::path::absolute(original)
-            .map_err(|err| format!("规范化插件 artifact {} 失败: {err}", original.display()))?;
-        let staged_abs = std::path::absolute(staged)
-            .map_err(|err| format!("规范化暂存副本 {} 失败: {err}", staged.display()))?;
+        let original_abs =
+            std::path::absolute(original).map_err(|err| crate::source::ClassifiedVerifyError {
+                category: FailureCategory::Integrity,
+                message: format!("规范化插件 artifact {} 失败: {err}", original.display()),
+            })?;
+        let staged_abs =
+            std::path::absolute(staged).map_err(|err| crate::source::ClassifiedVerifyError {
+                category: FailureCategory::Integrity,
+                message: format!("规范化暂存副本 {} 失败: {err}", staged.display()),
+            })?;
         let same = match (
             std::fs::canonicalize(&original_abs),
             std::fs::canonicalize(&staged_abs),
@@ -3894,34 +3985,42 @@ impl LoadedPlugin {
             _ => original_abs == staged_abs,
         };
         if same {
-            return Err("open_staged_verified 拒绝把原始 artifact 当作暂存副本".into());
+            return Err(crate::source::ClassifiedVerifyError {
+                category: FailureCategory::Integrity,
+                message: "open_staged_verified 拒绝把原始 artifact 当作暂存副本".into(),
+            });
         }
         let discard_staged = || {
             drop(StagedFile::new(staged));
         };
-        let verified = match policy.verify(&original_abs) {
+        let verified = match policy.verify_classified(&original_abs) {
             Ok(verified) => verified,
             Err(error) => {
                 discard_staged();
-                return Err(error.into());
+                return Err(error);
             }
         };
         let staged_hash = match crate::source::sha256_file(&staged_abs) {
             Ok(hash) => hash,
             Err(error) => {
                 discard_staged();
-                return Err(error.into());
+                return Err(crate::source::ClassifiedVerifyError {
+                    category: FailureCategory::Integrity,
+                    message: error,
+                });
             }
         };
         if staged_hash != verified.sha256 {
             discard_staged();
-            return Err(format!(
-                "暂存副本 SHA256 与已校验 artifact 不匹配: staged={staged_hash} verified={}",
-                verified.sha256
-            )
-            .into());
+            return Err(crate::source::ClassifiedVerifyError {
+                category: FailureCategory::Integrity,
+                message: format!(
+                    "暂存副本 SHA256 与已校验 artifact 不匹配: staged={staged_hash} verified={}",
+                    verified.sha256
+                ),
+            });
         }
-        let mut plugin = match Self::open(&staged_abs) {
+        let mut plugin = match Self::open_classified(&staged_abs) {
             Ok(plugin) => plugin,
             Err(error) => {
                 discard_staged();
@@ -3932,11 +4031,13 @@ impl LoadedPlugin {
             let plugin_id = plugin.name.clone();
             drop(plugin);
             discard_staged();
-            return Err(format!(
-                "插件 id 与 manifest 不匹配: manifest={} plugin={plugin_id}",
-                verified.manifest.id
-            )
-            .into());
+            return Err(crate::source::ClassifiedVerifyError {
+                category: FailureCategory::Integrity,
+                message: format!(
+                    "插件 id 与 manifest 不匹配: manifest={} plugin={plugin_id}",
+                    verified.manifest.id
+                ),
+            });
         }
         Arc::get_mut(&mut plugin.library)
             .expect("新打开的 LoadedPlugin 独占 library")

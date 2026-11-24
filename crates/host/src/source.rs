@@ -219,6 +219,29 @@ pub struct PluginSourcePolicy {
     allowed: Vec<AllowedPlugin>,
 }
 
+/// 分类后的来源/完整性校验错误（供装载器按策略独立处置）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClassifiedVerifyError {
+    pub category: crate::FailureCategory,
+    pub message: String,
+}
+
+impl ClassifiedVerifyError {
+    fn source(message: impl Into<String>) -> Self {
+        Self {
+            category: crate::FailureCategory::Source,
+            message: message.into(),
+        }
+    }
+
+    fn integrity(message: impl Into<String>) -> Self {
+        Self {
+            category: crate::FailureCategory::Integrity,
+            message: message.into(),
+        }
+    }
+}
+
 impl PluginSourcePolicy {
     pub fn new(allowed: Vec<AllowedPlugin>) -> Self {
         Self { allowed }
@@ -239,54 +262,62 @@ impl PluginSourcePolicy {
 
     /// 在加载动态库**之前**读取 artifact hash 与 sidecar manifest，并匹配 allow-list。
     pub fn verify(&self, artifact: impl AsRef<Path>) -> Result<VerifiedPluginSource, String> {
+        self.verify_classified(artifact).map_err(|err| err.message)
+    }
+
+    /// 与 [`Self::verify`] 语义一致，但保留精确的 [`crate::FailureCategory`]（`Source` vs `Integrity`）。
+    pub(crate) fn verify_classified(
+        &self,
+        artifact: impl AsRef<Path>,
+    ) -> Result<VerifiedPluginSource, ClassifiedVerifyError> {
         let artifact = std::path::absolute(artifact.as_ref()).map_err(|err| {
-            format!(
+            ClassifiedVerifyError::integrity(format!(
                 "规范化插件 artifact {} 失败: {err}",
                 artifact.as_ref().display()
-            )
+            ))
         })?;
-        let actual = sha256_file(&artifact)?;
-        let manifest = read_manifest(&artifact)?;
-        validate_manifest(&manifest)?;
+        let actual = sha256_file(&artifact).map_err(ClassifiedVerifyError::integrity)?;
+        let manifest = read_manifest(&artifact).map_err(ClassifiedVerifyError::integrity)?;
+        validate_manifest(&manifest).map_err(ClassifiedVerifyError::integrity)?;
         if manifest.sha256.to_ascii_lowercase() != actual {
-            return Err(format!(
+            return Err(ClassifiedVerifyError::integrity(format!(
                 "插件 artifact SHA256 不匹配: manifest={} actual={actual}",
                 manifest.sha256
-            ));
+            )));
         }
         let allowed = self
             .allowed
             .iter()
             .find(|item| item.sha256.eq_ignore_ascii_case(&actual))
             .ok_or_else(|| {
-                format!(
+                ClassifiedVerifyError::source(format!(
                     "插件 artifact 不在来源 allow-list 中: {} ({actual})",
                     artifact.display()
-                )
+                ))
             })?;
         if allowed.id != manifest.id {
-            return Err(format!(
+            return Err(ClassifiedVerifyError::source(format!(
                 "插件 id 与 allow-list 不匹配: manifest={} allow-list={}",
                 manifest.id, allowed.id
-            ));
+            )));
         }
         if allowed.version != manifest.version {
-            return Err(format!(
+            return Err(ClassifiedVerifyError::source(format!(
                 "插件 version 与 allow-list 不匹配: manifest={} allow-list={}",
                 manifest.version, allowed.version
-            ));
+            )));
         }
         if allowed.source_revision != manifest.source_revision {
-            return Err(format!(
+            return Err(ClassifiedVerifyError::source(format!(
                 "插件 source_revision 与 allow-list 不匹配: manifest={} allow-list={}",
                 manifest.source_revision, allowed.source_revision
-            ));
+            )));
         }
         if allowed.abi_version != manifest.abi_version {
-            return Err(format!(
+            return Err(ClassifiedVerifyError::source(format!(
                 "插件 abi_version 与 allow-list 不匹配: manifest={} allow-list={}",
                 manifest.abi_version, allowed.abi_version
-            ));
+            )));
         }
         Ok(VerifiedPluginSource {
             path: artifact,

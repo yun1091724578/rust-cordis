@@ -152,6 +152,27 @@ pub fn mount(
     config: Config,
     row_inject: Option<Config>,
 ) -> Arc<cordis_core::Fiber> {
+    mount_inner(ctx, plugin, config, row_inject, None)
+}
+
+/// 装载器内部挂载入口：在 `Fiber` 创建时绑定不可变行标，确保 `apply` 首跳就能获得稳定的行身份。
+pub(crate) fn mount_with_label(
+    ctx: &Ctx,
+    plugin: Arc<dyn Plugin>,
+    config: Config,
+    row_inject: Option<Config>,
+    label: &str,
+) -> Arc<cordis_core::Fiber> {
+    mount_inner(ctx, plugin, config, row_inject, Some(label))
+}
+
+fn mount_inner(
+    ctx: &Ctx,
+    plugin: Arc<dyn Plugin>,
+    config: Config,
+    row_inject: Option<Config>,
+    host_label: Option<&str>,
+) -> Arc<cordis_core::Fiber> {
     let mut inject = plugin.inject();
     let parsed = row_inject
         .as_ref()
@@ -168,7 +189,7 @@ pub fn mount(
         }
     }
     ctx.store
-        .plugin_with_optional(ctx, plugin, config, inject, &parsed.optional)
+        .plugin_with_host_label(ctx, plugin, config, inject, &parsed.optional, host_label)
 }
 
 /// 便利函数：把一个 `Error` 转成 JSON 友好的字符串。
