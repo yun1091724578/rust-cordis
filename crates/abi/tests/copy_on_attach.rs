@@ -63,9 +63,12 @@ fn truncated_host_api_reads_only_inside_its_own_copy() {
     }
 
     // 4) 结构性断言：一切读都在插件自有副本之内。
-    //    （fn 指针没有 Debug，比较转成 usize：同一 crate 内地址区分 A/B 足够。）
+    //    Miri 允许同一函数指针在不同处拥有不同符号地址，行为身份由下方第 5 步真实调用断言。
+    assert!(api.ctx_get.is_some(), "快照里的 ctx_get 必须存在");
+    #[cfg(not(miri))]
     assert!(
-        api.ctx_get.map(|f| f as usize) == Some(get_a as CtxGetFn as usize),
+        api.ctx_get
+            .is_some_and(|f| std::ptr::fn_addr_eq(f, get_a as CtxGetFn)),
         "插件读到的必须是 attach 那一刻的快照（A），而不是宿主表现在的值（B）：got {:#x}",
         api.ctx_get.map_or(0, |f| f as usize)
     );
