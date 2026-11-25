@@ -12,7 +12,7 @@
 
 ## 当前版本
 
-- **`0.1.6`**（待发布）：
+- **`0.1.6`**（tag `v0.1.6`）：
   - **结构化流错误与受管后台任务**：新增 `StreamSink::fail_error`、`HostApi::ctx_stream_fail_payload`（尾追加独立协商的结构化流错误入口，保留原 `ctx_stream_fail` 纯文本语义并对 `0.1.5` 及更早宿主自动降级）与 `abi::sdk::Ctx::stream_fail_payload`；新增 `Ctx::spawn_scoped` / `Fiber::spawn_scoped` / `SpawnScopedError` / `ReloadDeferred`（归属 fiber 生命周期的受管后台任务，自动取消等待、首次 poll 前后释放保序、防重入自锁与 ADR 0011 `correlation_id` 透传）。
     - **`ReloadDeferred` 调用方处理**：受管后台任务（`spawn_scoped` / 原生流任务）内部重入调用所属、祖先或提供者 fiber 的 `Fiber::restart` / `Fiber::update` / `Fiber::update_with` 触发重载时，为避免与 `dispose_native_tasks` 自锁且不误报尚未执行的新一代 `apply()` 成功，调用会返回 `Err`（`err.downcast_ref::<ReloadDeferred>()` 可精确匹配），而不返回 `Ok(())` 或 `UpdateOutcome::Restarted`。调用方应据此区分“重载已受理推迟”与“重载失败”：检查 `deferred.is_scheduled()`（为 `true` 表示收敛已移交后台任务，当前任务应尽快退出以放行卸载；为 `false` 表示当前无活跃 Tokio 运行时，需在外部显式调用 `fiber.settle().await`），并在受管任务外部通过 `fiber.settle().await` / `fiber.state()` / `fiber.error()` 观测新一代的最终收敛结果。
   - **可观测关停、结构化热重载报告与三段等待预算**：

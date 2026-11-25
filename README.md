@@ -172,13 +172,13 @@ Stop-Service Cordis
 
 ## 发布状态
 
-**`0.1.5` 已正式发布到 crates.io**：
+**`0.1.6` 已正式发布到 crates.io**：
 
-- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.5`
-- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.5`
-- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.5`
-- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.5`
-- [`rust-cordis-sdk`](https://crates.io/crates/rust-cordis-sdk) `0.1.5`（库名 `cordis`）
+- [`rust-cordis-core`](https://crates.io/crates/rust-cordis-core) `0.1.6`
+- [`rust-cordis-abi`](https://crates.io/crates/rust-cordis-abi) `0.1.6`
+- [`rust-cordis-macros`](https://crates.io/crates/rust-cordis-macros) `0.1.6`
+- [`rust-cordis-host`](https://crates.io/crates/rust-cordis-host) `0.1.6`
+- [`rust-cordis-sdk`](https://crates.io/crates/rust-cordis-sdk) `0.1.6`（库名 `cordis`）
 
 `cordis-components`、`cordis-cli` 与 examples 仍保持 `publish = false`。发布门禁见 [`docs/release.md`](docs/release.md)；平台证据见 [`docs/platform-matrix.md`](docs/platform-matrix.md)；夜间 soak 见 [`.github/workflows/nightly-soak.yml`](.github/workflows/nightly-soak.yml)；产物封存格式见 [`docs/release-seal.md`](docs/release-seal.md)。
 
