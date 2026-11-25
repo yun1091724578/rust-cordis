@@ -682,7 +682,13 @@ impl PatchOwners {
         }
     }
 
-    fn note_overlay(&mut self, entry: &Entry, patch: &Patch, layer: usize) {
+    fn note_overlay(
+        &mut self,
+        entry: &Entry,
+        patch: &Patch,
+        layer: usize,
+        children_replaced: bool,
+    ) {
         let Some(id) = entry.id.as_deref() else {
             return;
         };
@@ -693,8 +699,8 @@ impl PatchOwners {
         if patch.disabled.is_some() || patch.disabled_expr.is_some() {
             owners.disabled = Some(layer);
         }
-        // group 的 config 替换会带来新的 children；它们的字段由当前层引入。
-        if patch.config.is_some() {
+        // 只有 group 的 config 真正替换了 children 时，才将新子项归属记为当前层。
+        if children_replaced {
             for child in &entry.children {
                 self.note(child, layer);
             }
@@ -774,15 +780,23 @@ pub(crate) fn apply_entry_patches_tracked(
                         continue;
                     }
                 }
-                // group 的 config 会整体替换 children：旧子树的归属必须先失效，
-                // 否则被移除的子 id 会留下幽灵 owner。
-                if patch.config.is_some() {
+                // group 被关闭（group: false）或其 config 被 null/array 替换时，旧子树归属失效。
+                let next_group = patch.group.unwrap_or(target.group);
+                let clears_children = patch.group == Some(false)
+                    || (next_group
+                        && patch
+                            .config
+                            .as_ref()
+                            .is_some_and(|c| c.is_null() || c.is_array()));
+                let children_replaced =
+                    next_group && patch.config.as_ref().is_some_and(|c| c.is_array());
+                if clears_children {
                     for child in &target.children {
                         owners.untrack(child);
                     }
                 }
                 target.overlay(patch, warn);
-                owners.note_overlay(target, patch, layer);
+                owners.note_overlay(target, patch, layer, children_replaced);
             }
             None => warn(&format!("patch 目标 \"{id}\" 未找到，已跳过")),
         }
@@ -902,12 +916,21 @@ pub(crate) fn apply_entry_patches_full(
                         continue;
                     }
                 }
-                if patch.config.is_some() {
+                let prev_group = target.group;
+                let next_group = patch.group.unwrap_or(prev_group);
+                let clears_children = patch.group == Some(false)
+                    || (next_group
+                        && patch
+                            .config
+                            .as_ref()
+                            .is_some_and(|c| c.is_null() || c.is_array()));
+                let children_replaced =
+                    next_group && patch.config.as_ref().is_some_and(|c| c.is_array());
+                if clears_children {
                     for child in &target.children {
                         owners.untrack(child);
                     }
                 }
-                let prev_group = target.group;
                 target.overlay(patch, warn);
                 if let Some(group) = patch.group {
                     if !group {
@@ -935,7 +958,7 @@ pub(crate) fn apply_entry_patches_full(
                 if let Some(startup_override) = item.startup {
                     target_node.explicit = startup_override;
                 }
-                owners.note_overlay(target, patch, layer);
+                owners.note_overlay(target, patch, layer, children_replaced);
             }
             None => warn(&format!("patch 目标 \"{id}\" 未找到，已跳过")),
         }

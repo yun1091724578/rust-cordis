@@ -1,13 +1,13 @@
-//! 宿主派发看门狗（[`DispatchPolicy`]）与容量上限（[`HostLimits`]）注册表（O11 拆分）。
+//! 宿主派发看门狗（[`DispatchPolicy`]）、容量上限（[`HostLimits`]）、启动策略与方法白名单注册表（O11 拆分）。
 //!
-//! 两个注册表共享同一语义：per-App 优先（以 `Weak<Store>` 追踪 App 生命周期并在读写时清理失活条目），
+//! per-App 策略直接存放在 `ctx.store` 扩展槽中（随 `App`/`Store` 自动释放，无进程级裸指针表），
 //! 缺失时回落到进程级默认值；实例在注册时取一份快照。
 
 pub use cordis_core::LifecyclePolicy;
-use cordis_core::{CallerIdentity, Ctx, Store};
+use cordis_core::{CallerIdentity, Ctx};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, RwLock};
 
 /// 派发看门狗（M2，D3；P0-2 起按 App 配置）：宿主等待 `ctx_fulfill` 的上限。
 ///
@@ -57,47 +57,21 @@ pub(crate) fn dispatch_policy() -> DispatchPolicy {
     *DISPATCH_POLICY.read().unwrap()
 }
 
-/// 一个 App 的看门狗条目：`store` 是**弱引用**，App 释放后条目可被顺手清掉，
-/// 注册表不会把 `Store` 吊住。
-struct AppDispatchPolicy {
-    store: Weak<Store>,
-    policy: DispatchPolicy,
-}
-
-/// 键是 `Arc::as_ptr(&ctx.store)`（App 的身份；派生 ctx 共享同一个 `Arc<Store>`）。
-fn app_dispatch_policies() -> &'static Mutex<HashMap<usize, AppDispatchPolicy>> {
-    static POLICIES: OnceLock<Mutex<HashMap<usize, AppDispatchPolicy>>> = OnceLock::new();
-    POLICIES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// 设置**单个 App** 的派发看门狗。
 ///
-/// App 由 `ctx.store` 的同一性标识：同一个 `App` 上派生的所有 ctx（isolate /
-/// intercept / 装载器行）共享这条策略；不同 `App` 互不影响。装载器在
-/// `LoaderConfig.dispatch_policy` 有值时会在挂载前调用它。
+/// App 由 `ctx.store` 标识：策略直接保存在 `ctx.store` 上，随 `App` 自动释放；
+/// 同一个 `App` 上派生的所有 ctx 共享这条策略，不同 `App` 互不影响。
+/// 装载器在 `LoaderConfig.dispatch_policy` 有值时会在挂载前调用它。
 ///
 /// 只影响**之后注册**的实例（实例在注册时取快照）；已注册实例不会被追溯修改。
 pub fn set_dispatch_policy_for(ctx: &Ctx, policy: DispatchPolicy) {
-    let key = Arc::as_ptr(&ctx.store) as usize;
-    let mut policies = app_dispatch_policies().lock().unwrap();
-    policies.retain(|_, entry| entry.store.strong_count() > 0);
-    policies.insert(
-        key,
-        AppDispatchPolicy {
-            store: Arc::downgrade(&ctx.store),
-            policy,
-        },
-    );
+    ctx.store.set_extension(policy);
 }
 
-/// 内部读取：per-App 优先，缺失或 App 已释放时回落到进程级策略。
+/// 内部读取：per-App 优先，缺失时回落到进程级策略。
 pub(crate) fn dispatch_policy_for_ctx(ctx: &Ctx) -> DispatchPolicy {
-    let key = Arc::as_ptr(&ctx.store) as usize;
-    let mut policies = app_dispatch_policies().lock().unwrap();
-    policies.retain(|_, entry| entry.store.strong_count() > 0);
-    policies
-        .get(&key)
-        .map(|entry| entry.policy)
+    ctx.store
+        .extension::<DispatchPolicy>()
         .unwrap_or_else(dispatch_policy)
 }
 
@@ -212,38 +186,17 @@ pub(crate) fn default_host_limits() -> HostLimits {
     *DEFAULT_HOST_LIMITS.read().unwrap()
 }
 
-/// 一个 App 的容量上限条目：弱引用 Store，App 释放后条目可被清理。
-struct AppHostLimits {
-    store: Weak<Store>,
-    limits: HostLimits,
-}
-
-/// 键是 `Arc::as_ptr(&ctx.store)`（App 的身份；派生 ctx 共享同一个 `Arc<Store>`）。
-fn app_host_limits() -> &'static Mutex<HashMap<usize, AppHostLimits>> {
-    static LIMITS: OnceLock<Mutex<HashMap<usize, AppHostLimits>>> = OnceLock::new();
-    LIMITS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// 设置**单个 App** 的容量准入上限。
 ///
-/// App 由 `ctx.store` 的同一性标识：同一个 `App` 上派生的所有 ctx（isolate /
-/// intercept / 装载器行）共享这套上限；不同 `App` 互不影响。装载器在
-/// `LoaderConfig.host_limits` 有值时会在挂载前调用它。
+/// App 由 `ctx.store` 标识：上限直接保存在 `ctx.store` 上，随 `App` 自动释放；
+/// 同一个 `App` 上派生的所有 ctx 共享这套上限，不同 `App` 互不影响。
+/// 装载器在 `LoaderConfig.host_limits` 有值时会在挂载前调用它。
 ///
 /// 只影响**之后注册**的实例（实例在注册时取快照）；已注册实例不会被追溯修改。
 /// 任一项为 0 会返回错误且不改动当前值。
 pub fn set_host_limits_for(ctx: &Ctx, limits: HostLimits) -> std::result::Result<(), String> {
     limits.validate()?;
-    let key = Arc::as_ptr(&ctx.store) as usize;
-    let mut registry = app_host_limits().lock().unwrap();
-    registry.retain(|_, entry| entry.store.strong_count() > 0);
-    registry.insert(
-        key,
-        AppHostLimits {
-            store: Arc::downgrade(&ctx.store),
-            limits,
-        },
-    );
+    ctx.store.set_extension(limits);
     Ok(())
 }
 
@@ -264,14 +217,10 @@ pub fn lifecycle_policy_for(ctx: &Ctx) -> LifecyclePolicy {
     ctx.store.lifecycle_policy()
 }
 
-/// 内部读取：per-App 优先；缺失或 App 已释放时回落到进程级默认。
+/// 内部读取：per-App 优先；缺失时回落到进程级默认。
 pub(crate) fn host_limits_for_ctx(ctx: &Ctx) -> HostLimits {
-    let key = Arc::as_ptr(&ctx.store) as usize;
-    let mut registry = app_host_limits().lock().unwrap();
-    registry.retain(|_, entry| entry.store.strong_count() > 0);
-    registry
-        .get(&key)
-        .map(|entry| entry.limits)
+    ctx.store
+        .extension::<HostLimits>()
         .unwrap_or_else(default_host_limits)
 }
 
@@ -433,46 +382,20 @@ impl StartupPolicy {
     }
 }
 
-struct AppStartupPolicy {
-    store: Weak<Store>,
-    policy: StartupPolicy,
-}
-
-fn app_startup_policies() -> &'static Mutex<HashMap<usize, AppStartupPolicy>> {
-    static POLICIES: OnceLock<Mutex<HashMap<usize, AppStartupPolicy>>> = OnceLock::new();
-    POLICIES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// 为单个 App 安装或清除 [`StartupPolicy`]。
 ///
 /// 传 `None` 恢复默认行为（行级 `Optional` 仅降级 `RuntimeUnavailable`，`Source`/`Integrity`/`PersistedState`
 /// 默认 fail-closed，兼容既有 `strict = false` 诊断路径）。
 pub fn set_startup_policy_for(ctx: &Ctx, policy: Option<StartupPolicy>) {
-    let key = Arc::as_ptr(&ctx.store) as usize;
-    let mut registry = app_startup_policies().lock().unwrap();
-    registry.retain(|_, entry| entry.store.strong_count() > 0);
     match policy {
-        Some(policy) => {
-            registry.insert(
-                key,
-                AppStartupPolicy {
-                    store: Arc::downgrade(&ctx.store),
-                    policy,
-                },
-            );
-        }
-        None => {
-            registry.remove(&key);
-        }
+        Some(policy) => ctx.store.set_extension(policy),
+        None => ctx.store.remove_extension::<StartupPolicy>(),
     }
 }
 
 /// 读取单个 App 当前安装的 [`StartupPolicy`]（未显式安装时为 `None`）。
 pub fn startup_policy_for(ctx: &Ctx) -> Option<StartupPolicy> {
-    let key = Arc::as_ptr(&ctx.store) as usize;
-    let mut registry = app_startup_policies().lock().unwrap();
-    registry.retain(|_, entry| entry.store.strong_count() > 0);
-    registry.get(&key).map(|entry| entry.policy.clone())
+    ctx.store.extension::<StartupPolicy>()
 }
 
 // ------------------------------------------------------------ 宿主方法白名单（阶段 3）
@@ -712,25 +635,12 @@ impl MethodAllowList {
     }
 }
 
-struct AppMethodAllowList {
-    store: Weak<Store>,
-    policy: MethodAllowList,
-}
-
-fn app_method_allow_lists() -> &'static Mutex<HashMap<usize, AppMethodAllowList>> {
-    static POLICIES: OnceLock<Mutex<HashMap<usize, AppMethodAllowList>>> = OnceLock::new();
-    POLICIES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// 为单个 App 安装或清除宿主方法白名单策略。
 ///
 /// 传 `Some(policy)` 后，本 `App` 上所有经由 `Context::call_iface`、`Context::call_iface_stream`
 /// 及 T2 `HostApi::ctx_call_iface` 发起的方法调用都会在执行前按宿主绑定的 [`CallerIdentity`]
 /// 校验白名单（默认拒绝）；传 `None` 清除白名单限制。
 pub fn set_method_allow_list_for(ctx: &Ctx, policy: Option<MethodAllowList>) {
-    let key = Arc::as_ptr(&ctx.store) as usize;
-    let mut registry = app_method_allow_lists().lock().unwrap();
-    registry.retain(|_, entry| entry.store.strong_count() > 0);
     match policy {
         Some(policy) => {
             let shared = Arc::new(policy.clone());
@@ -739,25 +649,16 @@ pub fn set_method_allow_list_for(ctx: &Ctx, policy: Option<MethodAllowList>) {
                     shared.check(caller, service, method)
                 },
             )));
-            registry.insert(
-                key,
-                AppMethodAllowList {
-                    store: Arc::downgrade(&ctx.store),
-                    policy,
-                },
-            );
+            ctx.store.set_extension(policy);
         }
         None => {
             ctx.store.set_call_auth_hook(None);
-            registry.remove(&key);
+            ctx.store.remove_extension::<MethodAllowList>();
         }
     }
 }
 
 /// 读取单个 App 当前安装的方法白名单策略（未安装时为 `None`）。
 pub fn method_allow_list_for(ctx: &Ctx) -> Option<MethodAllowList> {
-    let key = Arc::as_ptr(&ctx.store) as usize;
-    let mut registry = app_method_allow_lists().lock().unwrap();
-    registry.retain(|_, entry| entry.store.strong_count() > 0);
-    registry.get(&key).map(|entry| entry.policy.clone())
+    ctx.store.extension::<MethodAllowList>()
 }

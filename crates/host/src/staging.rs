@@ -103,6 +103,13 @@ pub fn stage_plugin(path: &Path, revision: u64) -> Result<PathBuf> {
 /// 换成一个包管理器（npm 风格的 `node_modules` 解析、OCI、内置 registry）
 /// 只需要替换这一个函数——内核与 ABI 都不需要改。
 pub fn resolve_plugin_path(name: &str, search: &[PathBuf]) -> Result<PathBuf> {
+    let raw = Path::new(name);
+    if raw
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("插件名 \"{name}\" 不允许包含父目录跳转 (..)").into());
+    }
     let candidates = |stem: &str| {
         let mut files = vec![PathBuf::from(stem)];
         if cfg!(windows) {
@@ -118,18 +125,27 @@ pub fn resolve_plugin_path(name: &str, search: &[PathBuf]) -> Result<PathBuf> {
         }
         files
     };
-    for candidate in candidates(name) {
-        let path = candidate;
-        if path.is_file() {
-            return Ok(path);
+    // 显式绝对路径直接按路径解析，不拼接到 search 目录。
+    if raw.is_absolute() {
+        for candidate in candidates(name) {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
+        return Err(format!("找不到插件 \"{name}\"；搜索目录: {search:?}").into());
     }
+    // 优先搜索显式配置的 search 目录（如 `--plugin-dir` / 配置目录），避免被 CWD 劫持。
     for dir in search {
         for candidate in candidates(name) {
             let path = dir.join(candidate);
             if path.is_file() {
                 return Ok(path);
             }
+        }
+    }
+    for candidate in candidates(name) {
+        if candidate.is_file() {
+            return Ok(candidate);
         }
     }
     Err(format!("找不到插件 \"{name}\"；搜索目录: {search:?}").into())

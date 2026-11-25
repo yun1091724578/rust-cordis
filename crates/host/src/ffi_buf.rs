@@ -24,8 +24,11 @@ pub(crate) unsafe fn reply(out: *mut Out, bytes: &[u8]) -> i32 {
 /// 同 `reply`。
 pub(crate) unsafe fn fail(out: *mut Out, message: &str) -> i32 {
     if !out.is_null() {
-        let text = truncate_utf8(message, (*out).cap);
-        reply(out, text.as_bytes());
+        let cap = (*out).cap;
+        if cap <= isize::MAX as usize && (cap == 0 || !(*out).ptr.is_null()) {
+            let text = truncate_utf8(message, cap);
+            reply(out, text.as_bytes());
+        }
     }
     STATUS_ERR
 }
@@ -247,7 +250,10 @@ pub(crate) unsafe fn with_instance_payload<T>(
 where
     T: AsRef<[u8]>,
 {
-    let instance = instances().read().unwrap().get(handle);
+    let instance = match instances().read() {
+        Ok(table) => table.get(handle),
+        Err(_) => return fail(out, "宿主实例表锁已中毒（已在 ABI 边界截获）"),
+    };
     match instance {
         None => fail(
             out,
@@ -382,6 +388,8 @@ impl CallBuffer {
     }
 }
 
+const MAX_CALL_BUFFER_POOL: usize = 8;
+
 impl Drop for CallBuffer {
     fn drop(&mut self) {
         let mut buffer = std::mem::take(&mut self.0);
@@ -390,7 +398,12 @@ impl Drop for CallBuffer {
             // 否则同线程的下一个插件会看到上一次调用的残留数据。
             buffer.resize(16 * 1024, 0);
             buffer.fill(0);
-            CALL_BUFFER_POOL.with(|pool| pool.borrow_mut().push(buffer));
+            let _ = CALL_BUFFER_POOL.try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < MAX_CALL_BUFFER_POOL {
+                    pool.push(buffer);
+                }
+            });
         }
     }
 }
@@ -484,7 +497,7 @@ pub(crate) unsafe fn invoke_raw_with(
         }
         if out.len > buffer.len() {
             return (
-                retried,
+                STATUS_TOO_SMALL,
                 format!(
                     "插件回调输出声称 {} 字节，超过宿主缓冲 {} 字节；消息未完整写入",
                     out.len,
@@ -496,9 +509,9 @@ pub(crate) unsafe fn invoke_raw_with(
     }
     if out.len > buffer.len() {
         // `Out` 契约要求插件只在 cap 内回填；超限时原消息一个字节都没写，
-        // 不能把零缓冲当成错误文本。返回一条有界的宿主诊断。
+        // 不能把零缓冲当成错误文本，也不能保留 STATUS_OK/STATUS_PENDING 误导调用方。
         return (
-            status,
+            STATUS_TOO_SMALL,
             format!(
                 "插件回调输出声称 {} 字节，超过宿主缓冲 {} 字节；消息未完整写入",
                 out.len,

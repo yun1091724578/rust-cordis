@@ -126,47 +126,68 @@ pub fn resolve(entries: &[PlanEntry]) -> Result<ResolvedPlan, Vec<String>> {
         }
     }
 
-    let mut resolved = ResolvedPlan::default();
+    let mut reqs_by_key: BTreeMap<&str, Vec<(&PlanEntry, &VersionReq)>> = BTreeMap::new();
     for entry in entries {
         for (key, req) in &entry.requires {
-            let Some(candidates) = by_key.get(key) else {
+            reqs_by_key
+                .entry(key.as_str())
+                .or_default()
+                .push((entry, req));
+        }
+    }
+
+    let mut resolved = ResolvedPlan::default();
+    for (key, reqs) in reqs_by_key {
+        let Some(candidates) = by_key.get(key) else {
+            for (entry, req) in reqs {
                 errors.push(format!(
                     "插件 {} {} 需要 {key} {}，但没有提供者",
                     entry.id, entry.version, req
                 ));
-                continue;
-            };
+            }
+            continue;
+        };
+        if let Some(provider) = candidates
+            .iter()
+            .find(|provider| reqs.iter().all(|(_, req)| req.matches(&provider.version)))
+        {
+            resolved.providers.insert(
+                key.to_string(),
+                Provider {
+                    plugin: provider.plugin.clone(),
+                    version: provider.version.clone(),
+                },
+            );
+            continue;
+        }
+        // 没有单个候选能同时满足全部要求：分别报出无候选者或版本冲突，保留清晰诊断。
+        let available = candidates
+            .iter()
+            .map(|provider| format!("{} {}", provider.plugin, provider.version))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut first_match: Option<&Provider> = None;
+        for (entry, req) in reqs {
             let Some(provider) = candidates
                 .iter()
                 .find(|provider| req.matches(&provider.version))
             else {
-                let available = candidates
-                    .iter()
-                    .map(|provider| format!("{} {}", provider.plugin, provider.version))
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 errors.push(format!(
                     "插件 {} {} 需要 {key} {}，可用版本为 [{}]",
                     entry.id, entry.version, req, available
                 ));
                 continue;
             };
-            if let Some(previous) = resolved.providers.get(key) {
+            if let Some(previous) = first_match {
                 if previous.plugin != provider.plugin || previous.version != provider.version {
                     errors.push(format!(
                         "服务键 {key} 被解析到不同提供者：{} {} 与 {} {}",
                         previous.plugin, previous.version, provider.plugin, provider.version
                     ));
-                    continue;
                 }
+            } else {
+                first_match = Some(provider);
             }
-            resolved.providers.insert(
-                key.clone(),
-                Provider {
-                    plugin: provider.plugin.clone(),
-                    version: provider.version.clone(),
-                },
-            );
         }
     }
 

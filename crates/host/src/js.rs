@@ -968,6 +968,13 @@ fn eval_step(base: Value, step: &Step, ctx: &Ctx) -> std::result::Result<Value, 
                         .unwrap_or(Value::Missing)),
                     None => Err(format!("对象下标必须是字符串：{}", describe(&index))),
                 },
+                Value::Builtin(Builtin::Env) => match as_string(&index) {
+                    Some(key) => Ok(std::env::var(&key)
+                        .ok()
+                        .map(|text| Value::Json(Config::String(text)))
+                        .unwrap_or(Value::Missing)),
+                    None => Err(format!("环境变量下标必须是字符串：{}", describe(&index))),
+                },
                 other => Err(format!("不能对 {} 取下标", describe(&other))),
             }
         }
