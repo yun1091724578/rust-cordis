@@ -99,14 +99,26 @@ impl RegistryHandle {
         let name_owned = name.to_string();
         Ok(Disposable::new(move || {
             Box::pin(async move {
-                provided.run().await;
-                if let Some(table) = table.upgrade() {
-                    table
-                        .names
-                        .lock()
-                        .unwrap()
-                        .retain(|existing| existing != &name_owned);
+                struct SlotCleanup {
+                    table: Weak<RegistryHandle>,
+                    name: String,
                 }
+                impl Drop for SlotCleanup {
+                    fn drop(&mut self) {
+                        if let Some(table) = self.table.upgrade() {
+                            table
+                                .names
+                                .lock()
+                                .unwrap()
+                                .retain(|existing| existing != &self.name);
+                        }
+                    }
+                }
+                let _cleanup = SlotCleanup {
+                    table,
+                    name: name_owned,
+                };
+                provided.run().await;
             })
         }))
     }
@@ -130,6 +142,9 @@ impl RegistryHandle {
     /// 读**当下**的值（走注册表自己的提交视图，不是注册时的快照）。没有 ⇒ `None`。
     pub fn get(&self, name: &str) -> Option<Dyn> {
         let ctx = self.ctx.upgrade()?;
+        if !ctx.is_active() {
+            return None;
+        }
         if !self
             .names
             .lock()
@@ -144,7 +159,10 @@ impl RegistryHandle {
 
     /// 当前槽位名（按注册顺序）。注册表已卸载 ⇒ 空表（优雅降级）。
     pub fn names(&self) -> Vec<String> {
-        if self.ctx.upgrade().is_none() {
+        let Some(ctx) = self.ctx.upgrade() else {
+            return Vec::new();
+        };
+        if !ctx.is_active() {
             return Vec::new();
         }
         self.names.lock().unwrap().clone()

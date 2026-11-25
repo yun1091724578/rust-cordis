@@ -284,6 +284,9 @@ impl Out {
     /// # Safety
     /// `self.ptr`/`self.cap` 必须指向宿主提供的一块有效可写内存。
     pub unsafe fn write(&mut self, bytes: &[u8]) -> i32 {
+        if self.cap > isize::MAX as usize || (!bytes.is_empty() && self.ptr.is_null()) {
+            return STATUS_ERR;
+        }
         if bytes.len() > self.cap {
             self.len = bytes.len();
             return STATUS_TOO_SMALL;
@@ -417,8 +420,11 @@ impl HostApi {
     /// # Safety
     /// `self` 必须指向一份仍有效、完整尺寸的 `HostApi`；`size` 覆盖的字节必须可读。
     pub unsafe fn field_at<T: Copy>(&self, offset: usize) -> Option<T> {
-        if (self.size as usize) >= offset + std::mem::size_of::<T>() {
-            // SAFETY：上面的判界保证 offset + width 落在调用方声明的可读范围内。
+        if offset
+            .checked_add(std::mem::size_of::<T>())
+            .is_some_and(|end| (self.size as usize) >= end)
+        {
+            // SAFETY：上面的判界保证 offset + width 落在调用方声明的可读范围内且不溢出。
             let base = self as *const Self as *const u8;
             Some(std::ptr::read_unaligned(base.add(offset) as *const T))
         } else {
@@ -480,8 +486,11 @@ impl PluginDesc {
     /// `desc` 必须指向至少 8 字节、且按 `size` 声明可读的插件描述表。
     pub unsafe fn field_at<T: Copy>(desc: *const Self, offset: usize) -> Option<T> {
         let size = (*desc).size as usize;
-        if size >= offset + std::mem::size_of::<T>() {
-            // SAFETY：上面的判界保证 `offset + width` 落在插件自己声明的结构体内。
+        if offset
+            .checked_add(std::mem::size_of::<T>())
+            .is_some_and(|end| size >= end)
+        {
+            // SAFETY：上面的判界保证 `offset + width` 落在插件自己声明的结构体内且不溢出。
             let base = desc as *const u8;
             Some(std::ptr::read_unaligned(base.add(offset) as *const T))
         } else {

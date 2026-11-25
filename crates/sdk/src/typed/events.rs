@@ -47,7 +47,9 @@ pub fn decode_ret<P: DeserializeOwned>(ret: Ret) -> Result<Option<P>, Error> {
     let Some(value) = ret else {
         return Ok(None);
     };
-    let raw = payload_of(&value).unwrap_or(Config::Null);
+    let raw = payload_of(&value).ok_or_else(|| -> Error {
+        "事件返回值不是 JSON 信封（`ExternValue`）".into()
+    })?;
     // `null` 在核心的 `Ret` 里就是"不表态"（与 `undefined` 合并）；
     // 不能把它当成一个必须解码成 `P` 的载荷，否则下游一句 `Reply(Null)`
     // 就会让 typed 上游收到假错误。

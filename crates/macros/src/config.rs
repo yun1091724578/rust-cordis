@@ -16,10 +16,10 @@ use crate::attr;
 pub fn config(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     attr::expect_empty(args, "cordis::config")?;
     let item: ItemStruct = syn::parse2(item)?;
-    if !item.generics.params.is_empty() {
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
         return Err(syn::Error::new_spanned(
             &item.generics,
-            "配置类型不能带泛型参数（它要被 JSON 解出来）",
+            "配置类型不能带泛型参数或 where 子句（它要被 JSON 解出来）",
         ));
     }
     let ident = item.ident.clone();
@@ -29,10 +29,11 @@ pub fn config(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
             .iter()
             .filter(|field| !should_skip_probe(&field.attrs))
             .filter_map(|field| {
-                field
-                    .ident
-                    .as_ref()
-                    .map(|ident| (ident.to_string(), field.ty.clone()))
+                field.ident.as_ref().map(|ident| {
+                    let raw_name = ident.to_string();
+                    let name = raw_name.strip_prefix("r#").unwrap_or(&raw_name).to_string();
+                    (name, field.ty.clone())
+                })
             })
             .collect(),
         _ => Vec::new(),
@@ -117,6 +118,7 @@ fn should_skip_probe(attrs: &[syn::Attribute]) -> bool {
                 || path.is_ident("skip_deserializing")
                 || path.is_ident("with")
                 || path.is_ident("deserialize_with")
+                || path.is_ident("flatten")
         })
     })
 }

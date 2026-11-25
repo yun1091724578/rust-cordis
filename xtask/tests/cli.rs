@@ -1088,3 +1088,29 @@ fn arch_passes_on_the_real_repo() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn docs_consistency_and_reference_index_pass() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let sdk_guide = std::fs::read_to_string(root.join("SDK指南.md")).unwrap();
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+
+    assert!(
+        !sdk_guide.contains("第三方组件（受审计）"),
+        "SDK指南.md 不应与 README / ADR 0005 冲突（T2 不承载第三方插件）"
+    );
+    assert!(
+        !sdk_guide.contains("计划中（ADR，M8）"),
+        "SDK指南.md 不应与 ADR 0001 冲突（T3 已决定不实现）"
+    );
+    assert!(
+        !readme.contains("dist/cordis-0.1.1-formal"),
+        "README.md 不应引用仓库中不存在的 dist/cordis-0.1.1-formal 路径"
+    );
+    let ref_index = root.join("docs/references-and-milestones.md");
+    assert!(
+        ref_index.is_file(),
+        "缺少里程碑代号与上游参考索引文档: {}",
+        ref_index.display()
+    );
+}

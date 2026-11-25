@@ -39,6 +39,12 @@ pub fn install() -> Result<(), String> {
     Ok(())
 }
 
+/// 重置进程级关闭状态，支持同一进程内多次调用 `cordis_cli::run` / `service_main`。
+pub fn reset() {
+    REQUESTED.store(false, Ordering::SeqCst);
+    COMPLETE.store(false, Ordering::SeqCst);
+}
+
 /// 请求关闭。信号处理器与测试都走这里；仅做原子写，满足信号安全。
 pub fn request_shutdown() {
     REQUESTED.store(true, Ordering::SeqCst);

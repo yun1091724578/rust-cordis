@@ -79,7 +79,7 @@ manifest 示例：
 示例插件写出 `provides` / `requires`；`seal --verify` 校验的是生成器写出的规范
 字节。`PluginDesc` 自述仍不参与求解。
 
-支持契约见 [`docs/support-contract.md`](docs/support-contract.md)，设计决策见 `docs/adr/`。
+支持契约见 [`docs/support-contract.md`](docs/support-contract.md)，设计决策见 `docs/adr/`，源码注释里的里程碑代号与上游对照索引见 [`docs/references-and-milestones.md`](docs/references-and-milestones.md)。
 
 ## 快速开始
 
@@ -98,7 +98,7 @@ cargo test -p rsi-substrate --test e2e
 cargo xtask test
 cargo xtask consumer
 cargo xtask package-check
-cargo xtask seal-consume dist/cordis-0.1.1-formal
+cargo xtask seal-consume <seal-dir>
 cargo xtask demo
 cargo xtask e2e
 cargo xtask ci
@@ -114,7 +114,7 @@ cargo xtask doctor
 
 `cargo xtask ci` 依次执行格式检查、inventory/docs/平台矩阵检查、clippy（`-D warnings`、`--all-features`）、全 target 的 `--all-features` 编译检查、workspace 测试、doctest（`cargo test --workspace --doc`）、独立服务消费者测试、demo 快照比较与真 DLL harness；三平台 GitHub CI 也直接运行 `cargo xtask consumer` 和 consumer 的 fmt 检查。`cargo xtask consumer` 会先构建 `greeting` / `hello` cdylib，再在独立 workspace 中验证真实 ABI 服务组合、`PluginSourcePolicy` + sidecar 准入和关闭。正式封存消费者演练（本地/发布证据，不在 PR CI）：
 ```text
-cargo xtask seal-consume dist/cordis-0.1.1-formal
+cargo xtask seal-consume <seal-dir>
 ```
 
 `cargo xtask fmt` 可单独检查格式；格式基线已建立，是阻塞门禁。`cargo xtask matrix` 只检查矩阵结构，不验证真实平台结果；实际结果记录在 [`docs/platform-matrix.md`](docs/platform-matrix.md)，是一次三平台 CI 的快照。`cargo xtask seal` 是发布时入口：构建三个宿主目标示例插件，写 sidecar manifest、`allow-list.json`、SHA256/源码树/工具链清单，用同版本 `inspect --source-policy` 逐插件核对身份，并保存 `smoke/inspect.txt`；它不在 `ci` 内，边界见 [`docs/release-seal.md`](docs/release-seal.md)。`cargo xtask soak [cycles]` 运行默认被忽略的宿主资源 soak（默认 1000 轮）和 200 轮真实 `open_staged` soak，同样不进入 `ci`；位置参数只影响主 soak，真 DLL 的 `open_staged` soak 由 `CORDIS_STAGED_SOAK_CYCLES` 控制（默认 200）。`cargo xtask dhat` 单独跑 `dhat-heap` 下的真实 `open_staged` 堆剖析（带 feature 守卫并打印 stats），也不进入 `ci`；`cargo xtask package-check` 用打包产物在隔离目录构建消费者并跑一次跨 ABI 服务调用，防止源码 path 后门，同样不在 `ci` 里、按需运行；`scripts/version-matrix.ps1` 运行本地相邻版本矩阵。

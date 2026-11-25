@@ -285,6 +285,10 @@ impl Plugin for Provisioned {
         self.inner.validate(raw)
     }
 
+    fn config_schema(&self) -> Option<String> {
+        self.inner.config_schema()
+    }
+
     fn volatile_paths(&self) -> Vec<String> {
         self.inner.volatile_paths()
     }
@@ -397,6 +401,7 @@ pub enum Level {
 }
 
 pub type LogSink = Arc<dyn Fn(Level, &str, &str) + Send + Sync>;
+type AsyncCommitObserver = Arc<dyn Fn(Arc<Fiber>, Config, bool) -> BoxFuture<()> + Send + Sync>;
 
 type CleanupErrorLog = Mutex<Vec<(u64, crate::fiber::CleanupError)>>;
 
@@ -434,6 +439,7 @@ pub struct Store {
     /// `internal/commit` 同理——它是"配置被改了就落盘"的同步通知。
     plugin_observers: Mutex<Vec<(u64, PluginObserver)>>,
     commit_observers: Mutex<Vec<(u64, CommitObserver)>>,
+    async_commit_observers: Mutex<Vec<(u64, AsyncCommitObserver)>>,
     /// **同步监听器钩子**：`ctx.on` 每次注册前先咨询它们（`internal/listener` 的 Rust 形态）。
     ///
     /// 与事件表不同，这条链是**同步**的：`ctx.on` 本身是同步函数，返回 `Disposable`；
@@ -464,6 +470,8 @@ pub struct Store {
     background_cleanups: Mutex<Vec<BackgroundCleanupEntry>>,
     background_cleanup_sn: AtomicU64,
     background_cleanup_notify: tokio::sync::Notify,
+    /// 按类型擦除的 per-App（per-Store）扩展槽：供上层宿主存放 App 级策略，随 `Store` 自动释放。
+    extensions: Mutex<HashMap<std::any::TypeId, Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
 impl Default for Store {
@@ -483,6 +491,7 @@ impl Store {
             root_fiber: Mutex::new(None),
             plugin_observers: Mutex::new(Vec::new()),
             commit_observers: Mutex::new(Vec::new()),
+            async_commit_observers: Mutex::new(Vec::new()),
             listener_hooks: Mutex::new(Vec::new()),
             get_hooks: Mutex::new(Vec::new()),
             set_hooks: Mutex::new(Vec::new()),
@@ -503,6 +512,7 @@ impl Store {
             background_cleanups: Mutex::new(Vec::new()),
             background_cleanup_sn: AtomicU64::new(1),
             background_cleanup_notify: tokio::sync::Notify::new(),
+            extensions: Mutex::new(HashMap::new()),
         };
         // 内置监听器钩子（上游 `events.ts:54-58` 的那个 `internal/listener` 监听器）：
         // 把**非全局**的 `internal/update` 注册路由进 fiber 自己的钩子链——
@@ -541,6 +551,32 @@ impl Store {
     /// 读取本 `App` / `Store` 当前的生命周期等待预算。
     pub fn lifecycle_policy(&self) -> crate::fiber::LifecyclePolicy {
         *self.lifecycle_policy.lock().unwrap()
+    }
+
+    /// 写入一条按类型隔离的 per-App 扩展值（随 `Store` 释放，替代进程级裸指针表）。
+    pub fn set_extension<T: Send + Sync + 'static>(&self, value: T) {
+        self.extensions
+            .lock()
+            .unwrap()
+            .insert(std::any::TypeId::of::<T>(), Arc::new(value));
+    }
+
+    /// 移除指定类型的 per-App 扩展值。
+    pub fn remove_extension<T: Send + Sync + 'static>(&self) {
+        self.extensions
+            .lock()
+            .unwrap()
+            .remove(&std::any::TypeId::of::<T>());
+    }
+
+    /// 读取指定类型的 per-App 扩展值副本。
+    pub fn extension<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
+        self.extensions
+            .lock()
+            .unwrap()
+            .get(&std::any::TypeId::of::<T>())
+            .and_then(|v| v.downcast_ref::<T>())
+            .cloned()
     }
 
     /// 安装或清除宿主管理的方法调用授权钩子（作用于本 `Store` 上的 `call_iface` 与 `call_iface_stream`）。
@@ -929,6 +965,34 @@ impl Store {
         })
     }
 
+    /// 异步观察“插件配置被提交”（例如 loader 将阻塞磁盘落盘移交 `spawn_blocking`）。
+    ///
+    /// 在同步 `on_commit` 之后、仍在 `Fiber::update_with` 的提交临界区内被 await，
+    /// 既保证 `update().await` 返回时落盘已完成，又不阻塞 Tokio async worker 线程。
+    pub fn on_commit_async<F>(self: &Arc<Self>, ctx: &Ctx, observer: F) -> crate::Disposable
+    where
+        F: Fn(Arc<Fiber>, Config, bool) -> BoxFuture<()> + Send + Sync + 'static,
+    {
+        let store = self.clone();
+        let observer: AsyncCommitObserver = Arc::new(observer);
+        ctx.fiber().effect(move |_| {
+            let sn = store.observer_sn.fetch_add(1, Ordering::SeqCst);
+            store
+                .async_commit_observers
+                .lock()
+                .unwrap()
+                .push((sn, observer));
+            let store2 = store.clone();
+            crate::Disposable::sync(move || {
+                store2
+                    .async_commit_observers
+                    .lock()
+                    .unwrap()
+                    .retain(|(s, _)| *s != sn);
+            })
+        })
+    }
+
     pub(crate) fn fire_plugin(&self, fiber: &Arc<Fiber>) {
         let observers: Vec<_> = self
             .plugin_observers
@@ -952,6 +1016,24 @@ impl Store {
             .collect();
         for observer in observers {
             observer(fiber, config, no_save);
+        }
+    }
+
+    pub(crate) async fn fire_commit_async(
+        &self,
+        fiber: &Arc<Fiber>,
+        config: &Config,
+        no_save: bool,
+    ) {
+        let observers: Vec<_> = self
+            .async_commit_observers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, f)| f.clone())
+            .collect();
+        for observer in observers {
+            observer(fiber.clone(), config.clone(), no_save).await;
         }
     }
 
@@ -1010,15 +1092,25 @@ impl Store {
     /// 3. 走到无 fiber 的根 → "没有声明 inject 就不能读属性"；
     /// 4. 跨了隔离域边界 → 拒绝。
     pub fn resolve(&self, ctx: &Ctx, name: &str) -> std::result::Result<Dyn, ResolveError> {
-        let fiberless = ctx
-            .fiber_opt()
-            .map(|fiber| fiber.runtime.is_none())
-            .unwrap_or(true);
-        if fiberless {
-            return self
-                .try_get(ctx, name, false)
-                .ok_or_else(|| ResolveError::NoInject(name.into()));
-        }
+        let initial_fiber = match ctx.fiber_opt() {
+            Some(fiber) => {
+                if fiber.runtime.is_none() {
+                    return self
+                        .try_get(ctx, name, false)
+                        .ok_or_else(|| ResolveError::NoInject(name.into()));
+                }
+                fiber
+            }
+            None => {
+                if ctx.has_attached_fiber() {
+                    // 曾绑定过 fiber 但 fiber 已被处置释放：fail-closed，不能回退到无约束根读。
+                    return Err(ResolveError::Inactive(name.into()));
+                }
+                return self
+                    .try_get(ctx, name, false)
+                    .ok_or_else(|| ResolveError::NoInject(name.into()));
+            }
+        };
         // M3-3：`internal/get` 的 Rust 形态——**查表之前**先咨询读钩子链。
         // 任一钩子返回 `Some` 即接管这次读取（含跳过注入检查——与上游一致：
         // waterfall 包住了做检查的那段 tail，`reflect.ts:82`）。
@@ -1036,15 +1128,13 @@ impl Store {
         }
         // 可选依赖不进入 committed 快照（不参与激活判定），因此不能按必需依赖
         // 的“声明处停住”逻辑处理：直接按全局服务表探测，缺席时回报 Inactive。
-        if let Some(fiber) = ctx.fiber_opt() {
-            if fiber.declares_optional_inject(name) && !fiber.declares_inject(name) {
-                return self
-                    .try_get(ctx, name, true)
-                    .ok_or_else(|| ResolveError::Inactive(name.into()));
-            }
+        if initial_fiber.declares_optional_inject(name) && !initial_fiber.declares_inject(name) {
+            return self
+                .try_get(ctx, name, true)
+                .ok_or_else(|| ResolveError::Inactive(name.into()));
         }
         let realm = self.realm_of(ctx, name);
-        let mut fiber = ctx.fiber();
+        let mut fiber = initial_fiber;
         loop {
             if let Some(impl_) = fiber.committed(name, realm) {
                 return Ok(impl_.get());
@@ -1095,12 +1185,13 @@ impl Store {
         check: Option<Check>,
     ) -> Result<Disposable> {
         let store = Arc::clone(self);
-        let ctx = ctx.clone();
+        let ctx_in = ctx.clone();
         let name_owned: Box<str> = name.into();
         // setup 是同步执行的，所以冲突结果立刻可见；失败时直接返回 `Err`，
         // **不产生恢复栈登记**（`effect_result` 的语义）——曾经这里先登记一条
         // 空壳、再在外层返回错误，调用方拿不到句柄，于是每次撞名都欠一笔永久条目。
-        ctx.fiber().effect_result(move |_| {
+        let disposable = ctx.fiber().effect_result(move |_| {
+            let ctx = ctx_in;
             let realm = store.realm_of(&ctx, &name_owned);
             let impl_ = Arc::new(Impl::new(
                 name_owned.clone(),
@@ -1130,9 +1221,6 @@ impl Store {
             // `this.ctx.fiber.store![name] = impl`。
             ctx.fiber()
                 .committed_insert(name_owned.clone(), impl_.clone());
-            if ctx.fiber().state() == crate::fiber::FiberState::Active {
-                store.notify(&[&name_owned], &ctx, true);
-            }
             let store2 = Arc::clone(&store);
             let ctx2 = ctx.clone();
             let name2 = name_owned.clone();
@@ -1146,17 +1234,29 @@ impl Store {
                     store2.impls.lock().unwrap().remove(&realm);
                     let dependents = store2.notify(&[&name2], &ctx2, true);
                     let provider_fiber = ctx2.fiber_opt();
+                    let provider_tearing_down = provider_fiber.as_ref().is_none_or(|p| {
+                        p.is_disposed() || p.state() == crate::fiber::FiberState::Unloading
+                    });
                     for fiber in dependents {
+                        if provider_fiber
+                            .as_ref()
+                            .is_some_and(|provider| Arc::ptr_eq(provider, &fiber))
+                        {
+                            continue;
+                        }
                         // 依赖者如果正在拆自己（尤其它是 provider 的祖先），等它 settle
                         // 会回头抢父 fiber 已持有的 driver：父 unload 等子 dispose、
                         // 子 provide disposer 又等父 settle，形成死锁。
+                        // 若提供者自身正在卸载/处置，`wait_for_dependents` 已按 `drain_timeout_ms`
+                        // 处理过依赖等待，此处不再无界等待已进入 Unloading 的依赖者。
                         let ancestor_consumer = provider_fiber
                             .as_ref()
                             .is_some_and(|provider| fiber.is_ancestor_of(provider));
-                        if fiber.is_disposed()
-                            || fiber.state() == crate::fiber::FiberState::Unloading
-                            || fiber.is_cycle_blocked(&name2)
+                        if fiber.is_cycle_blocked(&name2)
                             || ancestor_consumer
+                            || (provider_tearing_down
+                                && (fiber.is_disposed()
+                                    || fiber.state() == crate::fiber::FiberState::Unloading))
                         {
                             if ancestor_consumer {
                                 if let Some(provider) = &provider_fiber {
@@ -1165,17 +1265,29 @@ impl Store {
                             }
                             continue;
                         }
-                        fiber.settle().await;
+                        if fiber.is_disposed() {
+                            fiber.wait_disposed().await;
+                        } else {
+                            fiber.settle().await;
+                        }
                     }
                     // 最后才从**自己的提交视图**里摘掉自己那条（`reflect.ts:202`）。
                     // 顺序是要害：放到这里，提供者的 disposer 在整个拆除过程中都还能
                     // 读到自己提供的服务——JS 那一行的注释就是
                     // *"ensure self access before dependencies cleanup"*。
-                    ctx2.fiber().remove_dep(&name2);
-                    ctx2.fiber().committed_remove(&name2, realm);
+                    if let Some(provider) = provider_fiber {
+                        provider.remove_dep(&name2);
+                        provider.committed_remove(&name2, realm);
+                    }
                 })
             }))
-        })
+        })?;
+        // 放到 `effect_result` 成功注册 disposer 之后再 `notify`：即使依赖者的 `Check` 谓词
+        // 在 `notify` 内 panic，已插入的 `store.impls` 条目也已挂入恢复栈，不会永久泄漏。
+        if ctx.fiber().state() == crate::fiber::FiberState::Active {
+            self.notify(&[name], ctx, true);
+        }
+        Ok(disposable)
     }
 
     /// 覆盖已注册服务的值。只有提供者 fiber 自己可以写（`reflect.ts:164-175`）。
@@ -1508,6 +1620,9 @@ impl Store {
                 let mut hooks = store2.hooks.lock().unwrap();
                 if let Some(list) = hooks.get_mut(&name2) {
                     list.retain(|h| h.sn != sn);
+                    if list.is_empty() {
+                        hooks.remove(&name2);
+                    }
                 }
             })
         })
@@ -1870,19 +1985,25 @@ impl Store {
     }
 
     pub(crate) fn register_fiber(&self, runtime: &Arc<Runtime>, fiber: &Arc<Fiber>) {
+        // 统一锁序：`self.runtimes` → `runtime.fibers`，避免与 `unregister_fiber` 竞态孤立新 fiber。
+        let mut runtimes = self.runtimes.lock().unwrap();
+        if !runtimes.iter().any(|r| Arc::ptr_eq(r, runtime)) {
+            runtimes.push(runtime.clone());
+        }
         runtime.fibers.lock().unwrap().push(fiber.clone());
     }
 
     pub(crate) fn unregister_fiber(&self, runtime: &Arc<Runtime>, fiber: &Arc<Fiber>) {
-        {
+        // 与 `register_fiber` / `inventory` 相同锁序：`self.runtimes` → `runtime.fibers`。
+        let mut runtimes = self.runtimes.lock().unwrap();
+        let is_empty = {
             let mut fibers = runtime.fibers.lock().unwrap();
             fibers.retain(|f| !Arc::ptr_eq(f, fiber));
-            if !fibers.is_empty() {
-                return;
-            }
+            fibers.is_empty()
+        };
+        if is_empty {
+            runtimes.retain(|r| !Arc::ptr_eq(r, runtime));
         }
-        let mut runtimes = self.runtimes.lock().unwrap();
-        runtimes.retain(|r| !Arc::ptr_eq(r, runtime));
     }
 
     /// 配置解析：先过 `internal/config` 瀑布（loader 在这里做 `!!js` 插值），

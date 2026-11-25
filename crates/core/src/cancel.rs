@@ -35,10 +35,7 @@ impl CancelToken {
     /// 撤销这次派发。**幂等**。
     pub fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::SeqCst);
-        // 两个都要：`notify_waiters` 唤醒**已注册**的等待者；
-        // `notify_one` 给"还没开始等"的那个留一个许可（不丢唤醒）。
         self.inner.notify.notify_waiters();
-        self.inner.notify.notify_one();
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -47,8 +44,15 @@ impl CancelToken {
 
     /// 挂起直到取消；已取消时立即返回。
     pub async fn cancelled(&self) {
-        while !self.is_cancelled() {
-            self.inner.notify.notified().await;
+        loop {
+            // 先注册再检查原子位，避免多个并发等待者在首次 poll 前错过 `notify_waiters()`。
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
         }
     }
 }

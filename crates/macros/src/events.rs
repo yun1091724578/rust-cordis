@@ -18,10 +18,10 @@ use crate::attr;
 pub fn events(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     attr::expect_empty(args, "cordis::events")?;
     let item: ItemEnum = syn::parse2(item)?;
-    if !item.generics.params.is_empty() {
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
         return Err(Error::new_spanned(
             &item.generics,
-            "事件枚举不能有泛型参数（每个变体自己带载荷类型）",
+            "事件枚举不能有泛型参数或 where 子句（每个变体自己带载荷类型）",
         ));
     }
 
@@ -49,24 +49,28 @@ pub fn events(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         let dispatch_ident = format_ident!("{}", attr::snake_case(variant_ident));
         let listener_ident = format_ident!("on_{}", attr::snake_case(variant_ident));
 
+        let cfg_attrs: Vec<_> = variant
+            .attrs
+            .iter()
+            .filter(|attribute| attribute.path().is_ident("cfg"))
+            .collect();
+
         names.push(event_name.clone());
         consts.push(quote! {
+            #(#cfg_attrs)*
             #[doc = concat!("事件名（逐字）：`", #event_name, "`")]
             pub const #const_ident: &'static str = #event_name;
         });
-        helpers.push(dispatch_helper(
-            &dispatch_ident,
-            &const_ident,
-            &payload,
-            mode,
-            &event_name,
-        ));
-        helpers.push(listener_helper(
-            &listener_ident,
-            &const_ident,
-            &payload,
-            mode,
-        ));
+        let disp = dispatch_helper(&dispatch_ident, &const_ident, &payload, mode, &event_name);
+        let listen = listener_helper(&listener_ident, &const_ident, &payload, mode);
+        helpers.push(quote! {
+            #(#cfg_attrs)*
+            #disp
+        });
+        helpers.push(quote! {
+            #(#cfg_attrs)*
+            #listen
+        });
         // 变体本身只是声明面（运行期走 JSON），但 `#[cfg]`/`#[doc]` 等属性必须保留；
         // 只丢掉给这个宏吃的 `#[event(…)]`（否则编译器会报 "cannot find attribute"）。
         let variant_attrs: Vec<_> = variant

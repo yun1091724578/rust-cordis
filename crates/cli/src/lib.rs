@@ -1146,6 +1146,7 @@ pub async fn status(config_path: &Path, options: RunOptions) -> Result<StatusRep
 /// `windows-sys`/`dlltool`，破坏本仓当前的可移植构建。这里用平台最小的
 /// 控制台/`signal` FFI，处理器只置一个原子 flag；清理仍走 `App::close`。
 pub async fn run(config_path: &Path, options: RunOptions) -> Result<RunReport, RunError> {
+    shutdown::reset();
     if let Err(err) = shutdown::install() {
         eprintln!("无法安装关闭信号处理器（仍可按 Enter 关闭）: {err}");
     }

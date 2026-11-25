@@ -26,8 +26,8 @@ mod windows {
     use std::os::raw::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
-    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
     const SERVICE_STOPPED: u32 = 0x0000_0001;
@@ -85,12 +85,28 @@ mod windows {
         options: RunOptions,
     }
 
+    #[derive(Clone, Copy)]
+    struct ServiceState {
+        state: u32,
+        exit_code: u32,
+        checkpoint: u32,
+        wait_hint: u32,
+    }
+
     static ARGS: OnceLock<ServiceArgs> = OnceLock::new();
     static STATUS_HANDLE: AtomicIsize = AtomicIsize::new(0);
-    static LAST_STATE: AtomicU32 = AtomicU32::new(SERVICE_STOPPED);
-    static LAST_EXIT: AtomicU32 = AtomicU32::new(0);
-    static LAST_CHECKPOINT: AtomicU32 = AtomicU32::new(0);
-    static LAST_WAIT_HINT: AtomicU32 = AtomicU32::new(0);
+    static SERVICE_STATE: OnceLock<Mutex<ServiceState>> = OnceLock::new();
+
+    fn state_lock() -> &'static Mutex<ServiceState> {
+        SERVICE_STATE.get_or_init(|| {
+            Mutex::new(ServiceState {
+                state: SERVICE_STOPPED,
+                exit_code: 0,
+                checkpoint: 0,
+                wait_hint: 0,
+            })
+        })
+    }
 
     type ServiceMainFn = unsafe extern "system" fn(u32, *mut *mut u16);
 
@@ -167,6 +183,7 @@ mod windows {
         if handle == 0 {
             return;
         }
+        crate::shutdown::reset();
         STATUS_HANDLE.store(handle, Ordering::SeqCst);
         set_status(SERVICE_START_PENDING, 0, 1, 30_000);
 
@@ -185,9 +202,7 @@ mod windows {
             runtime.block_on(async {
                 match RunSession::start(&args.config, args.options.clone(), disk_source()).await {
                     Ok(session) => {
-                        if !crate::shutdown::is_requested() {
-                            set_status(SERVICE_RUNNING, 0, 0, 0);
-                        }
+                        set_running_if_not_stopping();
                         crate::shutdown::wait_service().await;
                         let report = session.shutdown().await;
                         crate::shutdown::complete();
@@ -252,19 +267,38 @@ mod windows {
     }
 
     fn set_status(state: u32, exit_code: u32, checkpoint: u32, wait_hint: u32) {
-        LAST_STATE.store(state, Ordering::SeqCst);
-        LAST_EXIT.store(exit_code, Ordering::SeqCst);
-        LAST_CHECKPOINT.store(checkpoint, Ordering::SeqCst);
-        LAST_WAIT_HINT.store(wait_hint, Ordering::SeqCst);
+        let mut guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        *guard = ServiceState {
+            state,
+            exit_code,
+            checkpoint,
+            wait_hint,
+        };
         report(ServiceStatus::new(state, exit_code, checkpoint, wait_hint));
     }
 
+    /// 仅在尚未收到停止请求时切到 `SERVICE_RUNNING`，避免与 `control_handler` 竞态覆盖 `STOP_PENDING`。
+    fn set_running_if_not_stopping() {
+        let mut guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        if crate::shutdown::is_requested() || guard.state == SERVICE_STOP_PENDING {
+            return;
+        }
+        *guard = ServiceState {
+            state: SERVICE_RUNNING,
+            exit_code: 0,
+            checkpoint: 0,
+            wait_hint: 0,
+        };
+        report(ServiceStatus::new(SERVICE_RUNNING, 0, 0, 0));
+    }
+
     fn report_current() {
+        let guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
         report(ServiceStatus::new(
-            LAST_STATE.load(Ordering::SeqCst),
-            LAST_EXIT.load(Ordering::SeqCst),
-            LAST_CHECKPOINT.load(Ordering::SeqCst),
-            LAST_WAIT_HINT.load(Ordering::SeqCst),
+            guard.state,
+            guard.exit_code,
+            guard.checkpoint,
+            guard.wait_hint,
         ));
     }
 

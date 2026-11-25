@@ -28,10 +28,10 @@ fn validate_schema(text: &str) -> Result<(), String> {
 
 pub fn plugin(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let item: ItemStruct = syn::parse2(item)?;
-    if !item.generics.params.is_empty() {
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
         return Err(syn::Error::new_spanned(
             &item.generics,
-            "插件类型不能带泛型参数（注册表身份键要求它是具体类型）",
+            "插件类型不能带泛型参数或 where 子句（注册表身份键要求它是具体类型）",
         ));
     }
     let ident = item.ident.clone();

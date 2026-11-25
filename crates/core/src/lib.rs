@@ -189,13 +189,16 @@ impl App {
         root.dispose().await;
         if reentrant {
             let store = self.store.clone();
+            let root_ctx = self.root;
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     root.wait_disposed().await;
                     store.clear_hooks();
+                    drop(root_ctx);
                 });
             } else {
                 self.store.clear_hooks();
+                drop(root_ctx);
             }
         } else {
             self.store.clear_hooks();

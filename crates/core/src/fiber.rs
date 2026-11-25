@@ -739,6 +739,9 @@ pub struct Fiber {
     budgeted_dispose: AtomicBool,
     /// 每次 `load()` 递增的装载代次，防止上一代失败后台清理误清下一代的 `committed` 视图。
     load_gen: AtomicU64,
+    /// 前置 `dispose_effects_bounded` 超时移交后台的恢复栈计数（仅限恢复栈，不含 drain/close 观察者）。
+    effect_bg_cleanups: AtomicUsize,
+    effect_bg_notify: tokio::sync::Notify,
     /// 是否已调度“后台清理归零后自动重试收敛”的任务（避免重复调度）。
     cleanup_retry_scheduled: AtomicBool,
     /// 支持范围外拓扑只告警一次，避免卸载链上重复刷屏。
@@ -817,6 +820,8 @@ impl Fiber {
             cleanup_errors: Mutex::new(Vec::new()),
             budgeted_dispose: AtomicBool::new(false),
             load_gen: AtomicU64::new(0),
+            effect_bg_cleanups: AtomicUsize::new(0),
+            effect_bg_notify: tokio::sync::Notify::new(),
             cleanup_retry_scheduled: AtomicBool::new(false),
             unsupported_ancestor_logged: AtomicBool::new(false),
             cycle_blocked: Mutex::new(HashSet::new()),
@@ -907,6 +912,8 @@ impl Fiber {
             cleanup_errors: Mutex::new(Vec::new()),
             budgeted_dispose: AtomicBool::new(false),
             load_gen: AtomicU64::new(0),
+            effect_bg_cleanups: AtomicUsize::new(0),
+            effect_bg_notify: tokio::sync::Notify::new(),
             cleanup_retry_scheduled: AtomicBool::new(false),
             unsupported_ancestor_logged: AtomicBool::new(false),
             cycle_blocked: Mutex::new(HashSet::new()),
@@ -1770,8 +1777,13 @@ impl Fiber {
         }
     }
 
-    fn open_effects(&self) {
-        self.effect_gate.lock().unwrap().closed = false;
+    fn open_effects(&self) -> bool {
+        let mut gate = self.effect_gate.lock().unwrap();
+        if self.is_disposed() {
+            return false;
+        }
+        gate.closed = false;
+        true
     }
 
     /// 把建好的 disposer 挂进本 fiber 的**逆序**清单（`effect`/`try_effect` 的共同落点）。
@@ -2027,6 +2039,9 @@ impl Fiber {
                 let mut hooks = fiber2.hooks.lock().unwrap();
                 if let Some(list) = hooks.get_mut(&name2) {
                     list.retain(|(s, _)| *s != sn);
+                    if list.is_empty() {
+                        hooks.remove(&name2);
+                    }
                 }
             })
         })
@@ -2045,10 +2060,25 @@ impl Fiber {
     // ------------------------------------------------------------- 状态迁移
 
     fn set_state(self: &Arc<Self>, next: FiberState) {
-        let prev = FiberState::from_u8(self.state.swap(next as u8, Ordering::SeqCst));
-        if prev == next {
-            return;
-        }
+        // 单一入口状态机不变量：fiber 一旦置为已处置（`UID_DISPOSED`），绝不允许再迁回
+        // `Pending` / `Loading` / `Active` / `Failed`（仅允许清理期 `Unloading` 与终态 `Disposed`）。
+        let mut cur = self.state.load(Ordering::SeqCst);
+        let prev = loop {
+            let prev_state = FiberState::from_u8(cur);
+            if prev_state == next {
+                return;
+            }
+            if self.is_disposed() && !matches!(next, FiberState::Disposed | FiberState::Unloading) {
+                return;
+            }
+            match self
+                .state
+                .compare_exchange(cur, next as u8, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break prev_state,
+                Err(actual) => cur = actual,
+            }
+        };
         self.emit_status(prev);
         // 只有 ACTIVE ↔ 非 ACTIVE 的跨界才需要通知依赖者。
         if (prev == FiberState::Active) == (next == FiberState::Active) {
@@ -2057,17 +2087,8 @@ impl Fiber {
         if let Some(ctx) = self.ctx_opt() {
             for (name, realm) in self.store.impls_owned_by_with_realm(self) {
                 // 状态迁移只做依赖唤醒，**不广播** `internal/service`（M3-4）——
-                // 上游的广播点只有 provide 与移除两条路径。
-                let dependents = self.store.notify_realm(&[&name], &ctx, realm, false);
-                for fiber in dependents {
-                    if Arc::ptr_eq(&fiber, self) {
-                        continue;
-                    }
-                    if tokio::runtime::Handle::try_current().is_ok() {
-                        let fiber = fiber.clone();
-                        tokio::spawn(async move { fiber.settle().await });
-                    }
-                }
+                // 上游的广播点只有 provide 与移除两条路径；`notify_realm` 已为每个受影响依赖者 spawn `settle()`。
+                let _ = self.store.notify_realm(&[&name], &ctx, realm, false);
             }
         }
     }
@@ -2204,8 +2225,10 @@ impl Fiber {
 
     async fn load(self: &Arc<Self>, epoch: u64) {
         let gen = self.load_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        // 上一轮卸载/失败会关闭闸门；新装载重新开放 effect 登记。
-        self.open_effects();
+        // 上一轮卸载/失败会关闭闸门；新装载重新开放 effect 登记（已处置则直接退出）。
+        if !self.open_effects() {
+            return;
+        }
         self.set_state(FiberState::Loading);
         // 重拍提交视图（`fiber.ts:421`）。**必须在 `apply` 之前**：
         // 插件在 apply 里 `provide` 的东西会由 `committed_insert` 追加进来，
@@ -2213,6 +2236,9 @@ impl Fiber {
         self.resnapshot();
         // 让出一拍，合并同一 tick 内到达的多次通知（对应 JS 的 `await Promise.resolve()`）。
         tokio::task::yield_now().await;
+        if self.is_disposed() {
+            return;
+        }
         let Some(ctx) = self.ctx_opt() else { return };
         let Some(runtime) = self.runtime.clone() else {
             return;
@@ -2225,6 +2251,9 @@ impl Fiber {
                 return;
             }
         };
+        if self.is_disposed() {
+            return;
+        }
         // 已解析配置与 volatile 引用都是"装载的一部分"（M4-5）：引用在**插件跑之前**建好，
         // 插件的 `apply` 里就能 `ctx.volatile("data")` 取到——对应上游"校验期创建引用"。
         self.adopt_resolved(&resolved, &runtime);
@@ -2261,6 +2290,11 @@ impl Fiber {
             },
             None => CatchPanic::new(apply).await,
         };
+        if self.is_disposed() {
+            // apply 期间并发触发了 dispose：禁止把已处置 fiber 推回 Active/Failed，
+            // 留给外层 `settle_inner` 下一轮执行 `unload()` 统一回收。
+            return;
+        }
         match outcome {
             Ok(Ok(())) => {
                 *self.error.lock().unwrap() = None;
@@ -2291,7 +2325,9 @@ impl Fiber {
         self.dispose_native_tasks(drain_budget, drain_deadline)
             .await;
         self.dispose_effects_for_fail(gen).await;
-        self.set_state(FiberState::Failed);
+        if !self.is_disposed() {
+            self.set_state(FiberState::Failed);
+        }
     }
 
     /// 装载失败或非处置重载卸载时回滚恢复栈：受 `LifecyclePolicy::dispose_timeout_ms` 约束。
@@ -2332,8 +2368,19 @@ impl Fiber {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let bg_guard = self.defer_background_cleanup_without_error();
         let bg_id = bg_guard.id();
+        self.effect_bg_cleanups.fetch_add(1, Ordering::SeqCst);
+        struct EffectBgGuard(Arc<Fiber>);
+        impl Drop for EffectBgGuard {
+            fn drop(&mut self) {
+                if self.0.effect_bg_cleanups.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    self.0.effect_bg_notify.notify_waiters();
+                }
+            }
+        }
+        let effect_bg_guard = EffectBgGuard(self.clone());
         let this = self.clone();
         rt.spawn(async move {
+            let _effect_bg = effect_bg_guard;
             this.run_disposable_entries(entries).await;
             if this.load_gen.load(Ordering::SeqCst) == gen {
                 *this.committed.lock().unwrap() = None;
@@ -2379,7 +2426,8 @@ impl Fiber {
         self.wait_for_dependents(drain_budget, drain_deadline).await;
         if self.is_disposed() {
             self.dispose_effects().await;
-            // 提交视图在**所有 disposer 都跑完之后**才清空（`fiber.ts:459`）。
+            self.wait_effect_background_cleanups().await;
+            // 提交视图在**所有 disposer（含前置超时移交后台的恢复栈）都跑完之后**才清空（`fiber.ts:459`）。
             *self.committed.lock().unwrap() = None;
             *self.running.lock().unwrap() = None;
             self.set_state(FiberState::Disposed);
@@ -2518,6 +2566,18 @@ impl Fiber {
     /// 注意这只隔离 panic 的**传播**，不修复它造成的**状态破坏**：
     /// 如果 panting 的 disposer 当时持有一把 `Mutex`，那把锁会中毒，
     /// 之后任何 `.unwrap()` 都会再次 panic。真正的隔离需要在插件边界做进程隔离。
+    async fn wait_effect_background_cleanups(&self) {
+        loop {
+            let notified = self.effect_bg_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.effect_bg_cleanups.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     async fn dispose_effects(self: &Arc<Self>) {
         let name = self.name();
         // 每次只把队尾（最后注册）移出 fiber；调用者 Future 中途被丢弃时，
@@ -2576,7 +2636,9 @@ impl Fiber {
     /// 移交后台任务执行，但本调用返回 `Err`（具体类型为 [`ReloadDeferred`]），绝不把
     /// 尚未执行的新一代 `apply()` 误报为 `Ok(())`。
     pub async fn restart(self: &Arc<Self>) -> Result<()> {
-        self.assert_active();
+        if self.is_disposed() {
+            return Err("cannot restart disposed fiber".into());
+        }
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.refresh_desired();
         match self.settle_inner().await {
@@ -2619,7 +2681,9 @@ impl Fiber {
         config: Config,
         no_save: bool,
     ) -> Result<UpdateOutcome> {
-        self.assert_active();
+        if self.is_disposed() {
+            return Err("cannot update disposed fiber".into());
+        }
         // 同步取号：并发 update 的“新旧”由此决定，而不是由解析/派发完成顺序决定。
         let my_rev = self.update_rev.fetch_add(1, Ordering::SeqCst) + 1;
         let loaded = self.running.lock().unwrap().is_some();
@@ -2628,8 +2692,11 @@ impl Fiber {
             let Some(runtime) = self.runtime.clone() else {
                 return Err("fiber 没有 runtime：无法解析配置".into());
             };
+            let Some(ctx) = self.ctx_opt() else {
+                return Err("cannot update disposed fiber".into());
+            };
             self.store
-                .resolve_config(&self.ctx(), &runtime, config.clone())
+                .resolve_config(&ctx, &runtime, config.clone())
                 .await?
         } else {
             config.clone()
@@ -2658,10 +2725,9 @@ impl Fiber {
                 }
             };
             if latest {
-                // commit **总是**发出（含 no_save）：loader 靠它同时推进记录与决定是否落盘。
-                self.store.fire_commit(self, &config, no_save);
-                // 赋值在派发之前（上游 `fiber.ts:492`）。
-                *self.config.lock().unwrap() = config;
+                // 赋值在派发之前（上游 `fiber.ts:492`），避免 `fire_commit` 观察者 panic 导致
+                // `committed_rev` 已推进但 `config`/`resolved`/`error` 仍停在旧值。
+                *self.config.lock().unwrap() = config.clone();
                 // `adopt_resolved` 会重建 volatile 引用表；若 `internal/update` 随后否决，
                 // 必须把**旧表原样**放回去——重建会换 `Arc`，插件缓存的引用就再也写不到了。
                 previous = loaded.then(|| {
@@ -2679,6 +2745,9 @@ impl Fiber {
                 }
                 *self.error.lock().unwrap() = None; // FAILED 的唯一恢复路径
                 did_commit = true;
+                // commit **总是**发出（含 no_save）：loader 靠它同时推进记录与决定是否落盘。
+                self.store.fire_commit(self, &config, no_save);
+                self.store.fire_commit_async(self, &config, no_save).await;
             }
         }
         if !did_commit {
@@ -2998,7 +3067,17 @@ impl Fiber {
         // 又有 effect 通过闸门。
         self.mark_effects_closed();
         // uid 已置空后才派发 internal/plugin，loader 靠这一点识别"用户手动停用了这一行"。
-        self.store.fire_plugin(self);
+        // 截住用户 `on_plugin` 观察者 panic，确保后续清理任务仍会被启动，避免 dispose 永久挂起。
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.store.fire_plugin(self);
+        })) {
+            let reason = format!(
+                "dispose 阶段 on_plugin 观察者 panic: {}",
+                crate::panic_message(&*payload)
+            );
+            self.record_cleanup_error(CleanupErrorKind::InternalCleanup, reason.clone());
+            self.store.log(Level::Error, &self.name(), &reason);
+        }
         *self.desired.lock().unwrap() = None;
         *self.error.lock().unwrap() = None;
         // 状态迁移会通知依赖者，用户提供的 `Check` 谓词可能 panic。

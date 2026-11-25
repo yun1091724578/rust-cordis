@@ -137,9 +137,7 @@ pub fn without_volatile(config: &Config, paths: &[Vec<String>]) -> Config {
                 }
                 Config::Object(out)
             }
-            Config::Array(list) => {
-                Config::Array(list.iter().map(|item| walk(item, paths, prefix)).collect())
-            }
+            Config::Array(list) => Config::Array(list.clone()),
             other => other.clone(),
         }
     }
@@ -192,6 +190,10 @@ impl Plugin for VolatilePlugin {
 
     fn validate(&self, raw: Config) -> std::result::Result<Config, crate::ValidationError> {
         self.inner.validate(raw)
+    }
+
+    fn config_schema(&self) -> Option<String> {
+        self.inner.config_schema()
     }
 
     /// 包装器必须转发声明：否则 `declare_volatile(with_provision(...))` 会让

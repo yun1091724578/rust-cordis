@@ -1,7 +1,7 @@
 # cordis-rs SDK 指南
 
 > 面向**写插件的人**与**接载体的人**。权威实现以代码与测试为准。
-> 配套契约：[`docs/support-contract.md`](docs/support-contract.md)、[`兼容矩阵.md`](兼容矩阵.md)（自动生成）、`docs/adr/`。
+> 配套契约：[`docs/support-contract.md`](docs/support-contract.md)、[`兼容矩阵.md`](兼容矩阵.md)（自动生成）、[`docs/references-and-milestones.md`](docs/references-and-milestones.md)、`docs/adr/`。
 
 ---
 
@@ -86,8 +86,8 @@ let fiber = app.plugin(std::sync::Arc::new(AgentLoop), serde_json::json!({ "conc
 | 档 | 载体 | 装卸 | 能力面 | 信任 | 典型用途 |
 |---|---|---|---|---|---|
 | **T1** in-process native | Rust crate，链进宿主 | 无（编译期） | **全量**（含 typed 服务、流式） | 完全信任 | 领域骨架、性能热点、流式提供者 |
-| **T2** in-process dylib | `dlopen` / `LoadLibrary` | 丢文件即装 | ABI v2（单入口 + 7 个 op 码 + 22 个宿主函数：v1 的 11 + v2 的 11） | **完全信任**（同地址空间） | 第三方组件（受审计） |
-| **T3** out-of-process / Wasm | 计划中（ADR，M8） | 丢文件即装 | 同一套 op 协议 | **不提供沙箱** | 模型自生成组件（**需 OS 边界，SDK 不承诺**） |
+| **T2** in-process dylib | `dlopen` / `LoadLibrary` | 丢文件即装 | ABI v2（单入口 + 7 个 op 码 + 22 个宿主函数：v1 的 11 + v2 的 11） | **完全信任**（同地址空间） | 第一方动态扩展组件（可审查、固定 revision，详见 ADR 0005） |
+| **T3** out-of-process / Wasm | 不实现（见 ADR 0001） | 丢文件即装 | 同一套 op 协议 | **不提供沙箱** | 仅保留协议接缝与落地路径；模型自生成/不可信组件须运行在独立 OS 边界内 |
 
 **两条硬话**：
 

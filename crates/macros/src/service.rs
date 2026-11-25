@@ -61,7 +61,7 @@ struct Method {
     attrs: Vec<syn::Attribute>,
     ident: Ident,
     /// `(is_mut, 参数名, 参数类型)`，按声明顺序。
-    args: Vec<(bool, String, Type)>,
+    args: Vec<(bool, Ident, Type)>,
     /// 返回类型**原样**（`Result<T, E>`）。
     output: Type,
 }
@@ -78,10 +78,10 @@ impl Method {
                 ),
             ));
         }
-        if !sig.generics.params.is_empty() {
+        if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
             return Err(syn::Error::new(
                 span,
-                "服务方法不能有泛型参数（trait 必须 object-safe）",
+                "服务方法不能有泛型参数或 where 子句（trait 必须 object-safe）",
             ));
         }
         let mut inputs = sig.inputs.iter();
@@ -121,9 +121,15 @@ impl Method {
                     "服务方法的参数必须是简单名字（`who: String`），不能是解构/通配模式",
                 ));
             };
+            if pattern.by_ref.is_some() || pattern.subpat.is_some() {
+                return Err(syn::Error::new_spanned(
+                    pattern,
+                    "服务方法的参数不能使用 `ref` 或 `@` 子模式",
+                ));
+            }
             args.push((
                 pattern.mutability.is_some(),
-                pattern.ident.to_string(),
+                pattern.ident.clone(),
                 (**ty).clone(),
             ));
         }
@@ -153,7 +159,6 @@ impl Method {
             ..
         } = self;
         let params = args.iter().map(|(is_mut, name, ty)| {
-            let name = Ident::new(name, ty.span());
             if allow_mut && *is_mut {
                 quote!(mut #name: #ty)
             } else {
@@ -170,10 +175,16 @@ impl Method {
 // ------------------------------------------------------------------ trait 侧
 
 fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<TokenStream> {
-    if !item.generics.params.is_empty() {
+    if item.unsafety.is_some() {
+        return Err(syn::Error::new_spanned(
+            item.unsafety,
+            "服务 trait 不能声明为 `unsafe`",
+        ));
+    }
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
         return Err(syn::Error::new_spanned(
             &item.generics,
-            "服务 trait 不能有泛型参数（注册键是具体类型，`dyn Trait` 也要求它具体）",
+            "服务 trait 不能有泛型参数或 where 子句（注册键是具体类型，`dyn Trait` 也要求它具体）",
         ));
     }
     let trait_ident = item.ident.clone();
@@ -232,13 +243,29 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
     }
 
     let attrs = &item.attrs;
-    let names: Vec<String> = methods
+    let method_entries: Vec<TokenStream> = methods
         .iter()
-        .map(|method| method.ident.to_string())
+        .map(|method| {
+            let method_name = method.ident.to_string();
+            let cfgs: Vec<_> = method
+                .attrs
+                .iter()
+                .filter(|a| a.path().is_ident("cfg"))
+                .collect();
+            quote! {
+                #(#cfgs)*
+                #method_name
+            }
+        })
         .collect();
 
     let arms = methods.iter().map(|method| {
         let method_name = method.ident.to_string();
+        let cfgs: Vec<_> = method
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("cfg"))
+            .collect();
         let arity = method.args.len();
         let open = if arity == 0 {
             // 零参数方法不开游标：免得生成一个没用的绑定（也会招来 unused 警告）。
@@ -250,13 +277,16 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
             .args
             .iter()
             .enumerate()
-            .map(|(index, (_, arg_name, arg_type))| {
+            .map(|(index, (_, arg_ident, arg_type))| {
                 let bind = format_ident!("a{index}");
+                let raw_name = arg_ident.to_string();
+                let arg_name = raw_name.strip_prefix("r#").unwrap_or(&raw_name);
                 quote!(let #bind: #arg_type = envelope.take::<#arg_type>(#arg_name)?;)
             });
         let binds: Vec<Ident> = (0..arity).map(|index| format_ident!("a{index}")).collect();
         let call = &method.ident;
         quote! {
+            #(#cfgs)*
             #method_name => {
                 #open
                 #(#takes)*
@@ -270,10 +300,27 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
         }
     });
 
-    let has_method_body = if names.is_empty() {
+    let has_method_arms = methods.iter().map(|method| {
+        let method_name = method.ident.to_string();
+        let cfgs: Vec<_> = method
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("cfg"))
+            .collect();
+        quote! {
+            #(#cfgs)*
+            #method_name => true,
+        }
+    });
+    let has_method_body = if methods.is_empty() {
         quote!(false)
     } else {
-        quote!(::core::matches!(method, #(#names)|*))
+        quote! {
+            match method {
+                #(#has_method_arms)*
+                _ => false,
+            }
+        }
     };
 
     Ok(quote! {
@@ -345,7 +392,8 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
             }
 
             fn methods(&self) -> ::std::vec::Vec<::std::string::String> {
-                ::std::vec![#(#names.to_string()),*]
+                let names: &[&str] = &[#(#method_entries),*];
+                names.iter().map(|n| (*n).to_string()).collect()
             }
 
             fn has_method(&self, method: &str) -> bool {
@@ -365,7 +413,7 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
                         other => ::core::result::Result::Err(::cordis::typed::service::unknown_method(
                             #companion::NAME,
                             other,
-                            &[#(#names),*],
+                            &[#(#method_entries),*],
                         )),
                     }
                 })
@@ -377,16 +425,22 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
 // ------------------------------------------------------------------ impl 侧
 
 fn expand_impl(item: ItemImpl) -> syn::Result<TokenStream> {
+    if item.unsafety.is_some() {
+        return Err(syn::Error::new_spanned(
+            item.unsafety,
+            "服务 impl 不能声明为 `unsafe`",
+        ));
+    }
     let trait_path = item
         .trait_
         .as_ref()
         .ok_or_else(|| syn::Error::new_spanned(&item.self_ty, "只能用在 `impl Trait for Type` 上"))?
         .0
         .clone();
-    if !item.generics.params.is_empty() {
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
         return Err(syn::Error::new_spanned(
             &item.generics,
-            "服务 impl 不能带泛型参数（与 `#[cordis::service]` 的 trait 侧同一限制）",
+            "服务 impl 不能带泛型参数或 where 子句（与 `#[cordis::service]` 的 trait 侧同一限制）",
         ));
     }
     let item_attrs = &item.attrs;

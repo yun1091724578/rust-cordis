@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{BoxFuture, Config, Result};
+use crate::{BoxFuture, Result};
 
 /// 一次调用的结局。`Err` 里是错误码（如 `HOST_TIMEOUT` / `host_panic`）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,11 +173,11 @@ impl<F: Future + Unpin> Future for ScopedCaller<F> {
 }
 
 /// 给一个内核 iface 调用套上 caller 与 correlation 作用域。
-pub(crate) fn scope_caller(
-    future: BoxFuture<Result<Config>>,
+pub(crate) fn scope_caller<T: 'static>(
+    future: BoxFuture<Result<T>>,
     caller_uid: u64,
     correlation_id: Option<Arc<str>>,
-) -> BoxFuture<Result<Config>> {
+) -> BoxFuture<Result<T>> {
     Box::pin(ScopedCaller::new(caller_uid, correlation_id, future))
 }
 

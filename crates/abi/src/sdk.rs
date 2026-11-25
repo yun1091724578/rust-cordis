@@ -215,6 +215,7 @@ pub enum CallbackKind {
 pub struct Ctx {
     host: &'static HostApi,
     handle: u64,
+    owner: u64,
 }
 
 /// 读一个尾追加函数前的存在性判断。
@@ -449,6 +450,7 @@ impl Ctx {
         Ok(Ctx {
             host: self.host,
             handle,
+            owner: self.owner,
         })
     }
 
@@ -536,7 +538,7 @@ impl Ctx {
             .stream_push_fn()
             .ok_or("宿主不支持 ctx_stream_push：请升级宿主（流式是 ABI v2 的尾追加字段）")?;
         let continuation = registry().register_text_continuation_for(
-            self.handle,
+            self.owner,
             Box::new(move |result| match result {
                 Ok(payload) => {
                     let window = payload.get("window").and_then(Json::as_u64).unwrap_or(0) as usize;
@@ -646,7 +648,7 @@ impl Ctx {
         F: FnOnce(Result<Json, String>) + Send + 'static,
     {
         let api = self.next_fn().ok_or("宿主不支持 ctx_next：请升级宿主")?;
-        let cb = registry().register_text_continuation_for(self.handle, Box::new(on_done));
+        let cb = registry().register_text_continuation_for(self.owner, Box::new(on_done));
         let payload = serde_json::json!({ "args": args }).to_string();
         match self.invoke(|out| unsafe {
             api(
@@ -673,7 +675,7 @@ impl Ctx {
         F: FnOnce(Result<Json, crate::ErrorPayload>) + Send + 'static,
     {
         let api = self.next_fn().ok_or("宿主不支持 ctx_next：请升级宿主")?;
-        let cb = registry().register_detailed_continuation_for(self.handle, Box::new(on_done));
+        let cb = registry().register_detailed_continuation_for(self.owner, Box::new(on_done));
         let payload = serde_json::json!({ "args": args }).to_string();
         match self.invoke(|out| unsafe {
             api(
@@ -708,7 +710,11 @@ impl Ctx {
     /// 而"不经动态库的 ABI 形状插件"（`apply_via` + 手写 `CallFn`）需要一个构造点。
     /// 插件作者在真实插件里**不需要**它。
     pub fn from_host(host: &'static HostApi, handle: u64) -> Ctx {
-        Ctx { host, handle }
+        Ctx {
+            host,
+            handle,
+            owner: handle,
+        }
     }
 
     /// 注册一个纯数据服务。
@@ -764,7 +770,7 @@ impl Ctx {
             };
             handler(input.arg(), input.meta.clone())
         });
-        let cb = registry().register_handler_for(self.handle, dispatcher);
+        let cb = registry().register_handler_for(self.owner, dispatcher);
         let names_json = serde_json::to_vec(&names).unwrap_or_else(|_| b"[]".to_vec());
         match self.invoke(|out| unsafe {
             api(
@@ -828,7 +834,7 @@ impl Ctx {
             .into_iter()
             .map(|(name, f)| (name.to_string(), f))
             .collect();
-        let cb = registry().register_async_iface_for(self.handle, table);
+        let cb = registry().register_async_iface_for(self.owner, table);
         let names_json = serde_json::to_vec(&names).unwrap_or_else(|_| b"[]".to_vec());
         match self.invoke(|out| unsafe {
             api(
@@ -864,7 +870,7 @@ impl Ctx {
     where
         F: FnOnce(Result<Json, String>) + Send + 'static,
     {
-        let cb = registry().register_text_continuation_for(self.handle, Box::new(on_done));
+        let cb = registry().register_text_continuation_for(self.owner, Box::new(on_done));
         self.call_iface_with_cb(service, version, method, args, cb)
     }
 
@@ -883,7 +889,7 @@ impl Ctx {
     where
         F: FnOnce(Result<Json, crate::ErrorPayload>) + Send + 'static,
     {
-        let cb = registry().register_detailed_continuation_for(self.handle, Box::new(on_done));
+        let cb = registry().register_detailed_continuation_for(self.owner, Box::new(on_done));
         self.call_iface_with_cb(service, version, method, args, cb)
     }
 
@@ -965,7 +971,7 @@ impl Ctx {
         F: FnOnce(Result<Json, String>) + Send + 'static,
     {
         let api = self.dispatch_fn().ok_or("宿主不支持 ctx_dispatch")?;
-        let cb = registry().register_text_continuation_for(self.handle, Box::new(on_done));
+        let cb = registry().register_text_continuation_for(self.owner, Box::new(on_done));
         let payload = serde_json::json!({ "mode": mode, "args": args }).to_string();
         let response = match self.invoke(|out| unsafe {
             api(
@@ -1035,7 +1041,7 @@ impl Ctx {
         F: FnOnce(Result<Json, crate::ErrorPayload>) + Send + 'static,
     {
         let api = self.dispatch_fn().ok_or("宿主不支持 ctx_dispatch")?;
-        let cb = registry().register_detailed_continuation_for(self.handle, Box::new(on_done));
+        let cb = registry().register_detailed_continuation_for(self.owner, Box::new(on_done));
         let payload = serde_json::json!({ "mode": mode, "args": args }).to_string();
         let response = match self.invoke(|out| unsafe {
             api(
@@ -1080,7 +1086,7 @@ impl Ctx {
     {
         let api = self.on_fn().ok_or("宿主不支持 ctx_on")?;
         let dispatcher: Handler = Arc::new(move |input: CallbackInput| handler(input.args));
-        let cb = registry().register_handler_for(self.handle, dispatcher);
+        let cb = registry().register_handler_for(self.owner, dispatcher);
         self.emit_raw(api, event, cb)
     }
 
@@ -1095,7 +1101,7 @@ impl Ctx {
     {
         let api = self.on_fn().ok_or("宿主不支持 ctx_on")?;
         let dispatcher: AsyncHandler = Arc::new(handler);
-        let cb = registry().register_async_handler_for(self.handle, dispatcher);
+        let cb = registry().register_async_handler_for(self.owner, dispatcher);
         self.emit_raw(api, event, cb)
     }
 
@@ -1121,7 +1127,7 @@ impl Ctx {
         F: FnOnce() + Send + 'static,
     {
         let api = self.effect_fn().ok_or("宿主不支持 ctx_effect")?;
-        let id = registry().register_cleanup_for(self.handle, Box::new(cleanup));
+        let id = registry().register_cleanup_for(self.owner, Box::new(cleanup));
         match self.invoke(|out| unsafe { api(self.handle, id, out) }) {
             Ok(_) => Ok(()),
             Err(err) => {
@@ -1707,14 +1713,18 @@ fn apply_volatile(owner: u64, payload: &Json) -> Result<(), String> {
     let Some(list) = payload.get("paths").and_then(|value| value.as_array()) else {
         return Err("OP_VOLATILE_APPLY 的载荷缺少 paths".to_string());
     };
-    let mut store = volatile_values().lock().unwrap();
-    let values = store.entry(owner).or_default();
+    let mut staged: Vec<(String, Json)> = Vec::with_capacity(list.len());
     for item in list {
         let Some(path) = item.get("path").and_then(|value| value.as_str()) else {
             return Err("OP_VOLATILE_APPLY 的 path 项缺少 path".to_string());
         };
         let value = item.get("value").cloned().unwrap_or(Json::Null);
-        values.insert(path.to_string(), value);
+        staged.push((path.to_string(), value));
+    }
+    let mut store = volatile_values().lock().unwrap();
+    let values = store.entry(owner).or_default();
+    for (path, value) in staged {
+        values.insert(path, value);
     }
     Ok(())
 }
@@ -1911,7 +1921,7 @@ pub unsafe extern "C" fn attach(host: *const HostApi) {
     // 版本闸门就在这里，而不是在每次 call 里：一次检查，之后零成本。
     // 主版本不等就不予登记，后续 call 返回"版本不匹配"，宿主会把它标成 FAILED
     // ——失败是**显式**的，而不是以未定义行为的形式出现。
-    if (*host).abi_version != crate::ABI_VERSION {
+    if (*host).abi_version != crate::ABI_VERSION || ((*host).size as usize) < 8 {
         return;
     }
     // copy-on-attach（G15）：宿主表可能比本插件认识的布局**短**（旧宿主只分配
@@ -1947,10 +1957,18 @@ pub fn attached_host() -> Option<&'static HostApi> {
 }
 
 unsafe extern "C" fn call(ctx: u64, op: u32, a: Blob, b: Blob, out: *mut Out) -> i32 {
+    if out.is_null() {
+        return STATUS_ERR;
+    }
     let target = &mut *out;
     let Some(host) = HOST.get() else {
-        target.write(b"plugin abi_version mismatch: rebuild this plugin against cordis-abi v1");
-        return STATUS_ERR;
+        return write_error(
+            target,
+            0,
+            "plugin abi_version mismatch: rebuild this plugin against cordis-abi v1",
+            "abi_mismatch",
+            "lifecycle",
+        );
     };
     let _ = b;
     // **M5-1 护栏**：下面跑的是插件的**用户代码**（apply / 监听器 / cleanup），
@@ -2085,8 +2103,28 @@ unsafe fn dispatch(host: &'static HostApi, ctx: u64, op: u32, a: Blob, target: &
             }
         }
         OP_APPLY => {
-            let config: Json = serde_json::from_slice(a.as_bytes()).unwrap_or(Json::Null);
-            let ctx = Ctx { host, handle: ctx };
+            let bytes = a.as_bytes();
+            let config: Json = if bytes.is_empty() {
+                Json::Null
+            } else {
+                match serde_json::from_slice(bytes) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return write_error(
+                            target,
+                            host.error_format(),
+                            &format!("OP_APPLY 载荷不是合法 JSON: {err}"),
+                            "bad_payload",
+                            "protocol",
+                        );
+                    }
+                }
+            };
+            let ctx = Ctx {
+                host,
+                handle: ctx,
+                owner: ctx,
+            };
             let Some(apply) = APPLY.get() else {
                 return write_error(
                     target,
@@ -2137,8 +2175,27 @@ unsafe fn dispatch(host: &'static HostApi, ctx: u64, op: u32, a: Blob, target: &
             }
         }
         OP_CLEANUP => {
-            let payload: Json = serde_json::from_slice(a.as_bytes()).unwrap_or(Json::Null);
-            let id = payload.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let payload: Json = match serde_json::from_slice(a.as_bytes()) {
+                Ok(value) => value,
+                Err(err) => {
+                    return write_error(
+                        target,
+                        host.error_format(),
+                        &format!("OP_CLEANUP 载荷不是合法 JSON: {err}"),
+                        "bad_payload",
+                        "protocol",
+                    );
+                }
+            };
+            let Some(id) = payload.get("id").and_then(|v| v.as_u64()) else {
+                return write_error(
+                    target,
+                    host.error_format(),
+                    "OP_CLEANUP 载荷缺少有效的 id",
+                    "bad_payload",
+                    "protocol",
+                );
+            };
             registry().run_cleanup(id);
             target.write(b"")
         }
@@ -2298,6 +2355,7 @@ mod tests {
                 None,
             ),
             handle: 1,
+            owner: 1,
         };
         let error = ctx
             .isolate("svc", "")
@@ -2335,6 +2393,7 @@ mod tests {
         let ctx = Ctx {
             host: host_with(std::mem::size_of::<HostApi>() as u32, None, None),
             handle: 1,
+            owner: 1,
         };
         let error = ctx
             .isolate("svc", "")
@@ -2356,6 +2415,7 @@ mod tests {
                 Some(dummy_set),
             ),
             handle: 1,
+            owner: 1,
         };
         let error = ctx.require("svc").expect_err("旧宿主上必须报不支持");
         assert!(error.contains("宿主不支持 ctx_require"), "{error}");
@@ -2372,6 +2432,7 @@ mod tests {
                 Some(dummy_set),
             ),
             handle: 1,
+            owner: 1,
         };
         assert!(ctx.require("svc").is_ok(), "require 在中间代宿主上必须可用");
         let error = ctx
@@ -2387,6 +2448,7 @@ mod tests {
                 Some(dummy_set),
             ),
             handle: 1,
+            owner: 1,
         };
         assert!(
             ctx.require_fn().is_some(),
@@ -2959,7 +3021,11 @@ mod tests {
             Some(coded_require),
             None,
         );
-        let ctx = Ctx { host, handle: 0 };
+        let ctx = Ctx {
+            host,
+            handle: 0,
+            owner: 0,
+        };
 
         let first = ctx.require_detailed("svc").unwrap_err();
         let second = ctx.require_detailed("svc").unwrap_err();
@@ -2989,7 +3055,11 @@ mod tests {
         use std::sync::atomic::Ordering;
         SET_CODE.store(0, Ordering::SeqCst);
         let host = host_with(std::mem::size_of::<HostApi>() as u32, None, Some(coded_set));
-        let ctx = Ctx { host, handle: 0 };
+        let ctx = Ctx {
+            host,
+            handle: 0,
+            owner: 0,
+        };
 
         let first = ctx.set_detailed("svc", Json::Null).unwrap_err();
         let second = ctx.set_detailed("svc", Json::Null).unwrap_err();
@@ -3010,7 +3080,11 @@ mod tests {
             Some(over_cap_require),
             None,
         );
-        let ctx = Ctx { host, handle: 0 };
+        let ctx = Ctx {
+            host,
+            handle: 0,
+            owner: 0,
+        };
         let error = ctx.require_detailed("svc").unwrap_err();
         assert_eq!(error.code, "host_protocol");
         assert!(
@@ -3113,7 +3187,11 @@ mod tests {
             Some(too_small_huge),
             None,
         );
-        let ctx = Ctx { host, handle: 0 };
+        let ctx = Ctx {
+            host,
+            handle: 0,
+            owner: 0,
+        };
         let err = ctx.require_detailed("svc").unwrap_err();
         assert_eq!(err.code, "host_too_small");
         assert!(
@@ -3139,7 +3217,11 @@ mod tests {
             Some(large_require),
             None,
         );
-        let ctx = Ctx { host, handle: 0 };
+        let ctx = Ctx {
+            host,
+            handle: 0,
+            owner: 0,
+        };
         let value = ctx.require("svc").expect("大响应必须读回");
         assert_eq!(
             value.as_str().map(str::len),
@@ -3200,7 +3282,11 @@ mod tests {
             crate::ERROR_FORMAT_V1,
             "测试宿主必须探测到能力位"
         );
-        let ctx = Ctx { host, handle: 0 };
+        let ctx = Ctx {
+            host,
+            handle: 0,
+            owner: 0,
+        };
         assert_eq!(ctx.require("svc").unwrap_err(), "clean");
     }
 
@@ -3210,7 +3296,11 @@ mod tests {
         // 这不是真实旧宿主进程，四格文档中必须标注为“桩”。
         let cap = std::mem::offset_of!(HostApi, error_format) as u32;
         let host = host_with(cap, Some(structured_require), None);
-        let ctx = Ctx { host, handle: 0 };
+        let ctx = Ctx {
+            host,
+            handle: 0,
+            owner: 0,
+        };
         let err = ctx.require("svc").unwrap_err();
         assert!(
             err.contains("\"error\":\"clean\""),
@@ -3229,7 +3319,11 @@ mod tests {
             Some(too_small_once),
             Some(too_small_never),
         );
-        let ctx = Ctx { host, handle: 0 };
+        let ctx = Ctx {
+            host,
+            handle: 0,
+            owner: 0,
+        };
 
         assert_eq!(ctx.require("svc").unwrap(), serde_json::json!(42));
         assert_eq!(
@@ -3251,7 +3345,11 @@ mod tests {
     fn text_host_errors_use_unknown_code_and_category() {
         let cap = std::mem::offset_of!(HostApi, error_format) as u32;
         let host = host_with(cap, Some(plain_require), None);
-        let ctx = Ctx { host, handle: 0 };
+        let ctx = Ctx {
+            host,
+            handle: 0,
+            owner: 0,
+        };
         let err = ctx.require_detailed("svc").unwrap_err();
         assert_eq!(err.error, "clean");
         assert_eq!(err.code, "unknown");
@@ -3412,6 +3510,7 @@ mod tests {
         let ctx = Ctx {
             host: dispatch_host(),
             handle: 0xD15,
+            owner: 0xD15,
         };
         let (tx, rx) = std::sync::mpsc::channel::<Result<Json, String>>();
         let error = ctx
@@ -3435,6 +3534,7 @@ mod tests {
         let ctx = Ctx {
             host: dispatch_host(),
             handle: 0xD16,
+            owner: 0xD16,
         };
         let seen = Arc::new(Mutex::new(None));
         let seen_in = seen.clone();
@@ -3472,6 +3572,7 @@ mod tests {
         let ctx = Ctx {
             host,
             handle: 0xD17,
+            owner: 0xD17,
         };
         let seen = Arc::new(Mutex::new(None));
         let seen_in = seen.clone();
@@ -3541,7 +3642,11 @@ mod tests {
             error_format: crate::ERROR_FORMAT_V1,
             ..HostApi::default()
         }));
-        let ctx = Ctx { host, handle: 1 };
+        let ctx = Ctx {
+            host,
+            handle: 1,
+            owner: 1,
+        };
         let payload = crate::ErrorPayload::new("rate limited")
             .with_code("provider.rate_limited")
             .with_category("business")
@@ -3584,7 +3689,11 @@ mod tests {
             error_format: crate::ERROR_FORMAT_V1,
             ..HostApi::default()
         }));
-        let ctx = Ctx { host, handle: 1 };
+        let ctx = Ctx {
+            host,
+            handle: 1,
+            owner: 1,
+        };
         let payload = crate::ErrorPayload::new("plain human error")
             .with_code("provider.rate_limited")
             .with_category("business");

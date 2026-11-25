@@ -227,6 +227,11 @@ impl Context {
         self.fiber.lock().unwrap().as_ref().and_then(Weak::upgrade)
     }
 
+    /// 该上下文是否曾经绑定过 fiber（即使 fiber 已被处置释放也返回 `true`）。
+    pub(crate) fn has_attached_fiber(&self) -> bool {
+        self.fiber.lock().unwrap().is_some()
+    }
+
     /// 弱引用版本。后台任务（如热重载监听）应该持有 `Weak` 而不是 `Arc`，
     /// 否则它们会在插件卸载后继续把整棵上下文树吊住——
     /// 这与内核里"dispose 时清空 `Fiber.ctx` 以打破引用环"的意图直接冲突。
@@ -622,7 +627,13 @@ impl Context {
         let caller_uid = if traced {
             self.fiber_opt()
                 .map(|fiber| fiber.uid())
-                .unwrap_or(crate::fiber::UID_ROOT)
+                .unwrap_or_else(|| {
+                    if self.has_attached_fiber() {
+                        crate::fiber::UID_DISPOSED
+                    } else {
+                        crate::fiber::UID_ROOT
+                    }
+                })
         } else {
             crate::fiber::UID_ROOT
         };
@@ -685,27 +696,79 @@ impl Context {
         method: &str,
         args: Config,
     ) -> Result<crate::AsyncStream> {
-        if self.store.has_call_auth_hook() {
-            let caller = self.caller_identity();
-            self.store
-                .authorize_call(&caller, service, method)
-                .map_err(|err| err as crate::Error)?;
-        }
-        let (iface, caller_meta) = self.iface_target(service)?;
-        Self::check_iface_call(&iface, service, version, method)?;
-        let (sink, mut stream) = crate::StreamSink::new(crate::STREAM_WINDOW);
+        let traced = self.store.has_trace_sink();
+        let started = std::time::Instant::now();
         let correlation_id = self
             .correlation_id
             .clone()
             .or_else(crate::trace::current_correlation_id);
+        if self.store.has_call_auth_hook() {
+            let caller = self.caller_identity();
+            if let Err(err) = self.store.authorize_call(&caller, service, method) {
+                if traced {
+                    self.store.record_trace(crate::trace::failed(
+                        format!("{service}.{method}"),
+                        caller.fiber_uid,
+                        correlation_id,
+                        service,
+                        "host_unauthorized",
+                        started,
+                    ));
+                }
+                return Err(err as crate::Error);
+            }
+        }
+        let caller_uid = if traced {
+            self.fiber_opt()
+                .map(|fiber| fiber.uid())
+                .unwrap_or_else(|| {
+                    if self.has_attached_fiber() {
+                        crate::fiber::UID_DISPOSED
+                    } else {
+                        crate::fiber::UID_ROOT
+                    }
+                })
+        } else {
+            crate::fiber::UID_ROOT
+        };
+        let (iface, caller_meta) = match self.iface_target(service) {
+            Ok(pair) => pair,
+            Err(err) => {
+                if traced {
+                    self.store.record_trace(crate::trace::failed(
+                        format!("{service}.{method}"),
+                        caller_uid,
+                        correlation_id,
+                        service,
+                        "resolve_failed",
+                        started,
+                    ));
+                }
+                return Err(err);
+            }
+        };
+        if let Err(err) = Self::check_iface_call(&iface, service, version, method) {
+            if traced {
+                self.store.record_trace(crate::trace::failed(
+                    format!("{service}.{method}"),
+                    caller_uid,
+                    correlation_id,
+                    service,
+                    "iface_check_failed",
+                    started,
+                ));
+            }
+            return Err(err);
+        }
+        let (sink, mut stream) = crate::StreamSink::new(crate::STREAM_WINDOW);
         let mut future: BoxFuture<Result<()>> = {
             let _guard = correlation_id
                 .as_ref()
                 .map(|cid| crate::trace::enter_correlation(Some(cid.clone())));
             iface.call_stream(caller_meta, method.to_string(), args, sink.clone())
         };
-        if let Some(cid) = correlation_id {
-            future = Box::pin(crate::trace::scope_correlation(cid, future));
+        if traced || correlation_id.is_some() {
+            future = crate::trace::scope_caller(future, caller_uid, correlation_id);
         }
         // 提供者的前半段要**现在就跑到第一个挂起点**：同步实现的提供者（含一切跨 ABI 的）
         // 在这一步就把窗口填满；真异步的提供者交给运行时继续跑——消费者于是可以立刻
@@ -886,11 +949,26 @@ impl Context {
                 (handler)(call).await
             })
         });
-        *slot.lock().unwrap() = Some(inner);
+        {
+            let mut guard = slot.lock().unwrap();
+            if fired.load(Ordering::SeqCst) {
+                // 注册完成前已触发过一次：直接回收 `inner`，避免 hook 滞留在表里。
+                drop(guard);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        inner.run().await;
+                    });
+                }
+            } else {
+                *guard = Some(inner);
+            }
+        }
 
         let slot_out = slot;
+        let fired_out = fired;
         Disposable::new(move || {
             Box::pin(async move {
+                fired_out.store(true, Ordering::SeqCst);
                 let taken = slot_out.lock().unwrap().take();
                 if let Some(disposable) = taken {
                     disposable.run().await;
