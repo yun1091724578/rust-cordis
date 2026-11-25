@@ -516,3 +516,48 @@ async fn store_on_commit_async_runs_after_sync_and_is_awaited_by_update() {
     assert_eq!(*order.lock().unwrap(), vec!["sync", "async"]);
     app.close().await;
 }
+
+// Regression: once a fiber has completed `dispose()`, a late/stray `settle()` that was
+// queued on `driver` (or called afterwards) must NOT re-enter `unload()` and bounce
+// `Disposed -> Unloading -> Disposed`.
+#[tokio::test]
+async fn stray_settle_after_dispose_does_not_bounce_back_to_unloading() {
+    let app = App::new();
+    let fiber = app.root.plugin(
+        plugin_fn("stray-settle-target", Inject::default(), |_ctx, _cfg| {
+            Box::pin(async { Ok(()) })
+        }),
+        json!({}),
+    );
+    fiber.settle().await;
+    fiber.dispose().await;
+    assert_eq!(fiber.state(), FiberState::Disposed);
+
+    let bounced = Arc::new(AtomicBool::new(false));
+    let bounced_c = bounced.clone();
+    let target_ptr = Arc::as_ptr(&fiber) as usize;
+    let _obs = app.root.on("internal/status", move |call| {
+        let bounced_c = bounced_c.clone();
+        Box::pin(async move {
+            if let Some(f) = call
+                .args
+                .first()
+                .and_then(|d| d.downcast::<cordis_core::Fiber>())
+            {
+                if Arc::as_ptr(&f) as usize == target_ptr && f.state() != FiberState::Disposed {
+                    bounced_c.store(true, Ordering::SeqCst);
+                }
+            }
+            None
+        })
+    });
+
+    // Simulate a stray `settle()` running after `dispose()` has already completed.
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Disposed);
+    assert!(
+        !bounced.load(Ordering::SeqCst),
+        "stray settle() after dispose() bounced fiber out of Disposed"
+    );
+    app.close().await;
+}
