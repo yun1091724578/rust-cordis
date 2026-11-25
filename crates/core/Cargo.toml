@@ -18,3 +18,9 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 serde_json = { workspace = true }
+
+# `loom` -> `generator` -> `windows-sys` (`raw-dylib`) 依赖 `dlltool`+`as`，
+# 在无独立 MinGW 的 `windows-gnu` 工具链上不可用；Linux / macOS / Windows MSVC CI 全量运行 `loom`，
+# 同时 `tests/interleaving_model.rs` 提供零依赖的全平台穷举交错模型检查。
+[target.'cfg(not(all(windows, target_env = "gnu")))'.dev-dependencies]
+loom = "0.7"
