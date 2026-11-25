@@ -60,6 +60,16 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p rust-cordis-host --features dhat-heap --test dhat_profile -- --ignored --nocapture | tee dhat.log
+      - name: Run miri on rust-cordis-abi
+        if: success()
+        shell: bash
+        env:
+          # Pin nightly date to avoid spurious failures from upstream nightly regressions.
+          MIRI_TOOLCHAIN: nightly-2026-11-20
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$MIRI_TOOLCHAIN" --component miri --no-self-update
+          cargo +"$MIRI_TOOLCHAIN" miri test -p rust-cordis-abi --locked
       - name: Upload soak log
         if: ${{ always() && hashFiles('soak.log') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

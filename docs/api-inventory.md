@@ -261,25 +261,25 @@
 | `OP_VOLATILE_APPLY` | {"paths": [{"path": ..., "value": ...}]} | 空正文 + STATUS_OK；失败 STATUS_ERR（文本或 ErrorPayload） | `crates/abi/src/lib.rs` |
 | `OP_DISPOSE` | 空 | 空正文 + STATUS_OK | `crates/abi/src/lib.rs` |
 | `OP_CLEANUP` | {"id": <u64>} | 空正文 + STATUS_OK | `crates/abi/src/lib.rs` |
-| `ctx_get` | 服务名 | {"value": ...} / {"missing": true} | `crates/host/src/lib.rs` |
-| `ctx_provide` | name + value_json | disposer JSON | `crates/host/src/lib.rs` |
-| `ctx_on` | event + cb | 空正文 + STATUS_OK | `crates/host/src/lib.rs` |
-| `ctx_effect` | cb | 空正文 + STATUS_OK | `crates/host/src/lib.rs` |
-| `ctx_emit` | {"mode": ..., "args": [...]} | 内联 {"pending":false,"result":...,"dispatch_id":...}；无 cb 时 {"dispatch_id":...}；异步 cb 的 args[0] 带 result/error；能力位为 1 时 error 带结构化兄弟字段 | `crates/host/src/lib.rs` |
-| `log` | level + message | STATUS_OK | `crates/host/src/lib.rs` |
-| `ctx_provide_iface` | name + version + methods + cb | 空正文 + STATUS_OK | `crates/host/src/lib.rs` |
-| `ctx_call_iface` | service + version + method + args + cb | 内联 {"pending":false,"result":...} / {"pending":false,"error":...} / {"pending":true}；异步 cb 的 args[0] 带 result/error；能力位为 1 时 error 带结构化兄弟字段 | `crates/host/src/lib.rs` |
-| `ctx_dispatch` | mode + event + args + cb | 内联 {"pending":false,"result":...,"dispatch_id":...} / {"pending":false,"error":...,"dispatch_id":...} / {"pending":true,"dispatch_id":...}；能力位为 1 时 error 带结构化兄弟字段 | `crates/host/src/lib.rs` |
-| `ctx_require` | 服务名 | {"value": ...} / STATUS_ERR + ResolveError（文本或 ErrorPayload） | `crates/host/src/lib.rs` |
-| `ctx_set` | name + value_json | 空正文 + STATUS_OK | `crates/host/src/lib.rs` |
-| `ctx_isolate` | config JSON | {"handle": <u64>}（bit63 = 派生句柄，见 DERIVED_HANDLE_TAG） | `crates/host/src/lib.rs` |
-| `ctx_intercept` | metadata JSON | {"handle": <u64>} | `crates/host/src/lib.rs` |
-| `ctx_use` | url / @native 描述 | handle 或错误 | `crates/host/src/lib.rs` |
-| `ctx_dispose` | {"handle": ...} | 空正文 + STATUS_OK | `crates/host/src/lib.rs` |
-| `ctx_dispose_self` | 空 | 空正文 + STATUS_OK | `crates/host/src/lib.rs` |
-| `ctx_fulfill` | dispatch_id + value | STATUS_OK / STATUS_ERR + ErrorPayload（文本或结构化；宿主生命周期失败为 host_fulfill/lifecycle） | `crates/host/src/lib.rs` |
-| `ctx_next` | dispatch_id + args | STATUS_OK / STATUS_ERR（文本或 ErrorPayload；生命周期失败为 host_next/lifecycle）/ STATUS_PENDING；on_done 的 args[0] 带 result/error，能力位为 1 时 error 带结构化兄弟字段 | `crates/host/src/lib.rs` |
-| `ctx_abort` | dispatch_id + reason | STATUS_OK / STATUS_ERR | `crates/host/src/lib.rs` |
+| `ctx_get` | 服务名 | {"value": ...} / {"missing": true} | `crates/host/src/ffi_exports.rs` |
+| `ctx_provide` | name + value_json | disposer JSON | `crates/host/src/ffi_exports.rs` |
+| `ctx_on` | event + cb | 空正文 + STATUS_OK | `crates/host/src/ffi_exports.rs` |
+| `ctx_effect` | cb | 空正文 + STATUS_OK | `crates/host/src/ffi_exports.rs` |
+| `ctx_emit` | {"mode": ..., "args": [...]} | 内联 {"pending":false,"result":...,"dispatch_id":...}；无 cb 时 {"dispatch_id":...}；异步 cb 的 args[0] 带 result/error；能力位为 1 时 error 带结构化兄弟字段 | `crates/host/src/ffi_exports.rs` |
+| `log` | level + message | STATUS_OK | `crates/host/src/ffi_exports.rs` |
+| `ctx_provide_iface` | name + version + methods + cb | 空正文 + STATUS_OK | `crates/host/src/ffi_exports.rs` |
+| `ctx_call_iface` | service + version + method + args + cb | 内联 {"pending":false,"result":...} / {"pending":false,"error":...} / {"pending":true}；异步 cb 的 args[0] 带 result/error；能力位为 1 时 error 带结构化兄弟字段 | `crates/host/src/ffi_exports.rs` |
+| `ctx_dispatch` | mode + event + args + cb | 内联 {"pending":false,"result":...,"dispatch_id":...} / {"pending":false,"error":...,"dispatch_id":...} / {"pending":true,"dispatch_id":...}；能力位为 1 时 error 带结构化兄弟字段 | `crates/host/src/ffi_exports.rs` |
+| `ctx_require` | 服务名 | {"value": ...} / STATUS_ERR + ResolveError（文本或 ErrorPayload） | `crates/host/src/ffi_exports.rs` |
+| `ctx_set` | name + value_json | 空正文 + STATUS_OK | `crates/host/src/ffi_exports.rs` |
+| `ctx_isolate` | config JSON | {"handle": <u64>}（bit63 = 派生句柄，见 DERIVED_HANDLE_TAG） | `crates/host/src/ffi_exports.rs` |
+| `ctx_intercept` | metadata JSON | {"handle": <u64>} | `crates/host/src/ffi_exports.rs` |
+| `ctx_use` | url / @native 描述 | handle 或错误 | `crates/host/src/ffi_exports.rs` |
+| `ctx_dispose` | {"handle": ...} | 空正文 + STATUS_OK | `crates/host/src/ffi_exports.rs` |
+| `ctx_dispose_self` | 空 | 空正文 + STATUS_OK | `crates/host/src/ffi_exports.rs` |
+| `ctx_fulfill` | dispatch_id + value | STATUS_OK / STATUS_ERR + ErrorPayload（文本或结构化；宿主生命周期失败为 host_fulfill/lifecycle） | `crates/host/src/ffi_exports.rs` |
+| `ctx_next` | dispatch_id + args | STATUS_OK / STATUS_ERR（文本或 ErrorPayload；生命周期失败为 host_next/lifecycle）/ STATUS_PENDING；on_done 的 args[0] 带 result/error，能力位为 1 时 error 带结构化兄弟字段 | `crates/host/src/ffi_exports.rs` |
+| `ctx_abort` | dispatch_id + reason | STATUS_OK / STATUS_ERR | `crates/host/src/ffi_exports.rs` |
 | `ctx_stream_push` | dispatch_id + chunk + on_credit | STATUS_OK / STATUS_PENDING / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段） | `crates/host/src/lib.rs` |
 | `ctx_stream_close` | dispatch_id | STATUS_OK / STATUS_STREAM_GONE | `crates/host/src/lib.rs` |
 | `ctx_stream_fail` | dispatch_id + reason（纯文本错误，始终原样交付） | STATUS_OK / STATUS_STREAM_GONE / STATUS_ERR + ErrorPayload（能力位为 1 时带结构化兄弟字段） | `crates/host/src/lib.rs` |
