@@ -724,10 +724,6 @@ pub struct Fiber {
     native_task_sn: AtomicU64,
     /// 处置完成通知：重复 `dispose()` 都等同一次清理，而不是看到终态就早退。
     dispose_tx: tokio::sync::watch::Sender<bool>,
-    /// 终态卸载完成标记（仅在持有 `driver` 锁或 `recover_cleanup` 兜底完成后置位）：
-    /// 防止已在队列中等待 `driver` 的迟到 `settle()` 在 `dispose()` 完成后再次调用 `unload()`，
-    /// 把终态 `Disposed` 反弹回 `Unloading`。
-    dispose_unloaded: AtomicBool,
     /// **行内钩子**（上游 `Fiber._hooks`，`fiber.ts:111`）。
     ///
     /// `ctx.on('internal/update', …)` 的非全局注册会被内置监听器路由到这里
@@ -816,7 +812,6 @@ impl Fiber {
             native_tasks: Mutex::new(HashMap::new()),
             native_task_sn: AtomicU64::new(1),
             dispose_tx,
-            dispose_unloaded: AtomicBool::new(false),
             hooks: Mutex::new(HashMap::new()),
             hook_sn: AtomicU64::new(1),
             desired: Mutex::new(None),
@@ -909,7 +904,6 @@ impl Fiber {
             native_tasks: Mutex::new(HashMap::new()),
             native_task_sn: AtomicU64::new(1),
             dispose_tx,
-            dispose_unloaded: AtomicBool::new(false),
             hooks: Mutex::new(HashMap::new()),
             hook_sn: AtomicU64::new(1),
             desired: Mutex::new(None),
@@ -2150,9 +2144,6 @@ impl Fiber {
                 // 已注册子 fiber/effect"的 fiber 同样必须走 `unload`，
                 // 否则 `dispose` 只改状态、不释放任何资源。
                 if this.is_disposed() {
-                    if this.dispose_unloaded.load(Ordering::Acquire) {
-                        break;
-                    }
                     if let Err(payload) = CatchPanic::new(this.unload()).await {
                         let reason = format!(
                             "生命周期清理任务 panic: {}",
@@ -2165,7 +2156,6 @@ impl Fiber {
                         this.store.log(Level::Error, &this.name(), &reason);
                         this.recover_cleanup().await;
                     }
-                    this.dispose_unloaded.store(true, Ordering::Release);
                     break;
                 }
                 if this.error.lock().unwrap().is_some() {
@@ -2419,7 +2409,39 @@ impl Fiber {
             .await;
     }
 
+    /// 判定已处置 fiber 是否已处于彻底静默的终态（所有资源已关闭并排空）。
+    ///
+    /// 满足该条件时 `unload()` 自身即幂等空操作，无需调用者额外维护布尔护栏，
+    /// 也不会把终态 `Disposed` 反弹回 `Unloading`。
+    fn is_disposed_quiescent(self: &Arc<Self>) -> bool {
+        if !self.is_disposed() || self.state() != FiberState::Disposed {
+            return false;
+        }
+        {
+            let gate = self.effect_gate.lock().unwrap();
+            if !gate.closed || gate.in_flight != 0 {
+                return false;
+            }
+        }
+        if self.effect_bg_cleanups.load(Ordering::SeqCst) != 0 {
+            return false;
+        }
+        if !self.disposables.lock().unwrap().is_empty() {
+            return false;
+        }
+        if !self.native_tasks.lock().unwrap().is_empty() {
+            return false;
+        }
+        if self.committed.lock().unwrap().is_some() || self.running.lock().unwrap().is_some() {
+            return false;
+        }
+        self.store.impls_owned_by_with_realm(self).is_empty()
+    }
+
     async fn unload(self: &Arc<Self>) {
+        if self.is_disposed_quiescent() {
+            return;
+        }
         self.set_state(FiberState::Unloading);
         // 先关门，确保没有迟到的 effect / 原生任务登记；再取消并等待本 fiber
         // 自己的后台任务（它们可能正调用即将拆除的依赖），然后等依赖者拆完，
@@ -3134,7 +3156,6 @@ impl Fiber {
         self.settle().await;
         // `unload` 已按终态收敛；这里再确认一次，避免未来改动把终态次序改坏。
         self.set_state(FiberState::Disposed);
-        self.dispose_unloaded.store(true, Ordering::Release);
         self.clear_context();
     }
 
@@ -3182,7 +3203,6 @@ impl Fiber {
             self.record_cleanup_error(CleanupErrorKind::InternalCleanup, reason.clone());
             self.store.log(Level::Error, &self.name(), &reason);
         }
-        self.dispose_unloaded.store(true, Ordering::Release);
         self.clear_context();
     }
 

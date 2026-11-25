@@ -561,3 +561,218 @@ async fn stray_settle_after_dispose_does_not_bounce_back_to_unloading() {
     );
     app.close().await;
 }
+
+// Regression: disposing an already-quiescent Pending fiber (never loaded, no effects/tasks/
+// committed view) must stay in `Disposed` without needlessly bouncing through `Unloading`.
+#[tokio::test]
+async fn dispose_empty_pending_fiber_does_not_bounce_through_unloading() {
+    let app = App::new();
+    let fiber = app.root.plugin(
+        plugin_fn(
+            "never-loaded-pending",
+            Inject::of(&["missing_dep_for_idempotent_unload"]),
+            |_ctx, _cfg| Box::pin(async { Ok(()) }),
+        ),
+        json!({}),
+    );
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Pending);
+
+    let status_events = Arc::new(AtomicUsize::new(0));
+    let status_events_c = status_events.clone();
+    let target_ptr = Arc::as_ptr(&fiber) as usize;
+    let _obs = app.root.on("internal/status", move |call| {
+        let status_events_c = status_events_c.clone();
+        Box::pin(async move {
+            if let Some(f) = call
+                .args
+                .first()
+                .and_then(|d| d.downcast::<cordis_core::Fiber>())
+            {
+                if Arc::as_ptr(&f) as usize == target_ptr {
+                    status_events_c.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            None
+        })
+    });
+
+    fiber.dispose().await;
+    fiber.settle().await;
+    // Allow any spawned internal/status handler to run.
+    tokio::task::yield_now().await;
+    assert_eq!(fiber.state(), FiberState::Disposed);
+    assert_eq!(
+        status_events.load(Ordering::SeqCst),
+        1,
+        "quiescent Pending fiber should emit only Pending -> Disposed (no Unloading bounce)"
+    );
+    app.close().await;
+}
+
+// Regression: after `dispose()` completes on an Active fiber with effects + scoped task +
+// provided service, subsequent `dispose()`, `settle()`, `update()`, and `restart()` calls
+// must all be idempotent no-ops/errors with zero status bounces out of `Disposed`.
+#[tokio::test]
+async fn repeated_lifecycle_calls_after_dispose_are_idempotent() {
+    let app = App::new();
+    let disposed_count = Arc::new(AtomicUsize::new(0));
+    let dc = disposed_count.clone();
+    let fiber = app.root.plugin(
+        plugin_fn(
+            "idempotent-after-dispose",
+            Inject::default(),
+            move |ctx, _| {
+                let dc = dc.clone();
+                Box::pin(async move {
+                    let _ = ctx.provide("idempotent_svc", Dyn::new(42u32));
+                    ctx.effect(move |_| {
+                        let dc = dc.clone();
+                        cordis_core::Disposable::new(move || {
+                            let dc = dc.clone();
+                            Box::pin(async move {
+                                dc.fetch_add(1, Ordering::SeqCst);
+                            })
+                        })
+                    });
+                    let _ = ctx.spawn_scoped(|cancel| async move {
+                        cancel.cancelled().await;
+                    });
+                    Ok(())
+                })
+            },
+        ),
+        json!({ "v": 1 }),
+    );
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    fiber.dispose().await;
+    assert_eq!(fiber.state(), FiberState::Disposed);
+    assert_eq!(disposed_count.load(Ordering::SeqCst), 1);
+
+    let bounced = Arc::new(AtomicBool::new(false));
+    let bounced_c = bounced.clone();
+    let target_ptr = Arc::as_ptr(&fiber) as usize;
+    let _obs = app.root.on("internal/status", move |call| {
+        let bounced_c = bounced_c.clone();
+        Box::pin(async move {
+            if let Some(f) = call
+                .args
+                .first()
+                .and_then(|d| d.downcast::<cordis_core::Fiber>())
+            {
+                if Arc::as_ptr(&f) as usize == target_ptr {
+                    bounced_c.store(true, Ordering::SeqCst);
+                }
+            }
+            None
+        })
+    });
+
+    fiber.dispose().await;
+    fiber.settle().await;
+    assert!(fiber.update(json!({ "v": 2 })).await.is_err());
+    assert!(fiber.restart().await.is_err());
+    fiber.settle().await;
+
+    assert_eq!(fiber.state(), FiberState::Disposed);
+    assert_eq!(disposed_count.load(Ordering::SeqCst), 1);
+    assert!(
+        !bounced.load(Ordering::SeqCst),
+        "post-dispose lifecycle calls must not emit status transitions"
+    );
+    app.close().await;
+}
+
+// Regression: when a prior reload timed out and moved effect cleanup to background
+// (`effect_bg_cleanups > 0`), `unload()` on `dispose()` must NOT treat the fiber as
+// quiescent until the background cleanup completes, and only then become a no-op.
+#[tokio::test]
+async fn dispose_waits_for_bg_cleanups_before_becoming_quiescent() {
+    let app = App::new();
+    app.store
+        .set_lifecycle_policy(LifecyclePolicy {
+            dispose_timeout_ms: Some(15),
+            ..LifecyclePolicy::default()
+        })
+        .unwrap();
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let bg_finished = Arc::new(AtomicBool::new(false));
+    let gate_c = gate.clone();
+    let bg_finished_c = bg_finished.clone();
+
+    let fiber = app.root.plugin(
+        plugin_fn("bg-quiescent-target", Inject::default(), move |ctx, _| {
+            let gate_c = gate_c.clone();
+            let bg_finished_c = bg_finished_c.clone();
+            Box::pin(async move {
+                ctx.effect(move |_| {
+                    let gate_c = gate_c.clone();
+                    let bg_finished_c = bg_finished_c.clone();
+                    cordis_core::Disposable::new(move || {
+                        let gate_c = gate_c.clone();
+                        let bg_finished_c = bg_finished_c.clone();
+                        Box::pin(async move {
+                            gate_c.notified().await;
+                            bg_finished_c.store(true, Ordering::SeqCst);
+                        })
+                    })
+                });
+                Ok(())
+            })
+        }),
+        json!({ "v": 1 }),
+    );
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    // Reload times out and hands the slow effect disposer to background (`effect_bg_cleanups == 1`).
+    let _ = fiber.restart().await;
+    assert!(!bg_finished.load(Ordering::SeqCst));
+
+    let f_disp = fiber.clone();
+    let dispose_task = tokio::spawn(async move {
+        f_disp.dispose().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !dispose_task.is_finished(),
+        "dispose() must not treat fiber as quiescent while effect_bg_cleanups > 0"
+    );
+
+    gate.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), dispose_task)
+        .await
+        .expect("dispose() hung after background cleanup unblocked")
+        .unwrap();
+    assert!(bg_finished.load(Ordering::SeqCst));
+    assert_eq!(fiber.state(), FiberState::Disposed);
+
+    // Now quiescent: stray settle() must not bounce out of Disposed.
+    let bounced = Arc::new(AtomicBool::new(false));
+    let bounced_c = bounced.clone();
+    let target_ptr = Arc::as_ptr(&fiber) as usize;
+    let _obs = app.root.on("internal/status", move |call| {
+        let bounced_c = bounced_c.clone();
+        Box::pin(async move {
+            if let Some(f) = call
+                .args
+                .first()
+                .and_then(|d| d.downcast::<cordis_core::Fiber>())
+            {
+                if Arc::as_ptr(&f) as usize == target_ptr && f.state() != FiberState::Disposed {
+                    bounced_c.store(true, Ordering::SeqCst);
+                }
+            }
+            None
+        })
+    });
+
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Disposed);
+    assert!(!bounced.load(Ordering::SeqCst));
+    app.close().await;
+}
