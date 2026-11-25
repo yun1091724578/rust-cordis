@@ -109,7 +109,6 @@ struct FiberModel {
     driver: Mutex<()>,
     disposables: Mutex<usize>,
     disposed_effects: AtomicUsize,
-    saw_disposed: AtomicBool,
     illegal_resurrection: AtomicBool,
 }
 
@@ -128,7 +127,6 @@ impl FiberModel {
             driver: Mutex::new(()),
             disposables: Mutex::new(0),
             disposed_effects: AtomicUsize::new(0),
-            saw_disposed: AtomicBool::new(false),
             illegal_resurrection: AtomicBool::new(false),
         }
     }
@@ -163,9 +161,10 @@ impl FiberModel {
                 .compare_exchange(cur, next as u8, Ordering::SeqCst, Ordering::SeqCst)
             {
                 Ok(_) => {
-                    if next == FiberState::Disposed {
-                        self.saw_disposed.store(true, Ordering::SeqCst);
-                    } else if self.saw_disposed.load(Ordering::SeqCst)
+                    // Check the exact pre-CAS state `cur` atomically replaced by this transition
+                    // (a separate post-CAS atomic load could observe a subsequent `dispose()`
+                    // that legally happened *after* this CAS).
+                    if cur == FiberState::Disposed as u8
                         && !matches!(next, FiberState::Disposed | FiberState::Unloading)
                     {
                         self.illegal_resurrection.store(true, Ordering::SeqCst);
@@ -357,7 +356,7 @@ fn loom_fiber_unload_vs_restart_and_dispose() {
 }
 
 /// 4. Exhaustively check `Store::unregister_fiber` vs `runtime_for` + `register_fiber`
-/// under unified lock order `runtimes -> runtime.fibers`.
+///    under unified lock order `runtimes -> runtime.fibers`.
 #[test]
 fn loom_store_unregister_vs_register_fiber_no_orphan() {
     struct RuntimeModel {
