@@ -66,6 +66,8 @@ jobs:
         env:
           # Pin nightly date to avoid spurious failures from upstream nightly regressions.
           MIRI_TOOLCHAIN: nightly-2026-11-20
+          # Plugin descriptors and HostApi test fixtures intentionally Box::leak 'static memory.
+          MIRIFLAGS: -Zmiri-ignore-leaks
         run: |
           set -euo pipefail
           rustup toolchain install "$MIRI_TOOLCHAIN" --component miri --no-self-update
