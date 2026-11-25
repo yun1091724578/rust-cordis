@@ -1736,8 +1736,16 @@ fn forget_volatile(owner: u64) {
 
 // ------------------------------------------------------------------ 装配
 
+#[derive(Copy, Clone)]
+struct SyncDescPtr(*const PluginDesc);
+
+// SAFETY: `PluginDesc` is immutable process-lifetime metadata leaked via `Box::leak`
+// (or null on init panic) and safely shared across threads.
+unsafe impl Send for SyncDescPtr {}
+unsafe impl Sync for SyncDescPtr {}
+
 pub struct DescSlot {
-    slot: OnceLock<usize>,
+    slot: OnceLock<SyncDescPtr>,
 }
 
 impl DescSlot {
@@ -1748,7 +1756,7 @@ impl DescSlot {
     }
 
     pub fn get_or_init(&self, build: impl FnOnce() -> *const PluginDesc) -> *const PluginDesc {
-        *self.slot.get_or_init(|| build() as usize) as *const PluginDesc
+        self.slot.get_or_init(|| SyncDescPtr(build())).0
     }
 
     /// 与 [`DescSlot::get_or_init`] 相同，但把构造期的 panic 截在入口内。
@@ -1760,18 +1768,20 @@ impl DescSlot {
         &self,
         build: impl FnOnce() -> *const PluginDesc,
     ) -> *const PluginDesc {
-        *self.slot.get_or_init(|| {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
-                Ok(desc) => desc as usize,
-                Err(payload) => {
-                    eprintln!(
-                        "[cordis] 插件描述表构造失败: {}",
-                        panic_message(payload.as_ref())
-                    );
-                    0
-                }
-            }
-        }) as *const PluginDesc
+        self.slot
+            .get_or_init(
+                || match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+                    Ok(desc) => SyncDescPtr(desc),
+                    Err(payload) => {
+                        eprintln!(
+                            "[cordis] 插件描述表构造失败: {}",
+                            panic_message(payload.as_ref())
+                        );
+                        SyncDescPtr(std::ptr::null())
+                    }
+                },
+            )
+            .0
     }
 }
 
@@ -1921,7 +1931,18 @@ pub unsafe extern "C" fn attach(host: *const HostApi) {
     // 版本闸门就在这里，而不是在每次 call 里：一次检查，之后零成本。
     // 主版本不等就不予登记，后续 call 返回"版本不匹配"，宿主会把它标成 FAILED
     // ——失败是**显式**的，而不是以未定义行为的形式出现。
-    if (*host).abi_version != crate::ABI_VERSION || ((*host).size as usize) < 8 {
+    // 按字节读前 8 字节（`abi_version` + `size`），避免未对齐指针在 copy-on-attach 前触发 UB。
+    let mut header = [0u32; 2];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            host as *const u8,
+            header.as_mut_ptr() as *mut u8,
+            std::mem::size_of::<[u32; 2]>(),
+        );
+    }
+    let abi_version = header[0];
+    let host_size = header[1] as usize;
+    if abi_version != crate::ABI_VERSION || host_size < 8 {
         return;
     }
     // copy-on-attach（G15）：宿主表可能比本插件认识的布局**短**（旧宿主只分配
@@ -1934,8 +1955,7 @@ pub unsafe extern "C" fn attach(host: *const HostApi) {
     // 声明，必在其分配之内），目的端是本进程自有的栈上副本，两者不重叠。
     let copy: HostApi = unsafe {
         let mut copy = HostApi::default();
-        let bytes = (*host).size as usize;
-        let bytes = bytes.min(std::mem::size_of::<HostApi>());
+        let bytes = host_size.min(std::mem::size_of::<HostApi>());
         std::ptr::copy_nonoverlapping(
             host as *const u8,
             &mut copy as *mut HostApi as *mut u8,

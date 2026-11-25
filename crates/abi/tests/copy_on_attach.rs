@@ -33,7 +33,10 @@ fn truncated_host_api_reads_only_inside_its_own_copy() {
         ctx_get: Some(get_a),
         ..HostApi::default()
     };
-    let mut arena = [0xA5u8; TRUNC + 16];
+    #[repr(C, align(8))]
+    struct AlignedArena([u8; TRUNC + 16]);
+    let mut arena_buf = AlignedArena([0xA5u8; TRUNC + 16]);
+    let arena = &mut arena_buf.0;
     unsafe {
         std::ptr::copy_nonoverlapping(
             &full as *const HostApi as *const u8,
