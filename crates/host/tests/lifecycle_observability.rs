@@ -1448,34 +1448,24 @@ async fn reload_rollback_surfaces_failed_new_cleanup_errors_and_blocks_unsafe_ro
     );
 
     // 2) 新版本 apply 失败且半途 disposer 挂死超过 dispose_timeout_ms：
-    //    `fiber.fail()` 自身也在执行该挂死 disposer（或延迟清理未完成），此时应拒绝在半拆状态上挂载回滚。
-    //    这里用自定义 dispose_timeout_ms + 挂起 apply 并在 fail() 后挂起 disposer 来触发。
-    set_lifecycle_policy_for(
-        &app.root,
-        LifecyclePolicy::new(None, None, Some(50)).unwrap(),
-    )
-    .unwrap();
-    let release = Arc::new(tokio::sync::Notify::new());
-    let release_d = release.clone();
-    // 注意：Fiber::fail() 会执行 disposer，所以这里让新版本在 apply 里先挂一个依赖外部放行的子 fiber
-    // 并让新版本成功 apply 还是失败？更直接：让新版本注册一个 disposer 在 fail() 之外的第二次 dispose 挂住
-    // 或利用 drain_timeout_ms 限制 fail() 中的卡死任务，再配合 dispose_timeout_ms：
-    // 实际上：如果新版本在 apply 期间通过 spawn_scoped 启动卡死任务 + 返回 Err，fail() 会超时将任务移交后台；
-    // 这里验证一个真实场景：失败新实例存在未结束的后台清理且 state 尚未 Disposed 时拒绝回滚，
-    // 而在已 Disposed（仅后台任务收尾）时允许安全回滚并把 Timeout 透出到 dispose_report！
+    //    `Fiber::fail()` 遵守 dispose_timeout_ms 及时返回并登记后台清理，
+    //    `swap_entry` 看到 `new_dispose.still_running == true` 必须拒绝在不安全状态上挂载回滚旧实例
+    //    （返回 `Lost` 并登记 `draining` 阻止旁路重挂），直到后台清理完成。
     set_lifecycle_policy_for(
         &app.root,
         LifecyclePolicy::new(None, Some(40), Some(40)).unwrap(),
     )
     .unwrap();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_d = release.clone();
     let v3_stuck_fail = plugin_fn("svc-v3", Inject::default(), move |ctx: Ctx, _| {
         let rel = release_d.clone();
         Box::pin(async move {
-            ctx.spawn_scoped(move |_cancel| async move {
-                rel.notified().await;
-            })
-            .unwrap();
-            Err("v3-apply-failed-with-stuck-task".into())
+            ctx.effect(move |_| {
+                let rel = rel.clone();
+                Disposable::new(move || Box::pin(async move { rel.notified().await }))
+            });
+            Err("v3-apply-failed-with-stuck-disposer".into())
         })
     });
     let r2 = tokio::time::timeout(
@@ -1483,19 +1473,583 @@ async fn reload_rollback_surfaces_failed_new_cleanup_errors_and_blocks_unsafe_ro
         reload_one_with_plugin(&app.root, &state, "svc", v3_stuck_fail),
     )
     .await
-    .expect("失败新实例含卡死任务时重载也必须受 drain 预算约束及时返回");
-    assert_eq!(r2.status, ReloadStatus::RolledBack);
+    .expect("失败新实例含卡死 disposer 时重载必须受 dispose 预算约束及时返回");
+    assert_eq!(
+        r2.status,
+        ReloadStatus::Lost,
+        "失败新实例仍有后台清理未完成时必须拒绝不安全回滚: {r2:?}"
+    );
     let disp2 = r2
         .dispose_report
         .as_ref()
-        .expect("失败新实例的排水超时必须透出到 dispose_report");
+        .expect("失败新实例的清理超时必须透出到 dispose_report");
     assert_eq!(disp2.status, CloseStatus::TimedOut);
     assert!(disp2.still_running);
+    assert!(
+        state.mounted_labels().is_empty(),
+        "拒绝不安全回滚后不得把旧实例放回 mounted"
+    );
+
+    // 后台清理未完成前，`sync()` 也不得旁路重挂。
+    let blocked = state.sync().await;
+    assert!(
+        blocked
+            .failures
+            .iter()
+            .any(|msg| msg.contains("后台清理尚未完成")),
+        "draining 期间 sync() 必须阻断旁路重挂: {:?}",
+        blocked.failures
+    );
 
     release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), app.store.wait_background_cleanups())
         .await
         .expect("放行后后台清理收敛");
+
+    // 后台清理归零后，`sync()` 可安全重新挂起该行。
+    let recovered = state.sync().await;
+    assert!(
+        recovered.failures.is_empty(),
+        "draining 结束后 sync 应恢复挂载: {:?}",
+        recovered.failures
+    );
+    assert_eq!(state.mounted_labels(), vec!["svc".to_string()]);
+
+    let close = app.close_with_report(None).await;
+    assert_eq!(close.status, CloseStatus::Completed);
+    let _ = std::fs::remove_file(&cfg_path);
+}
+
+// ------------------------------------------------------------------ 11. T2 热重载 OP_APPLY 超时拒绝不安全回滚 + 严格 LIFO 清理
+
+struct LifoCleanupState {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+    order: Arc<Mutex<Vec<String>>>,
+    probe_dropped: Arc<AtomicBool>,
+}
+
+static LIFO_CLEANUP_STATE: Mutex<Option<LifoCleanupState>> = Mutex::new(None);
+
+unsafe extern "C" fn apply_two_cleanups_then_block_plugin(
+    handle: u64,
+    op: u32,
+    a: Blob,
+    _: Blob,
+    out: *mut Out,
+) -> i32 {
+    match op {
+        OP_APPLY => {
+            let Some(effect) = host_api().ctx_effect else {
+                return STATUS_UNSUPPORTED;
+            };
+            let mut buf = [0u8; 64];
+            let mut effect_out = Out {
+                ptr: buf.as_mut_ptr(),
+                cap: buf.len(),
+                len: 0,
+            };
+            if effect(handle, 1, &mut effect_out) != STATUS_OK {
+                return STATUS_ERR;
+            }
+            if effect(handle, 2, &mut effect_out) != STATUS_OK {
+                return STATUS_ERR;
+            }
+            let (entered, release, order) = {
+                let guard = LIFO_CLEANUP_STATE.lock().unwrap();
+                let st = guard.as_ref().expect("LIFO_CLEANUP_STATE 已初始化");
+                (st.entered.clone(), st.release.clone(), st.order.clone())
+            };
+            entered.wait();
+            release.wait();
+            order.lock().unwrap().push("apply_exit".to_string());
+            (*out).write(b"")
+        }
+        OP_CLEANUP => {
+            let payload: serde_json::Value =
+                serde_json::from_slice(a.as_bytes()).unwrap_or(serde_json::Value::Null);
+            let id = payload.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let guard = LIFO_CLEANUP_STATE.lock().unwrap();
+            let st = guard.as_ref().expect("LIFO_CLEANUP_STATE 已初始化");
+            assert!(!st.probe_dropped.load(Ordering::SeqCst));
+            st.order.lock().unwrap().push(format!("cleanup:{id}"));
+            (*out).write(b"")
+        }
+        OP_DISPOSE => {
+            let guard = LIFO_CLEANUP_STATE.lock().unwrap();
+            let st = guard.as_ref().expect("LIFO_CLEANUP_STATE 已初始化");
+            assert!(!st.probe_dropped.load(Ordering::SeqCst));
+            st.order.lock().unwrap().push("dispose".to_string());
+            (*out).write(b"")
+        }
+        _ => STATUS_UNSUPPORTED,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_t2_apply_timeout_blocks_unsafe_rollback_and_preserves_lifo_cleanup() {
+    let _guard = instance_lock().await;
+    assert_eq!(loaded_instances(), 0);
+
+    let (probe, probe_dropped) = make_probe();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let order = Arc::new(Mutex::new(Vec::new()));
+    *LIFO_CLEANUP_STATE.lock().unwrap() = Some(LifoCleanupState {
+        entered: entered.clone(),
+        release: release.clone(),
+        order: order.clone(),
+        probe_dropped: probe_dropped.clone(),
+    });
+
+    let cfg_path = temp_config("reload-t2-apply-timeout", "- id: svc\n  name: svc\n");
+    let app = App::new();
+    set_lifecycle_policy_for(
+        &app.root,
+        LifecyclePolicy::new(Some(60), Some(60), Some(60)).unwrap(),
+    )
+    .unwrap();
+
+    let v1 = plugin_fn("svc-v1", Inject::default(), |ctx: Ctx, _| {
+        Box::pin(async move {
+            ctx.provide("svc.ver", cordis_core::Dyn::new(1u32))?;
+            Ok(())
+        })
+    });
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(StaticSource(v1)),
+    )
+    .await
+    .expect("初装成功");
+
+    let keepalive = Mutex::new(Some(probe));
+    let v2_t2_hanging = plugin_fn("svc-v2-t2", Inject::default(), move |ctx: Ctx, cfg| {
+        let lease = keepalive.lock().unwrap().take();
+        apply_via_with_keepalive(
+            apply_two_cleanups_then_block_plugin,
+            ctx,
+            cfg,
+            "svc-v2-t2",
+            lease,
+        )
+    });
+
+    let entered_wait = entered.clone();
+    let enter_task = tokio::task::spawn_blocking(move || entered_wait.wait());
+    let rep = tokio::time::timeout(
+        Duration::from_secs(2),
+        reload_one_with_plugin(&app.root, &state, "svc", v2_t2_hanging),
+    )
+    .await
+    .expect("T2 OP_APPLY 超时后重载必须及时返回");
+    enter_task.await.expect("T2 OP_APPLY 已进入阻塞");
+
+    // 关键断言：即使失败新 fiber 的 state 已到 Disposed，但 T2 OP_APPLY 仍在后台跑（still_running=true），
+    // 绝不能绕过护栏回滚挂载 v1！
+    assert_eq!(
+        rep.status,
+        ReloadStatus::Lost,
+        "T2 OP_APPLY 超时后台未退时必须返回 Lost 拒绝回滚: {rep:?}"
+    );
+    assert!(
+        state.mounted_labels().is_empty(),
+        "拒绝不安全回滚后不得恢复 v1 到 mounted"
+    );
+    assert!(
+        app.root.get("svc.ver").is_none(),
+        "不得在 T2 新版本仍在运行时并发挂回旧服务"
+    );
+    assert!(
+        !probe_dropped.load(Ordering::SeqCst),
+        "OP_APPLY 未退出前不得释放动态库保活"
+    );
+    let disp = rep
+        .dispose_report
+        .as_ref()
+        .expect("必须携带 dispose_report");
+    assert_eq!(disp.status, CloseStatus::TimedOut);
+    assert!(disp.still_running);
+
+    // draining 期间 sync 不得旁路重挂
+    let blocked = state.sync().await;
+    assert!(
+        blocked
+            .failures
+            .iter()
+            .any(|msg| msg.contains("后台清理尚未完成")),
+        "T2 超时后台排空期间 sync 必须被阻断: {:?}",
+        blocked.failures
+    );
+
+    let release_wait = release.clone();
+    tokio::task::spawn_blocking(move || release_wait.wait())
+        .await
+        .expect("放行 T2 OP_APPLY");
+    tokio::time::timeout(Duration::from_secs(2), app.store.wait_background_cleanups())
+        .await
+        .expect("后台清理收敛");
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["apply_exit", "cleanup:2", "cleanup:1", "dispose"],
+        "必须严格按 OP_APPLY 退出 -> LIFO OP_CLEANUP(2 -> 1) -> OP_DISPOSE 执行"
+    );
+    assert!(probe_dropped.load(Ordering::SeqCst));
+    assert_eq!(loaded_instances(), 0);
+
+    let close = app.close_with_report(None).await;
+    assert_eq!(close.status, CloseStatus::Completed);
+    let _ = std::fs::remove_file(&cfg_path);
+    *LIFO_CLEANUP_STATE.lock().unwrap() = None;
+}
+
+// ------------------------------------------------------------------ 12. 回滚自身也失败时清理 fiber、合并报告并登记 draining
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_double_failure_disposes_failed_rollback_and_tracks_draining() {
+    let _guard = instance_lock().await;
+    assert_eq!(loaded_instances(), 0);
+
+    let cfg_path = temp_config("reload-double-fail", "- id: svc\n  name: svc\n");
+    let app = App::new();
+    set_lifecycle_policy_for(
+        &app.root,
+        LifecyclePolicy::new(None, Some(40), Some(40)).unwrap(),
+    )
+    .unwrap();
+
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_p = attempts.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_p = release.clone();
+    let v1_flaky_rollback = plugin_fn("svc-v1-flaky", Inject::default(), move |ctx: Ctx, _| {
+        let attempts = attempts_p.clone();
+        let release = release_p.clone();
+        Box::pin(async move {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                ctx.provide("svc.ver", cordis_core::Dyn::new(1u32))?;
+                Ok(())
+            } else {
+                // 回滚重挂时也失败，且半途 disposer 挂起超出 dispose 预算。
+                ctx.effect(move |_| {
+                    let release = release.clone();
+                    Disposable::new(move || Box::pin(async move { release.notified().await }))
+                });
+                Err("v1-rollback-apply-failed".into())
+            }
+        })
+    });
+
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(StaticSource(v1_flaky_rollback)),
+    )
+    .await
+    .expect("初装成功");
+
+    let v2_clean_fail = plugin_fn("svc-v2-fail", Inject::default(), |_, _| {
+        Box::pin(async move { Err("v2-apply-failed".into()) })
+    });
+    let rep = tokio::time::timeout(
+        Duration::from_secs(2),
+        reload_one_with_plugin(&app.root, &state, "svc", v2_clean_fail),
+    )
+    .await
+    .expect("双重失败也必须受 dispose 预算约束及时返回");
+
+    assert_eq!(rep.status, ReloadStatus::Lost);
+    let disp = rep
+        .dispose_report
+        .as_ref()
+        .expect("回滚失败的清理超时必须合并进 dispose_report");
+    assert_eq!(disp.status, CloseStatus::TimedOut);
+    assert!(disp.still_running);
+    assert!(state.mounted_labels().is_empty(), "Lost 后不得残留挂载记录");
+
+    // 失败回滚实例仍在后台清理：sync 必须阻断重挂
+    let blocked = state.sync().await;
+    assert!(
+        blocked
+            .failures
+            .iter()
+            .any(|msg| msg.contains("后台清理尚未完成")),
+        "回滚失败实例 draining 期间必须阻断旁路重挂: {:?}",
+        blocked.failures
+    );
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), app.store.wait_background_cleanups())
+        .await
+        .expect("后台清理收敛");
+    assert!(
+        app.store.fibers_by_plugin_name("svc-v1-flaky").is_empty(),
+        "失败的回滚 fiber 必须已被彻底 dispose 注销，不得泄漏在 runtime 表"
+    );
+
+    let close = app.close_with_report(None).await;
+    assert_eq!(close.status, CloseStatus::Completed);
+    let _ = std::fs::remove_file(&cfg_path);
+}
+
+// ------------------------------------------------------------------ 13. mount_loaded 失败遵守 dispose 预算并登记 draining + Update 防并发重叠
+
+struct SwitchableSource(Arc<Mutex<Arc<dyn Plugin>>>);
+
+impl PluginSource for SwitchableSource {
+    fn load(
+        &self,
+        _entry: &Entry,
+        _search: &[PathBuf],
+        _revision: u64,
+    ) -> std::result::Result<LoadedFile, String> {
+        Ok(LoadedFile {
+            plugin: self.0.lock().unwrap().clone(),
+            source: PathBuf::from("switchable"),
+            staged: PathBuf::new(),
+            fingerprint: None,
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mount_loaded_failure_respects_dispose_budget_and_blocks_bypass_remount() {
+    let _guard = instance_lock().await;
+    assert_eq!(loaded_instances(), 0);
+
+    let cfg_path = temp_config("mount-fail-draining", "- id: svc\n  name: svc\n");
+    let app = App::new();
+    set_lifecycle_policy_for(
+        &app.root,
+        LifecyclePolicy::new(Some(40), Some(40), Some(40)).unwrap(),
+    )
+    .unwrap();
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_d = release.clone();
+    let failing = plugin_fn("mount-stuck-fail", Inject::default(), move |ctx: Ctx, _| {
+        let release = release_d.clone();
+        Box::pin(async move {
+            ctx.effect(move |_| {
+                let release = release.clone();
+                Disposable::new(move || Box::pin(async move { release.notified().await }))
+            });
+            Err("initial-mount-failed".into())
+        })
+    });
+    let active_plugin: Arc<Mutex<Arc<dyn Plugin>>> = Arc::new(Mutex::new(failing));
+    let source = Arc::new(SwitchableSource(active_plugin.clone()));
+
+    let mut cfg = LoaderConfig::new(cfg_path.to_string_lossy().into_owned());
+    cfg.strict = false;
+    let state = tokio::time::timeout(
+        Duration::from_secs(2),
+        load_with_source(app.root.clone(), cfg, source),
+    )
+    .await
+    .expect("mount_loaded 失败清理必须受 dispose_timeout_ms 约束及时返回")
+    .expect("strict=false 下初装降级返回 LoaderState");
+
+    assert!(state.mounted_labels().is_empty());
+    assert!(
+        app.store.pending_background_cleanups() >= 1,
+        "失败挂载的超时清理必须仍在后台跟踪"
+    );
+
+    // 换上健康插件并在 draining 期间尝试 sync()：必须被 draining 挡住，不能旁路重挂。
+    let healthy = plugin_fn("mount-healthy", Inject::default(), |ctx: Ctx, _| {
+        Box::pin(async move {
+            ctx.provide("svc.ok", cordis_core::Dyn::new(true))?;
+            Ok(())
+        })
+    });
+    *active_plugin.lock().unwrap() = healthy;
+
+    let blocked = state.sync().await;
+    assert!(
+        blocked
+            .failures
+            .iter()
+            .any(|msg| msg.contains("后台清理尚未完成")),
+        "mount_loaded 失败转后台清理期间 sync 必须阻断旁路重挂: {:?}",
+        blocked.failures
+    );
+    assert!(state.mounted_labels().is_empty());
+
+    // 放行后台清理后，再次 sync 应正常挂上健康插件。
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), app.store.wait_background_cleanups())
+        .await
+        .expect("后台清理收敛");
+
+    let ok = state.sync().await;
+    assert!(ok.failures.is_empty(), "排空后 sync 应成功挂载: {ok:?}");
+    assert_eq!(state.mounted_labels(), vec!["svc".to_string()]);
+    assert!(app.root.get("svc.ok").is_some());
+
+    let close = app.close_with_report(None).await;
+    assert_eq!(close.status, CloseStatus::Completed);
+    let _ = std::fs::remove_file(&cfg_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_reconcile_rejects_overlapping_restart_while_previous_gen_draining() {
+    let _guard = instance_lock().await;
+    assert_eq!(loaded_instances(), 0);
+
+    let cfg_path = temp_config(
+        "update-draining-guard",
+        "- id: svc\n  name: svc\n  config:\n    mode: ok\n",
+    );
+    let app = App::new();
+    set_lifecycle_policy_for(
+        &app.root,
+        LifecyclePolicy::new(None, Some(40), Some(40)).unwrap(),
+    )
+    .unwrap();
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_p = release.clone();
+    let ok_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ok_runs_p = ok_runs.clone();
+    let plugin = plugin_fn("svc-updatable", Inject::default(), move |ctx: Ctx, cfg| {
+        let release = release_p.clone();
+        let ok_runs = ok_runs_p.clone();
+        Box::pin(async move {
+            let mode = cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("ok");
+            if mode == "fail" {
+                ctx.effect(move |_| {
+                    let release = release.clone();
+                    Disposable::new(move || Box::pin(async move { release.notified().await }))
+                });
+                return Err("update-failed-with-slow-disposer".into());
+            }
+            ok_runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    });
+
+    let mut cfg = LoaderConfig::new(cfg_path.to_string_lossy().into_owned());
+    cfg.strict = false;
+    let state = load_with_source(app.root.clone(), cfg, Arc::new(StaticSource(plugin)))
+        .await
+        .expect("初装成功");
+    assert_eq!(ok_runs.load(Ordering::SeqCst), 1);
+
+    // 第 1 次配置更新触发 apply 失败 + disposer 超时进入后台清理。
+    std::fs::write(
+        &cfg_path,
+        "- id: svc\n  name: svc\n  config:\n    mode: fail\n",
+    )
+    .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), state.reload())
+        .await
+        .expect("失败更新必须受 dispose_timeout_ms 约束及时返回");
+    assert!(app.store.pending_background_cleanups() >= 1);
+
+    // 后台清理尚未结束时再次切回 mode: ok：必须拒绝并发更新重启，不得把 ok_runs 推到 2。
+    std::fs::write(
+        &cfg_path,
+        "- id: svc\n  name: svc\n  config:\n    mode: ok\n",
+    )
+    .unwrap();
+    let _ = state.reload().await;
+    assert_eq!(
+        ok_runs.load(Ordering::SeqCst),
+        1,
+        "旧代次后台清理未结束前不得并发重启新代次"
+    );
+    assert!(
+        state
+            .failed_rows()
+            .iter()
+            .any(|row| row.label == "svc" && row.message.contains("后台清理尚未完成")),
+        "应记录拒绝并发更新的失败原因: {:?}",
+        state.failed_rows()
+    );
+
+    // 放行后台清理后，再 reload 切一个新配置值即可恢复正常更新。
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), app.store.wait_background_cleanups())
+        .await
+        .expect("后台清理收敛");
+    std::fs::write(
+        &cfg_path,
+        "- id: svc\n  name: svc\n  config:\n    mode: recovered\n",
+    )
+    .unwrap();
+    let _ = state.reload().await;
+    assert_eq!(ok_runs.load(Ordering::SeqCst), 2);
+    assert!(state.failed_rows().is_empty());
+
+    let close = app.close_with_report(None).await;
+    assert_eq!(close.status, CloseStatus::Completed);
+    let _ = std::fs::remove_file(&cfg_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_disabled_group_row_does_not_rollback_when_child_dispose_times_out() {
+    let _guard = instance_lock().await;
+    assert_eq!(loaded_instances(), 0);
+
+    let cfg_path = temp_config(
+        "group-disable-timeout",
+        "- id: grp\n  name: group\n  group: true\n  config:\n    - id: slow-child\n      name: slow\n",
+    );
+    let app = App::new();
+    set_lifecycle_policy_for(
+        &app.root,
+        LifecyclePolicy::new(None, None, Some(40)).unwrap(),
+    )
+    .unwrap();
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_d = release.clone();
+    let plugin = plugin_fn("slow-group-child", Inject::default(), move |ctx: Ctx, _| {
+        let release = release_d.clone();
+        Box::pin(async move {
+            ctx.effect(move |_| {
+                let release = release.clone();
+                Disposable::new(move || Box::pin(async move { release.notified().await }))
+            });
+            Ok(())
+        })
+    });
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(StaticSource(plugin)),
+    )
+    .await
+    .expect("初装成功");
+    assert_eq!(state.mounted_labels(), vec!["slow-child".to_string()]);
+
+    // 停用组行：子行 disposer 超时后已从 mounted 摘除并登记 draining，
+    // `set_disabled` 返回 Err，但绝不能把组行 `grp` 回滚成 `disabled = false`。
+    let err = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.set_disabled("grp", Some(true)),
+    )
+    .await
+    .expect("停用组行必须受 dispose_timeout_ms 约束及时返回")
+    .expect_err("子行卸载超时应返回 Err");
+    assert!(err.contains("slow-child"));
+    assert!(state.mounted_labels().is_empty());
+
+    // 组行必须保持 disabled = true：此时即便放行后台清理再 sync()，也不会意外复活 slow-child。
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), app.store.wait_background_cleanups())
+        .await
+        .expect("后台清理收敛");
+    let after = state.sync().await;
+    assert!(after.failures.is_empty());
+    assert!(
+        state.mounted_labels().is_empty(),
+        "组行保持 disabled=true，sync 不得意外复活已停用子行"
+    );
 
     let close = app.close_with_report(None).await;
     assert_eq!(close.status, CloseStatus::Completed);

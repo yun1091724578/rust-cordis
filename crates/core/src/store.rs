@@ -408,6 +408,9 @@ struct CleanupCollector {
 struct BackgroundCleanupEntry {
     id: u64,
     ancestors: Arc<[u64]>,
+    fiber_name: String,
+    fiber_uid: u64,
+    error: Option<(u64, crate::fiber::CleanupError)>,
 }
 
 pub struct Store {
@@ -625,13 +628,34 @@ impl Store {
     pub(crate) fn register_background_cleanup(
         self: &Arc<Self>,
         ancestors: Arc<[u64]>,
+        fiber_name: String,
+        fiber_uid: u64,
+        error: Option<(u64, crate::fiber::CleanupError)>,
     ) -> crate::fiber::BackgroundCleanupGuard {
         let id = self.background_cleanup_sn.fetch_add(1, Ordering::SeqCst);
         self.background_cleanups
             .lock()
             .unwrap()
-            .push(BackgroundCleanupEntry { id, ancestors });
+            .push(BackgroundCleanupEntry {
+                id,
+                ancestors,
+                fiber_name,
+                fiber_uid,
+                error,
+            });
         crate::fiber::BackgroundCleanupGuard::new(Arc::clone(self), id)
+    }
+
+    pub(crate) fn set_background_cleanup_error(
+        &self,
+        id: u64,
+        seq: u64,
+        error: crate::fiber::CleanupError,
+    ) {
+        let mut list = self.background_cleanups.lock().unwrap();
+        if let Some(entry) = list.iter_mut().find(|entry| entry.id == id) {
+            entry.error = Some((seq, error));
+        }
     }
 
     pub(crate) fn finish_background_cleanup(&self, id: u64) {
@@ -654,6 +678,40 @@ impl Store {
             .iter()
             .filter(|entry| entry.ancestors.contains(&root_id))
             .count()
+    }
+
+    /// 原子抓取本子树当前仍在后台进行的清理任务数量与对应诊断错误，
+    /// 确保 `still_running == true` 时即便超时早于本次关闭发生，报告也不会出现空 `errors`。
+    pub(crate) fn background_cleanups_snapshot_under(
+        &self,
+        root_id: u64,
+    ) -> (usize, Vec<(u64, crate::fiber::CleanupError)>) {
+        let list = self.background_cleanups.lock().unwrap();
+        let mut count = 0usize;
+        let mut errors = Vec::new();
+        for entry in list
+            .iter()
+            .filter(|entry| entry.ancestors.contains(&root_id))
+        {
+            count += 1;
+            if let Some((seq, err)) = &entry.error {
+                errors.push((*seq, err.clone()));
+            } else {
+                errors.push((
+                    0,
+                    crate::fiber::CleanupError {
+                        fiber: entry.fiber_name.clone(),
+                        uid: entry.fiber_uid,
+                        kind: crate::fiber::CleanupErrorKind::Timeout,
+                        message: format!(
+                            "fiber `{}#{}` 仍有后台清理任务尚未完成",
+                            entry.fiber_name, entry.fiber_uid
+                        ),
+                    },
+                ));
+            }
+        }
+        (count, errors)
     }
 
     /// 等待本 `Store` 中全部被移交到后台的延后清理任务结束。

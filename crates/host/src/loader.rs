@@ -2488,9 +2488,14 @@ impl LoaderState {
         };
         let outcome = self.sync_inner().await;
         if !outcome.failures.is_empty() {
-            // 若该行已在本次对账中被实际拆卸（例如停用时触发 `dispose_timeout_ms` 超时），
+            // 若该行或其子行（目标为组行时）已在本次对账中被实际拆卸（例如停用时触发 `dispose_timeout_ms` 超时），
             // fiber 已进入不可逆的 Disposed 态且从 `mounted` 摘除，不能把 `tree` 回滚回启用态。
-            if !outcome.disposed.iter().any(|disposed| disposed == label) {
+            let subtree_labels = collect_subtree_labels(&self.tree_snapshot(), label);
+            let subtree_disposed = outcome
+                .disposed
+                .iter()
+                .any(|disposed| subtree_labels.contains(disposed));
+            if !subtree_disposed {
                 {
                     let _gate = self.config_gate.lock().unwrap();
                     if let Some(entry) = find_by_label(&mut self.tree.lock().unwrap(), label) {
@@ -3645,6 +3650,26 @@ impl LoaderState {
                     }
                 }
                 PatchWork::Update(config) => match state.fiber_of(&owned.label) {
+                    Some(fiber) if fiber.pending_background_cleanups() > 0 => {
+                        let prev = state
+                            .mounted
+                            .lock()
+                            .unwrap()
+                            .get(&owned.label)
+                            .map(|record| record.plugin.clone());
+                        let provides = state.declared_provides_for(
+                            &owned.label,
+                            &owned.entry,
+                            prev.as_ref(),
+                            None,
+                        );
+                        ActionOutcome::Failed {
+                            failure: LoadFailure::runtime(
+                                "旧代次后台清理尚未完成，拒绝并发更新重启",
+                            ),
+                            provides,
+                        }
+                    }
                     Some(fiber) => match fiber.update_with(config, true).await {
                         Ok(UpdateOutcome::Restarted) => {
                             // 记录跟着走：`no_save=true` 的提交已经由观察者推进过内存记录，
@@ -4081,7 +4106,7 @@ impl LoaderState {
     /// 这里是**首次挂载**的入口：`load` 与挂载相邻。换实例路径不走这里——
     /// 它先在拆卸之前 `load`（O5b-2），再调 [`Self::mount_loaded`] 复用那份 artifact。
     async fn mount_row(
-        &self,
+        self: &Arc<Self>,
         row: &FlatRow,
     ) -> std::result::Result<Mounted, (LoadFailure, Vec<String>)> {
         let admission = self.source.admission();
@@ -4101,7 +4126,7 @@ impl LoaderState {
     /// resolve → stage → open → ping 全部发生在拆卸旧实例**之前**，所以 artifact
     /// 由调用方先拿到，这里只负责挂载与失败自清理——绝不二次加载。
     async fn mount_loaded(
-        &self,
+        self: &Arc<Self>,
         row: &FlatRow,
         loaded: LoadedFile,
     ) -> std::result::Result<Mounted, (LoadFailure, Vec<String>)> {
@@ -4115,10 +4140,19 @@ impl LoaderState {
         fiber.settle().await;
         if let Some(error) = fiber.error() {
             // `apply` 失败留下的 fiber 仍然占着 runtime 表（`fibers_by_plugin_name` 看得见），
-            // 它的 effect 也没跑过清理。不在这里拆掉，每次失败挂载都会漏一条半成品 fiber。
+            // 必须按 App 的生命周期等待预算做结构化清理；若后台清理仍在运行（例如 T2 `OP_APPLY`
+            // 超时或半途 disposer 超时），登记到 `draining` 阻止后续对账旁路重挂。
             let provides =
                 self.declared_provides_for(&row.label, &row.entry, Some(&loaded.plugin), None);
-            fiber.dispose().await;
+            let close_report = fiber.dispose_with_report(None).await;
+            if close_report.still_running {
+                self.mark_row_draining(&row.label, fiber);
+                let detail = format!(
+                    "{error}（失败清理未在预算内完成，状态={}，后台清理仍在进行，清理完成前禁止重挂）",
+                    close_report.status.as_str()
+                );
+                return Err((LoadFailure::runtime(detail), provides));
+            }
             return Err((LoadFailure::runtime(error), provides));
         }
         // volatile 声明在**装载成功之后**取（对应 §8 M4-5 的"paths 在挂载成功后查询"）：
@@ -6172,9 +6206,12 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
 
     // 新实例失败：先把它拆干净——半途注册的副作用必须回收，
     // 否则它们会跟着回滚后的旧实例一起留在线上。
+    // 与旧实例卸载及对账替换采用同一安全红线：只要仍有未完成的后台清理
+    // （包括 T2 OP_APPLY 超时延后清理、半途 disposer 超时或受管任务未退出），
+    // 一律拒绝在不安全状态上挂载回滚旧实例，并登记 `draining_fiber` 阻断旁路重挂。
     let new_dispose = fiber.dispose_with_report(None).await;
     let dispose_report = merge_close_reports(dispose_report, new_dispose.clone());
-    if new_dispose.still_running && fiber.state() != FiberState::Disposed {
+    if new_dispose.still_running {
         let rollback_error = format!(
             "失败新实例的清理未在预算内完成（状态={}），后台清理仍在进行，拒绝挂载回滚实例",
             new_dispose.status.as_str()
@@ -6211,16 +6248,29 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
                 dispose_report,
             }
         }
-        // 回滚也失败：必须把两件事都报出来。此时线上**确实**是空的，
-        // 静默才是最坏的结果——调用方需要知道要人工介入。
-        Some(rollback_error) => SwapOutcome::Lost {
-            error: format!(
-                "{error}；且回滚失败：{rollback_error}（该条目当前没有可用实例，需要人工介入）"
-            ),
-            rollback_error,
-            dispose_report,
-            draining_fiber: None,
-        },
+        // 回滚也失败：必须先按预算清理失败的回滚 fiber（避免泄漏在 runtime 表或漏登 draining），
+        // 再把新旧两边的错误都报出来。此时线上**确实**是空的，静默才是最坏的结果。
+        Some(rollback_error) => {
+            let rollback_dispose = restored.dispose_with_report(None).await;
+            let dispose_report = merge_close_reports(dispose_report, rollback_dispose.clone());
+            let draining_fiber = rollback_dispose.still_running.then_some(restored);
+            let extra = if rollback_dispose.still_running {
+                format!(
+                    "；且回滚实例清理未在预算内完成（状态={}，后台清理仍在进行）",
+                    rollback_dispose.status.as_str()
+                )
+            } else {
+                String::new()
+            };
+            SwapOutcome::Lost {
+                error: format!(
+                    "{error}；且回滚失败：{rollback_error}{extra}（该条目当前没有可用实例，需要人工介入）"
+                ),
+                rollback_error,
+                dispose_report,
+                draining_fiber,
+            }
+        }
     }
 }
 
@@ -6590,6 +6640,30 @@ fn find_by_label_into<'a>(
         }
     }
     None
+}
+
+/// 收集指定行（及其全部后代，当目标为组行时）的结构行标集合，与 `stable_label` 同序。
+fn collect_subtree_labels(entries: &[Entry], target: &str) -> HashSet<String> {
+    fn visit(
+        entries: &[Entry],
+        target: &str,
+        in_subtree: bool,
+        ordinals: &mut HashMap<String, usize>,
+        out: &mut HashSet<String>,
+    ) {
+        for entry in entries {
+            let label = stable_label(entry, ordinals);
+            let matched = in_subtree || label == target;
+            if matched {
+                out.insert(label);
+            }
+            visit(&entry.children, target, matched, ordinals, out);
+        }
+    }
+    let mut ordinals = HashMap::new();
+    let mut out = HashSet::new();
+    visit(entries, target, false, &mut ordinals, &mut out);
+    out
 }
 
 /// 现在**应当**挂着的一行：叶子条目 + 稳定行标 + 派生挂载上下文 + 上下文输入。

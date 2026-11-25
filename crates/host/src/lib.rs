@@ -3361,11 +3361,10 @@ unsafe extern "C" fn host_ctx_effect(handle: u64, cb: u64, out: *mut Out) -> i32
                         let Some(instance) = instance else {
                             return;
                         };
-                        // 若 OP_APPLY 已超时并仍在阻塞运行，不能并发重入插件调用 OP_CLEANUP；
-                        // 按 LIFO 登记到 deferred_cleanups，待 OP_APPLY 退出后先于 OP_DISPOSE 补跑。
-                        if instance.apply_timed_out.load(Ordering::SeqCst)
-                            && *instance.lifecycle.lock().unwrap() > 0
-                        {
+                        // 若 OP_APPLY 曾超时，统一按 LIFO 压入 deferred_cleanups，由卸载收尾阶段
+                        // （严格在 wait_lifecycle_exclusive 之后、OP_DISPOSE 之前）按序补跑，
+                        // 避免中途 OP_APPLY 恰好退出导致剩余回调抢跑破坏 LIFO 逆序。
+                        if instance.apply_timed_out.load(Ordering::SeqCst) {
                             instance.deferred_cleanups.lock().unwrap().push(cb);
                             return;
                         }
@@ -4588,7 +4587,8 @@ async fn finish_instance_teardown(
     drain_deadline: Option<tokio::time::Instant>,
     mut outbound: Vec<Outbound>,
 ) -> TeardownStatus {
-    let Some(deadline) = drain_deadline else {
+    let Some(deadline) = drain_deadline.filter(|_| tokio::runtime::Handle::try_current().is_ok())
+    else {
         finish_instance_teardown_unbounded(
             handle,
             instance,
@@ -4759,7 +4759,9 @@ fn apply_via_with_keepalive_and_format(
                             drain_timeout.map(|limit| tokio::time::Instant::now() + limit);
                         let drain_timed_out = if instance.apply_timed_out.load(Ordering::SeqCst) {
                             *instance.lifecycle.lock().unwrap() > 0
-                        } else if let Some(deadline) = drain_deadline {
+                        } else if let (Some(deadline), Ok(_)) =
+                            (drain_deadline, tokio::runtime::Handle::try_current())
+                        {
                             tokio::time::timeout_at(deadline, wait_lifecycle_exclusive(&instance))
                                 .await
                                 .is_err()

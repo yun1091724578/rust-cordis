@@ -158,7 +158,7 @@ impl App {
             let store = self.store.clone();
             let root_ctx = self.root;
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let finalize_guard = root.defer_background_cleanup();
+                let finalize_guard = root.defer_background_cleanup_without_error();
                 let finalize_id = finalize_guard.id();
                 handle.spawn(async move {
                     root.wait_disposed().await;
