@@ -8,22 +8,20 @@
 > `Windows GNU` 是本地 `cargo.cmd` 的工具链；`Windows MSVC` 是 GitHub Actions
 > `windows-latest` 的默认目标，必须单独记录，不能拿 GNU 结果代替。
 
-当前基线：2026-11-07 的 `v0.1.1` 元数据补丁在
+当前基线：2026-11-25 在
+run [`45573749789`](https://github.com/yun1091724578/rust-cordis/actions/runs/45573749789)
+（main，commit `29a9c75`）三平台（Windows MSVC / Linux / macOS）完整通过
+`cargo test --workspace --all-targets --locked`、`cargo test --workspace --doc --locked`、
+`cargo xtask consumer`、`cargo xtask demo` 与 `cargo xtask e2e`，且 `lint`、`msrv`（rustc 1.85.0）与 `package` 全绿；
+Windows GNU 另有 2026-11-25 本地 `.\cargo.cmd test --workspace --offline`、`clippy -D warnings`、
+`xtask docs/matrix/inventory/arch` 全量通过。历史基线：`v0.1.1` 的
 run [`42332542433`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542433)
-（main，commit `8ab64f9`）和
-run [`42332542329`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542329)
-（tag `v0.1.1`）三平台通过。2026-11-18 的 WP1/WP2/WP2b 增量在 Windows GNU 本地
-`cargo test --workspace --all-targets --locked`、`cargo xtask demo` 与
-`cargo xtask docs/matrix/inventory` 全绿；这三条新保证的 MSVC/Linux/macOS
-列仍为 `待验证`。更早的 2026-11-02/03 基线是
-[`41460414477`](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)
+（commit `8ab64f9`）/ [`42332542329`](https://github.com/yun1091724578/rust-cordis/actions/runs/42332542329)，
+以及 2026-11-02/03 的 [`41460414477`](https://github.com/yun1091724578/rust-cordis/actions/runs/41460414477)
 / [`41560497289`](https://github.com/yun1091724578/rust-cordis/actions/runs/41560497289)。
-Windows MSVC / Linux / macOS 的 `test` job 均通过完整
-`cargo test --workspace --all-targets --locked`、`cargo xtask demo` 与
-`cargo xtask e2e`；Windows GNU 另有 2026-11-07 本地 `.\cargo.cmd xtask ci`
-（exit 0）全量通过。逐条保证的测试名见 `docs/support-contract.md`。
+逐条保证的测试名见 `docs/support-contract.md`。
 
-**这是快照，不是持续保证。** 上表状态对应上述 run / commit 与 2026-11-07 的 Windows GNU
+**这是快照，不是持续保证。** 上表状态对应上述 run / commit 与 2026-11-25 的 Windows GNU
 本地执行；此后任何提交都必须重跑三平台并更新本表，旧值不自动延续。Windows GNU 列没有
 CI run 记录，只有本地执行记录。
 
@@ -34,12 +32,12 @@ CI run 记录，只有本地执行记录。
 | 撞名的 `provide` 失败后不增长恢复栈 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/weak_audit.rs` |
 | 手动释放的 effect 不留在恢复栈 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/weak_audit.rs` |
 | 丢弃 `dispose` Future 后剩余恢复栈仍执行 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/lifecycle_races.rs` |
-| 结构化关闭报告汇总清理错误并按三段预算约束等待（超时仍保活同进程动态库） | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/close_report.rs` / `crates/host/tests/lifecycle_observability.rs` |
-| 热重载报告显式区分 Active 与 Pending 并汇总旧实例清理错误 | 通过 | 待验证 | 待验证 | 待验证 | `crates/host/tests/lifecycle_observability.rs` |
+| 结构化关闭报告汇总清理错误并按三段预算约束等待（超时仍保活同进程动态库） | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/close_report.rs` / `crates/host/tests/lifecycle_observability.rs` |
+| 热重载报告显式区分 Active 与 Pending 并汇总旧实例清理错误 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/lifecycle_observability.rs` |
 | 提供者先等直接消费者拆完再关资源 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/lifecycle_races.rs` |
 | 卸载行后宿主拆除时不残留插件对象 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/loader_release.rs` |
-| 流式失败端到端保留结构化错误类型（含跨 ABI 独立能力协商） | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/stream.rs` / `crates/abi/src/sdk.rs` / `crates/host/tests/abi_stream.rs` / `crates/host/tests/abi_stream_timeout.rs` |
-| 受管后台任务归属 fiber 生命周期（卸载取消并等待、完成摘除、防自锁与释放保序、透传 correlation） | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/spawn_scoped.rs` |
+| 流式失败端到端保留结构化错误类型（含跨 ABI 独立能力协商） | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/stream.rs` / `crates/abi/src/sdk.rs` / `crates/host/tests/abi_stream.rs` / `crates/host/tests/abi_stream_timeout.rs` |
+| 受管后台任务归属 fiber 生命周期（卸载取消并等待、完成摘除、防自锁与释放保序、透传 correlation） | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/spawn_scoped.rs` |
 | 取消后迟到的 `fulfill` 被拒绝 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/abi_m2c.rs` |
 | 未知 dispatch 的 abort 是可读错误 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/abi_m2c.rs` |
 | 同一键原地换值不重挂消费者 | 通过 | 通过 | 通过 | 通过 | `crates/components/tests/registry.rs` |
@@ -47,13 +45,13 @@ CI run 记录，只有本地执行记录。
 | 跨 ABI 错误能力位与结构化载荷（传输层） | 通过 | 通过 | 通过 | 通过 | `crates/abi/tests/error_format.rs` / `crates/abi/src/sdk.rs` / `crates/host/src/lib.rs` |
 | 配置 schema 在装载前可见（插件自述，不据此验证） | 通过 | 通过 | 通过 | 通过 | `crates/abi/tests/schema.rs` / `crates/macros/src/plugin.rs` / `crates/host/tests/loader_capabilities.rs` / `crates/cli/tests/inspect.rs` |
 | Pending 诊断给出精确缺失键与原因 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/pending_diagnostics.rs` / `crates/host/tests/loader_cycles.rs` / `crates/cli/tests/status.rs` |
-| loader.report 将下游 Pending 关联到已知失败的上游行 | 通过 | 待验证 | 待验证 | 待验证 | `crates/host/tests/host_policies.rs` |
-| 行级 required/optional 启动策略与来源、完整性、持久化状态错误独立处置 | 通过 | 待验证 | 待验证 | 待验证 | `crates/host/tests/host_policies.rs` |
-| 宿主管理调用入口的方法白名单与宿主绑定身份 | 通过 | 待验证 | 待验证 | 待验证 | `crates/core/tests/call_auth.rs` / `crates/host/tests/host_policies.rs` / `crates/host/tests/embedding_contract.rs` |
+| loader.report 将下游 Pending 关联到已知失败的上游行 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/host_policies.rs` |
+| 行级 required/optional 启动策略与来源、完整性、持久化状态错误独立处置 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/host_policies.rs` |
+| 宿主管理调用入口的方法白名单与宿主绑定身份 | 通过 | 通过 | 通过 | 通过 | `crates/core/tests/call_auth.rs` / `crates/host/tests/host_policies.rs` / `crates/host/tests/embedding_contract.rs` |
 | 看门狗超时撤销派发记录（四条路径） | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/abi_m2_timeout.rs` / `crates/host/tests/abi_outbound_timeout.rs` / `crates/host/tests/abi_outbound_dispatch_timeout.rs` / `crates/host/tests/abi_next_timeout.rs` / `crates/host/tests/dispatch_policy_scope.rs` |
-| 逐跳归因记录（iface-only，一次调用至多一条） | 通过 | 待验证 | 待验证 | 待验证 | `crates/host/tests/abi_trace_chain.rs` / `crates/host/tests/abi_trace_depth.rs` / `crates/host/tests/abi_trace_pending.rs` / `crates/host/tests/abi_trace_cancel.rs` / `crates/host/tests/abi_trace_scopes.rs` / `crates/host/tests/abi_trace_t1_suspend.rs` / `crates/host/tests/abi_trace_timeouts.rs` / `crates/host/tests/abi_trace_timeout_parent.rs` / `crates/host/tests/abi_trace_protocol.rs` / `crates/host/tests/abi_trace_unload.rs` / `crates/host/tests/abi_trace_panic_async.rs` / `crates/host/tests/abi_trace_panic_status_err.rs` / `crates/host/tests/panic_future_iface_sync.rs` / `crates/host/src/lib.rs` / `crates/core/src/trace_tests.rs` |
-| loader.report capabilities 行带 uid 与内容 sha256 | 通过 | 待验证 | 待验证 | 待验证 | `crates/host/tests/loader_capabilities_identity.rs` |
-| status --json 导出可调用服务的名字、版本与方法名集合 | 通过 | 待验证 | 待验证 | 待验证 | `crates/cli/tests/status.rs` / `crates/cli/tests/source_policy.rs` / `crates/core/tests/services_of.rs` |
+| 逐跳归因记录（iface-only，一次调用至多一条） | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/abi_trace_chain.rs` / `crates/host/tests/abi_trace_depth.rs` / `crates/host/tests/abi_trace_pending.rs` / `crates/host/tests/abi_trace_cancel.rs` / `crates/host/tests/abi_trace_scopes.rs` / `crates/host/tests/abi_trace_t1_suspend.rs` / `crates/host/tests/abi_trace_timeouts.rs` / `crates/host/tests/abi_trace_timeout_parent.rs` / `crates/host/tests/abi_trace_protocol.rs` / `crates/host/tests/abi_trace_unload.rs` / `crates/host/tests/abi_trace_panic_async.rs` / `crates/host/tests/abi_trace_panic_status_err.rs` / `crates/host/tests/panic_future_iface_sync.rs` / `crates/host/src/lib.rs` / `crates/core/src/trace_tests.rs` |
+| loader.report capabilities 行带 uid 与内容 sha256 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/loader_capabilities_identity.rs` |
+| status --json 导出可调用服务的名字、版本与方法名集合 | 通过 | 通过 | 通过 | 通过 | `crates/cli/tests/status.rs` / `crates/cli/tests/source_policy.rs` / `crates/core/tests/services_of.rs` |
 | 插件 panic 被截在 ABI 边界内 | 通过 | 通过 | 通过 | 通过 | `crates/abi/src/sdk.rs` / `crates/abi/tests/invalid_schema_entry.rs` |
 | 重复成功/失败/丢弃 Future/卸载/waterfall/stream/重载后资源计数回到基线 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/resource_baseline.rs` |
 | 多轮暂存后台账回到基线 | 通过 | 通过 | 通过 | 通过 | `crates/host/tests/staged.rs` |
