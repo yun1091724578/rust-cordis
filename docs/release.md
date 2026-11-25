@@ -12,6 +12,10 @@
 
 ## 当前版本
 
+- **`0.1.7`**（tag `v0.1.7`）：正确性加固、并发收敛修复、零行为变更重构与三平台/Miri/1M-soak 验证闭环（无新增破坏性变更）：
+  - **ABI 边界与内存安全（Miri 全量零 UB / 零告警）**：`HostApi::field_at` 改用 `checked_add` 防算术溢出；`Out::write` 显式校验非零 `cap` 下的空指针与 `isize::MAX` 上限；`sdk::attach` 改按字节拷贝读取前 8 字节 `(abi_version, size)` 消除未对齐解引用 UB；`DescSlot` 改用 `SyncDescPtr(*const PluginDesc)` 保持 strict provenance。
+  - **核心生命周期与并发收敛**：`Fiber::unload()` 入口通过 `is_disposed_quiescent()` 成为真正幂等操作，彻底消除滞后 `settle()` 将终态 `Disposed` 反弹回 `Unloading` 的竞态；`Fiber::set_state` 固化 `Disposed` 吸收态约束；`Store::on_commit_async` 支持在 `update_with` 内异步落盘，避免阻塞 Tokio worker；修复 `CancelToken` 多等待者唤醒、`Store` 运行时锁序与 `Context::once` 手动释放清理、`App::close` 重入保活。
+  - **宿主与工具链加固**：per-App 策略（方法白名单、启动策略、派发策略）下沉至 `Store` 扩展槽位，消除全局裸指针表；加固 `ffi_buf`、`staging`、`plan`、`js` 与 `patch` 边界；拆分 `crates/host/src/ffi_exports.rs` 与 `crates/host/src/loader/` 子模块；`nightly-soak` 接入 `rust-cordis-abi` Miri 门禁并跑通 1,000,000 cycles soak + dhat + Miri；`docs/platform-matrix.md` 更新为三平台实测通过基线。
 - **`0.1.6`**（tag `v0.1.6`）：
   - **结构化流错误与受管后台任务**：新增 `StreamSink::fail_error`、`HostApi::ctx_stream_fail_payload`（尾追加独立协商的结构化流错误入口，保留原 `ctx_stream_fail` 纯文本语义并对 `0.1.5` 及更早宿主自动降级）与 `abi::sdk::Ctx::stream_fail_payload`；新增 `Ctx::spawn_scoped` / `Fiber::spawn_scoped` / `SpawnScopedError` / `ReloadDeferred`（归属 fiber 生命周期的受管后台任务，自动取消等待、首次 poll 前后释放保序、防重入自锁与 ADR 0011 `correlation_id` 透传）。
     - **`ReloadDeferred` 调用方处理**：受管后台任务（`spawn_scoped` / 原生流任务）内部重入调用所属、祖先或提供者 fiber 的 `Fiber::restart` / `Fiber::update` / `Fiber::update_with` 触发重载时，为避免与 `dispose_native_tasks` 自锁且不误报尚未执行的新一代 `apply()` 成功，调用会返回 `Err`（`err.downcast_ref::<ReloadDeferred>()` 可精确匹配），而不返回 `Ok(())` 或 `UpdateOutcome::Restarted`。调用方应据此区分“重载已受理推迟”与“重载失败”：检查 `deferred.is_scheduled()`（为 `true` 表示收敛已移交后台任务，当前任务应尽快退出以放行卸载；为 `false` 表示当前无活跃 Tokio 运行时，需在外部显式调用 `fiber.settle().await`），并在受管任务外部通过 `fiber.settle().await` / `fiber.state()` / `fiber.error()` 观测新一代的最终收敛结果。
