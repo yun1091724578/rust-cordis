@@ -646,19 +646,16 @@ impl Context {
                 return Box::pin(async move { Err(err as crate::Error) });
             }
         }
-        let caller_uid = if traced {
-            self.fiber_opt()
-                .map(|fiber| fiber.uid())
-                .unwrap_or_else(|| {
-                    if self.has_attached_fiber() {
-                        crate::fiber::UID_DISPOSED
-                    } else {
-                        crate::fiber::UID_ROOT
-                    }
-                })
-        } else {
-            crate::fiber::UID_ROOT
-        };
+        let caller_uid = self
+            .fiber_opt()
+            .map(|fiber| fiber.uid())
+            .unwrap_or_else(|| {
+                if self.has_attached_fiber() {
+                    crate::fiber::UID_DISPOSED
+                } else {
+                    crate::fiber::UID_ROOT
+                }
+            });
         let (iface, caller_meta) = match self.iface_target(service) {
             Ok(pair) => pair,
             Err(err) => {
@@ -787,7 +784,11 @@ impl Context {
                 .map(|cid| crate::trace::enter_correlation(Some(cid.clone())));
             iface.call_stream(caller_meta, method.to_string(), args, sink.clone())
         };
-        if traced || correlation_id.is_some() || caller_uid != crate::fiber::UID_ROOT {
+        if traced
+            || correlation_id.is_some()
+            || caller_uid != crate::fiber::UID_ROOT
+            || crate::trace::current_caller_uid() != caller_uid
+        {
             future = crate::trace::scope_caller(future, caller_uid, correlation_id);
         }
         // 提供者的前半段要**现在就跑到第一个挂起点**：同步实现的提供者（含一切跨 ABI 的）
@@ -979,7 +980,11 @@ impl Context {
                 // 会看到 slot 还是 None，随后 hook 仍在表里，下一次派发就会再跑一次。
                 // `fired` 覆盖这个窗口；slot 为空时直接不表态。
                 if fired.swap(true, Ordering::SeqCst) {
-                    return None;
+                    return if call.next.is_linked() {
+                        call.next.call(call.args).await
+                    } else {
+                        None
+                    };
                 }
                 let taken = slot.lock().unwrap().take();
                 if let Some(disposable) = taken {
@@ -997,6 +1002,13 @@ impl Context {
                     handle.spawn(async move {
                         inner.run().await;
                     });
+                } else {
+                    // 无 Tokio 运行时：Store::on 的 disposer 是同步完成的，单次 poll 即可摘除。
+                    let fut = inner.run();
+                    tokio::pin!(fut);
+                    let waker = std::task::Waker::noop();
+                    let mut cx = std::task::Context::from_waker(waker);
+                    let _ = std::future::Future::poll(fut, &mut cx);
                 }
             } else {
                 *guard = Some(inner);

@@ -2207,7 +2207,19 @@ unsafe fn dispatch(host: &'static HostApi, ctx: u64, op: u32, a: Blob, target: &
             target.write(serde_json::json!({ "ret": paths }).to_string().as_bytes())
         }
         OP_VOLATILE_APPLY => {
-            let payload: Json = serde_json::from_slice(a.as_bytes()).unwrap_or(Json::Null);
+            let bytes = match a.try_as_bytes() {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    return write_error(
+                        target,
+                        host.error_format(),
+                        &format!("OP_VOLATILE_APPLY 载荷非法: {reason}"),
+                        "bad_payload",
+                        "protocol",
+                    );
+                }
+            };
+            let payload: Json = serde_json::from_slice(bytes).unwrap_or(Json::Null);
             match apply_volatile(ctx, &payload) {
                 Ok(()) => target.write(b""),
                 Err(message) => write_error(
@@ -2220,7 +2232,18 @@ unsafe fn dispatch(host: &'static HostApi, ctx: u64, op: u32, a: Blob, target: &
             }
         }
         OP_APPLY => {
-            let bytes = a.as_bytes();
+            let bytes = match a.try_as_bytes() {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    return write_error(
+                        target,
+                        host.error_format(),
+                        &format!("OP_APPLY 载荷非法: {reason}"),
+                        "bad_payload",
+                        "protocol",
+                    );
+                }
+            };
             let config: Json = if bytes.is_empty() {
                 Json::Null
             } else {
@@ -2272,7 +2295,19 @@ unsafe fn dispatch(host: &'static HostApi, ctx: u64, op: u32, a: Blob, target: &
             target.write(b"")
         }
         OP_CALLBACK => {
-            let payload: Json = serde_json::from_slice(a.as_bytes()).unwrap_or(Json::Null);
+            let bytes = match a.try_as_bytes() {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    return write_error(
+                        target,
+                        host.error_format(),
+                        &format!("OP_CALLBACK 载荷非法: {reason}"),
+                        "bad_payload",
+                        "protocol",
+                    );
+                }
+            };
+            let payload: Json = serde_json::from_slice(bytes).unwrap_or(Json::Null);
             let id = payload.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
             let input = CallbackInput::parse(&payload);
             match registry().dispatch(id, input) {
@@ -2292,7 +2327,19 @@ unsafe fn dispatch(host: &'static HostApi, ctx: u64, op: u32, a: Blob, target: &
             }
         }
         OP_CLEANUP => {
-            let payload: Json = match serde_json::from_slice(a.as_bytes()) {
+            let bytes = match a.try_as_bytes() {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    return write_error(
+                        target,
+                        host.error_format(),
+                        &format!("OP_CLEANUP 载荷非法: {reason}"),
+                        "bad_payload",
+                        "protocol",
+                    );
+                }
+            };
+            let payload: Json = match serde_json::from_slice(bytes) {
                 Ok(value) => value,
                 Err(err) => {
                     return write_error(
@@ -3944,5 +3991,46 @@ mod tests {
             dropped_c.load(Ordering::SeqCst) && dropped_d.load(Ordering::SeqCst),
             "dispose_owner 必须释放剩余全部回调"
         );
+    }
+
+    #[test]
+    fn r3_p1_dispatch_rejects_malformed_blob_and_plugin_desc_handles_null() {
+        assert!(unsafe { crate::PluginDesc::field_at::<u32>(std::ptr::null(), 0) }.is_none());
+
+        let mut buf = [0u8; 256];
+        let mut out = Out {
+            ptr: buf.as_mut_ptr(),
+            cap: buf.len(),
+            len: 0,
+        };
+        let bad_blobs = [
+            Blob {
+                ptr: std::ptr::null(),
+                len: 16,
+            },
+            Blob {
+                ptr: b"x".as_ptr(),
+                len: (isize::MAX as usize) + 1,
+            },
+        ];
+        let dummy_host: &'static HostApi = Box::leak(Box::new(unsafe { std::mem::zeroed() }));
+        for bad in bad_blobs {
+            assert!(unsafe { bad.try_as_bytes() }.is_err());
+            for op in [
+                crate::OP_APPLY,
+                crate::OP_CALLBACK,
+                crate::OP_VOLATILE_APPLY,
+                crate::OP_CLEANUP,
+            ] {
+                out.len = 0;
+                let rc = unsafe { dispatch(dummy_host, 1, op, bad, &mut out) };
+                assert_eq!(rc, crate::STATUS_ERR);
+                let msg = std::str::from_utf8(&buf[..out.len]).unwrap_or("");
+                assert!(
+                    msg.contains("Blob"),
+                    "op {op} 遇到畸形 Blob 必须显式按 Blob 校验拒绝，实际: {msg}"
+                );
+            }
+        }
     }
 }

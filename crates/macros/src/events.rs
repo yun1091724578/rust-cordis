@@ -46,8 +46,10 @@ pub fn events(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         };
         let variant_ident = &variant.ident;
         let const_ident = attr::screaming_snake(variant_ident);
-        let dispatch_ident = format_ident!("{}", attr::snake_case(variant_ident));
-        let listener_ident = format_ident!("on_{}", attr::snake_case(variant_ident));
+        let snake = attr::snake_case(variant_ident);
+        let dispatch_ident =
+            syn::parse_str::<syn::Ident>(&snake).unwrap_or_else(|_| format_ident!("r#{}", snake));
+        let listener_ident = format_ident!("on_{}", snake);
 
         let cfg_attrs: Vec<_> = variant
             .attrs

@@ -79,6 +79,23 @@ pub enum HookCtx {
 }
 
 impl HookCtx {
+    pub(crate) fn from_ctx(ctx: &Ctx) -> Self {
+        let is_root_fiber = ctx
+            .fiber_opt()
+            .is_some_and(|fiber| fiber.uid() == crate::fiber::UID_ROOT);
+        if is_root_fiber && ctx.parent.is_none() {
+            Self::Weak(Arc::downgrade(ctx))
+        } else if is_root_fiber {
+            let (detached, root) = ctx.detach_root_for_hook();
+            Self::DerivedRoot {
+                ctx: detached,
+                root,
+            }
+        } else {
+            Self::Strong(ctx.clone())
+        }
+    }
+
     pub(crate) fn upgrade(&self) -> Option<Ctx> {
         match self {
             Self::Strong(ctx) => Some(ctx.clone()),
@@ -300,22 +317,8 @@ fn run_waterfall_rev(
 /// `Store → Hook → root ctx → Store`。普通（有 fiber 的）注册仍强持，派生作用域
 /// ctx 的生命周期因此与 hook 一致。
 pub fn owned(ctx: &Ctx, handler: Handler, global: bool, sn: u64) -> Hook {
-    let is_root_fiber = ctx
-        .fiber_opt()
-        .is_some_and(|fiber| fiber.uid() == crate::fiber::UID_ROOT);
-    let owner = if is_root_fiber && ctx.parent.is_none() {
-        HookCtx::Weak(Arc::downgrade(ctx))
-    } else if is_root_fiber {
-        let (detached, root) = ctx.detach_root_for_hook();
-        HookCtx::DerivedRoot {
-            ctx: detached,
-            root,
-        }
-    } else {
-        HookCtx::Strong(ctx.clone())
-    };
     Hook {
-        ctx: owner,
+        ctx: HookCtx::from_ctx(ctx),
         handler,
         global,
         sn,

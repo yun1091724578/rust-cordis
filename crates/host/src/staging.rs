@@ -60,16 +60,42 @@ impl Drop for StagedFile {
     }
 }
 
-/// 创建或复用当前进程独占的私有暂存目录（Unix 上强制 `0o700`，非递归原子建目录，
-/// 防止在共享临时目录中被预先占位或符号链接劫持，也避免污染只读/可被外部篡改的插件源目录）。
+static STAGING_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+/// 返回当前进程正在使用的私有暂存目录（若有），供诊断/示例校验暂存副本回收情况。
+pub fn active_staging_dir() -> Option<PathBuf> {
+    STAGING_DIR
+        .get()
+        .and_then(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
+#[cfg(unix)]
+fn is_owned_private_dir(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    let euid = unsafe { geteuid() };
+    meta.is_dir()
+        && !meta.file_type().is_symlink()
+        && meta.uid() == euid
+        && (meta.mode() & 0o077) == 0
+}
+
+#[cfg(not(unix))]
+fn is_owned_private_dir(meta: &std::fs::Metadata) -> bool {
+    meta.is_dir() && !meta.file_type().is_symlink()
+}
+
+/// 创建或复用当前进程独占的私有暂存目录（Unix 上强制 `0o700` 且复用时复核 `uid`/`mode`，
+/// 非递归原子建目录，防止在共享临时目录中被预先占位、tmp 清理后抢注或符号链接劫持）。
 fn private_staging_dir() -> Result<PathBuf> {
-    static STAGING_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
     static DIR_NONCE: AtomicU64 = AtomicU64::new(0);
     let slot = STAGING_DIR.get_or_init(|| Mutex::new(None));
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dir) = guard.as_ref() {
         if let Ok(meta) = std::fs::symlink_metadata(dir) {
-            if meta.is_dir() && !meta.file_type().is_symlink() {
+            if is_owned_private_dir(&meta) {
                 return Ok(dir.clone());
             }
         }
@@ -166,6 +192,40 @@ pub fn stage_plugin(path: &Path, revision: u64) -> Result<PathBuf> {
 /// 这里是"任意插件安装"真正落地的地方。本实现只做最朴素的文件解析；
 /// 换成一个包管理器（npm 风格的 `node_modules` 解析、OCI、内置 registry）
 /// 只需要替换这一个函数——内核与 ABI 都不需要改。
+fn plugin_path_candidates(stem: &str) -> Vec<PathBuf> {
+    let raw = Path::new(stem);
+    let mut files = vec![PathBuf::from(stem)];
+    let parent = raw.parent();
+    let file_name = raw.file_name().and_then(|n| n.to_str());
+    let join_name = |name: String| -> PathBuf {
+        match parent {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+            _ => PathBuf::from(name),
+        }
+    };
+    if cfg!(windows) {
+        files.push(PathBuf::from(format!("{stem}.dll")));
+    } else if cfg!(target_os = "macos") {
+        files.push(PathBuf::from(format!("{stem}.dylib")));
+        // Cargo 的 cdylib 产物在 macOS 上带 `lib` 前缀：前缀只能加在文件名段上，保留父目录。
+        if let Some(name) = file_name {
+            files.push(join_name(format!("lib{name}.dylib")));
+        }
+    } else {
+        files.push(PathBuf::from(format!("{stem}.so")));
+        // 也接受 `lib<name>.so` 的约定：前缀只能加在文件名段上，避免把 `/opt/a` 变成 `lib/opt/a.so`。
+        if let Some(name) = file_name {
+            files.push(join_name(format!("lib{name}.so")));
+        }
+    }
+    files
+}
+
+#[cfg(test)]
+pub(crate) fn plugin_path_candidates_for_test(stem: &str) -> Vec<PathBuf> {
+    plugin_path_candidates(stem)
+}
+
 pub fn resolve_plugin_path(name: &str, search: &[PathBuf]) -> Result<PathBuf> {
     let raw = Path::new(name);
     if raw
@@ -174,24 +234,21 @@ pub fn resolve_plugin_path(name: &str, search: &[PathBuf]) -> Result<PathBuf> {
     {
         return Err(format!("插件名 \"{name}\" 不允许包含父目录跳转 (..)").into());
     }
-    let candidates = |stem: &str| {
-        let mut files = vec![PathBuf::from(stem)];
-        if cfg!(windows) {
-            files.push(PathBuf::from(format!("{stem}.dll")));
-        } else if cfg!(target_os = "macos") {
-            files.push(PathBuf::from(format!("{stem}.dylib")));
-            // Cargo 的 cdylib 产物在 macOS 上也带 `lib` 前缀。
-            files.push(PathBuf::from(format!("lib{stem}.dylib")));
-        } else {
-            files.push(PathBuf::from(format!("{stem}.so")));
-            // 也接受 `lib<name>.so` 的约定。
-            files.push(PathBuf::from(format!("lib{stem}.so")));
-        }
-        files
-    };
+    // Windows 上 `\foo`（无盘符根路径）与 `D:foo`（驱动器相对路径）均满足 `!is_absolute()`，
+    // 但 `dir.join(candidate)` 会丢弃 `dir` 导致逃逸出 `search` 目录；显式拒绝。
+    if !raw.is_absolute()
+        && raw.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("插件名 \"{name}\" 不允许使用无盘符根路径或驱动器相对路径").into());
+    }
     // 显式绝对路径直接按路径解析，不拼接到 search 目录。
     if raw.is_absolute() {
-        for candidate in candidates(name) {
+        for candidate in plugin_path_candidates(name) {
             if candidate.is_file() {
                 return Ok(candidate);
             }
@@ -200,14 +257,14 @@ pub fn resolve_plugin_path(name: &str, search: &[PathBuf]) -> Result<PathBuf> {
     }
     // 优先搜索显式配置的 search 目录（如 `--plugin-dir` / 配置目录），避免被 CWD 劫持。
     for dir in search {
-        for candidate in candidates(name) {
+        for candidate in plugin_path_candidates(name) {
             let path = dir.join(candidate);
             if path.is_file() {
                 return Ok(path);
             }
         }
     }
-    for candidate in candidates(name) {
+    for candidate in plugin_path_candidates(name) {
         if candidate.is_file() {
             return Ok(candidate);
         }

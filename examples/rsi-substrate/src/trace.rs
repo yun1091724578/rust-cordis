@@ -133,7 +133,9 @@ impl AsyncJsonlSink {
 
     pub fn marker(&self, phase: &str) {
         self.emit_dropped_summary();
-        self.enqueue(json!({ "kind": "marker", "phase": phase }));
+        let _ = self
+            .tx
+            .send(AsyncMsg::Line(json!({ "kind": "marker", "phase": phase })));
     }
 
     pub fn dropped_count(&self) -> u64 {
@@ -150,14 +152,24 @@ impl AsyncJsonlSink {
     }
 
     fn emit_dropped_summary(&self) {
-        let total = self.dropped.load(Ordering::Acquire);
-        let prev = self.reported_dropped.swap(total, Ordering::AcqRel);
-        if total > prev {
-            let _ = self.tx.send(AsyncMsg::Line(json!({
-                "kind": "dropped",
-                "dropped": total - prev,
-                "total_dropped": total,
-            })));
+        loop {
+            let total = self.dropped.load(Ordering::Acquire);
+            let prev = self.reported_dropped.load(Ordering::Acquire);
+            if total <= prev {
+                return;
+            }
+            if self
+                .reported_dropped
+                .compare_exchange(prev, total, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = self.tx.send(AsyncMsg::Line(json!({
+                    "kind": "dropped",
+                    "dropped": total - prev,
+                    "total_dropped": total,
+                })));
+                return;
+            }
         }
     }
 
@@ -201,21 +213,21 @@ impl TraceSink for AsyncJsonlSink {
     }
 }
 
-/// Records inside one marker window, excluding markers.
+/// Records inside one marker window, excluding markers and dropped summary lines.
 pub fn window(lines: &[Value], phase: &str) -> Vec<Value> {
     let mut started = false;
     let mut rows = Vec::new();
     for line in lines {
         if line["kind"] == "marker" {
+            if started {
+                break;
+            }
             if line["phase"] == phase {
-                if started {
-                    break;
-                }
                 started = true;
             }
             continue;
         }
-        if started {
+        if started && line["kind"] != "dropped" {
             rows.push(line.clone());
         }
     }
@@ -270,4 +282,29 @@ pub fn leaf_errors_by_session(rows: &[Value]) -> HashMap<String, HashMap<String,
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r3_p2_window_stops_at_any_next_marker_and_skips_dropped_summary() {
+        let lines = vec![
+            json!({"kind": "marker", "phase": "phase1"}),
+            json!({"kind": "call", "name": "in_phase1"}),
+            json!({"kind": "dropped", "dropped": 2, "total_dropped": 2}),
+            json!({"kind": "marker", "phase": "phase1-end"}),
+            json!({"kind": "call", "name": "after_phase1"}),
+            json!({"kind": "marker", "phase": "phase2"}),
+            json!({"kind": "call", "name": "in_phase2"}),
+        ];
+        let p1 = window(&lines, "phase1");
+        assert_eq!(
+            p1.len(),
+            1,
+            "window 必须在下一个任意 marker 处截断且过滤 dropped 摘要行: {p1:?}"
+        );
+        assert_eq!(p1[0]["name"], json!("in_phase1"));
+    }
 }

@@ -1042,6 +1042,12 @@ fn verify_dir_with_mode(dir: &Path, require_v2: bool) -> Result<SealManifest, Ve
     if !is_sha256(&manifest.smoke_evidence_sha256) || manifest.smoke_evidence_bytes == 0 {
         errors.push("smoke.evidence 的 SHA256 / 大小非法".to_string());
     }
+    if manifest.smoke_config == manifest.smoke_evidence {
+        errors.push(format!(
+            "smoke.config 与 smoke.evidence 不能指向同一路径：{}",
+            manifest.smoke_config
+        ));
+    }
     verify_sealed_file(
         dir,
         "smoke.config",
@@ -1058,6 +1064,24 @@ fn verify_dir_with_mode(dir: &Path, require_v2: bool) -> Result<SealManifest, Ve
         Some(manifest.smoke_evidence_bytes),
         &mut errors,
     );
+    if safe_relative_path(&manifest.smoke_evidence) && manifest.smoke_evidence.starts_with("smoke/")
+    {
+        match fs::read_to_string(dir.join(&manifest.smoke_evidence)) {
+            Ok(evidence_text) => {
+                if let Err(err) = verify_inspect_output(&evidence_text) {
+                    errors.push(format!("smoke.evidence 内容校验失败：{err}"));
+                }
+            }
+            Err(err) => {
+                if !errors.iter().any(|e| e.contains(&manifest.smoke_evidence)) {
+                    errors.push(format!(
+                        "读取 smoke.evidence {} 为 UTF-8 失败：{err}",
+                        manifest.smoke_evidence
+                    ));
+                }
+            }
+        }
+    }
 
     let mut seen = BTreeSet::new();
     let mut expected_sums = BTreeMap::new();
@@ -2339,5 +2363,80 @@ mod tests {
                 "符号链接 SHA256SUMS 必须显式报符号链接错误：{sym_errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn r3_p3_seal_verify_validates_smoke_evidence_content_and_distinct_paths() {
+        // Case 1: Tampered smoke/inspect.txt with matching SHA256 in seal.json + SHA256SUMS
+        // (claiming `mounted = 1` instead of valid `mounted = 0` + expected plugin rows) must fail.
+        let tree_bad = TempTree::new("bad-inspect-content");
+        let _ = fixture(&tree_bad.path);
+        let bad_inspect = b"mounted = 1\n";
+        fs::write(tree_bad.path.join("smoke/inspect.txt"), bad_inspect).unwrap();
+        let bad_sha = sha256_hex(bad_inspect);
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(tree_bad.path.join(SEAL_FILE)).unwrap())
+                .unwrap();
+        manifest["smoke"]["evidence_sha256"] = serde_json::json!(bad_sha);
+        manifest["smoke"]["evidence_bytes"] = serde_json::json!(bad_inspect.len() as u64);
+        fs::write(
+            tree_bad.path.join(SEAL_FILE),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let sums = fs::read_to_string(tree_bad.path.join(SUMS_FILE)).unwrap();
+        let updated_sums: String = sums
+            .lines()
+            .map(|line| {
+                if line.ends_with("  smoke/inspect.txt") {
+                    format!("{bad_sha}  smoke/inspect.txt")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(tree_bad.path.join(SUMS_FILE), updated_sums).unwrap();
+
+        let errs = verify_dir(&tree_bad.path).expect_err("非法 smoke.evidence 内容必须被拒绝");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("mounted = 0") || e.contains("inspect")),
+            "verify_dir 必须校验 smoke.evidence 的 inspect 内容：{errs:?}"
+        );
+
+        // Case 2: smoke.config == smoke.evidence collapsing both into smoke/cordis.yml must fail.
+        let tree_dup = TempTree::new("dup-smoke-path");
+        let _ = fixture(&tree_dup.path);
+        fs::remove_file(tree_dup.path.join("smoke/inspect.txt")).unwrap();
+        let mut manifest2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(tree_dup.path.join(SEAL_FILE)).unwrap())
+                .unwrap();
+        manifest2["smoke"]["evidence"] = manifest2["smoke"]["config"].clone();
+        manifest2["smoke"]["evidence_sha256"] = manifest2["smoke"]["config_sha256"].clone();
+        manifest2["smoke"]["evidence_bytes"] = manifest2["smoke"]["config_bytes"].clone();
+        fs::write(
+            tree_dup.path.join(SEAL_FILE),
+            serde_json::to_string_pretty(&manifest2).unwrap(),
+        )
+        .unwrap();
+        let sums2 = fs::read_to_string(tree_dup.path.join(SUMS_FILE)).unwrap();
+        let filtered_sums: String = sums2
+            .lines()
+            .filter(|line| !line.ends_with("  smoke/inspect.txt"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(tree_dup.path.join(SUMS_FILE), filtered_sums).unwrap();
+
+        let errs2 =
+            verify_dir(&tree_dup.path).expect_err("smoke.config == smoke.evidence 必须被拒绝");
+        assert!(
+            errs2.iter().any(|e| e.contains("smoke.config")
+                || e.contains("相同")
+                || e.contains("mounted = 0")),
+            "verify_dir 必须拒绝 smoke.config 与 smoke.evidence 指向同一文件：{errs2:?}"
+        );
     }
 }

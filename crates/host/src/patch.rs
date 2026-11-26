@@ -1174,8 +1174,14 @@ fn rewrite_tag_outside_quotes(input: &str, from: &str, to: &str) -> String {
             i = next;
             continue;
         }
-        // 引号与注释之外。
-        if byte == b'\'' || byte == b'"' {
+        // 引号与注释之外：YAML 引号标量只能出现在标量起点（行首、空白或结构分隔符之后），
+        // 不能把无引号标量里的撇号（如 `note: don't break`）误判成跨行单引号字符串。
+        let scalar_start = i == 0
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b'\n' | b'\r' | b':' | b'-' | b'[' | b'{' | b','
+            );
+        if (byte == b'\'' || byte == b'"') && scalar_start {
             quote = Some(byte);
             out.push(byte as char);
             i += 1;

@@ -138,3 +138,102 @@ async fn plugin_macro_apply_hook_runs_and_config_is_validated() {
     assert!(!err.issues.is_empty(), "解析失败要给出可读的 issue：{err}");
     assert!(err.to_string().contains("concurrency"), "{err}");
 }
+
+#[cordis::events]
+pub enum KeywordEvents {
+    #[event("r3/type")]
+    Type(String),
+}
+
+#[cordis::service(name = "r3kw", version = 1)]
+pub trait RawIdentService {
+    async fn r#type(&self) -> Result<String, String>;
+}
+
+struct RawIdentImpl;
+
+#[cordis::service_impl]
+impl RawIdentService for RawIdentImpl {
+    async fn r#type(&self) -> Result<String, String> {
+        Ok("ok-type".to_string())
+    }
+}
+
+fn default_flag() -> String {
+    "defaulted".to_string()
+}
+
+#[config]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefaultedConfig {
+    #[serde(default = "default_flag")]
+    pub flag: String,
+}
+
+#[plugin(
+    name = "r3-defaulted-plugin",
+    volatile("flag"),
+    config(DefaultedConfig)
+)]
+#[derive(Clone)]
+pub struct DefaultedPlugin {
+    pub saw_volatile: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl DefaultedPlugin {
+    async fn apply(&self, ctx: Ctx, _config: Config) -> cordis::core::Result<()> {
+        *self.saw_volatile.lock().unwrap() = ctx
+            .volatile("flag")
+            .and_then(|v| v.get().as_str().map(str::to_string));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn r3_p3_macros_keyword_event_raw_ident_method_and_config_defaults() {
+    let app = App::new();
+
+    // 1. Keyword variant `Type` in `#[cordis::events]` compiles and dispatches.
+    let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+    let _h = KeywordEvents::on_type(&app.root, {
+        let seen = seen.clone();
+        move |val| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                *seen.lock().unwrap() = Some(val);
+                Ok(())
+            })
+        }
+    });
+    KeywordEvents::r#type(&app.root, "hello".to_string()).await;
+    assert_eq!(*seen.lock().unwrap(), Some("hello".to_string()));
+
+    // 2. Raw-identifier method `r#type` exposes wire method name `"type"` (without `"r#"`).
+    let _svc = RawIdentServiceService::provide(&app.root, Arc::new(RawIdentImpl)).unwrap();
+    let res = app
+        .root
+        .call_iface("r3kw@1", 1, "type", json!([]))
+        .await
+        .unwrap();
+    assert_eq!(res, json!("ok-type"));
+
+    // 3. `#[cordis::plugin(volatile("flag"), config(DefaultedConfig))]` preserves serde defaults
+    //    in `fiber.resolved()` and creates the `VolatileRef`.
+    let saw_volatile = Arc::new(std::sync::Mutex::new(None));
+    let fiber = app
+        .plugin(
+            Arc::new(DefaultedPlugin {
+                saw_volatile: saw_volatile.clone(),
+            }),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fiber.resolved(), json!({ "flag": "defaulted" }));
+    assert_eq!(
+        *saw_volatile.lock().unwrap(),
+        Some("defaulted".to_string()),
+        "serde 默认字段必须落入 fiber.resolved() 并成功构造 VolatileRef"
+    );
+    app.close().await;
+}

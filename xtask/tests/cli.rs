@@ -341,10 +341,19 @@ fn seal_verify_accepts_a_complete_seal() {
         std::fs::write(dir.join("plugins").join(name), b"abc").unwrap();
     }
     std::fs::write(dir.join("smoke/cordis.yml"), b"abc").unwrap();
-    std::fs::write(dir.join("smoke/inspect.txt"), b"abc").unwrap();
+    let evidence = concat!(
+        "mounted = 0\n",
+        "- greeting (plugin: greeting)\n",
+        "- hello (plugin: hello)\n",
+        "- harness (plugin: harness-tool)\n",
+    );
+    let evidence_sha = sha256_hex(evidence.as_bytes());
+    let evidence_bytes = evidence.len();
+    std::fs::write(dir.join("smoke/inspect.txt"), evidence).unwrap();
     std::fs::write(
         dir.join("seal.json"),
-        r#"{
+        format!(
+            r#"{{
   "format": "cordis-plugin-seal/2",
   "created_unix": 0,
   "workspace_version": "0.1.0",
@@ -352,26 +361,27 @@ fn seal_verify_accepts_a_complete_seal() {
   "error_format": 1,
   "target": "test",
   "profile": "release",
-  "toolchain": {"rustc": "rustc test", "cargo": "cargo test", "rustflags": ""},
-  "source": {"kind": "workspace-tree", "sha256": "41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d", "files": 1},
-  "host": {"workspace_version": "0.1.0", "source_sha256": "41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d", "source_files": 1},
+  "toolchain": {{"rustc": "rustc test", "cargo": "cargo test", "rustflags": ""}},
+  "source": {{"kind": "workspace-tree", "sha256": "41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d", "files": 1}},
+  "host": {{"workspace_version": "0.1.0", "source_sha256": "41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d", "source_files": 1}},
   "artifacts": [
-    {"package": "plugin-greeting", "crate": "greeting", "path": "plugins/greeting.bin", "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "bytes": 3},
-    {"package": "plugin-hello", "crate": "hello", "path": "plugins/hello.bin", "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "bytes": 3},
-    {"package": "plugin-harness-tool", "crate": "harness_tool", "path": "plugins/harness_tool.bin", "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "bytes": 3}
+    {{"package": "plugin-greeting", "crate": "greeting", "path": "plugins/greeting.bin", "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "bytes": 3}},
+    {{"package": "plugin-hello", "crate": "hello", "path": "plugins/hello.bin", "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "bytes": 3}},
+    {{"package": "plugin-harness-tool", "crate": "harness_tool", "path": "plugins/harness_tool.bin", "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "bytes": 3}}
   ],
-  "smoke": {
+  "smoke": {{
     "config": "smoke/cordis.yml",
     "config_sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
     "config_bytes": 3,
     "evidence": "smoke/inspect.txt",
-    "evidence_sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-    "evidence_bytes": 3,
+    "evidence_sha256": "{evidence_sha}",
+    "evidence_bytes": {evidence_bytes},
     "checked": true,
     "method": "test"
-  }
-}
-"#,
+  }}
+}}
+"#
+        ),
     )
     .unwrap();
     let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -431,7 +441,7 @@ fn seal_verify_accepts_a_complete_seal() {
     }
     sums.push_str(&format!("{}  allow-list.json\n", sha256_hex(&allow_bytes)));
     sums.push_str(&format!("{sha}  smoke/cordis.yml\n"));
-    sums.push_str(&format!("{sha}  smoke/inspect.txt\n"));
+    sums.push_str(&format!("{evidence_sha}  smoke/inspect.txt\n"));
     std::fs::write(dir.join("SHA256SUMS"), sums).unwrap();
 
     let output = Command::new(bin())

@@ -319,7 +319,7 @@ pub fn test_exists_at(root: &std::path::Path, path: &str, name: &str) -> bool {
                 {
                     saw_test = true;
                 }
-                if previous == "#[ignore]" || previous.starts_with("#[ignore(") {
+                if is_ignore_attr(previous) {
                     saw_ignore = true;
                 }
                 continue;
@@ -331,6 +331,18 @@ pub fn test_exists_at(root: &std::path::Path, path: &str, name: &str) -> bool {
         }
     }
     false
+}
+
+fn is_ignore_attr(attr: &str) -> bool {
+    let Some(inner) = attr.strip_prefix("#[").and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    let head = inner
+        .trim()
+        .split(|c: char| c.is_whitespace() || c == '(' || c == '=')
+        .next()
+        .unwrap_or("");
+    head == "ignore" || head.ends_with("::ignore")
 }
 
 #[cfg(test)]
@@ -552,5 +564,35 @@ async fn async_test() {}
             .evidence
             .contains("plugin_panics_become_status_err_at_the_abi_boundary"));
         assert_eq!(check_contract(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r3_p2_rejects_ignore_with_reason_string() {
+        let root =
+            std::env::temp_dir().join(format!("cordis-contract-ignore-eq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            r#"
+#[test]
+#[ignore = "slow soak"]
+fn ignored_with_eq() {}
+
+#[ignore = "reason before test"]
+#[tokio::test]
+async fn ignored_before_test() {}
+"#,
+        )
+        .unwrap();
+        assert!(
+            !test_exists_at(&root, "src/lib.rs", "ignored_with_eq"),
+            "#[ignore = \"...\"] 测试不得作为活跃保证证据放行"
+        );
+        assert!(
+            !test_exists_at(&root, "src/lib.rs", "ignored_before_test"),
+            "前置 #[ignore = \"...\"] 测试不得作为活跃保证证据放行"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

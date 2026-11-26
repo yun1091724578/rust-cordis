@@ -246,7 +246,8 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
     let method_entries: Vec<TokenStream> = methods
         .iter()
         .map(|method| {
-            let method_name = method.ident.to_string();
+            let raw_name = method.ident.to_string();
+            let method_name = raw_name.strip_prefix("r#").unwrap_or(&raw_name);
             let cfgs: Vec<_> = method
                 .attrs
                 .iter()
@@ -260,7 +261,8 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
         .collect();
 
     let arms = methods.iter().map(|method| {
-        let method_name = method.ident.to_string();
+        let raw_name = method.ident.to_string();
+        let method_name = raw_name.strip_prefix("r#").unwrap_or(&raw_name);
         let cfgs: Vec<_> = method
             .attrs
             .iter()
@@ -301,7 +303,8 @@ fn expand_service(item: ItemTrait, name: String, version: u32) -> syn::Result<To
     });
 
     let has_method_arms = methods.iter().map(|method| {
-        let method_name = method.ident.to_string();
+        let raw_name = method.ident.to_string();
+        let method_name = raw_name.strip_prefix("r#").unwrap_or(&raw_name);
         let cfgs: Vec<_> = method
             .attrs
             .iter()

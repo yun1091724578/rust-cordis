@@ -59,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p rust-cordis-host --features dhat-heap --test dhat_profile -- --ignored --nocapture | tee dhat.log
+          cargo xtask dhat 2>&1 | tee dhat.log
       - name: Run miri on rust-cordis-abi
         if: success()
         shell: bash
@@ -78,6 +78,14 @@ jobs:
         with:
           name: soak-log-${{ github.run_id }}-c${{ github.event.inputs.cycles || '1000000' }}
           path: soak.log
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload dhat log
+        if: ${{ always() && hashFiles('dhat.log') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dhat-log-${{ github.run_id }}
+          path: dhat.log
           if-no-files-found: error
           retention-days: 90
       - name: Publish soak log to nightly-soak release

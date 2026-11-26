@@ -492,3 +492,257 @@ async fn r2_p2_reload_recovery_and_set_disabled_rollback_clear_stale_report_fail
     app.close().await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// R3 P1-8: Self-disposing plugin with async disposer must NOT be resurrected by concurrent `sync()`
+// before `persist_self_disposed` finishes writing `disabled: true` to `tree` and disk.
+#[tokio::test]
+async fn r3_p1_self_dispose_blocks_resurrection_during_async_teardown() {
+    use cordis_core::{plugin_fn, Disposable, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct SelfDisposeSource {
+        mount_count: Arc<AtomicUsize>,
+        disposing: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl PluginSource for SelfDisposeSource {
+        fn load(
+            &self,
+            _entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            let mount_count = self.mount_count.clone();
+            let disposing = self.disposing.clone();
+            let release = self.release.clone();
+            Ok(LoadedFile {
+                plugin: plugin_fn("self-disp", Inject::default(), move |ctx, _cfg| {
+                    let mount_count = mount_count.clone();
+                    let disposing = disposing.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        mount_count.fetch_add(1, Ordering::SeqCst);
+                        let _ = ctx.effect(move |_| {
+                            let disposing = disposing.clone();
+                            let release = release.clone();
+                            Disposable::new(move || {
+                                Box::pin(async move {
+                                    disposing.notify_one();
+                                    release.notified().await;
+                                })
+                            })
+                        });
+                        Ok(())
+                    })
+                }),
+                source: std::path::PathBuf::new(),
+                staged: std::path::PathBuf::new(),
+                fingerprint: None,
+            })
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "cordis-r3-self-dispose-resurrect-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(&cfg_path, "- id: victim\n  name: self-disp\n").unwrap();
+
+    let mount_count = Arc::new(AtomicUsize::new(0));
+    let disposing = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(SelfDisposeSource {
+            mount_count: mount_count.clone(),
+            disposing: disposing.clone(),
+            release: release.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mount_count.load(Ordering::SeqCst), 1);
+
+    let fiber = state.fiber_of("victim").expect("victim mounted");
+    let dispose_task = tokio::spawn(async move {
+        fiber.dispose().await;
+    });
+    disposing.notified().await;
+
+    // While `victim` is mid-teardown (after `enqueue_self_dispose`, before `persist_self_disposed`),
+    // run a concurrent `state.sync().await` -> must NOT resurrect `victim`.
+    let _ = state.sync().await;
+    assert_eq!(
+        mount_count.load(Ordering::SeqCst),
+        1,
+        "自我卸载异步收尾期间并发 sync 不得把该行重新复活成第二份实例"
+    );
+    assert!(
+        state.fiber_of("victim").is_none(),
+        "自我卸载期间 mounted 不得出现被复活的实例"
+    );
+
+    release.notify_one();
+    dispose_task.await.unwrap();
+    assert!(state.fiber_of("victim").is_none());
+    let on_disk = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        on_disk.contains("disabled: true"),
+        "自我卸载落盘后配置必须为 disabled: true: {on_disk}"
+    );
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// R3 P2-12: `set_disabled` rollback when enabling a group fails partially must dispose
+// any children newly mounted before the failure (no live orphan fibers).
+#[tokio::test]
+async fn r3_p2_set_disabled_rollback_disposes_newly_mounted_rows() {
+    use cordis_core::{plugin_fn, Dyn, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::Arc;
+
+    struct PartialGroupSource;
+    impl PluginSource for PartialGroupSource {
+        fn load(
+            &self,
+            entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            if entry.name == "bad" {
+                return Err("bad child fails".to_string());
+            }
+            Ok(LoadedFile {
+                plugin: plugin_fn("ok-child", Inject::default(), |ctx, _cfg| {
+                    Box::pin(async move {
+                        ctx.provide("ok-child-svc", Dyn::new(1u32))?;
+                        Ok(())
+                    })
+                }),
+                source: std::path::PathBuf::new(),
+                staged: std::path::PathBuf::new(),
+                fingerprint: None,
+            })
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "cordis-r3-set-disabled-orphan-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(
+        &cfg_path,
+        concat!(
+            "- id: grp\n",
+            "  group: true\n",
+            "  disabled: true\n",
+            "  config:\n",
+            "    - id: ok_child\n",
+            "      name: ok\n",
+            "    - id: bad_child\n",
+            "      name: bad\n",
+        ),
+    )
+    .unwrap();
+
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(PartialGroupSource),
+    )
+    .await
+    .unwrap();
+    assert!(state.mounted_labels().is_empty());
+
+    let res = state.set_disabled("grp", Some(false)).await;
+    assert!(res.is_err(), "组内子行失败应导致 set_disabled 返回 Err");
+    assert!(
+        state.mounted_labels().is_empty(),
+        "set_disabled 回滚必须同时卸载刚挂载成功的子行，不得遗留活实例: {:?}",
+        state.mounted_labels()
+    );
+    assert!(
+        app.root.get("ok-child-svc").is_none(),
+        "被回滚子行提供的服务必须已回收"
+    );
+
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// R3 P3-11: `LoaderState::capabilities()` must keep first-row JS capabilities when duplicate
+// labels exist under `strict: false`, and not advance anonymous ordinals into duplicate groups.
+#[tokio::test]
+async fn r3_p3_capabilities_keeps_first_row_on_duplicate_id() {
+    use cordis_core::{plugin_fn, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::Arc;
+
+    struct SimpleSource;
+    impl PluginSource for SimpleSource {
+        fn load(
+            &self,
+            _entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            Ok(LoadedFile {
+                plugin: plugin_fn("dup-p", Inject::default(), |_ctx, _cfg| {
+                    Box::pin(async { Ok(()) })
+                }),
+                source: std::path::PathBuf::new(),
+                staged: std::path::PathBuf::new(),
+                fingerprint: None,
+            })
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("cordis-r3-dup-caps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(
+        &cfg_path,
+        concat!(
+            "- id: dup\n",
+            "  name: dup-p\n",
+            "  config:\n",
+            "    secret: !!js process.env.R3_FIRST_ONLY\n",
+            "- id: dup\n",
+            "  name: dup-p\n",
+            "  config: {}\n",
+        ),
+    )
+    .unwrap();
+
+    let app = App::new();
+    let mut cfg = LoaderConfig::new(cfg_path.to_string_lossy().into_owned());
+    cfg.strict = false;
+    let state = load_with_source(app.root.clone(), cfg, Arc::new(SimpleSource))
+        .await
+        .unwrap();
+    let caps = state.capabilities();
+    let dup = caps
+        .iter()
+        .find(|row| row["label"] == "dup")
+        .expect("dup mounted");
+    assert_eq!(
+        dup["js"]["env"],
+        serde_json::json!(["R3_FIRST_ONLY"]),
+        "同名重行下 capabilities 必须遵循首行生效原则，不得被跳过的第二行空配置覆盖：{caps:?}"
+    );
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

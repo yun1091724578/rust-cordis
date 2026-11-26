@@ -288,3 +288,44 @@ async fn typed_registry_face_shares_the_table_with_the_native_handle() {
         .to_string();
     assert!(err.contains("replace") && err.contains("nope"), "{err}");
 }
+
+#[tokio::test]
+async fn r3_p2_registry_handle_retired_after_restart_no_split_brain() {
+    let app = App::new();
+    let reg_fiber = app.root.plugin(registry::plugin(), Config::Null);
+    reg_fiber.settle().await;
+
+    let handle_v1 = registry::handle(&app.root).expect("v1 handle");
+    let _d = handle_v1.put("llm@1", Dyn::new(1u32)).unwrap();
+    assert_eq!(handle_v1.names(), vec!["llm@1".to_string()]);
+
+    // Restart registry fiber: generation 2 reuses the same Context, so handle_v1 must retire.
+    reg_fiber.restart().await.unwrap();
+    let handle_v2 = registry::handle(&app.root).expect("v2 handle");
+
+    assert!(
+        handle_v1.names().is_empty(),
+        "重启后旧 RegistryHandle 的 names() 必须优雅降级为空"
+    );
+    assert!(
+        handle_v1.get("llm@1").is_none(),
+        "重启后旧 RegistryHandle 的 get() 必须返回 None"
+    );
+    assert!(
+        handle_v1.put("ghost", Dyn::new(9u32)).is_err(),
+        "重启后旧 RegistryHandle 不得向新代注册表注入幽灵槽位"
+    );
+
+    let _d2 = handle_v2.put("llm@1", Dyn::new(2u32)).unwrap();
+    assert!(
+        handle_v1.replace("llm@1", Dyn::new(99u32)).is_err(),
+        "重启后旧 RegistryHandle 不得覆盖新代槽位"
+    );
+    assert_eq!(
+        handle_v2
+            .get("llm@1")
+            .and_then(|v| v.downcast::<u32>().map(|n| *n)),
+        Some(2)
+    );
+    app.close().await;
+}

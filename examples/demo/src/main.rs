@@ -28,11 +28,12 @@ use cordis_core::{
     App, CancelToken, Config, Ctx, Dyn, ExternValue, FiberState, Inject, Level, Mode, Result,
 };
 use cordis_host::{
-    apply_via, apply_via_with_error_format, host_api, loader, pending_len, set_native_registry,
-    staged_leaked, NativeRegistry,
+    active_staging_dir, apply_via, apply_via_with_error_format, host_api, loader, pending_len,
+    set_native_registry, staged_leaked, NativeRegistry,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,8 +45,12 @@ static RUST_SIDE_MESSAGES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// 热重载段的日志缓冲：加载成功与依赖方再激活由不同异步线打印，真实顺序有抖动。
 /// 这一段统一入队，收敛后按固定顺序 flush（A2：输出必须逐字节可复现）。
 static HMR_LOG_CAPTURE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+static VOLATILE_RECONCILE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn emit_log_line(line: String) {
+    if line.contains("配置对账：") {
+        VOLATILE_RECONCILE_LOGGED.store(true, Ordering::SeqCst);
+    }
     if let Some(buffer) = HMR_LOG_CAPTURE.lock().unwrap().as_mut() {
         buffer.push(line);
     } else {
@@ -134,12 +139,14 @@ async fn main() -> Result<()> {
     std::fs::write(config_dir.join("cordis.yml"), main_yaml)?;
     std::fs::write(config_dir.join("cordis.patch.yml"), patch_yaml)?;
 
-    // M0b（G11）：先清掉**历史泄漏**——G11 修复之前的版本留下的 `.rN` 按定义
-    // 就是垃圾（这次运行会用同名路径重新暂存并认领，反正也带不走它们）。
+    // M0b（G11）：暂存副本现已迁入进程私有暂存目录（`active_staging_dir()`），
+    // 清掉旧目录遗留后，以私有暂存目录为基线记录本次运行产出的 `.rN` 副本。
     for stale in staged_copies(&exe_dir) {
         let _ = std::fs::remove_file(&stale);
     }
-    let staged_before = staged_copies(&exe_dir);
+    let staged_before = active_staging_dir()
+        .map(|dir| staged_copies(&dir))
+        .unwrap_or_default();
 
     // run_demo 返回**drop 之前**的暂存清单；main 在整体 drop 之后验证它们
     // 真的从磁盘消失——真删除断言（D9）只进 demo/spike。
@@ -385,29 +392,34 @@ async fn run_demo(exe_dir: &Path, config_dir: &Path, before: &[PathBuf]) -> Resu
         .and_then(|fiber| fiber.running_epoch());
     assert!(hello_before.is_some(), "hello 应当已经在运行");
 
-    // "重新编译"的最朴素等价物：把同一份字节写回去，只改 mtime。
-    // 真实场景里这一步是 `cargo build`，装载器的判定逻辑完全相同。
+    // "重新编译"的最朴素等价物：经临时文件原子替换回去，改 mtime 且不产生半截文件窗口。
     start_hmr_capture();
     let greeting_source = exe_dir.join(plugin_file("greeting"));
     let bytes = std::fs::read(&greeting_source)?;
-    std::fs::write(&greeting_source, &bytes)?;
+    atomic_rewrite_file(&greeting_source, &bytes)?;
     println!("  触碰了 greeting");
 
     // 等重载发生（间隔 100ms；WP2 起每次换副本要对整个 artifact 算一次
     // SHA-256，debug 下 12 MB 插件约 2s，给足十倍余量）。
+    // 同时等待 `热重载 greet` 与 `[probe]` 日志进入缓冲，避免 `flush_hmr_capture()` 漏截尾日志。
     let mut reload_seen = false;
     let mut reactivated = false;
+    let mut logs_ready = false;
     for _ in 0..200 {
         reload_seen = !reloads.lock().unwrap().is_empty();
         reactivated = RUST_SIDE_MESSAGES.lock().unwrap().len() >= 2;
-        if reload_seen && reactivated {
+        logs_ready = HMR_LOG_CAPTURE.lock().unwrap().as_ref().is_some_and(|buf| {
+            buf.iter().any(|l| l.contains("热重载 greet"))
+                && buf.iter().any(|l| l.contains("[probe]"))
+        });
+        if reload_seen && reactivated && logs_ready {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        reload_seen && reactivated,
-        "重载与 rust-side 再激活必须在时限内完成"
+        reload_seen && reactivated && logs_ready,
+        "重载、rust-side 再激活与收尾日志必须在时限内完成"
     );
     flush_hmr_capture();
     if let Some(message) = RUST_SIDE_MESSAGES.lock().unwrap().get(1).cloned() {
@@ -468,13 +480,16 @@ async fn run_demo(exe_dir: &Path, config_dir: &Path, before: &[PathBuf]) -> Resu
         "      disabled: true\n",
         "  id: optional-group\n",
     );
-    std::fs::write(config_dir.join("cordis.patch.yml"), patch_yaml)?;
+    VOLATILE_RECONCILE_LOGGED.store(false, Ordering::SeqCst);
+    atomic_rewrite_file(&config_dir.join("cordis.patch.yml"), patch_yaml.as_bytes())?;
 
-    // 等插件读到新值（宿主推 → 插件重新读副本 → 更新服务值）。
+    // 等插件读到新值且对账收尾日志落盘（避免与后面的 println 交错）。
     let mut observed = None;
     for _ in 0..60 {
         observed = note_of(&app);
-        if observed.as_deref() == Some("volatile 里的 note") {
+        if observed.as_deref() == Some("volatile 里的 note")
+            && VOLATILE_RECONCILE_LOGGED.load(Ordering::SeqCst)
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -951,7 +966,9 @@ async fn run_demo(exe_dir: &Path, config_dir: &Path, before: &[PathBuf]) -> Resu
     // `created` 是**测量时刻仍存活**的副本集合：HMR 换下来的旧副本会在旧实例
     // drop 后立即删除（提前回收后只剩当前 greeting + hello 两份）。
     // 这里不是"曾经创建过几个"的累计值。
-    let created: Vec<PathBuf> = staged_copies(exe_dir)
+    let created: Vec<PathBuf> = active_staging_dir()
+        .map(|dir| staged_copies(&dir))
+        .unwrap_or_default()
         .into_iter()
         .filter(|path| !before.contains(path))
         .collect();
@@ -1007,25 +1024,32 @@ static T9: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// M1 组的假 ABI 插件入口：`OP_APPLY` 里派生隔离域并挂 `@native:` 子组件。
 unsafe extern "C" fn t9_call(handle: u64, op: u32, _: Blob, _: Blob, out: *mut Out) -> i32 {
-    match op {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match op {
         OP_APPLY => {
             let host = host_api();
             let (status, text) = probe3(host.ctx_isolate, handle, b"demo-tool.echo", b"");
-            T9.lock().unwrap().push(format!("isolate:{status}:{text}"));
+            T9.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("isolate:{status}:{text}"));
             if status == STATUS_OK {
                 if let Some(derived) = handle_of(&text) {
                     let (st, body) = probe3(host.ctx_use, derived, b"@native:demo-tool", b"null");
-                    T9.lock().unwrap().push(format!("use:{st}:{body}"));
+                    T9.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(format!("use:{st}:{body}"));
                 }
             }
             (*out).write(b"")
         }
         OP_DISPOSE => {
-            T9.lock().unwrap().push("disposed".into());
+            T9.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("disposed".into());
             (*out).write(b"")
         }
         _ => STATUS_UNSUPPORTED,
-    }
+    }))
+    .unwrap_or(STATUS_ERR)
 }
 
 /// M2 组（=== 7.6）的记账：监听器注册结局、结算调用结局。
@@ -1036,9 +1060,9 @@ static T10_PENDING_ID: Mutex<u64> = Mutex::new(0);
 /// M2 组的假 ABI 插件入口：`async/ask` 挂起（记下 dispatch_id），
 /// `async/settle` 用 `ctx_fulfill` 把它结算成 `{"answer":42}`。
 unsafe extern "C" fn async_call(handle: u64, op: u32, a: Blob, _: Blob, out: *mut Out) -> i32 {
-    match op {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match op {
         OP_APPLY => {
-            *T10_HANDLE.lock().unwrap() = handle;
+            *T10_HANDLE.lock().unwrap_or_else(|e| e.into_inner()) = handle;
             // 宿主不支持就原样降级（**绝不在 `extern "C"` 里 panic**，D10 铁律）。
             let Some(on) = host_api().ctx_on else {
                 return STATUS_UNSUPPORTED;
@@ -1057,20 +1081,22 @@ unsafe extern "C" fn async_call(handle: u64, op: u32, a: Blob, _: Blob, out: *mu
                 len: 0,
             };
             let settle = on(handle, Blob::new(b"async/settle"), 8, &mut settle_out);
-            T10.lock().unwrap().push(format!("on:{ask}:{settle}"));
+            T10.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("on:{ask}:{settle}"));
             (*out).write(b"")
         }
         OP_CALLBACK => {
             let payload: Value = serde_json::from_slice(a.as_bytes()).unwrap_or(Value::Null);
             let id = payload.get("id").and_then(Value::as_u64).unwrap_or(0);
             if id == 7 {
-                *T10_PENDING_ID.lock().unwrap() = payload
+                *T10_PENDING_ID.lock().unwrap_or_else(|e| e.into_inner()) = payload
                     .get("dispatch_id")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 STATUS_PENDING
             } else {
-                let dispatch_id = *T10_PENDING_ID.lock().unwrap();
+                let dispatch_id = *T10_PENDING_ID.lock().unwrap_or_else(|e| e.into_inner());
                 let value = json!({ "answer": 42 }).to_string();
                 let status = match host_api().ctx_fulfill {
                     None => -1,
@@ -1089,13 +1115,16 @@ unsafe extern "C" fn async_call(handle: u64, op: u32, a: Blob, _: Blob, out: *mu
                         )
                     }
                 };
-                T10.lock().unwrap().push(format!("fulfill:{status}"));
+                T10.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(format!("fulfill:{status}"));
                 (*out).write(b"")
             }
         }
         OP_DISPOSE => (*out).write(b""),
         _ => STATUS_UNSUPPORTED,
-    }
+    }))
+    .unwrap_or(STATUS_ERR)
 }
 
 /// 从 `{"handle": <u64>}` 应答里取句柄。
@@ -1122,10 +1151,8 @@ unsafe fn probe3(
     match f {
         Some(f) => {
             let status = f(handle, Blob::new(a), Blob::new(b), &mut out);
-            (
-                status,
-                String::from_utf8_lossy(&buffer[..out.len]).into_owned(),
-            )
+            let n = out.len.min(buffer.len());
+            (status, String::from_utf8_lossy(&buffer[..n]).into_owned())
         }
         None => (-1, "宿主不支持这个函数（None）".into()),
     }
@@ -1146,13 +1173,64 @@ unsafe fn probe1(
     match f {
         Some(f) => {
             let status = f(handle, Blob::new(a), &mut out);
-            (
-                status,
-                String::from_utf8_lossy(&buffer[..out.len]).into_owned(),
-            )
+            let n = out.len.min(buffer.len());
+            (status, String::from_utf8_lossy(&buffer[..n]).into_owned())
         }
         None => (-1, "宿主不支持这个函数（None）".into()),
     }
+}
+
+/// 同目录临时文件 + 原子替换，避免 HMR / 配置文件在重写瞬间被读到半截内容。
+fn atomic_rewrite_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let temp = dir.join(format!(".{name}.demo-tmp-{}", std::process::id()));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&temp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    replace_file_atomic(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
+#[cfg(windows)]
+fn replace_file_atomic(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let from = wide(temp);
+    let to = wide(target);
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic(temp: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, target)
 }
 
 /// 经派生句柄读一个名字，把应答归类成 `value` / `missing` / `error:<status>`。

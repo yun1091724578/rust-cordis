@@ -188,8 +188,7 @@ mod windows {
             return;
         }
         crate::shutdown::reset();
-        STATUS_HANDLE.store(handle, Ordering::SeqCst);
-        set_status(SERVICE_START_PENDING, 0, 1, PENDING_WAIT_HINT_MS);
+        set_handle_and_start_pending(handle);
 
         let exit_code = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let start_heartbeat =
@@ -206,7 +205,7 @@ mod windows {
                 }
             };
 
-            runtime.block_on(async {
+            let code = runtime.block_on(async {
                 match RunSession::start(&args.config, args.options.clone(), disk_source()).await {
                     Ok(session) => {
                         drop(start_heartbeat);
@@ -247,7 +246,11 @@ mod windows {
                         err.exit_code() as u32
                     }
                 }
-            })
+            });
+            // 超时插件的 `spawn_blocking` 线程可能永久阻塞：不能让 `Drop for Runtime`
+            // 无限等待阻塞线程池，否则永远到不了 `set_stopped_and_clear_handle`（SCM 1053）。
+            runtime.shutdown_background();
+            code
         })) {
             Ok(code) => code,
             Err(_) => {
@@ -258,6 +261,25 @@ mod windows {
         };
 
         set_stopped_and_clear_handle(exit_code);
+    }
+
+    /// 原子登记 `STATUS_HANDLE` 并上报 `SERVICE_START_PENDING`，与 `set_stopped_and_clear_handle`
+    /// 对称，避免 `control_handler` 在句柄非零但状态仍为 `SERVICE_STOPPED` 的窗口内读到旧态。
+    fn set_handle_and_start_pending(handle: isize) {
+        let mut guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        STATUS_HANDLE.store(handle, Ordering::SeqCst);
+        *guard = ServiceState {
+            state: SERVICE_START_PENDING,
+            exit_code: 0,
+            checkpoint: 1,
+            wait_hint: PENDING_WAIT_HINT_MS,
+        };
+        report(ServiceStatus::new(
+            SERVICE_START_PENDING,
+            0,
+            1,
+            PENDING_WAIT_HINT_MS,
+        ));
     }
 
     /// 原子完成终态上报并清零 `STATUS_HANDLE`，避免 `control_handler` 在 `SERVICE_STOPPED`
@@ -376,6 +398,7 @@ mod windows {
         }
     }
 
+    #[cfg(test)]
     fn set_status(state: u32, exit_code: u32, checkpoint: u32, wait_hint: u32) {
         let mut guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
         *guard = ServiceState {
@@ -529,6 +552,47 @@ mod windows {
             );
             assert_eq!(snap.exit_code, 4);
             crate::shutdown::reset();
+        }
+
+        #[test]
+        fn r3_p1_p3_service_start_pending_atomic_and_runtime_shutdown_background() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            set_status(SERVICE_STOPPED, 4, 0, 0);
+            // handle = 0 不会调 SetServiceStatus，但仍验证在同一锁下原子切入 START_PENDING。
+            set_handle_and_start_pending(0);
+            let snap = *state_lock().lock().unwrap();
+            assert_eq!(snap.state, SERVICE_START_PENDING);
+            assert_eq!(snap.exit_code, 0);
+            assert_eq!(snap.checkpoint, 1);
+            assert_eq!(snap.wait_hint, PENDING_WAIT_HINT_MS);
+            set_stopped_and_clear_handle(0);
+
+            // 验证 `shutdown_background` 不会被阻塞的 `spawn_blocking` 插件任务卡死。
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let release = Arc::new((Mutex::new(false), Condvar::new()));
+            let release_bg = Arc::clone(&release);
+            rt.block_on(async move {
+                std::mem::drop(tokio::task::spawn_blocking(move || {
+                    let (lock, cvar) = &*release_bg;
+                    let mut done = lock.lock().unwrap();
+                    while !*done {
+                        let (g, _) = cvar.wait_timeout(done, Duration::from_secs(5)).unwrap();
+                        done = g;
+                    }
+                }));
+            });
+            let start = std::time::Instant::now();
+            rt.shutdown_background();
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "shutdown_background 不得等待卡死的 spawn_blocking 线程"
+            );
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
         }
     }
 }

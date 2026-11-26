@@ -131,17 +131,21 @@ impl ScopeAnchor {
         self: &Arc<Self>,
         parent: &Arc<ScopeAnchor>,
     ) -> std::result::Result<(), String> {
-        // 检查与写入在同一个拓扑写临界区里：两个方向相反的并发绑定只能成功一个。
-        let _topology = TOPOLOGY
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.uid == parent.uid || self.is_ancestor_or_self_locked(parent) {
-            return Err(format!(
-                "绑定作用域父键会成环：{} 自己（或它的后代）不能当它的父",
-                self.uid
-            ));
-        }
-        *self.parent.lock().unwrap() = Some(parent.clone());
+        // 先在拓扑写临界区内替换并取出旧父，再把旧 `Arc<ScopeAnchor>`（及其用户 `ScopePredicate`）
+        // 移出锁外析构，避免用户 `Drop` 重入 `TOPOLOGY` 造成进程级死锁或锁中毒。
+        let old_parent = {
+            let _topology = TOPOLOGY
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.uid == parent.uid || self.is_ancestor_or_self_locked(parent) {
+                return Err(format!(
+                    "绑定作用域父键会成环：{} 自己（或它的后代）不能当它的父",
+                    self.uid
+                ));
+            }
+            self.parent.lock().unwrap().replace(parent.clone())
+        };
+        drop(old_parent);
         Ok(())
     }
 }

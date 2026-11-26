@@ -31,8 +31,8 @@ use cordis_core::{
     Result,
 };
 use cordis_host::{
-    host_api, loaded_instances, loader, pending_len, probe_capabilities, set_native_registry,
-    staged_leaked, streams_len, NativeRegistry,
+    active_staging_dir, host_api, loaded_instances, loader, pending_len, probe_capabilities,
+    set_native_registry, staged_leaked, streams_len, NativeRegistry,
 };
 use harness_spike::{
     boot_agents, boot_core_in, mount_tool, replay_llm, scripted_llm, Agent, AgentService, Core,
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     let _ = std::fs::remove_file(&log_path);
     let config_path = write_config(&config_dir, &log_path)?;
 
-    // 清掉历史暂存副本（与 demo 同一纪律：它们按定义就是垃圾）。
+    // 清掉旧目录的历史暂存副本；现行暂存文件位于进程私有暂存目录（`active_staging_dir()`）。
     for stale in staged_copies(&exe_dir) {
         let _ = std::fs::remove_file(&stale);
     }
@@ -532,10 +532,13 @@ async fn run_spike(
 
     // ---------------------------------------------------------------- 自我卸载
     println!("=== 9. A4：插件自我卸载（dispose_self）===");
-    let staged_while_loaded = staged_copies(exe_dir);
+    // 重载完成后旧暂存副本随旧 LoadedPlugin drop 即刻回收，此时私有暂存目录下应保留当前存活副本。
+    let staged_while_loaded = active_staging_dir()
+        .map(|dir| staged_copies(&dir))
+        .unwrap_or_default();
     assert!(
-        staged_while_loaded.len() >= 2,
-        "重载会带来第二份暂存副本：{staged_while_loaded:?}"
+        !staged_while_loaded.is_empty(),
+        "存活插件在私有暂存目录中必须存在对应的暂存副本：{staged_while_loaded:?}"
     );
     // 先记下这一行的 fiber：`ctx_dispose_self` 是异步的，loader 行先消失，
     // 不代表 effect / OP_DISPOSE / 实例注销已经完成。用同一个 fiber 的 dispose
@@ -775,14 +778,15 @@ fn derived_json(handle: u64, name: &str) -> Result<Value> {
         .ctx_get
         .ok_or_else(|| -> Error { "宿主没有 ctx_get".into() })?;
     let status = unsafe { f(handle, Blob::new(name.as_bytes()), &mut out) };
+    let n = out.len.min(buffer.len());
     if status != STATUS_OK {
         return Err(format!(
             "ctx_get({name}) 失败：status={status} {}",
-            String::from_utf8_lossy(&buffer[..out.len])
+            String::from_utf8_lossy(&buffer[..n])
         )
         .into());
     }
-    let text = String::from_utf8_lossy(&buffer[..out.len]).into_owned();
+    let text = String::from_utf8_lossy(&buffer[..n]).into_owned();
     let value: Value = serde_json::from_str(&text).map_err(|err| -> Error {
         format!("ctx_get 的应答不是 JSON：{err}（{text}）").into()
     })?;

@@ -16,6 +16,7 @@ use cordis_abi::sdk::{self, AsyncIfaceFn, AsyncReply};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -71,6 +72,7 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 /// calls never cause unbounded OS thread creation.
 pub struct SolverPool {
     tx: Option<SyncSender<Job>>,
+    shutdown: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -79,16 +81,24 @@ impl SolverPool {
         let workers = workers.max(1);
         let (tx, rx) = mpsc::sync_channel::<Job>(queue_capacity.max(1));
         let shared_rx = Arc::new(Mutex::new(rx));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::with_capacity(workers);
         for index in 0..workers {
             let rx = shared_rx.clone();
+            let shutdown = shutdown.clone();
             if let Ok(handle) = std::thread::Builder::new()
                 .name(format!("cordis-solver-{index}"))
                 .spawn(move || loop {
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
                     let next = {
                         let guard = rx.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         guard.recv()
                     };
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
                     match next {
                         Ok(job) => job(),
                         Err(_) => break,
@@ -100,6 +110,7 @@ impl SolverPool {
         }
         Self {
             tx: Some(tx),
+            shutdown,
             workers: handles,
         }
     }
@@ -108,6 +119,9 @@ impl SolverPool {
     where
         F: FnOnce() + Send + 'static,
     {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err("host_lifecycle: solver worker pool closed");
+        }
         let Some(tx) = self.tx.as_ref() else {
             return Err("host_lifecycle: solver worker pool closed");
         };
@@ -121,6 +135,7 @@ impl SolverPool {
 
 impl Drop for SolverPool {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
         self.tx.take();
         for handle in self.workers.drain(..) {
             let _ = handle.join();
@@ -317,5 +332,49 @@ mod tests {
         assert!(err.contains("host_capacity"), "unexpected error: {err}");
 
         release.wait();
+    }
+
+    #[test]
+    fn r3_p2_solver_pool_drop_skips_queued_jobs_immediately() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let pool = SolverPool::new(1, 32);
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let executed = Arc::new(AtomicUsize::new(0));
+
+        let s1 = started.clone();
+        let r1 = release.clone();
+        pool.try_submit(move || {
+            s1.wait();
+            r1.wait();
+        })
+        .unwrap();
+        started.wait();
+
+        for _ in 0..15 {
+            let ex = executed.clone();
+            pool.try_submit(move || {
+                ex.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+            })
+            .unwrap();
+        }
+
+        let t0 = Instant::now();
+        release.wait();
+        drop(pool);
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "SolverPool::drop 不得耗尽队列里积压的慢任务（elapsed={:?}, executed={}）",
+            t0.elapsed(),
+            executed.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            0,
+            "drop 后排队任务必须被跳过而不是继续执行"
+        );
     }
 }

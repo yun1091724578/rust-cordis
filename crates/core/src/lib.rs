@@ -100,7 +100,11 @@ impl App {
         // 把"正在更新的那个 fiber 自己的行内钩子"接到全局链最前面。
         // 于是顺序恒为：**行内钩子 → 全局钩子 → tail**。
         let splice: event::Handler = Arc::new(|call: event::Call| {
-            let own = call.ctx.fiber().own_hooks(event::INTERNAL_UPDATE);
+            let own = call
+                .ctx
+                .fiber_opt()
+                .map(|fiber| fiber.own_hooks(event::INTERNAL_UPDATE))
+                .unwrap_or_default();
             let ctx = call.ctx.clone();
             let args = call.args.clone();
             let next_args = call.args.clone();

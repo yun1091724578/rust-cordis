@@ -321,13 +321,18 @@ fn member_at(tokens: &[Token], at: usize) -> Option<(String, usize)> {
     }
 }
 
-/// `tokens[at]` 是 `[` 且紧跟字符串 ⇒ `(键名, `]` 之后的游标)`。
+/// `tokens[at]` 是 `[` 或 `?.` + `[` 且紧跟字符串 ⇒ `(键名, `]` 之后的游标)`。
 fn index_string_at(tokens: &[Token], at: usize) -> Option<(String, usize)> {
-    if !matches!(tokens.get(at), Some(Token::Punct("["))) {
+    let bracket = if matches!(tokens.get(at), Some(Token::Punct("?."))) {
+        at + 1
+    } else {
+        at
+    };
+    if !matches!(tokens.get(bracket), Some(Token::Punct("["))) {
         return None;
     }
-    match (tokens.get(at + 1), tokens.get(at + 2)) {
-        (Some(Token::Str(name)), Some(Token::Punct("]"))) => Some((name.clone(), at + 3)),
+    match (tokens.get(bracket + 1), tokens.get(bracket + 2)) {
+        (Some(Token::Str(name)), Some(Token::Punct("]"))) => Some((name.clone(), bracket + 3)),
         _ => None,
     }
 }

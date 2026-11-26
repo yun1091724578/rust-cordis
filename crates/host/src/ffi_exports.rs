@@ -729,8 +729,12 @@ pub(crate) unsafe extern "C" fn host_ctx_call_iface(
         };
         match deferred {
             // 内联完成：把结果直接带回，插件侧自己消费掉它的续延（零额外跨边界往返）。
+            // 若 `unregister_dispatch_node` 返回 `false`，说明重入 `ctx_abort` 或并发卸载已
+            // 摘走节点并通过 `OP_CALLBACK` 结算续延，此时返回 `pending: true` 避免双重结算。
             Ok(Some(result)) => {
-                unregister_dispatch_node(consumer, iface_id);
+                if !unregister_dispatch_node(consumer, iface_id) {
+                    return Ok(json!({ "pending": true }).to_string());
+                }
                 match result {
                     Ok(value) => Ok(json!({ "pending": false, "result": value }).to_string()),
                     // 并发收紧白名单时，内核 `call_iface` 复检仍可能返回 `MethodUnauthorized`：
@@ -761,7 +765,9 @@ pub(crate) unsafe extern "C" fn host_ctx_call_iface(
                 if let Some(trace) = trace.as_ref() {
                     trace.record("host_call");
                 }
-                unregister_dispatch_node(consumer, iface_id);
+                if !unregister_dispatch_node(consumer, iface_id) {
+                    return Ok(json!({ "pending": true }).to_string());
+                }
                 Err(ErrorPayload::new(message)
                     .with_code("host_call")
                     .with_category("protocol"))
@@ -772,7 +778,9 @@ pub(crate) unsafe extern "C" fn host_ctx_call_iface(
                 if let Some(trace) = trace.as_ref() {
                     trace.record(&payload.code);
                 }
-                unregister_dispatch_node(consumer, iface_id);
+                if !unregister_dispatch_node(consumer, iface_id) {
+                    return Ok(json!({ "pending": true }).to_string());
+                }
                 Err(payload)
             }
         }
@@ -924,6 +932,7 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
             trace_parent: None,
             trace_correlation: None,
         };
+        let cancel_slot: CancelOutboundSlot = Arc::new(Mutex::new(Some(cancel_outbound)));
         let frame = {
             let mut table = instance.dispatches.lock().unwrap();
             if instance.closed.load(Ordering::SeqCst) {
@@ -936,7 +945,7 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
                         dispatch_task_with_cancel(
                             instance,
                             dispatch_id,
-                            Some((cancel_outbound, delivered.clone())),
+                            Some((cancel_slot.clone(), delivered.clone())),
                         ),
                     )
                 }),
@@ -956,6 +965,7 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
         });
         let scoped = with_next_timeout(scoped, dispatch_id, instance.dispatch_policy);
         let deliver_flag = delivered.clone();
+        let deliver_cancel = cancel_slot.clone();
         let deliver: Arc<dyn Fn(std::result::Result<Ret, ErrorPayload>) + Send + Sync> =
             Arc::new(move |result| {
                 deliver_next(
@@ -964,6 +974,7 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
                     on_done,
                     error_format,
                     &deliver_flag,
+                    Some(&deliver_cancel),
                     result,
                 );
             });
@@ -986,13 +997,28 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
             Ok(Some(result)) => deliver(result),
             Ok(None) => {}
             Err(DeferFailure::NoRuntime(message)) => {
-                // 返回 Err 时 SDK 会立刻 `forget(cb)`，置位避免并发取消再投递一次。
-                delivered.store(true, Ordering::SeqCst);
+                // 在 `dispatches` 锁内原子撤销 `cancel_slot` 并抢占 `delivered`：
+                // 若首 poll 期间取消/排水已先认领 `delivered`，返回 `Ok` 让 SDK 保留回调以匹配恰好一次交付。
+                let already_claimed = {
+                    let _table = instance.dispatches.lock().unwrap();
+                    let _ = cancel_slot.lock().unwrap().take();
+                    delivered.swap(true, Ordering::SeqCst)
+                };
+                if already_claimed {
+                    return Ok(String::new());
+                }
                 return Err(next_error(message));
             }
             // 首 poll panic：**不摘入站记录**（它由事件派发/取消路径收尾），只返回错误。
             Err(DeferFailure::Panic(payload)) => {
-                delivered.store(true, Ordering::SeqCst);
+                let already_claimed = {
+                    let _table = instance.dispatches.lock().unwrap();
+                    let _ = cancel_slot.lock().unwrap().take();
+                    delivered.swap(true, Ordering::SeqCst)
+                };
+                if already_claimed {
+                    return Ok(String::new());
+                }
                 return Err(payload);
             }
         }
@@ -1004,13 +1030,15 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
 ///
 /// 与 [`deliver_outbound`] 同口径：`closed` 检查、`delivered` 终态认领与 `ActiveCall`
 /// 准入在同一把 `dispatches` 锁内原子完成——若关闭已经先赢，不置位 `delivered`，
-/// 留给卸载收尾经 `cancel_outbound` 投递 `host_lifecycle`（恰好一次，绝不丢失）。
-fn deliver_next(
+/// 若同步快路径下 `TaskExit` 已提前退表且尚未入队，则在此将 `cancel_slot` 移交
+/// `deferred_outbounds`，确保卸载收尾在 `OP_DISPOSE` 前交付恰好一次（绝不丢失或重复）。
+pub(crate) fn deliver_next(
     handle: u64,
     dispatch_id: u64,
     on_done: u64,
     error_format: u32,
-    delivered: &AtomicBool,
+    delivered: &Arc<AtomicBool>,
+    cancel_slot: Option<&CancelOutboundSlot>,
     result: std::result::Result<Ret, ErrorPayload>,
 ) {
     let Some(instance) = instances().read().unwrap().get(handle) else {
@@ -1019,13 +1047,34 @@ fn deliver_next(
     let _active = {
         let _table = instance.dispatches.lock().unwrap();
         if instance.closed.load(Ordering::SeqCst) {
+            if !delivered.load(Ordering::SeqCst) {
+                if let Some(entry) = cancel_slot.and_then(|slot| slot.lock().unwrap().take()) {
+                    instance
+                        .deferred_outbounds
+                        .lock()
+                        .unwrap()
+                        .push((entry, delivered.clone()));
+                }
+            }
             return;
         }
         let Ok(lease) = call_lease(&instance) else {
+            if !delivered.load(Ordering::SeqCst) {
+                if let Some(entry) = cancel_slot.and_then(|slot| slot.lock().unwrap().take()) {
+                    instance
+                        .deferred_outbounds
+                        .lock()
+                        .unwrap()
+                        .push((entry, delivered.clone()));
+                }
+            }
             return;
         };
         if delivered.swap(true, Ordering::SeqCst) {
             return;
+        }
+        if let Some(slot) = cancel_slot {
+            let _ = slot.lock().unwrap().take();
         }
         *instance.lifecycle.lock().unwrap() += 1;
         ActiveCall {
@@ -1424,36 +1473,46 @@ pub(crate) unsafe fn dispatch_impl(
         Ok(match deferred {
             Ok(Some(Ok(ret))) => {
                 // 内联完成：结果直接带回，插件自己消费续延（M2 起的既有语义）；
-                // 节点顺手摘掉（不投递）。
-                finished();
-                json!({ "pending": false, "result": ret_to_json(ret), "dispatch_id": dispatch_id })
-                    .to_string()
+                // 若节点已被取消/卸载摘走，则回 `pending: true` 避免双重结算。
+                if !finished() {
+                    json!({ "pending": true, "dispatch_id": dispatch_id }).to_string()
+                } else {
+                    json!({ "pending": false, "result": ret_to_json(ret), "dispatch_id": dispatch_id })
+                        .to_string()
+                }
             }
             Ok(Some(Err(err))) => {
-                finished();
-                let mut payload = json!({
-                    "pending": false,
-                    "dispatch_id": dispatch_id,
-                });
-                if let Value::Object(map) = &mut payload {
-                    if let Value::Object(error) = error_arg(error_format, &err) {
-                        map.extend(error);
+                if !finished() {
+                    json!({ "pending": true, "dispatch_id": dispatch_id }).to_string()
+                } else {
+                    let mut payload = json!({
+                        "pending": false,
+                        "dispatch_id": dispatch_id,
+                    });
+                    if let Value::Object(map) = &mut payload {
+                        if let Value::Object(error) = error_arg(error_format, &err) {
+                            map.extend(error);
+                        }
                     }
+                    payload.to_string()
                 }
-                payload.to_string()
             }
             Ok(None) => json!({ "pending": true, "dispatch_id": dispatch_id }).to_string(),
             Err(DeferFailure::NoRuntime(message)) => {
                 // 没有运行时，future 已被丢弃：必须把登记节点也摘掉，
-                // 否则取消/排水会看到一条永远不会结算的记录。
-                finished();
+                // 否则取消/排水会看到一条永远不会结算的记录；若已被取消结算则返回 `pending: true`。
+                if !finished() {
+                    return Ok(json!({ "pending": true, "dispatch_id": dispatch_id }).to_string());
+                }
                 return Err(ErrorPayload::new(message)
                     .with_code("host_call")
                     .with_category("protocol"));
             }
-            // 首 poll panic：同样必须**先摘表再返回错误**（否则关闭时补发 abort）。
+            // 首 poll panic：同样必须**先摘表再返回错误**（若已被取消结算则返回 `pending: true`）。
             Err(DeferFailure::Panic(payload)) => {
-                finished();
+                if !finished() {
+                    return Ok(json!({ "pending": true, "dispatch_id": dispatch_id }).to_string());
+                }
                 return Err(payload);
             }
         })

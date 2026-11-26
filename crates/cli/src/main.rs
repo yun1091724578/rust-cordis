@@ -152,7 +152,7 @@ fn status(args: &[String]) -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    match runtime.block_on(cordis_cli::status(Path::new(&parsed.path), options)) {
+    let exit = match runtime.block_on(cordis_cli::status(Path::new(&parsed.path), options)) {
         Ok(report) => {
             if parsed.json {
                 println!("{}", report.to_json());
@@ -171,7 +171,10 @@ fn status(args: &[String]) -> ExitCode {
             eprintln!("status 失败: {err}");
             ExitCode::from(err.exit_code())
         }
-    }
+    };
+    // 超时插件的 `spawn_blocking` 线程可能永不返回：禁止 `Drop for Runtime` 无限挂死进程退出。
+    runtime.shutdown_background();
+    exit
 }
 
 fn run(args: &[String]) -> ExitCode {
@@ -202,7 +205,7 @@ fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    match runtime.block_on(cordis_cli::run(Path::new(&parsed.path), options)) {
+    let exit = match runtime.block_on(cordis_cli::run(Path::new(&parsed.path), options)) {
         Ok(report) => {
             println!("mounted = {}", report.mounted.len());
             for label in &report.mounted {
@@ -224,15 +227,19 @@ fn run(args: &[String]) -> ExitCode {
                         err.message
                     );
                 }
-                return ExitCode::from(4);
+                ExitCode::from(4)
+            } else {
+                ExitCode::SUCCESS
             }
-            ExitCode::SUCCESS
         }
         Err(err) => {
             eprintln!("run 失败: {err}");
             ExitCode::from(err.exit_code())
         }
-    }
+    };
+    // 超时插件的 `spawn_blocking` 线程可能永不返回：禁止 `Drop for Runtime` 无限挂死进程退出。
+    runtime.shutdown_background();
+    exit
 }
 
 fn service(args: &[String]) -> ExitCode {

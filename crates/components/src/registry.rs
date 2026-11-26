@@ -28,6 +28,7 @@
 //! - [`RegistryHandle`] 只持 `Weak<Context>`（M4 的 Weak 纪律：句柄通常被别的插件
 //!   拿在手里活得更久，不能把上下文树吊住）；注册表卸载后所有入口**优雅降级**。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use cordis_core::{
@@ -57,14 +58,24 @@ pub trait Registry {
     async fn names(&self) -> Result<Vec<String>, String>;
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    Pending,
+    Active,
+    Removing,
+}
+
 /// 注册表的**原生句柄**（T1）：槽位值可以是任意 [`Dyn`]。
 ///
 /// 它只持注册表 ctx 的**弱引用**，因此可以被别的插件长期持有：
-/// 注册表卸载之后每个入口都会给出可读的降级结果，而不是 panic 或悬空。
+/// 注册表卸载或重启之后，本代句柄的 `alive` 标志永久置 `false`，所有入口都会给出可读的降级结果。
 pub struct RegistryHandle {
     ctx: Weak<Context>,
-    /// 槽位名（按注册顺序）。**值本身只有一份真相**——在服务表里。
-    names: Mutex<Vec<String>>,
+    /// 本代注册表实例的存活标记：卸载/重启时由 effect disposer 置 `false`，
+    /// 防止 `Fiber::restart` 复用同一 `Arc<Context>` 时旧句柄与新代注册表脑裂。
+    alive: Arc<AtomicBool>,
+    /// 槽位名与状态（按注册顺序）。**值本身只有一份真相**——在服务表里。
+    names: Mutex<Vec<(String, SlotState)>>,
 }
 
 impl RegistryHandle {
@@ -79,11 +90,19 @@ impl RegistryHandle {
         let ctx = self.live_ctx()?;
         {
             let mut names = self.names.lock().unwrap();
-            if names.iter().any(|existing| existing == name) {
-                return Err(format!("槽位 \"{name}\" 已经注册过：原地换值请用 replace").into());
+            if let Some((_, state)) = names.iter().find(|(existing, _)| existing == name) {
+                return match state {
+                    SlotState::Removing => Err(format!(
+                        "槽位 \"{name}\" 正在卸载清理中：请等待卸载完成后再注册"
+                    )
+                    .into()),
+                    SlotState::Pending | SlotState::Active => {
+                        Err(format!("槽位 \"{name}\" 已经注册过：原地换值请用 replace").into())
+                    }
+                };
             }
-            // 先占位再释放锁，避免并发 `put` 同名槽位的 TOCTOU，同时不跨 `provide` 持锁。
-            names.push(name.to_string());
+            // 先以 Pending 占位再释放锁，避免并发 `put` 同名槽位的 TOCTOU，同时不向 `names`/`replace` 暴露未就绪槽位。
+            names.push((name.to_string(), SlotState::Pending));
         }
         let provided = match ctx.provide(name, value) {
             Ok(provided) => provided,
@@ -91,14 +110,29 @@ impl RegistryHandle {
                 self.names
                     .lock()
                     .unwrap()
-                    .retain(|existing| existing != name);
+                    .retain(|(existing, _)| existing != name);
                 return Err(err);
             }
         };
+        {
+            let mut names = self.names.lock().unwrap();
+            if let Some((_, state)) = names.iter_mut().find(|(existing, _)| existing == name) {
+                *state = SlotState::Active;
+            }
+        }
         let table = Arc::downgrade(self);
         let name_owned = name.to_string();
         Ok(Disposable::new(move || {
             Box::pin(async move {
+                if let Some(table) = table.upgrade() {
+                    let mut names = table.names.lock().unwrap();
+                    if let Some((_, state)) = names
+                        .iter_mut()
+                        .find(|(existing, _)| existing == &name_owned)
+                    {
+                        *state = SlotState::Removing;
+                    }
+                }
                 struct SlotCleanup {
                     table: Weak<RegistryHandle>,
                     name: String,
@@ -110,7 +144,7 @@ impl RegistryHandle {
                                 .names
                                 .lock()
                                 .unwrap()
-                                .retain(|existing| existing != &self.name);
+                                .retain(|(existing, _)| existing != &self.name);
                         }
                     }
                 }
@@ -132,7 +166,7 @@ impl RegistryHandle {
             .lock()
             .unwrap()
             .iter()
-            .any(|existing| existing == name)
+            .any(|(existing, state)| existing == name && *state == SlotState::Active)
         {
             return Err(format!("槽位 \"{name}\" 还没注册过：先 put 再 replace").into());
         }
@@ -141,6 +175,9 @@ impl RegistryHandle {
 
     /// 读**当下**的值（走注册表自己的提交视图，不是注册时的快照）。没有 ⇒ `None`。
     pub fn get(&self, name: &str) -> Option<Dyn> {
+        if !self.alive.load(Ordering::Acquire) {
+            return None;
+        }
         let ctx = self.ctx.upgrade()?;
         if !ctx.is_active() {
             return None;
@@ -150,7 +187,7 @@ impl RegistryHandle {
             .lock()
             .unwrap()
             .iter()
-            .any(|existing| existing == name)
+            .any(|(existing, state)| existing == name && *state == SlotState::Active)
         {
             return None;
         }
@@ -159,18 +196,32 @@ impl RegistryHandle {
 
     /// 当前槽位名（按注册顺序）。注册表已卸载 ⇒ 空表（优雅降级）。
     pub fn names(&self) -> Vec<String> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         let Some(ctx) = self.ctx.upgrade() else {
             return Vec::new();
         };
         if !ctx.is_active() {
             return Vec::new();
         }
-        self.names.lock().unwrap().clone()
+        self.names
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, state)| *state == SlotState::Active)
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// 注册表自己的 ctx，且必须**在运行**：`provide` 在未激活/正在卸载的状态上会
     /// `assert`（那是内核护栏），组件不该去撞它——这里先给出可读错误。
     fn live_ctx(&self) -> Result<Ctx, Error> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(
+                "注册表已卸载或重启：请重新获取 cordis_components::registry::handle()".into(),
+            );
+        }
         let ctx = self.ctx.upgrade().ok_or_else(|| -> Error {
             "注册表已卸载：请重新挂载 cordis_components::registry::plugin()".into()
         })?;
@@ -203,8 +254,16 @@ pub fn plugin() -> Arc<dyn Plugin> {
             Inject::default(),
             |ctx: Ctx, _config: Config| {
                 Box::pin(async move {
+                    let alive = Arc::new(AtomicBool::new(true));
+                    let alive_drop = alive.clone();
+                    let _retire = ctx.effect(move |_| {
+                        Disposable::sync(move || {
+                            alive_drop.store(false, Ordering::Release);
+                        })
+                    });
                     let handle = Arc::new(RegistryHandle {
                         ctx: ctx.downgrade(),
+                        alive,
                         names: Mutex::new(Vec::new()),
                     });
                     ctx.provide(HANDLE_KEY, Dyn::shared(handle.clone()))?;

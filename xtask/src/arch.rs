@@ -583,6 +583,10 @@ fn fallback_explicitly_fails(rhs: &str) -> bool {
         .or_else(|| rhs.strip_prefix('(').and_then(|s| s.strip_suffix(')')))
         .unwrap_or(rhs)
         .trim();
+    // 兜底块内禁止出现未加引号的 `&&` / `||`（例如 `{ true && exit 0; exit 1; }`），避免提前以 0 退出。
+    if contains_unquoted_seq(body, b"&&") || contains_unquoted_seq(body, b"||") {
+        return false;
+    }
     let clauses: Vec<&str> = body
         .split(';')
         .map(str::trim)
@@ -625,24 +629,52 @@ fn fallback_explicitly_fails(rhs: &str) -> bool {
     parse_nonzero_exit(last).unwrap_or(false)
 }
 
-fn contains_unquoted_semicolon(s: &str) -> bool {
+fn find_unquoted_seq(s: &str, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
-    for b in s.bytes() {
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
         if escaped {
             escaped = false;
+            i += 1;
             continue;
         }
         match b {
-            b'\\' if !in_single => escaped = true,
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b';' if !in_single && !in_double => return true,
-            _ => {}
+            b'\\' if !in_single => {
+                escaped = true;
+                i += 1;
+            }
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                i += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                i += 1;
+            }
+            _ if !in_single
+                && !in_double
+                && i + needle.len() <= bytes.len()
+                && &bytes[i..i + needle.len()] == needle =>
+            {
+                return Some(i);
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
-    false
+    None
+}
+
+fn contains_unquoted_seq(s: &str, needle: &[u8]) -> bool {
+    find_unquoted_seq(s, needle).is_some()
 }
 
 fn suppresses_failure(line: &str) -> bool {
@@ -650,16 +682,128 @@ fn suppresses_failure(line: &str) -> bool {
     if trimmed.ends_with('&') && !trimmed.ends_with("&&") {
         return true;
     }
-    if let Some((lhs, rhs)) = trimmed.split_once("||") {
-        if contains_unquoted_semicolon(lhs) {
+    if let Some(idx) = find_unquoted_seq(trimmed, b"||") {
+        let lhs = &trimmed[..idx];
+        let rhs = &trimmed[idx + 2..];
+        if contains_unquoted_seq(lhs, b";") || contains_unquoted_seq(lhs, b"&&") {
             return true;
         }
         return !fallback_explicitly_fails(rhs);
     }
-    if contains_unquoted_semicolon(trimmed) {
+    if contains_unquoted_seq(trimmed, b";") || contains_unquoted_seq(trimmed, b"&&") {
         return true;
     }
     false
+}
+
+/// 简易 shell 分词：保留单/双引号内容并标记 token 是否曾被引号包裹。
+fn shell_tokens(s: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_tok = false;
+    let mut was_quoted = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for ch in s.chars() {
+        if escaped {
+            cur.push(ch);
+            in_tok = true;
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => {
+                escaped = true;
+                in_tok = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                in_tok = true;
+                was_quoted = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                in_tok = true;
+                was_quoted = true;
+            }
+            c if c.is_ascii_whitespace() && !in_single && !in_double => {
+                if in_tok {
+                    out.push((std::mem::take(&mut cur), was_quoted));
+                    in_tok = false;
+                    was_quoted = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                in_tok = true;
+            }
+        }
+    }
+    if in_tok {
+        out.push((cur, was_quoted));
+    }
+    out
+}
+
+/// 解析行中的 heredoc 起始标记（`<<EOF` / `<<'EOF'` / `<<-EOF` 等；排除 here-string `<<<`）。
+fn parse_heredoc_start(line: &str) -> Option<(String, bool)> {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' if !in_single => {
+                escaped = true;
+                i += 1;
+            }
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                i += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                i += 1;
+            }
+            b'<' if !in_single && !in_double && bytes[i + 1] == b'<' => {
+                if i + 2 < bytes.len() && bytes[i + 2] == b'<' {
+                    i += 3;
+                    continue;
+                }
+                let mut j = i + 2;
+                let strip_tabs = if j < bytes.len() && bytes[j] == b'-' {
+                    j += 1;
+                    true
+                } else {
+                    false
+                };
+                let rest = line[j..].trim_start();
+                let mut delim = String::new();
+                for ch in rest.chars() {
+                    if ch.is_ascii_whitespace() || ch == ';' || ch == '&' || ch == '|' {
+                        break;
+                    }
+                    if ch != '\'' && ch != '"' && ch != '\\' {
+                        delim.push(ch);
+                    }
+                }
+                if !delim.is_empty() {
+                    return Some((delim, strip_tabs));
+                }
+                i = j;
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// 判断 workflow 是否由主 CI / 合并队列 / 可复用 CI 门禁触发（不因改名、merge_group 或
@@ -713,16 +857,55 @@ fn is_grep_assertion(rhs: &str, expected_version: &str) -> bool {
     else {
         return false;
     };
-    for token in rest.split_whitespace() {
-        if token == "--invert-match" {
-            return false;
+    let tokens = shell_tokens(rest);
+    let mut expect_pattern = false;
+    let mut after_double_dash = false;
+    // 扫描全部 token（GNU grep 允许把 `-v` 等选项写在模式之后，如 `grep -q 'pat' -v`）。
+    for (token, was_quoted) in &tokens {
+        if expect_pattern {
+            if token.is_empty() {
+                return false;
+            }
+            expect_pattern = false;
+            continue;
         }
-        if token.starts_with('-') && !token.starts_with("--") && token[1..].contains('v') {
-            return false;
+        if !after_double_dash && !*was_quoted {
+            if token == "--" {
+                after_double_dash = true;
+                continue;
+            }
+            if token == "--invert-match"
+                || token == "-f"
+                || token == "--file"
+                || token.starts_with("--file=")
+            {
+                return false;
+            }
+            if token == "-e" || token == "--regexp" {
+                expect_pattern = true;
+                continue;
+            }
+            if let Some(pat) = token.strip_prefix("--regexp=") {
+                if pat.is_empty() {
+                    return false;
+                }
+                continue;
+            }
+            if token.starts_with('-') && !token.starts_with("--") {
+                let flags = &token[1..];
+                if flags.contains('v') || flags.contains('f') {
+                    return false;
+                }
+                if let Some(idx) = flags.find('e') {
+                    if flags[idx + 1..].is_empty() {
+                        expect_pattern = true;
+                    }
+                }
+            }
         }
-        if !token.starts_with('-') {
-            break;
-        }
+    }
+    if expect_pattern {
+        return false;
     }
     contains_version_token(rest, expected_version)
 }
@@ -732,7 +915,10 @@ fn line_disables_errexit(line: &str) -> bool {
     if tokens.first().copied() != Some("set") {
         return false;
     }
-    tokens.iter().skip(1).any(|&tok| tok == "+e")
+    tokens
+        .iter()
+        .skip(1)
+        .any(|&tok| tok.starts_with('+') && !tok.starts_with("++") && tok[1..].contains('e'))
         || tokens.windows(2).any(|w| w[0] == "+o" && w[1] == "errexit")
 }
 
@@ -748,12 +934,65 @@ fn line_enables_errexit(line: &str) -> bool {
         || tokens.windows(2).any(|w| w[0] == "-o" && w[1] == "errexit")
 }
 
+fn update_block_depth(line: &str, block_depth: &mut usize) -> bool {
+    let first = line
+        .split(|c: char| c.is_ascii_whitespace() || c == ';')
+        .next()
+        .unwrap_or("");
+    let closes_block = matches!(first, "fi" | "done" | "esac" | "}");
+    let opens_block = matches!(first, "if" | "for" | "while" | "until" | "case")
+        || line == "{"
+        || line.ends_with(" {");
+    if closes_block {
+        *block_depth = block_depth.saturating_sub(1);
+        return true;
+    }
+    if opens_block {
+        // 单行 `if ...; then ...; fi` 不改变净深度，但本身也不是顶层断言。
+        let closed_same_line = line.ends_with("; fi")
+            || line.ends_with(" fi")
+            || line.ends_with("; done")
+            || line.ends_with(" done")
+            || line.ends_with("; esac")
+            || line.ends_with(" esac")
+            || line.ends_with('}');
+        if !closed_same_line {
+            *block_depth += 1;
+        }
+        return true;
+    }
+    false
+}
+
 fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool {
     let mut captured_vars: Vec<String> = Vec::new();
     let mut errexit_disabled = false;
+    let mut heredoc_end: Option<(String, bool)> = None;
+    let mut block_depth: usize = 0;
     for raw_line in run_script.lines() {
+        if let Some((ref delim, strip_tabs)) = heredoc_end {
+            let candidate = if strip_tabs {
+                raw_line.trim_start_matches('\t')
+            } else {
+                raw_line
+            };
+            if candidate == delim {
+                heredoc_end = None;
+            }
+            continue;
+        }
         let line = strip_inline_comment(raw_line).trim();
         if line.is_empty() {
+            continue;
+        }
+        if let Some(hd) = parse_heredoc_start(line) {
+            heredoc_end = Some(hd);
+            continue;
+        }
+        if update_block_depth(line, &mut block_depth) {
+            continue;
+        }
+        if block_depth > 0 {
             continue;
         }
         if line_disables_errexit(line) {
@@ -768,7 +1007,7 @@ fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool
             continue;
         }
         // `set +e` / `set +o errexit` 生效期间，裸断言失败不会终止步骤，必须带显式失败的 `||` 兜底。
-        if errexit_disabled && !line.contains("||") {
+        if errexit_disabled && !contains_unquoted_seq(line, b"||") {
             continue;
         }
         // 记录 `VAR=$(rustc --version)` 或 `VAR="$(rustc --version)"` 赋值。
@@ -787,9 +1026,12 @@ fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool
         if let Some((lhs, rhs)) = line.split_once('|') {
             if !rhs.starts_with('|') {
                 let lhs = lhs.trim();
-                let grep_stage = rhs.split("||").next().unwrap_or(rhs).trim();
+                let grep_stage = match find_unquoted_seq(rhs, b"||") {
+                    Some(idx) => rhs[..idx].trim(),
+                    None => rhs.trim(),
+                };
                 if lhs == "rustc --version"
-                    && !grep_stage.contains('|')
+                    && !contains_unquoted_seq(grep_stage, b"|")
                     && is_grep_assertion(grep_stage, expected_version)
                 {
                     return true;
@@ -797,12 +1039,29 @@ fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool
             }
         }
         // 形态 2：shell 条件断言 `[[ "$(rustc --version)" == "rustc <ver>"* ]]` /
-        //        `[[ "$ver" == "rustc <ver>"* ]]`。
-        let expr = line.split("||").next().unwrap_or(line).trim();
-        if (expr.starts_with("[[ ") && expr.ends_with(" ]]"))
-            || (expr.starts_with("[ ") && expr.ends_with(" ]"))
-            || expr.starts_with("test ")
-        {
+        //        `[[ "$ver" == "rustc <ver>"* ]]`（拒绝 `!` 取反、`!=` 或 `-o`/`||` 逻辑或放行）。
+        let expr = match find_unquoted_seq(line, b"||") {
+            Some(idx) => line[..idx].trim(),
+            None => line.trim(),
+        };
+        let inner = expr
+            .strip_prefix("[[ ")
+            .and_then(|s| s.strip_suffix(" ]]"))
+            .or_else(|| expr.strip_prefix("[ ").and_then(|s| s.strip_suffix(" ]")))
+            .or_else(|| expr.strip_prefix("test "));
+        if let Some(inner) = inner {
+            let tokens = shell_tokens(inner);
+            let has_unsafe_op = tokens.iter().any(|(tok, quoted)| {
+                !*quoted
+                    && (tok == "!"
+                        || tok == "!="
+                        || tok == "-o"
+                        || tok == "||"
+                        || tok.starts_with('!'))
+            });
+            if has_unsafe_op {
+                continue;
+            }
             let references_rustc = expr.contains("$(rustc --version)")
                 || expr.contains("`rustc --version`")
                 || captured_vars.iter().any(|v| {
@@ -2046,5 +2305,30 @@ version = "0.1.3"
                 "{trigger} workflow 必须受 rustc --version 守卫约束：{problems:?}"
             );
         }
+    }
+
+    #[test]
+    fn r3_p2_rustc_guard_rejects_set_plus_eu_and_and_inverted_grep_heredoc() {
+        for bypass in [
+            "set +eu\nrustc --version | grep -q '^rustc 1\\.98\\.1 '",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' && echo ok",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || { true && exit 0; exit 1; }",
+            "[[ ! \"$(rustc --version)\" == \"rustc 1.98.1 \"* ]]",
+            "[ \"$(rustc --version)\" = \"rustc 1.98.1 \" -o 1 = 1 ]",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' -v",
+            "rustc --version | grep -q -e '' -e '^rustc 1\\.98\\.1 '",
+            "if false; then\n  rustc --version | grep -q '^rustc 1\\.98\\.1 '\nfi",
+            "cat <<'EOF'\nrustc --version | grep -q '^rustc 1\\.98\\.1 '\nEOF",
+        ] {
+            assert!(
+                !step_verifies_rustc_version(bypass, "1.98.1"),
+                "绕过写法 `{bypass}` 必须被 rustc --version 守卫拒绝"
+            );
+        }
+        // Sanity: genuine guard scripts still pass.
+        assert!(step_verifies_rustc_version(
+            "set -euo pipefail\nrustc --version | grep -q '^rustc 1\\.98\\.1 '",
+            "1.98.1"
+        ));
     }
 }

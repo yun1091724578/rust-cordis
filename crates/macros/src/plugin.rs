@@ -107,14 +107,15 @@ pub fn plugin(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     });
 
     // `config(Type)` 给了就把校验接到挂载期（`Store::resolve_config` 会先问 `validate`）。
+    // 返回 `parsed.to_config()` 以保留 `#[serde(default)]` 填充的默认字段（供 `fiber.resolved()` 与 `VolatileRef` 使用）。
     let validate_fn = config.map(|config| {
         quote! {
             fn validate(
                 &self,
                 raw: ::cordis::core::Config,
             ) -> ::core::result::Result<::cordis::core::Config, ::cordis::core::ValidationError> {
-                <#config>::parse(raw.clone())?;
-                ::core::result::Result::Ok(raw)
+                let parsed = <#config>::parse(raw)?;
+                ::core::result::Result::Ok(parsed.to_config())
             }
         }
     });

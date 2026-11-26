@@ -390,6 +390,9 @@ pub struct Runtime {
     pub name: String,
     pub plugin: Arc<dyn Plugin>,
     pub fibers: Mutex<Vec<Arc<Fiber>>>,
+    /// `delete_plugin` 后标记退役：仍保留至活跃 fiber 全部完成 `DisposeDone` 以便环检测可见，
+    /// 但 `runtime_for` 不得把新挂载的同名插件复用进已退役的旧 `Runtime`。
+    pub(crate) retired: AtomicBool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -535,7 +538,8 @@ impl Store {
     }
 
     pub fn set_log_sink(&self, sink: LogSink) {
-        *self.log_sink.lock().unwrap() = sink;
+        let old = std::mem::replace(&mut *self.log_sink.lock().unwrap(), sink);
+        drop(old);
     }
 
     /// 设置本 `App` / `Store` 的生命周期等待预算（apply / drain / dispose）。
@@ -558,18 +562,22 @@ impl Store {
 
     /// 写入一条按类型隔离的 per-App 扩展值（随 `Store` 释放，替代进程级裸指针表）。
     pub fn set_extension<T: Send + Sync + 'static>(&self, value: T) {
-        self.extensions
+        let old = self
+            .extensions
             .lock()
             .unwrap()
             .insert(std::any::TypeId::of::<T>(), Arc::new(value));
+        drop(old);
     }
 
     /// 移除指定类型的 per-App 扩展值。
     pub fn remove_extension<T: Send + Sync + 'static>(&self) {
-        self.extensions
+        let old = self
+            .extensions
             .lock()
             .unwrap()
             .remove(&std::any::TypeId::of::<T>());
+        drop(old);
     }
 
     /// 读取指定类型的 per-App 扩展值副本。
@@ -584,10 +592,14 @@ impl Store {
 
     /// 安装或清除宿主管理的方法调用授权钩子（作用于本 `Store` 上的 `call_iface` 与 `call_iface_stream`）。
     pub fn set_call_auth_hook(&self, hook: Option<CallAuthHook>) {
-        let mut slot = self.call_auth_hook.lock().unwrap();
-        let enabled = hook.is_some();
-        *slot = hook;
-        self.has_call_auth.store(enabled, Ordering::Release);
+        let old = {
+            let mut slot = self.call_auth_hook.lock().unwrap();
+            let enabled = hook.is_some();
+            let old = std::mem::replace(&mut *slot, hook);
+            self.has_call_auth.store(enabled, Ordering::Release);
+            old
+        };
+        drop(old);
     }
 
     /// 本 `Store` 当前是否安装了方法调用授权钩子（热路径单次原子读）。
@@ -933,11 +945,8 @@ impl Store {
             store.plugin_observers.lock().unwrap().push((sn, observer));
             let store2 = store.clone();
             crate::Disposable::sync(move || {
-                store2
-                    .plugin_observers
-                    .lock()
-                    .unwrap()
-                    .retain(|(s, _)| *s != sn);
+                let removed = remove_by_sn(&store2.plugin_observers, sn);
+                drop(removed);
             })
         })
     }
@@ -959,11 +968,8 @@ impl Store {
             store.commit_observers.lock().unwrap().push((sn, observer));
             let store2 = store.clone();
             crate::Disposable::sync(move || {
-                store2
-                    .commit_observers
-                    .lock()
-                    .unwrap()
-                    .retain(|(s, _)| *s != sn);
+                let removed = remove_by_sn(&store2.commit_observers, sn);
+                drop(removed);
             })
         })
     }
@@ -987,11 +993,8 @@ impl Store {
                 .push((sn, observer));
             let store2 = store.clone();
             crate::Disposable::sync(move || {
-                store2
-                    .async_commit_observers
-                    .lock()
-                    .unwrap()
-                    .retain(|(s, _)| *s != sn);
+                let removed = remove_by_sn(&store2.async_commit_observers, sn);
+                drop(removed);
             })
         })
     }
@@ -1015,11 +1018,8 @@ impl Store {
                 .push((sn, observer));
             let store2 = store.clone();
             crate::Disposable::sync(move || {
-                store2
-                    .async_plugin_dispose_observers
-                    .lock()
-                    .unwrap()
-                    .retain(|(s, _)| *s != sn);
+                let removed = remove_by_sn(&store2.async_plugin_dispose_observers, sn);
+                drop(removed);
             })
         })
     }
@@ -1046,7 +1046,30 @@ impl Store {
             .map(|(_, f)| f.clone())
             .collect();
         for observer in observers {
-            observer(fiber.clone()).await;
+            let fut = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer(fiber.clone())
+            })) {
+                Ok(fut) => fut,
+                Err(payload) => {
+                    let msg = format!(
+                        "on_plugin_dispose_async 观察者构造阶段 panic: {}",
+                        crate::panic_message(&*payload)
+                    );
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.log(Level::Error, &fiber.name(), &msg);
+                    }));
+                    continue;
+                }
+            };
+            if let Err(payload) = crate::fiber::CatchPanic::new(fut).await {
+                let msg = format!(
+                    "on_plugin_dispose_async 观察者 panic: {}",
+                    crate::panic_message(&*payload)
+                );
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.log(Level::Error, &fiber.name(), &msg);
+                }));
+            }
         }
     }
 
@@ -1274,7 +1297,9 @@ impl Store {
             // `this.ctx.fiber.store![name] = impl`。
             fiber_for_setup.committed_insert(name_owned.clone(), impl_.clone());
             let store2 = Arc::clone(&store);
-            let ctx2 = ctx.clone();
+            // 对根上下文（及其派生上下文）使用 `HookCtx` 弱引用持有根 `Context`，
+            // 防止 `app.root.provide(...)` 在 `root_fiber.disposables` 中构成 `root_keepalive` 强引用环。
+            let hook_ctx2 = event::HookCtx::from_ctx(&ctx);
             let name2 = name_owned.clone();
             Ok(Disposable::new(move || {
                 Box::pin(async move {
@@ -1283,6 +1308,9 @@ impl Store {
                     // 先放锁再析构取出的 `Arc<Impl>`，避免用户值 `Drop` 重入 `Store` 导致自锁或锁中毒。
                     let removed = { store2.impls.lock().unwrap().remove(&realm) };
                     drop(removed);
+                    let Some(ctx2) = hook_ctx2.upgrade() else {
+                        return;
+                    };
                     let dependents = store2.notify(&[&name2], &ctx2, true);
                     let provider_fiber = ctx2.fiber_opt();
                     let provider_tearing_down = provider_fiber.as_ref().is_none_or(|p| {
@@ -1441,6 +1469,9 @@ impl Store {
         let Some(caller_fiber) = ctx.fiber_opt() else {
             return Err(format!("cannot set property \"{name}\" on inactive context").into());
         };
+        if caller_fiber.is_disposed() {
+            return Err(format!("cannot set property \"{name}\" on disposed fiber").into());
+        }
         let realm = self.realm_of(ctx, name);
         let impl_ = {
             let impls = self.impls.lock().unwrap();
@@ -1545,8 +1576,21 @@ impl Store {
                     let store = Arc::clone(self);
                     let ctx = provider_ctx.clone();
                     let name = (*name).to_string();
-                    let value = self.try_get(provider_ctx, &name, false);
-                    let filter = self.realm_filter(provider_ctx, &name);
+                    let (value, filter) = match realm_override {
+                        Some(target_realm) => {
+                            let value = self.lookup(target_realm).map(|impl_| impl_.get());
+                            let store_f = Arc::clone(self);
+                            let name_f: Box<str> = name.as_str().into();
+                            let filter: Filter = Arc::new(move |hook_ctx: &Ctx| {
+                                store_f.realm_of(hook_ctx, &name_f) == target_realm
+                            });
+                            (value, Some(filter))
+                        }
+                        None => (
+                            self.try_get(provider_ctx, &name, false),
+                            self.realm_filter(provider_ctx, &name),
+                        ),
+                    };
                     tokio::spawn(async move {
                         let args: Args = vec![Dyn::new(name), Dyn::new(value)];
                         store
@@ -1813,13 +1857,25 @@ impl Store {
             let store2 = store.clone();
             let name2 = name_owned.clone();
             crate::Disposable::sync(move || {
-                let mut hooks = store2.hooks.lock().unwrap();
-                if let Some(list) = hooks.get_mut(&name2) {
-                    list.retain(|h| h.sn != sn);
-                    if list.is_empty() {
-                        hooks.remove(&name2);
+                let removed = {
+                    let mut hooks = store2.hooks.lock().unwrap();
+                    let mut removed = Vec::new();
+                    if let Some(list) = hooks.get_mut(&name2) {
+                        let mut i = 0;
+                        while i < list.len() {
+                            if list[i].sn == sn {
+                                removed.push(list.remove(i));
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if list.is_empty() {
+                            hooks.remove(&name2);
+                        }
                     }
-                }
+                    removed
+                };
+                drop(removed);
             })
         })
     }
@@ -1836,7 +1892,8 @@ impl Store {
     /// 应用关闭时清空事件表：`Hook` 持注册者 ctx，而 ctx 持 `Store`。
     /// 不清空的话，根级 hook 会让 `Store → Hook → ctx → Store` 留在堆上。
     pub(crate) fn clear_hooks(&self) {
-        self.hooks.lock().unwrap().clear();
+        let old = std::mem::take(&mut *self.hooks.lock().unwrap());
+        drop(old);
     }
 
     /// 注册一个**同步监听器钩子**：`ctx.on` 每次注册前都会先咨询它。
@@ -1856,11 +1913,8 @@ impl Store {
             store.listener_hooks.lock().unwrap().push((sn, hook));
             let store2 = store.clone();
             crate::Disposable::sync(move || {
-                store2
-                    .listener_hooks
-                    .lock()
-                    .unwrap()
-                    .retain(|(s, _)| *s != sn);
+                let removed = remove_by_sn(&store2.listener_hooks, sn);
+                drop(removed);
             })
         })
     }
@@ -1880,7 +1934,8 @@ impl Store {
             store.get_hooks.lock().unwrap().push((sn, hook));
             let store2 = store.clone();
             crate::Disposable::sync(move || {
-                store2.get_hooks.lock().unwrap().retain(|(s, _)| *s != sn);
+                let removed = remove_by_sn(&store2.get_hooks, sn);
+                drop(removed);
             })
         })
     }
@@ -1900,7 +1955,8 @@ impl Store {
             store.set_hooks.lock().unwrap().push((sn, hook));
             let store2 = store.clone();
             crate::Disposable::sync(move || {
-                store2.set_hooks.lock().unwrap().retain(|(s, _)| *s != sn);
+                let removed = remove_by_sn(&store2.set_hooks, sn);
+                drop(removed);
             })
         })
     }
@@ -2108,7 +2164,10 @@ impl Store {
     fn runtime_for(self: &Arc<Self>, plugin: &Arc<dyn Plugin>) -> Arc<Runtime> {
         let key = plugin.key();
         let mut runtimes = self.runtimes.lock().unwrap();
-        if let Some(existing) = runtimes.iter().find(|r| r.key == key) {
+        if let Some(existing) = runtimes
+            .iter()
+            .find(|r| !r.retired.load(Ordering::Acquire) && r.key == key)
+        {
             return existing.clone();
         }
         let runtime = Arc::new(Runtime {
@@ -2116,6 +2175,7 @@ impl Store {
             name: plugin.name().to_string(),
             plugin: plugin.clone(),
             fibers: Mutex::new(Vec::new()),
+            retired: AtomicBool::new(false),
         });
         runtimes.push(runtime.clone());
         runtime
@@ -2173,12 +2233,19 @@ impl Store {
     /// 卸载等待与环检测仍能观察到这些实例；每个实例在 `dispose()` 完成后由 `DisposeDone` 统一摘除。
     pub fn delete_plugin(&self, key: &str) -> Vec<Arc<Fiber>> {
         let mut runtimes = self.runtimes.lock().unwrap();
-        let Some(idx) = runtimes.iter().position(|r| &*r.key == key) else {
-            return Vec::new();
-        };
-        let fibers = runtimes[idx].fibers.lock().unwrap().clone();
-        if fibers.is_empty() {
-            runtimes.remove(idx);
+        let mut fibers = Vec::new();
+        let mut i = 0;
+        while i < runtimes.len() {
+            if !runtimes[i].retired.load(Ordering::Acquire) && &*runtimes[i].key == key {
+                runtimes[i].retired.store(true, Ordering::Release);
+                let live = runtimes[i].fibers.lock().unwrap().clone();
+                if live.is_empty() {
+                    runtimes.remove(i);
+                    continue;
+                }
+                fibers.extend(live);
+            }
+            i += 1;
         }
         fibers
     }
@@ -2221,10 +2288,15 @@ impl Store {
         runtime: &Arc<Runtime>,
         raw: Config,
     ) -> BoxFuture<Result<Config>> {
+        let Some(fiber) = ctx.fiber_opt() else {
+            return Box::pin(async { Err("cannot resolve config on inactive context".into()) });
+        };
+        if fiber.is_disposed() {
+            return Box::pin(async { Err("cannot resolve config on disposed fiber".into()) });
+        }
         let plugin = runtime.plugin.clone();
         let handlers = self.handlers("internal/config", None, ctx);
         let ctx = ctx.clone();
-        let fiber = ctx.fiber();
         Box::pin(async move {
             let tail_raw = raw.clone();
             let tail: BoxFuture<Ret> = Box::pin(async move { Some(Dyn::new(tail_raw)) });
@@ -2310,3 +2382,17 @@ impl std::fmt::Display for ResolveError {
 }
 
 impl std::error::Error for ResolveError {}
+
+fn remove_by_sn<T>(list: &Mutex<Vec<(u64, T)>>, sn: u64) -> Vec<(u64, T)> {
+    let mut guard = list.lock().unwrap();
+    let mut removed = Vec::new();
+    let mut i = 0;
+    while i < guard.len() {
+        if guard[i].0 == sn {
+            removed.push(guard.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    removed
+}

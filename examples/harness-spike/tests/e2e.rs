@@ -443,3 +443,158 @@ async fn r2_p2_scoped_tool_shadows_global_tool_with_same_name() {
         "作用域同名工具必须覆盖全局工具（内层作用域优先于 owner=0）"
     );
 }
+
+#[tokio::test]
+async fn r3_p2_agent_scope_anchor_drops_and_tool_plugin_unregisters_on_dispose() {
+    let app = App::new();
+    let weak_anchor = {
+        let scoped = agent_scope(&app.root);
+        let anchor = scoped.scope().expect("agent_scope must attach ScopeAnchor");
+        Arc::downgrade(&anchor)
+    };
+    assert!(
+        weak_anchor.upgrade().is_none(),
+        "agent_scope 释放后 ScopeAnchor 不得被谓词闭包循环强引用泄漏"
+    );
+
+    let harness = boot(&["alpha"], scripted_llm("s", vec![])).await.unwrap();
+    let alpha = harness.agent_ctx("alpha");
+    let fiber = mount_tool(&alpha, "alpha", "ephemeral").await;
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_eq!(agent_of(&alpha).tools().await.unwrap(), vec!["ephemeral"]);
+
+    fiber.dispose().await;
+    assert!(
+        agent_of(&alpha).tools().await.unwrap().is_empty(),
+        "tool_plugin 卸载后必须从 tools@1 注销自身，不得残留幽灵条目"
+    );
+
+    let remounted = mount_tool(&alpha, "alpha", "ephemeral").await;
+    assert_eq!(
+        remounted.state(),
+        FiberState::Active,
+        "卸载后同名工具重新挂载必须成功：{:?}",
+        remounted.error()
+    );
+}
+
+#[tokio::test]
+async fn r3_p2_child_scope_tool_shadows_parent_and_global_across_hooks_and_catalog() {
+    use cordis_core::{BoxFuture, Config, ExternService, Result as CoreResult};
+
+    struct TaggedIface(&'static str);
+    impl ExternService for TaggedIface {
+        fn service(&self) -> &str {
+            "tagged-iface"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["call".to_string()]
+        }
+        fn call(
+            &self,
+            _meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> BoxFuture<CoreResult<Config>> {
+            let label = self.0;
+            Box::pin(async move { Ok(json!({ "owner": label })) })
+        }
+    }
+
+    // 1. Parent hook tool vs child hook tool: child must shadow parent even though parent mounted first.
+    let harness = boot(
+        &["parent"],
+        scripted_llm(
+            "s",
+            vec![
+                plan("shared_hook", json!({})),
+                plan("hook_vs_iface", json!({})),
+                plan("iface_vs_hook", json!({})),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    let parent_ctx = harness.agent_ctx("parent");
+    mount_tool(&parent_ctx, "parent", "shared_hook").await;
+    mount_tool(&parent_ctx, "parent", "hook_vs_iface").await;
+
+    let sub = mount_agent(&parent_ctx, "child").await.unwrap();
+    let sub_uid = sub.ctx.scope().expect("child scope").uid();
+    mount_tool(&sub.ctx, "child", "shared_hook").await;
+    mount_tool(&sub.ctx, "child", "iface_vs_hook").await;
+
+    // Register global catalog iface tool for `iface_vs_hook` (child has hook tool)
+    // and child catalog iface tool for `hook_vs_iface` (parent has hook tool).
+    let _g = harness
+        .app
+        .root
+        .provide_iface("tool.global-ivh@1", Arc::new(TaggedIface("global-iface")))
+        .unwrap();
+    let _c = harness
+        .app
+        .root
+        .provide_iface("tool.child-hvi@1", Arc::new(TaggedIface("child-iface")))
+        .unwrap();
+    let tools = ToolsService::of(&sub.ctx).unwrap();
+    tools
+        .register(
+            0,
+            "iface_vs_hook".into(),
+            "global iface".into(),
+            Some("tool.global-ivh@1".into()),
+        )
+        .await
+        .unwrap();
+    tools
+        .register(
+            sub_uid,
+            "hook_vs_iface".into(),
+            "child iface".into(),
+            Some("tool.child-hvi@1".into()),
+        )
+        .await
+        .unwrap();
+
+    // Direct hook call on child scope must hit child's `shared_hook`, NOT parent's.
+    let direct = call_tool(&sub.ctx, "shared_hook").await.unwrap();
+    assert_eq!(
+        direct.output["owner"],
+        json!("child"),
+        "子作用域钩子工具必须覆盖父作用域同名钩子工具: {direct:?}"
+    );
+
+    // Full Agent::run must honor innermost scope precedence across BOTH hook and catalog tools.
+    let report = agent_of(&sub.ctx).run("shadow-check".into()).await.unwrap();
+    assert_eq!(
+        report.tools,
+        vec!["shared_hook", "hook_vs_iface", "iface_vs_hook"]
+    );
+    let tool_records: Vec<_> = harness
+        .session_records()
+        .into_iter()
+        .filter(|r| r["kind"] == json!("tool"))
+        .collect();
+    assert_eq!(tool_records.len(), 3);
+    assert_eq!(
+        tool_records[0]["output"]["owner"],
+        json!("child"),
+        "shared_hook 必须命中 child: {:?}",
+        tool_records[0]
+    );
+    assert_eq!(
+        tool_records[1]["output"]["owner"],
+        json!("child-iface"),
+        "子作用域 catalog iface 工具必须覆盖父作用域同名 hook 工具: {:?}",
+        tool_records[1]
+    );
+    assert_eq!(
+        tool_records[2]["output"]["owner"],
+        json!("child"),
+        "子作用域 hook 工具必须覆盖全局同名 catalog iface 工具: {:?}",
+        tool_records[2]
+    );
+}

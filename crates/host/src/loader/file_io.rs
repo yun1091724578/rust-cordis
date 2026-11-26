@@ -103,11 +103,158 @@ fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    fn CreateFileW(
+        file_name: *const u16,
+        desired_access: u32,
+        share_mode: u32,
+        security_attributes: *mut std::ffi::c_void,
+        creation_disposition: u32,
+        flags_and_attributes: u32,
+        template_file: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
 }
 
 #[cfg(not(any(unix, windows)))]
 fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn is_lock_contention(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+#[cfg(not(windows))]
+fn is_lock_contention(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::AlreadyExists
+}
+
+/// 跨进程/跨线程互斥的陈旧锁回收门禁：
+/// - Windows：`CreateFileW` 以 `dwShareMode = 0`（独占）+ `FILE_FLAG_DELETE_ON_CLOSE` 打开 `.reclaim`；
+///   进程崩溃后内核立即释放句柄，即使磁盘残留 `.reclaim` 文件也不会死锁，且绝无双持窗口。
+/// - Unix：`O_CREAT | O_RDWR` + `flock(LOCK_EX | LOCK_NB)` + 核验 `fstat.ino == stat.ino`，
+///   崩溃自动释放，同样不存在陈旧 `.reclaim` 误删窗口。
+#[cfg(windows)]
+struct ReclaimMutex {
+    handle: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+impl ReclaimMutex {
+    fn try_acquire(path: &Path) -> Option<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const DELETE: u32 = 0x0001_0000;
+        const OPEN_ALWAYS: u32 = 4;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        let invalid = (-1isize) as *mut std::ffi::c_void;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | DELETE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == invalid || handle.is_null() {
+            None
+        } else {
+            Some(Self { handle })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ReclaimMutex {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(unix)]
+struct ReclaimMutex {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl ReclaimMutex {
+    fn try_acquire(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        const LOCK_EX: std::ffi::c_int = 2;
+        const LOCK_NB: std::ffi::c_int = 4;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .ok()?;
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        if rc != 0 {
+            return None;
+        }
+        let fd_meta = file.metadata().ok()?;
+        let path_meta = std::fs::metadata(path).ok()?;
+        if fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino() {
+            return None;
+        }
+        Some(Self {
+            path: path.to_path_buf(),
+            _file: file,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReclaimMutex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ReclaimMutex {
+    path: PathBuf,
+}
+
+#[cfg(not(any(unix, windows)))]
+impl ReclaimMutex {
+    fn try_acquire(path: &Path) -> Option<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .ok()?;
+        drop(file);
+        Some(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl Drop for ReclaimMutex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// 同目录 lock 文件：把 `append_atomically` 的 read-modify-write 串行化。
@@ -148,13 +295,9 @@ impl ConfigLock {
                 }
                 // Windows 上另一个线程正打开/删除同名文件时，`create_new` 可能报
                 // `PermissionDenied`（ERROR_ACCESS_DENIED / sharing violation），
-                // 而不是 `AlreadyExists`；而且检查 `path.exists()` 时文件可能已经
-                // 被对方删掉。竞争窗口内一律按"锁被占用"重试，不能把瞬时竞争
-                // 误报成创建失败。
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::AlreadyExists
-                        || err.kind() == std::io::ErrorKind::PermissionDenied =>
-                {
+                // 而不是 `AlreadyExists`；非 Windows 平台仅对 `AlreadyExists` 重试，
+                // 真实目录权限错误立即返回，不再空转 1 秒。
+                Err(err) if is_lock_contention(&err) => {
                     let is_stale = |p: &Path, max_age: Duration| {
                         std::fs::metadata(p)
                             .and_then(|meta| meta.modified())
@@ -163,51 +306,16 @@ impl ConfigLock {
                             .is_some_and(|age| age > max_age)
                     };
                     if is_stale(&path, Duration::from_secs(30)) {
-                        // 用独立 `.reclaim` 互斥锁串行化陈旧锁回收，并在持锁后二次确认
+                        // 用内核级独占 `.reclaim` 互斥锁串行化陈旧锁回收，并在持锁后二次确认
                         // mtime 仍已陈旧，防止并发等待者在另一方刚创建新锁后误删新锁。
                         let reclaim_path = dir.join(format!(".{name}.lock.reclaim"));
-                        match std::fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&reclaim_path)
-                        {
-                            Ok(reclaim_file) => {
-                                drop(reclaim_file);
-                                struct ReclaimGuard(PathBuf);
-                                impl Drop for ReclaimGuard {
-                                    fn drop(&mut self) {
-                                        for _ in 0..50 {
-                                            match std::fs::remove_file(&self.0) {
-                                                Ok(()) => return,
-                                                Err(e)
-                                                    if e.kind() == std::io::ErrorKind::NotFound =>
-                                                {
-                                                    return;
-                                                }
-                                                Err(_) => {
-                                                    std::thread::sleep(Duration::from_millis(1));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                let _reclaim = ReclaimGuard(reclaim_path);
-                                if is_stale(&path, Duration::from_secs(30)) {
-                                    let _ = std::fs::remove_file(&path);
-                                }
+                        if let Some(_reclaim) = ReclaimMutex::try_acquire(&reclaim_path) {
+                            if is_stale(&path, Duration::from_secs(30))
+                                && std::fs::remove_file(&path).is_ok()
+                            {
+                                drop(_reclaim);
                                 continue;
                             }
-                            Err(reclaim_err)
-                                if reclaim_err.kind() == std::io::ErrorKind::AlreadyExists
-                                    || reclaim_err.kind()
-                                        == std::io::ErrorKind::PermissionDenied =>
-                            {
-                                // 极端崩溃遗留的陈旧 `.reclaim`（>60s）才清理；正常竞争直接退让。
-                                if is_stale(&reclaim_path, Duration::from_secs(60)) {
-                                    let _ = std::fs::remove_file(&reclaim_path);
-                                }
-                            }
-                            Err(_) => {}
                         }
                     }
                     std::thread::sleep(Duration::from_millis(1));
@@ -364,6 +472,59 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r3_p2_config_lock_stale_reclaim_file_also_preserves_mutual_exclusion() {
+        let dir = std::env::temp_dir().join(format!(
+            "cordis-config-lock-reclaim-race-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cordis.yml");
+        let lock_path = dir.join(".cordis.yml.lock");
+        let reclaim_path = dir.join(".cordis.yml.lock.reclaim");
+
+        for round in 0..20 {
+            let _ = std::fs::remove_file(&lock_path);
+            let _ = std::fs::remove_file(&reclaim_path);
+            let old = std::time::SystemTime::now() - Duration::from_secs(120);
+            for p in [&lock_path, &reclaim_path] {
+                let f = std::fs::File::create(p).unwrap();
+                f.set_modified(old).unwrap();
+            }
+
+            let active = Arc::new(AtomicUsize::new(0));
+            let violations = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(6));
+            let mut handles = Vec::new();
+            for _ in 0..6 {
+                let target = target.clone();
+                let active = active.clone();
+                let violations = violations.clone();
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    let _guard = ConfigLock::acquire(&target).expect("acquire lock");
+                    let prev = active.fetch_add(1, Ordering::SeqCst);
+                    if prev != 0 {
+                        violations.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                violations.load(Ordering::SeqCst),
+                0,
+                "round {round}: 并发回收陈旧 .reclaim 锁时破坏了互斥性"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -54,7 +54,10 @@ pub use policy::{
     StartupPolicy,
 };
 pub(crate) use staging::mount_with_label;
-pub use staging::{describe, mount, resolve_plugin_path, stage_plugin, staged_leaked, StagedFile};
+pub use staging::{
+    active_staging_dir, describe, mount, resolve_plugin_path, stage_plugin, staged_leaked,
+    StagedFile,
+};
 
 #[cfg(test)]
 use cordis_abi::ERROR_FORMAT_V1;
@@ -229,6 +232,10 @@ struct DispatchRecord {
     stream: Option<StreamSink>,
 }
 
+/// 共享一次性取消出站槽：`TaskExit::drop`、`deliver_next`、取消树与卸载排水共同竞争，
+/// 最多只有一方能取出 `Outbound`，杜绝同步快路径丢交付或重复入队。
+type CancelOutboundSlot = Arc<Mutex<Option<Outbound>>>;
+
 /// 业务记录摘除之后，取消与退出凭证仍由实例持有。
 struct DispatchTask {
     dispatch_id: u64,
@@ -236,7 +243,7 @@ struct DispatchTask {
     done: tokio::sync::oneshot::Receiver<()>,
     /// 与任务绑定的续延取消通知（如 `ctx_next` 的 `on_done`）：
     /// 取消或卸载排水时若尚未交付，则原子认领并投递一次错误，保证“恰好一次”。
-    cancel_outbound: Option<(Outbound, Arc<AtomicBool>)>,
+    cancel_outbound: Option<(CancelOutboundSlot, Arc<AtomicBool>)>,
 }
 
 struct TaskExit {
@@ -256,7 +263,7 @@ impl Drop for TaskExit {
             // `deliver_next` 见到 `closed` 放弃投递），把尚未认领的 `cancel_outbound` 转交
             // `deferred_outbounds`，确保卸载收尾仍能在 `OP_DISPOSE` 前交付恰好一次。
             if let Some(DispatchTask {
-                cancel_outbound: Some((entry, delivered)),
+                cancel_outbound: Some((slot, delivered)),
                 ..
             }) = removed
             {
@@ -265,8 +272,10 @@ impl Drop for TaskExit {
                     .upgrade()
                     .is_some_and(|flag| flag.load(Ordering::SeqCst));
                 if is_closed && !delivered.load(Ordering::SeqCst) {
-                    if let Some(deferred) = self.deferred_outbounds.upgrade() {
-                        deferred.lock().unwrap().push((entry, delivered));
+                    if let Some(entry) = slot.lock().unwrap().take() {
+                        if let Some(deferred) = self.deferred_outbounds.upgrade() {
+                            deferred.lock().unwrap().push((entry, delivered));
+                        }
                     }
                 }
             }
@@ -287,7 +296,7 @@ fn dispatch_task(instance: &Instance, dispatch_id: u64) -> (CancelToken, TaskExi
 fn dispatch_task_with_cancel(
     instance: &Instance,
     dispatch_id: u64,
-    cancel_outbound: Option<(Outbound, Arc<AtomicBool>)>,
+    cancel_outbound: Option<(CancelOutboundSlot, Arc<AtomicBool>)>,
 ) -> (CancelToken, TaskExit) {
     static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
     let id = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -962,12 +971,14 @@ fn stream_protocol_error(message: String) -> ErrorPayload {
 ///
 /// 锁只在这一条语句里持有：返回的是克隆，调用方在**放锁之后**才碰流。
 fn stream_of(instance: &Instance, dispatch_id: u64) -> Option<Option<StreamSink>> {
-    instance
-        .dispatches
-        .lock()
-        .unwrap()
-        .get(&dispatch_id)
-        .map(|record| record.stream.clone())
+    let table = instance.dispatches.lock().unwrap();
+    match table.get(&dispatch_id).map(|record| record.stream.clone()) {
+        Some(Some(sink)) => Some(Some(sink)),
+        // 实例已进入关闭排水（含 `drain_timed_out` 清空 `record.stream` 但尚未删键的窗口）时，
+        // 返回 `None`（`STATUS_STREAM_GONE`）保持 `stream_close`/`fail` 幂等，而不误报“不是流”。
+        Some(None) if instance.closed.load(Ordering::SeqCst) => None,
+        other => other,
+    }
 }
 
 /// 每条流最多挂多少条**等待窗口的推送**（credit 债）。
@@ -1231,9 +1242,11 @@ fn drain_dispatch_tree(instance: &Instance, root: u64, payload: &ErrorPayload) -
             for task in tasks.values_mut() {
                 if victims.contains(&task.dispatch_id) {
                     cancels.push(task.cancel.clone());
-                    if let Some((outbound, delivered)) = task.cancel_outbound.take() {
+                    if let Some((slot, delivered)) = task.cancel_outbound.take() {
                         if !delivered.swap(true, Ordering::SeqCst) {
-                            task_outbounds.push(outbound);
+                            if let Some(outbound) = slot.lock().unwrap().take() {
+                                task_outbounds.push(outbound);
+                            }
                         }
                     }
                 }
@@ -2457,31 +2470,22 @@ impl LoadedPlugin {
             })?)
         };
         let desc = unsafe { entry() };
-        if desc.is_null() {
-            return Err(crate::source::ClassifiedVerifyError {
-                category: FailureCategory::Integrity,
-                message: format!("{} 的 cordis_plugin_v1 返回了空指针", path.display()),
-            });
-        }
-        // **先只读冻结头**：`id`/`inject` 的 offset 在 `size` 覆盖范围之外时，
-        // 直接读 `(*desc).id` 会越界。门禁必须发生在任何尾字段读取之前。
-        let (abi_version, size) = unsafe { ((*desc).abi_version, (*desc).size as usize) };
-        desc_gate(abi_version, size, cordis_abi::PLUGIN_DESC_PREFIX_SIZE).map_err(|error| {
+        let prefix = unsafe { read_desc_prefix(desc) }.map_err(|error| {
             crate::source::ClassifiedVerifyError {
                 category: FailureCategory::Integrity,
                 message: format!("插件文件 {}：{error}", path.display()),
             }
         })?;
         let (id, inject_json, provision_json, schema, schema_error, error_format) = unsafe {
-            let schema = schema_from_blob((*desc).schema);
-            let id = blob_to_string((*desc).id, "PluginDesc.id").map_err(|error| {
+            let schema = schema_from_blob(prefix.schema);
+            let id = blob_to_string(prefix.id, "PluginDesc.id").map_err(|error| {
                 crate::source::ClassifiedVerifyError {
                     category: FailureCategory::Integrity,
                     message: format!("插件文件 {}：{error}", path.display()),
                 }
             })?;
             let inject_json =
-                blob_to_string((*desc).inject, "PluginDesc.inject").map_err(|error| {
+                blob_to_string(prefix.inject, "PluginDesc.inject").map_err(|error| {
                     crate::source::ClassifiedVerifyError {
                         category: FailureCategory::Integrity,
                         message: format!("插件文件 {}：{error}", path.display()),
@@ -2513,8 +2517,8 @@ impl LoadedPlugin {
         };
         // 把宿主函数表交给插件。**这是版本闸门的唯一入口**：插件在这里校验，
         // 不匹配就不登记，之后每次 call 都会显式失败。
-        unsafe { ((*desc).attach)(&HOST_API) };
-        let call = unsafe { (*desc).call };
+        unsafe { (prefix.attach)(&HOST_API) };
+        let call = prefix.call;
 
         Ok(LoadedPlugin {
             library: Arc::new(LoadedLibrary {
@@ -3131,9 +3135,11 @@ async fn finish_instance_teardown_unbounded(
         }
         let mut pending_rx = Vec::with_capacity(tasks.len());
         for mut task in tasks {
-            if let Some((entry, delivered)) = task.cancel_outbound.take() {
+            if let Some((slot, delivered)) = task.cancel_outbound.take() {
                 if !delivered.swap(true, Ordering::SeqCst) {
-                    outbound.push(entry);
+                    if let Some(entry) = slot.lock().unwrap().take() {
+                        outbound.push(entry);
+                    }
                 }
             }
             task.cancel.cancel();
@@ -3312,9 +3318,11 @@ async fn finish_instance_teardown(
         let mut pending_rx: Vec<tokio::sync::oneshot::Receiver<()>> =
             Vec::with_capacity(tasks.len());
         for mut task in tasks {
-            if let Some((entry, delivered)) = task.cancel_outbound.take() {
+            if let Some((slot, delivered)) = task.cancel_outbound.take() {
                 if !delivered.swap(true, Ordering::SeqCst) {
-                    outbound.push(entry);
+                    if let Some(entry) = slot.lock().unwrap().take() {
+                        outbound.push(entry);
+                    }
                 }
             }
             task.cancel.cancel();
@@ -3493,11 +3501,14 @@ fn apply_via_with_keepalive_and_format(
                                         .unwrap()
                                         .values_mut()
                                         .map(|task| {
-                                            if let Some((entry, delivered)) =
+                                            if let Some((slot, delivered)) =
                                                 task.cancel_outbound.take()
                                             {
                                                 if !delivered.swap(true, Ordering::SeqCst) {
-                                                    deferred_outbounds.push(entry);
+                                                    if let Some(entry) = slot.lock().unwrap().take()
+                                                    {
+                                                        deferred_outbounds.push(entry);
+                                                    }
                                                 }
                                             }
                                             task.cancel.clone()
@@ -3735,27 +3746,62 @@ impl Capabilities {
     pub fn origin(&self) -> &'static str {
         CAPABILITY_ORIGIN
     }
+}
 
-    /// 直接从一份 `PluginDesc` 读（**不经动态库与实例**，M5 的 ABI 生产路径）。
+/// 冻结前缀读取结果：全部经非对齐裸读取并校验 `attach`/`call` 非空后再转函数指针，
+/// 杜绝畸形/未对齐/含空函数指针的 `PluginDesc` 触发 Rust UB。
+struct DescPrefix {
+    id: Blob,
+    inject: Blob,
+    schema: Blob,
+    attach: unsafe extern "C" fn(*const cordis_abi::HostApi),
+    call: CallFn,
+}
+
+unsafe fn read_desc_prefix(desc: *const PluginDesc) -> std::result::Result<DescPrefix, String> {
+    if desc.is_null() {
+        return Err("cordis_plugin_v1 返回了空指针".to_string());
+    }
+    let abi_version = std::ptr::read_unaligned(std::ptr::addr_of!((*desc).abi_version));
+    let size = std::ptr::read_unaligned(std::ptr::addr_of!((*desc).size)) as usize;
+    desc_gate(abi_version, size, cordis_abi::PLUGIN_DESC_PREFIX_SIZE)
+        .map_err(|err| err.to_string())?;
+    let id = std::ptr::read_unaligned(std::ptr::addr_of!((*desc).id));
+    let inject = std::ptr::read_unaligned(std::ptr::addr_of!((*desc).inject));
+    let schema = std::ptr::read_unaligned(std::ptr::addr_of!((*desc).schema));
+    let attach_raw =
+        std::ptr::read_unaligned(std::ptr::addr_of!((*desc).attach) as *const *const ());
+    if attach_raw.is_null() {
+        return Err("PluginDesc.attach 函数指针为空".to_string());
+    }
+    let call_raw = std::ptr::read_unaligned(std::ptr::addr_of!((*desc).call) as *const *const ());
+    if call_raw.is_null() {
+        return Err("PluginDesc.call 函数指针为空".to_string());
+    }
+    let attach: unsafe extern "C" fn(*const cordis_abi::HostApi) = std::mem::transmute(attach_raw);
+    let call: CallFn = std::mem::transmute(call_raw);
+    Ok(DescPrefix {
+        id,
+        inject,
+        schema,
+        attach,
+        call,
+    })
+}
+
+impl Capabilities {
+    /// 直接从插件描述表读能力面（测试夹具与 `LoadedPlugin` 之外的探测入口）。
     ///
     /// # Safety
-    /// `desc` 必须按 ABI 约定有效（与 [`LoadedPlugin::open`] 的读法同一套判界规则：
-    /// 先校验 `abi_version` / `size`，`provision` 是尾字段，靠 `field_at` 按 `size`
-    /// 判断存在性）。
+    /// `desc` 为空时返回默认能力面；非空时必须按 ABI 约定有效（先非对齐校验 `abi_version` /
+    /// `size` / 非空 `attach` & `call`，尾字段走 `field_at`）。
     pub unsafe fn of_desc(desc: *const crate::PluginDesc) -> Self {
-        // 与 `LoadedPlugin::open` 相同：门禁必须先于任何尾字段读取。调用方即使传了
-        // 尺寸不足的 desc，也只会得到默认能力面，而不是越界读。
-        let abi_version = (*desc).abi_version;
-        let size = (*desc).size as usize;
-        if desc_gate(abi_version, size, cordis_abi::PLUGIN_DESC_PREFIX_SIZE).is_err() {
+        let Ok(prefix) = read_desc_prefix(desc) else {
             return Self::default();
-        }
-        // 不用 `&*desc`：v1 插件的分配可能只有 72B，形成 96B `&PluginDesc` 本身就是
-        // 超尺寸引用。这里只读冻结前缀内的字段，尾字段一律走 `field_at(desc, ...)`。
-        let attach = (*desc).attach;
+        };
         // 与 `LoadedPlugin::open` 同一套前置：**先把函数表交给插件**（copy-on-attach），
         // 否则插件侧的 `call` 会以"ABI 版本不匹配"拒绝服务（它还没有宿主表）。
-        unsafe { attach(host_api()) };
+        unsafe { (prefix.attach)(host_api()) };
         let provision = PluginDesc::field_at::<crate::Blob>(
             desc,
             std::mem::offset_of!(crate::PluginDesc, provision),
@@ -3763,7 +3809,7 @@ impl Capabilities {
         .and_then(|blob| blob_as_bytes(blob, "PluginDesc.provision").ok())
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
         .unwrap_or_default();
-        let inject_raw = blob_as_bytes((*desc).inject, "PluginDesc.inject")
+        let inject_raw = blob_as_bytes(prefix.inject, "PluginDesc.inject")
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
             .unwrap_or_default();
         let inject = parse_inject(&inject_raw);
@@ -3771,7 +3817,7 @@ impl Capabilities {
         let inject: Vec<String> = inject.0.iter().map(|(name, _)| name.to_string()).collect();
         let volatile = match unsafe {
             call_op_read(
-                (*desc).call,
+                prefix.call,
                 0,
                 cordis_abi::OP_VOLATILE_PATHS,
                 "",
@@ -3797,9 +3843,9 @@ impl Capabilities {
                 Vec::new()
             }
         };
-        let schema = schema_from_blob((*desc).schema);
+        let schema = schema_from_blob(prefix.schema);
         Self {
-            plugin: blob_as_bytes((*desc).id, "PluginDesc.id")
+            plugin: blob_as_bytes(prefix.id, "PluginDesc.id")
                 .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                 .unwrap_or_default(),
             // 冻结的 PluginDesc 没有 semver 字段；sidecar 版本不会从这里冒充。
@@ -3932,11 +3978,15 @@ fn probe_capabilities_with(
     // 再让 `source.load` 去读第二次准入"：两步之间全局被改，打开就走了另一份结论
     // （甚至走未校验分支），暂存副本也不再与已验证的 hash 绑定。
     let admission = source.admission();
-    if let Some(policy) = admission.resolve()? {
-        let resolved = resolve_plugin_path(&entry.name, search)?;
-        policy.verify(&resolved)?;
-    }
-    let loaded = source.load_admitted(&entry, search, next_use_revision(), &admission)?;
+    let frozen_admission = match admission.resolve()? {
+        Some(policy) => {
+            let resolved = resolve_plugin_path(&entry.name, search)?;
+            policy.verify(&resolved)?;
+            crate::source::SourceAdmission::strict(policy)
+        }
+        None => crate::source::SourceAdmission::dev_unverified(),
+    };
+    let loaded = source.load_admitted(&entry, search, next_use_revision(), &frozen_admission)?;
     // `loaded` 在这一句之后 drop：先 FreeLibrary、后删暂存副本（M0b 的字段序保证）。
     Ok(Capabilities::of_plugin(&*loaded.plugin))
 }

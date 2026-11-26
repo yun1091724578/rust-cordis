@@ -627,23 +627,19 @@ impl SessionLog {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let seq = state.next;
         let mut record = record;
-        if let Value::Object(map) = &mut record {
-            map.insert("seq".to_string(), json!(seq));
-            if map.get("kind").and_then(Value::as_str) == Some("boot") {
-                state.boots += 1;
-            }
-        }
-        let line =
+        let Some(map) = record.as_object_mut() else {
+            return Err("会话记录必须是 JSON 对象（否则重载恢复时无法提取 seq）".to_string());
+        };
+        map.insert("seq".to_string(), json!(seq));
+        let is_boot = map.get("kind").and_then(Value::as_str) == Some("boot");
+        let mut line =
             serde_json::to_string(&record).map_err(|err| format!("会话记录无法序列化: {err}"))?;
+        line.push('\n');
         let describe =
             |err: std::io::Error, what: &str| format!("{what} {} 失败: {err}", self.path.display());
         state
             .file
             .write_all(line.as_bytes())
-            .map_err(|err| describe(err, "写会话日志"))?;
-        state
-            .file
-            .write_all(b"\n")
             .map_err(|err| describe(err, "写会话日志"))?;
         // 屏障：write + flush + sync_all，一个都不能少（后者才是"到了盘上"）。
         state
@@ -655,6 +651,9 @@ impl SessionLog {
             .sync_all()
             .map_err(|err| describe(err, "sync 会话日志"))?;
         state.next = seq + 1;
+        if is_boot {
+            state.boots += 1;
+        }
         Ok(seq)
     }
 
@@ -683,8 +682,12 @@ impl SessionLog {
             .boots
     }
 
-    /// 末尾 `count` 条：**从文件读**，读到的就是盘上的真相。
+    /// 末尾 `count` 条：**从文件读**，持状态锁与 `append` 互斥避免并发读到半截行。
     fn tail(&self, count: u32) -> Result<Vec<Value>, String> {
+        let _guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let text = std::fs::read_to_string(&self.path)
             .map_err(|err| format!("读会话日志 {} 失败: {err}", self.path.display()))?;
         let lines: Vec<&str> = text
@@ -826,5 +829,51 @@ mod tests {
         );
         assert!(out2.closed.load(Ordering::SeqCst));
         assert_eq!(total_sent.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn r3_p2_session_log_rejects_non_object_and_serializes_concurrent_tail() {
+        let dir =
+            std::env::temp_dir().join(format!("cordis-r3-session-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.jsonl");
+
+        let log = Arc::new(SessionLog::open(path.clone()).unwrap());
+        assert_eq!(log.append(json!({ "kind": "boot" })).unwrap(), 1);
+        assert_eq!(log.boots(), 1);
+        // Non-object JSON must be rejected so seq cannot drift across reload.
+        assert!(
+            log.append(json!("not-an-object")).is_err(),
+            "非 JSON 对象记录必须被拒绝，防止重载后 seq 重复"
+        );
+        assert_eq!(log.next_seq(), 2);
+
+        // Concurrent append + tail must never observe torn/partial JSON lines.
+        let writer_log = Arc::clone(&log);
+        let reader_log = Arc::clone(&log);
+        let writer = std::thread::spawn(move || {
+            for i in 0..30u64 {
+                writer_log
+                    .append(json!({ "kind": "step", "i": i, "payload": "x".repeat(256) }))
+                    .unwrap();
+            }
+        });
+        let reader = std::thread::spawn(move || {
+            for _ in 0..60 {
+                let rows = reader_log
+                    .tail(10)
+                    .expect("concurrent tail must never fail");
+                assert!(!rows.is_empty());
+            }
+        });
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        // Reopen from disk and confirm seq continuity.
+        let reopened = SessionLog::open(path).unwrap();
+        assert_eq!(reopened.next_seq(), 32);
+        assert_eq!(reopened.boots(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

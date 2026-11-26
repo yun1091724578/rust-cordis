@@ -478,54 +478,47 @@ impl UpdateChain {
             return;
         }
         self.settled = true;
-        let restore = {
-            let mut state = self.fiber.update_rollback.lock().unwrap();
-            let was_live = state.live_rev == self.rev;
-            state.in_flight.retain(|(r, _)| *r != self.rev);
-            let restore = if was_live {
-                let candidate = match (state.in_flight.last(), state.baseline.as_ref()) {
-                    (Some((r1, s1)), Some((r2, s2))) => {
-                        if r1 >= r2 {
-                            Some((*r1, s1))
-                        } else {
-                            Some((*r2, s2))
-                        }
+        // 在同一把 `update_rollback` 锁内完成状态判定与 `config`/`resolved`/`volatile` 回滚，
+        // 统一锁序 `update_rollback -> (config, resolved, volatile)`，消除与并发 `update_with` 的锁间隙竞态。
+        let mut state = self.fiber.update_rollback.lock().unwrap();
+        let was_live = state.live_rev == self.rev;
+        state.in_flight.retain(|(r, _)| *r != self.rev);
+        if was_live {
+            let candidate = match (state.in_flight.last(), state.baseline.as_ref()) {
+                (Some((r1, s1)), Some((r2, s2))) => {
+                    if r1 >= r2 {
+                        Some((*r1, s1))
+                    } else {
+                        Some((*r2, s2))
                     }
-                    (Some((r1, s1)), None) => Some((*r1, s1)),
-                    (None, Some((r2, s2))) => Some((*r2, s2)),
-                    (None, None) => None,
                 }
-                .map(|(target_rev, s)| {
-                    (
-                        target_rev,
-                        UpdateSnapshot {
-                            config: s.config.clone(),
-                            resolved: s.resolved.clone(),
-                            volatile: s.volatile.clone(),
-                        },
-                    )
-                });
-                if let Some((target_rev, snap)) = candidate {
-                    state.live_rev = target_rev;
-                    Some(snap)
-                } else {
-                    state.live_rev = 0;
-                    None
+                (Some((r1, s1)), None) => Some((*r1, s1)),
+                (None, Some((r2, s2))) => Some((*r2, s2)),
+                (None, None) => None,
+            }
+            .map(|(target_rev, s)| {
+                (
+                    target_rev,
+                    UpdateSnapshot {
+                        config: s.config.clone(),
+                        resolved: s.resolved.clone(),
+                        volatile: s.volatile.clone(),
+                    },
+                )
+            });
+            if let Some((target_rev, snap)) = candidate {
+                state.live_rev = target_rev;
+                if !self.fiber.is_disposed() {
+                    *self.fiber.config.lock().unwrap() = snap.config;
+                    *self.fiber.resolved.lock().unwrap() = snap.resolved;
+                    *self.fiber.volatile.lock().unwrap() = snap.volatile;
                 }
             } else {
-                None
-            };
-            if state.in_flight.is_empty() {
-                state.baseline = None;
+                state.live_rev = 0;
             }
-            restore
-        };
-        if let Some(snap) = restore {
-            if !self.fiber.is_disposed() {
-                *self.fiber.config.lock().unwrap() = snap.config;
-                *self.fiber.resolved.lock().unwrap() = snap.resolved;
-                *self.fiber.volatile.lock().unwrap() = snap.volatile;
-            }
+        }
+        if state.in_flight.is_empty() {
+            state.baseline = None;
         }
     }
     fn cleanup_aborted(&mut self) {
@@ -1329,30 +1322,36 @@ impl Fiber {
     /// `resolveConfig(fiber.runtime, fiber.ctx.waterfall(fiber, 'internal/config', raw))`：
     /// 走一遍完整的解析链（`!!js` 会跟着**当前上下文**再算一次），失败即"候选无效"。
     pub async fn resolve_raw(self: &Arc<Self>, raw: &Config) -> Result<Config> {
+        if self.is_disposed() {
+            return Err("cannot resolve config on disposed fiber".into());
+        }
         let Some(runtime) = self.runtime.clone() else {
             return Err("fiber 没有 runtime：无法解析配置".into());
         };
-        self.store
-            .resolve_config(&self.ctx(), &runtime, raw.clone())
-            .await
+        let Some(ctx) = self.ctx_opt() else {
+            return Err("cannot resolve config on disposed fiber".into());
+        };
+        self.store.resolve_config(&ctx, &runtime, raw.clone()).await
     }
 
-    /// 记账：已解析配置 + volatile 引用表（每次装载重建，对应上游"校验期创建引用"）。
-    fn adopt_resolved(self: &Arc<Self>, resolved: &Config, runtime: &Arc<Runtime>) {
-        *self.resolved.lock().unwrap() = resolved.clone();
+    /// 构造 volatile 引用表（不含锁，供装载与更新共用）。
+    fn build_volatile_table(
+        self: &Arc<Self>,
+        resolved: &Config,
+        runtime: &Arc<Runtime>,
+    ) -> crate::volatile::VolatileTable {
         let paths = runtime.plugin.volatile_paths();
         if let Err(issue) = crate::validate_volatile_paths(&paths) {
             // 声明本身不合法：不建任何引用 ⇒ 这个插件退化成"配置一变就重挂"。
             // 之所以是日志而不是装载失败：它是**能力声明**的问题，不是这一行配置的问题。
             self.store.log(Level::Error, &self.name(), &issue);
-            self.volatile.lock().unwrap().clear();
-            return;
+            return crate::volatile::VolatileTable::new();
         }
         let mut table = crate::volatile::VolatileTable::new();
         for (path, value) in crate::values_at(resolved, &paths) {
             table.insert(path.into_boxed_str(), crate::VolatileRef::new(value));
         }
-        *self.volatile.lock().unwrap() = table;
+        table
     }
 
     /// 当前**正在运行**的那个 epoch。
@@ -2350,13 +2349,25 @@ impl Fiber {
             let fiber2 = fiber.clone();
             let name2 = name_owned.clone();
             Disposable::sync(move || {
-                let mut hooks = fiber2.hooks.lock().unwrap();
-                if let Some(list) = hooks.get_mut(&name2) {
-                    list.retain(|(s, _)| *s != sn);
-                    if list.is_empty() {
-                        hooks.remove(&name2);
+                let removed = {
+                    let mut hooks = fiber2.hooks.lock().unwrap();
+                    let mut removed = Vec::new();
+                    if let Some(list) = hooks.get_mut(&name2) {
+                        let mut i = 0;
+                        while i < list.len() {
+                            if list[i].0 == sn {
+                                removed.push(list.remove(i));
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if list.is_empty() {
+                            hooks.remove(&name2);
+                        }
                     }
-                }
+                    removed
+                };
+                drop(removed);
             })
         })
     }
@@ -2561,7 +2572,20 @@ impl Fiber {
             return;
         }
         let Some(ctx) = self.ctx_opt() else { return };
-        let raw = self.config.lock().unwrap().clone();
+        // 若仍有尚未被 `internal/update` 批准的在飞更新（`in_flight` 非空），装载只能采用
+        // 最新已批准的 `baseline` 配置，绝不把未批准/可能被否决的 `self.config` 交给 `plugin.apply`。
+        let (raw, loading_from_baseline) = {
+            let rb = self.update_rollback.lock().unwrap();
+            if !rb.in_flight.is_empty() {
+                if let Some((base_rev, snap)) = &rb.baseline {
+                    (snap.config.clone(), Some(*base_rev))
+                } else {
+                    (self.config.lock().unwrap().clone(), None)
+                }
+            } else {
+                (self.config.lock().unwrap().clone(), None)
+            }
+        };
         let resolved = match self.store.resolve_config(&ctx, &runtime, raw).await {
             Ok(config) => config,
             Err(err) => {
@@ -2574,7 +2598,23 @@ impl Fiber {
         }
         // 已解析配置与 volatile 引用都是"装载的一部分"（M4-5）：引用在**插件跑之前**建好，
         // 插件的 `apply` 里就能 `ctx.volatile("data")` 取到——对应上游"校验期创建引用"。
-        self.adopt_resolved(&resolved, &runtime);
+        let live_table = self.build_volatile_table(&resolved, &runtime);
+        {
+            let mut rb = self.update_rollback.lock().unwrap();
+            *self.volatile.lock().unwrap() = live_table.clone();
+            if rb.in_flight.is_empty() {
+                *self.resolved.lock().unwrap() = resolved.clone();
+            } else if let Some(base_rev) = loading_from_baseline {
+                // 同步刷新 baseline 里的存活 VolatileRef 表，确保后续在飞更新被否决回滚时
+                // 恢复的正是当前运行中插件持有的那份 live VolatileRef。
+                if let Some((rev, snap)) = rb.baseline.as_mut() {
+                    if *rev == base_rev {
+                        snap.resolved = resolved.clone();
+                        snap.volatile = live_table;
+                    }
+                }
+            }
+        }
         // **M5-1 护栏**：插件的 `apply` 是用户代码，它的 panic 不该让 fiber 无声地
         // 卡在 LOADING（`Store::plugin` 用 `tokio::spawn` 推状态机，panic 会被吞进
         // `JoinError`，之后再也没有人推进它）。截住 panic ⇒ 记成一次普通的装载失败。
@@ -2835,7 +2875,15 @@ impl Fiber {
         let Some(ctx) = self.ctx_opt() else { return };
         let mut to_wait: Vec<Arc<Fiber>> = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
-        for (name, realm) in self.store.impls_owned_by_with_realm(self) {
+        // 并入 `committed_owned_with_realm()`：当提供者手动撤销 `provide`（已摘除 `store.impls`
+        // 但仍在等消费者拆除）期间并发调用 `provider.dispose()` 时，不能漏等正在拆除的消费者。
+        let mut owned = self.store.impls_owned_by_with_realm(self);
+        for item in self.committed_owned_with_realm() {
+            if !owned.contains(&item) {
+                owned.push(item);
+            }
+        }
+        for (name, realm) in owned {
             let dependents = self.store.notify_realm(&[&name], &ctx, realm, false);
             for fiber in dependents {
                 if Arc::ptr_eq(&fiber, self) || fiber.is_cycle_blocked(name.as_ref()) {
@@ -3102,29 +3150,37 @@ impl Fiber {
                 }
             };
             if latest {
-                // `adopt_resolved` 会重建 volatile 引用表；若并发 `internal/update` 随后否决，
-                // 必须把前一份（或基线）的 `(config, resolved, volatile)` 原子还原。
-                let pre_commit = loaded.then(|| UpdateSnapshot {
-                    config: self.config.lock().unwrap().clone(),
-                    resolved: self.resolved.lock().unwrap().clone(),
-                    volatile: self.volatile.lock().unwrap().clone(),
-                });
-                // 赋值在派发之前（上游 `fiber.ts:492`），避免 `fire_commit` 观察者 panic 导致
-                // `committed_rev` 已推进但 `config`/`resolved`/`error` 仍停在旧值。
-                *self.config.lock().unwrap() = config.clone();
-                // 已解析的那一份同样推进（volatile 的候选比较拿它当基准，M4-5）。
-                if loaded {
-                    let runtime = self.runtime.clone();
-                    if let Some(runtime) = runtime {
-                        self.adopt_resolved(&resolved, &runtime);
-                    }
-                    let snap = UpdateSnapshot {
-                        config: config.clone(),
+                // 在 `update_rollback` 锁外构造新 volatile 表（避免持锁记日志）。
+                let new_volatile = if loaded {
+                    self.runtime
+                        .as_ref()
+                        .map(|runtime| self.build_volatile_table(&resolved, runtime))
+                } else {
+                    None
+                };
+                // 统一锁序：`update_rollback -> (config, resolved, volatile)`，消除与 `mark_vetoed`
+                // 的锁间隙竞态；且即便 `loaded == false` 也必须推进 `live_rev`，防止更早的在飞否决覆盖新提交。
+                let mut snap_for_chain = None;
+                {
+                    let mut rb = self.update_rollback.lock().unwrap();
+                    let pre_commit = loaded.then(|| UpdateSnapshot {
+                        config: self.config.lock().unwrap().clone(),
                         resolved: self.resolved.lock().unwrap().clone(),
                         volatile: self.volatile.lock().unwrap().clone(),
-                    };
-                    {
-                        let mut rb = self.update_rollback.lock().unwrap();
+                    });
+                    // 赋值在派发之前（上游 `fiber.ts:492`），避免 `fire_commit` 观察者 panic 导致
+                    // `committed_rev` 已推进但 `config`/`resolved`/`error` 仍停在旧值。
+                    *self.config.lock().unwrap() = config.clone();
+                    if loaded {
+                        *self.resolved.lock().unwrap() = resolved.clone();
+                        if let Some(table) = new_volatile {
+                            *self.volatile.lock().unwrap() = table;
+                        }
+                        let snap = UpdateSnapshot {
+                            config: config.clone(),
+                            resolved: self.resolved.lock().unwrap().clone(),
+                            volatile: self.volatile.lock().unwrap().clone(),
+                        };
                         if rb.in_flight.is_empty() {
                             let base_rev = rb.live_rev;
                             rb.baseline = pre_commit.map(|s| (base_rev, s));
@@ -3138,7 +3194,22 @@ impl Fiber {
                             },
                         ));
                         rb.live_rev = my_rev;
+                        snap_for_chain = Some(snap);
+                    } else {
+                        rb.live_rev = my_rev;
+                        if !rb.in_flight.is_empty() {
+                            rb.baseline = Some((
+                                my_rev,
+                                UpdateSnapshot {
+                                    config: config.clone(),
+                                    resolved: resolved.clone(),
+                                    volatile: self.volatile.lock().unwrap().clone(),
+                                },
+                            ));
+                        }
                     }
+                }
+                if let Some(snap) = snap_for_chain {
                     // 立即建立 RAII 守卫：即便 `fire_commit_async` 被取消/panic 或并发 dispose，
                     // 也能及时清理 `in_flight` 与 `active_chains`。
                     self.active_chains.fetch_add(1, Ordering::SeqCst);
@@ -3294,55 +3365,66 @@ impl Fiber {
     /// 参数 `no_save = true`，replay 不会再次落盘。若 replay 期间又有 update 提交，
     /// 循环到 revision 稳定为止。
     async fn run_replay(self: &Arc<Self>) {
-        {
-            let _gate = self.replay_gate.lock().await;
-            loop {
-                // 还有在飞 chain：让最后一个 chain 结束时再调度，避免与它并发写入。
-                if self.active_chains.load(Ordering::SeqCst) != 0 {
-                    break;
+        // RAII 守卫：即便 `internal/update` handler panic 或任务被取消，也必定复位
+        // `replay_scheduled` 并唤醒 `when_updates_settled()`，避免永久挂起。
+        struct ReplayScheduledGuard {
+            fiber: Arc<Fiber>,
+        }
+        impl Drop for ReplayScheduledGuard {
+            fn drop(&mut self) {
+                self.fiber.replay_scheduled.store(false, Ordering::SeqCst);
+                if !std::thread::panicking()
+                    && self.fiber.replay_owed.load(Ordering::SeqCst)
+                    && self.fiber.active_chains.load(Ordering::SeqCst) == 0
+                    && !self.fiber.is_disposed()
+                {
+                    self.fiber.schedule_replay();
                 }
-                if !self.replay_owed.swap(false, Ordering::SeqCst) {
-                    break;
-                }
-                let Some(ctx) = self.ctx_opt() else { break };
-                // 未装载或已处置：没有可修正的实例；下一次 update 会重新解析。
-                if self.running.lock().unwrap().is_none() || self.is_disposed() {
-                    break;
-                }
-                let rev = self.update_rev.load(Ordering::SeqCst);
-                let resolved = self.resolved.lock().unwrap().clone();
-                let tail_resolved = resolved.clone();
-                let tail: BoxFuture<Ret> = Box::pin(async move { Some(Dyn::new(tail_resolved)) });
-                let args: Args = vec![
-                    Dyn::shared(self.clone()),
-                    Dyn::new(resolved),
-                    Dyn::new(true),
-                ];
-                let _ = self
-                    .store
-                    .dispatch(
-                        Mode::Waterfall,
-                        INTERNAL_UPDATE,
-                        &ctx,
-                        args,
-                        Some(tail),
-                        None,
-                    )
-                    .await;
-                if self.update_rev.load(Ordering::SeqCst) == rev {
-                    break;
-                }
-                self.replay_owed.store(true, Ordering::SeqCst);
+                self.fiber.updates_settled.notify_waiters();
             }
         }
-        self.replay_scheduled.store(false, Ordering::SeqCst);
-        if self.replay_owed.load(Ordering::SeqCst)
-            && self.active_chains.load(Ordering::SeqCst) == 0
-            && !self.is_disposed()
-        {
-            self.schedule_replay();
+        let _guard = ReplayScheduledGuard {
+            fiber: self.clone(),
+        };
+        let _gate = self.replay_gate.lock().await;
+        loop {
+            // 还有在飞 chain：让最后一个 chain 结束时再调度，避免与它并发写入。
+            if self.active_chains.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            if !self.replay_owed.swap(false, Ordering::SeqCst) {
+                break;
+            }
+            let Some(ctx) = self.ctx_opt() else { break };
+            // 未装载或已处置：没有可修正的实例；下一次 update 会重新解析。
+            if self.running.lock().unwrap().is_none() || self.is_disposed() {
+                break;
+            }
+            let rev = self.update_rev.load(Ordering::SeqCst);
+            let resolved = self.resolved.lock().unwrap().clone();
+            let tail_resolved = resolved.clone();
+            let tail: BoxFuture<Ret> = Box::pin(async move { Some(Dyn::new(tail_resolved)) });
+            let args: Args = vec![
+                Dyn::shared(self.clone()),
+                Dyn::new(resolved),
+                Dyn::new(true),
+            ];
+            let _ = self
+                .store
+                .dispatch(
+                    Mode::Waterfall,
+                    INTERNAL_UPDATE,
+                    &ctx,
+                    args,
+                    Some(tail),
+                    None,
+                )
+                .await;
+            if self.update_rev.load(Ordering::SeqCst) == rev {
+                break;
+            }
+            self.replay_owed.store(true, Ordering::SeqCst);
         }
-        self.updates_settled.notify_waiters();
     }
 
     /// 卸载并释放这个 fiber 的一切。父 fiber 卸载时通过 effect 自动递归调用。
@@ -3593,9 +3675,11 @@ impl Fiber {
     }
 
     fn clear_context(&self) {
-        // 打破 Context <-> Fiber 的强引用环，避免 HMR 反复重载时泄漏。
-        *self.ctx.lock().unwrap() = None;
-        *self.ctx_weak.lock().unwrap() = None;
+        // 打破 Context <-> Fiber 的强引用环，并在锁外析构，避免用户析构逻辑重入锁。
+        let old_ctx = self.ctx.lock().unwrap().take();
+        let old_weak = self.ctx_weak.lock().unwrap().take();
+        drop(old_ctx);
+        drop(old_weak);
     }
 
     pub(crate) async fn wait_disposed(self: &Arc<Self>) {
@@ -3687,10 +3771,10 @@ fn effect_handle(owner: Weak<Fiber>, id: u64, cell: Arc<Mutex<Option<Disposable>
 ///
 /// 截住之后这个 future 会被丢弃：panic 中途的 future 状态"不确定"，继续 poll
 /// 它没有任何语义可依。
-struct CatchPanic<F>(Pin<Box<F>>);
+pub(crate) struct CatchPanic<F>(Pin<Box<F>>);
 
 impl<F> CatchPanic<F> {
-    fn new(inner: F) -> Self {
+    pub(crate) fn new(inner: F) -> Self {
         Self(Box::pin(inner))
     }
 }

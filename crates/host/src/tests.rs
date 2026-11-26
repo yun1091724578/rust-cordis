@@ -2545,3 +2545,157 @@ fn ffi_json_entries_reject_invalid_blobs_without_ub() {
         assert!(caps.provision.is_empty());
     }
 }
+
+#[test]
+fn r3_p2_patch_apostrophe_in_plain_scalar_preserves_subsequent_js_tags() {
+    let yaml = r#"
+- name: alpha
+  config:
+    note: don't break
+- name: beta
+  disabled: !!js false
+  config:
+    token: !!js "process.env.API_KEY"
+"#;
+    let entries = crate::patch::parse_entries(yaml).expect("valid yaml with apostrophe");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[1].disabled_expr.as_ref().map(|e| &e.body),
+        Some(&serde_json::json!(false)),
+        "无引号标量里的撇号不得吃掉后续行的 disabled: !!js 标签"
+    );
+    let caps = crate::patch::entry_js_capabilities(&entries[1]);
+    assert_eq!(
+        caps.env,
+        vec!["API_KEY".to_string()],
+        "无引号标量里的撇号不得吃掉后续行的 config !!js 标签与能力审计"
+    );
+}
+
+#[test]
+fn r3_p2_capabilities_of_desc_null_and_zero_fn_are_safe() {
+    let null_caps = unsafe { Capabilities::of_desc(std::ptr::null()) };
+    assert!(null_caps.plugin.is_empty());
+
+    // Simulate a corrupt PluginDesc with zeroed `attach` and `call` function pointers.
+    #[repr(C)]
+    struct RawCorruptDesc {
+        abi_version: u32,
+        size: u32,
+        id: Blob,
+        inject: Blob,
+        schema: Blob,
+        attach: *const (),
+        call: *const (),
+        provision: Blob,
+        error_format: u32,
+        tail_reserved: u32,
+    }
+    let raw = RawCorruptDesc {
+        abi_version: ABI_VERSION,
+        size: std::mem::size_of::<PluginDesc>() as u32,
+        id: Blob::new(b"corrupt"),
+        inject: Blob::EMPTY,
+        schema: Blob::EMPTY,
+        attach: std::ptr::null(),
+        call: std::ptr::null(),
+        provision: Blob::EMPTY,
+        error_format: 0,
+        tail_reserved: 0,
+    };
+    let caps = unsafe { Capabilities::of_desc(&raw as *const RawCorruptDesc as *const PluginDesc) };
+    assert!(
+        caps.plugin.is_empty(),
+        "attach/call 为空指针的畸形 PluginDesc 必须安全降级而非解引用空函数指针 UB"
+    );
+}
+
+#[test]
+fn r3_p2_probe_capabilities_freezes_fallback_admission() {
+    struct CapturingSource {
+        seen_mode: std::sync::Mutex<Option<String>>,
+    }
+    impl crate::loader::PluginSource for CapturingSource {
+        fn load(
+            &self,
+            _entry: &crate::patch::Entry,
+            _search: &[PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<crate::loader::LoadedFile, String> {
+            unreachable!("probe_capabilities_with must call load_admitted")
+        }
+        fn load_admitted(
+            &self,
+            _entry: &crate::patch::Entry,
+            _search: &[PathBuf],
+            _revision: u64,
+            admission: &crate::source::SourceAdmission,
+        ) -> std::result::Result<crate::loader::LoadedFile, String> {
+            *self.seen_mode.lock().unwrap() = Some(admission.mode().to_string());
+            Err("stop-after-capture".to_string())
+        }
+    }
+
+    // Install dev-unverified temporarily so Fallback resolves cleanly without touching disk.
+    let prev_allow = crate::source::allow_unverified();
+    crate::source::set_allow_unverified(true);
+    let src = Arc::new(CapturingSource {
+        seen_mode: std::sync::Mutex::new(None),
+    });
+    let _ = crate::probe_capabilities_with(src.clone(), Path::new("fake.dll"), &[]);
+    crate::source::set_allow_unverified(prev_allow);
+
+    assert_eq!(
+        src.seen_mode.lock().unwrap().as_deref(),
+        Some("dev-unverified"),
+        "probe_capabilities_with 必须冻结 Fallback 准入结论，不得把未冻结的 Fallback 传给 load_admitted"
+    );
+}
+
+#[test]
+fn r3_p3_js_capabilities_detects_optional_chaining_bracket_env() {
+    let caps1 = crate::js::capabilities_of("process.env?.['SECRET']");
+    assert_eq!(caps1.env, vec!["SECRET".to_string()]);
+    let caps2 = crate::js::capabilities_of("env?.['TOKEN']");
+    assert_eq!(caps2.env, vec!["TOKEN".to_string()]);
+}
+
+#[test]
+fn r3_p3_resolve_plugin_path_preserves_parent_for_lib_and_blocks_windows_root_escape() {
+    let cands = crate::staging::plugin_path_candidates_for_test("sub/demo");
+    #[cfg(not(windows))]
+    {
+        let has_nested_lib = cands
+            .iter()
+            .any(|p| p == Path::new("sub/libdemo.so") || p == Path::new("sub/libdemo.dylib"));
+        assert!(
+            has_nested_lib,
+            "Unix/macOS lib 前缀必须加在文件名上而非整条路径前: {cands:?}"
+        );
+    }
+    let _ = cands;
+
+    #[cfg(windows)]
+    {
+        let err = crate::staging::resolve_plugin_path(
+            "\\definitely-not-in-search",
+            &[PathBuf::from("C:\\nonexistent")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("不允许") || err.contains("路径"),
+            "Windows 无盘符根路径不得逃逸 search 目录: {err}"
+        );
+        let err2 = crate::staging::resolve_plugin_path(
+            "D:relative-escape",
+            &[PathBuf::from("C:\\nonexistent")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err2.contains("不允许") || err2.contains("路径"),
+            "Windows 驱动器相对路径不得逃逸 search 目录: {err2}"
+        );
+    }
+}

@@ -20,6 +20,9 @@ struct VersionSlot {
     service_key: Arc<str>,
     weight: u32,
     draining: bool,
+    /// Once a draining version reaches `in_flight == 0`, it is sealed (`drained = true`)
+    /// so previously pinned sessions cannot resurrect it before `unregister`.
+    drained: bool,
     in_flight: usize,
 }
 
@@ -80,11 +83,19 @@ impl Drop for VersionLease {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if self.release_on_drop {
+            if self.release_on_drop
+                && state
+                    .pinned
+                    .get(&self.session_id)
+                    .is_some_and(|pinned| pinned == &self.version)
+            {
                 state.pinned.remove(&self.session_id);
             }
             if let Some(slot) = state.versions.get_mut(&self.version) {
                 slot.in_flight = slot.in_flight.saturating_sub(1);
+                if slot.in_flight == 0 && slot.draining {
+                    slot.drained = true;
+                }
                 slot.in_flight == 0
             } else {
                 true
@@ -108,27 +119,39 @@ impl VersionRouter {
         service_key: impl Into<Arc<str>>,
         weight: u32,
     ) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let version = version.into();
-        let service_key = service_key.into();
-        state
-            .versions
-            .entry(version)
-            .and_modify(|slot| {
-                slot.service_key = service_key.clone();
-                slot.weight = weight;
-                slot.draining = false;
-            })
-            .or_insert(VersionSlot {
-                service_key,
-                weight,
-                draining: false,
-                in_flight: 0,
-            });
+        let woke_draining = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let version = version.into();
+            let service_key = service_key.into();
+            let mut cleared = false;
+            state
+                .versions
+                .entry(version)
+                .and_modify(|slot| {
+                    slot.service_key = service_key.clone();
+                    slot.weight = weight;
+                    if slot.draining {
+                        cleared = true;
+                    }
+                    slot.draining = false;
+                    slot.drained = false;
+                })
+                .or_insert(VersionSlot {
+                    service_key,
+                    weight,
+                    draining: false,
+                    drained: false,
+                    in_flight: 0,
+                });
+            cleared
+        };
+        if woke_draining {
+            self.inner.drained_notify.notify_waiters();
+        }
     }
 
     /// Update a version's canary weight (0 stops routing new sessions).
@@ -185,6 +208,9 @@ impl VersionRouter {
                 .ok_or_else(|| format!("cannot drain unknown version {version:?}"))?;
             slot.weight = 0;
             slot.draining = true;
+            if slot.in_flight == 0 {
+                slot.drained = true;
+            }
             slot.in_flight == 0
         };
         if notify {
@@ -196,23 +222,32 @@ impl VersionRouter {
     /// Wait until a draining version has zero active in-flight leases.
     pub async fn wait_drained(&self, version: &str) -> Result<(), String> {
         loop {
+            // Register the waiter BEFORE acquiring `state` to prevent lost wakeups when
+            // the last lease drops or `register()` clears `draining` between unlock and `.await`.
             let notified = self.inner.drained_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let done = {
-                let state = self
+                let mut state = self
                     .inner
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let slot = state
                     .versions
-                    .get(version)
+                    .get_mut(version)
                     .ok_or_else(|| format!("unknown version {version:?}"))?;
                 if !slot.draining {
                     return Err(format!(
                         "version {version:?} is not draining; call begin_drain first"
                     ));
                 }
-                slot.in_flight == 0
+                if slot.in_flight == 0 {
+                    slot.drained = true;
+                    true
+                } else {
+                    false
+                }
             };
             if done {
                 return Ok(());
@@ -261,7 +296,11 @@ impl VersionRouter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let chosen = if let Some(pinned) = state.pinned.get(session_id).cloned() {
-            if state.versions.contains_key(&pinned) {
+            if state
+                .versions
+                .get(&pinned)
+                .is_some_and(|slot| !slot.drained)
+            {
                 pinned
             } else {
                 let picked = pick_weighted(&state.versions, session_id)?;
@@ -447,5 +486,73 @@ mod tests {
         }
         assert_eq!(router.pinned_count(), 0);
         assert_eq!(router.in_flight("v1"), 0);
+    }
+
+    #[tokio::test]
+    async fn r3_p1_wait_drained_no_lost_wakeup_resurrection_or_stale_unpin() {
+        // 1. After drain completes (in_flight reaches 0), an old pinned session MUST NOT
+        //    resurrect the drained version before `unregister`.
+        let router = VersionRouter::new();
+        router.register("v1", "solver.v1@1", 100);
+        router.register("v2", "solver.v2@1", 0);
+
+        let lease1 = router.acquire("sess-old").unwrap();
+        assert_eq!(lease1.version(), "v1");
+        router.promote("v2").unwrap();
+        router.begin_drain("v1").unwrap();
+        drop(lease1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), router.wait_drained("v1"))
+            .await
+            .expect("wait_drained must finish")
+            .unwrap();
+
+        // Even BEFORE `unregister("v1")`, `sess-old` must migrate to v2 instead of resurrecting v1.
+        let lease_after = router.acquire("sess-old").unwrap();
+        assert_eq!(
+            lease_after.version(),
+            "v2",
+            "drain 完成后旧 pinned 会话不得再把已排空的 v1 复活"
+        );
+        assert_eq!(router.in_flight("v1"), 0);
+        router.unregister("v1").unwrap();
+        drop(lease_after);
+
+        // 2. Re-registering a draining version while `wait_drained` is sleeping must wake the waiter.
+        let router2 = VersionRouter::new();
+        router2.register("v1", "solver.v1@1", 100);
+        let held = router2.acquire("s1").unwrap();
+        router2.begin_drain("v1").unwrap();
+        let r2_wait = router2.clone();
+        let waiter = tokio::spawn(async move { r2_wait.wait_drained("v1").await });
+        tokio::task::yield_now().await;
+        // Re-register clears draining; waiter must wake and return Err instead of hanging.
+        router2.register("v1", "solver.v1@1", 100);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("register() clearing draining must wake wait_drained")
+            .unwrap();
+        assert!(res.is_err(), "cleared draining must surface Err: {res:?}");
+        drop(held);
+
+        // 3. Stale `release_session_on_drop` lease for v1 must NOT wipe out a newer v2 pin.
+        let router3 = VersionRouter::new();
+        router3.register("v1", "solver.v1@1", 100);
+        router3.register("v2", "solver.v2@1", 0);
+        let old_lease = router3
+            .acquire_version("shared-sess", "v1")
+            .unwrap()
+            .release_session_on_drop();
+        let new_lease = router3.acquire_version("shared-sess", "v2").unwrap();
+        drop(old_lease);
+        assert_eq!(
+            router3.pinned_count(),
+            1,
+            "旧版本租约释放不得误删同 session 已迁移到新版本的 pin"
+        );
+        let next = router3.acquire("shared-sess").unwrap();
+        assert_eq!(next.version(), "v2");
+        drop(next);
+        drop(new_lease);
     }
 }

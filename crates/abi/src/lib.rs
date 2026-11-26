@@ -245,10 +245,28 @@ impl Blob {
         }
     }
 
+    /// 安全地验证并借用原始字节：拒绝 `ptr == null && len != 0` 以及 `len > isize::MAX`，
+    /// 防止畸形 FFI `Blob` 在 `slice::from_raw_parts` 中触发 UB 或静默退化为空切片。
+    ///
     /// # Safety
-    /// `ptr` 必须在 `len` 字节内有效，且是 UTF-8。
+    /// 当 `len > 0` 且 `ptr` 非空、且 `len <= isize::MAX` 时，`ptr` 必须在 `len` 字节内有效可读。
+    pub unsafe fn try_as_bytes<'a>(self) -> Result<&'a [u8], &'static str> {
+        if self.len == 0 {
+            return Ok(&[]);
+        }
+        if self.ptr.is_null() {
+            return Err("Blob 指针为空但长度非零");
+        }
+        if self.len > isize::MAX as usize {
+            return Err("Blob 长度超过 isize::MAX");
+        }
+        Ok(std::slice::from_raw_parts(self.ptr, self.len))
+    }
+
+    /// # Safety
+    /// `ptr` 必须在 `len` 字节内有效，且 `len <= isize::MAX`。
     pub unsafe fn as_bytes<'a>(self) -> &'a [u8] {
-        if self.ptr.is_null() || self.len == 0 {
+        if self.ptr.is_null() || self.len == 0 || self.len > isize::MAX as usize {
             &[]
         } else {
             std::slice::from_raw_parts(self.ptr, self.len)
@@ -483,9 +501,12 @@ impl PluginDesc {
     /// `size` 覆盖的字段。
     ///
     /// # Safety
-    /// `desc` 必须指向至少 8 字节、且按 `size` 声明可读的插件描述表。
+    /// `desc` 为空时返回 `None`；非空时必须指向至少 8 字节、且按 `size` 声明可读的插件描述表。
     pub unsafe fn field_at<T: Copy>(desc: *const Self, offset: usize) -> Option<T> {
-        let size = (*desc).size as usize;
+        if desc.is_null() {
+            return None;
+        }
+        let size = std::ptr::read_unaligned(std::ptr::addr_of!((*desc).size)) as usize;
         if offset
             .checked_add(std::mem::size_of::<T>())
             .is_some_and(|end| size >= end)

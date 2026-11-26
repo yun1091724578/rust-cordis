@@ -1,12 +1,12 @@
 //! T1 evaluator: runs the fixed five-case suite through the T2 pipeline.
 
-use cordis_core::{BoxFuture, Config, Ctx, ExternService, Result};
+use cordis_core::{BoxFuture, Config, Context, ExternService, Result};
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 pub struct Evaluator {
-    pub ctx: Ctx,
+    pub ctx: Weak<Context>,
     pub score_path: PathBuf,
 }
 
@@ -29,9 +29,12 @@ impl ExternService for Evaluator {
         method: String,
         args: Config,
     ) -> BoxFuture<Result<Config>> {
-        let ctx = self.ctx.clone();
+        let ctx = self.ctx.upgrade();
         let score = self.score_path.clone();
         Box::pin(async move {
+            let ctx = ctx.ok_or_else(|| -> cordis_core::Error {
+                "evaluator provider has been unloaded".into()
+            })?;
             match method.as_str() {
                 "run_suite" => {
                     let cases = [1u64, 2, 3, 4, 5];
@@ -76,7 +79,7 @@ pub fn plugin_fn(score: PathBuf) -> Arc<dyn cordis_core::Plugin> {
             let score = score.clone();
             Box::pin(async move {
                 let service = Arc::new(Evaluator {
-                    ctx: ctx.clone(),
+                    ctx: ctx.downgrade(),
                     score_path: score,
                 });
                 ctx.provide_iface("evaluator@1", service)?;

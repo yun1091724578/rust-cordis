@@ -1352,3 +1352,202 @@ async fn r2_p1_deliver_next_racing_with_close_delivers_on_done_exactly_once() {
         "deliver_next racing with close must deliver on_done exactly once before OP_DISPOSE: {events:?}"
     );
 }
+
+// R3 P1-5: Sync fast-path `host_ctx_next` drops `TaskExit` BEFORE `deliver_next`;
+// if unload sets `instance.closed = true` in that window, `on_done` MUST still be
+// delivered exactly once via `deferred_outbounds` before `OP_DISPOSE`.
+#[tokio::test]
+async fn r3_p1_host_ctx_next_sync_fast_path_racing_with_close_delivers_on_done_once() {
+    let mut f = Fixture::new(None).await;
+    let delivered = Arc::new(AtomicBool::new(false));
+    let cancel_slot = Arc::new(std::sync::Mutex::new(Some(Outbound {
+        owner: f.handle,
+        continuation: 198,
+        kind: ContinuationKind::Next,
+        trace_parent: None,
+        trace_correlation: None,
+    })));
+    // Mark closed and start close paused in `wait_lifecycle_exclusive`.
+    *f.instance.lifecycle.lock().unwrap() += 1;
+    let mut close = Box::pin(f.app.take().unwrap().close());
+    std::future::poll_fn(|cx| {
+        let _ = close.as_mut().poll(cx);
+        if f.instance.closed.load(Ordering::SeqCst) {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+
+    // `instance.tasks` is empty (as after sync `complete_or_defer` dropped `TaskExit` before `closed` flipped).
+    // Calling `deliver_next` now sees `closed == true` and MUST hand `cancel_slot` to `deferred_outbounds`.
+    deliver_next(
+        f.handle,
+        71,
+        198,
+        0,
+        &delivered,
+        Some(&cancel_slot),
+        Ok(Some(Dyn::new(ExternValue(json!("sync-ok"))))),
+    );
+    {
+        let mut active = f.instance.lifecycle.lock().unwrap();
+        *active -= 1;
+        f.instance.calls_changed.notify_waiters();
+    }
+    close.await;
+
+    let events = f.events();
+    let dispose_idx = events
+        .iter()
+        .position(|(op, _, _)| *op == OP_DISPOSE)
+        .expect("OP_DISPOSE must be delivered");
+    let next_callbacks: Vec<_> = events[..dispose_idx]
+        .iter()
+        .filter(|(op, payload, _)| {
+            *op == OP_CALLBACK
+                && payload["kind"] == KIND_NEXT
+                && payload["id"].as_u64() == Some(198)
+        })
+        .collect();
+    assert_eq!(
+        next_callbacks.len(),
+        1,
+        "同步快路径 TaskExit 已先退出后 deliver_next 遇 closed==true 仍须交付一次 on_done: {events:?}"
+    );
+}
+
+// R3 P2-9: `host_ctx_call_iface` returning synchronously after re-entrant `host_ctx_abort`
+// must observe `unregister_dispatch_node == false` and return `pending: true` (no double settlement).
+#[tokio::test]
+async fn r3_p2_host_ctx_call_iface_reentrant_abort_does_not_double_settle() {
+    struct AbortingCallee {
+        handle: u64,
+        parent_dispatch_id: u64,
+    }
+    impl cordis_core::ExternService for AbortingCallee {
+        fn service(&self) -> &str {
+            "abort-callee"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["boom".to_string()]
+        }
+        fn call(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> cordis_core::BoxFuture<cordis_core::Result<Config>> {
+            let handle = self.handle;
+            let parent_id = self.parent_dispatch_id;
+            Box::pin(async move {
+                let mut buf = [0u8; 256];
+                let mut out = Out {
+                    ptr: buf.as_mut_ptr(),
+                    cap: buf.len(),
+                    len: 0,
+                };
+                let _ = unsafe { host_ctx_abort(handle, parent_id, &mut out) };
+                Ok(json!("inline-val"))
+            })
+        }
+    }
+
+    let f = Fixture::new(None).await;
+    let app = f.app.as_ref().unwrap();
+    let _prov = app
+        .root
+        .provide_iface(
+            "abort-callee@1",
+            Arc::new(AbortingCallee {
+                handle: f.handle,
+                parent_dispatch_id: 500,
+            }),
+        )
+        .unwrap();
+    // Register parent inbound dispatch 500 so child `call_iface` attaches under it.
+    f.instance.dispatches.lock().unwrap().insert(
+        500,
+        DispatchRecord {
+            parent: None,
+            sink: None,
+            frame: None,
+            outbound: None,
+            stream: None,
+        },
+    );
+
+    let mut buf = [0u8; 1024];
+    let mut out = Out {
+        ptr: buf.as_mut_ptr(),
+        cap: buf.len(),
+        len: 0,
+    };
+    let rc = {
+        let _scope = scope_push(f.handle, 500);
+        unsafe {
+            host_ctx_call_iface(
+                f.handle,
+                Blob::new(b"abort-callee@1"),
+                1,
+                Blob::new(b"boom"),
+                Blob::new(b"[]"),
+                501,
+                &mut out,
+            )
+        }
+    };
+    assert_eq!(rc, STATUS_OK);
+    let reply: serde_json::Value = serde_json::from_slice(&buf[..out.len]).unwrap();
+    assert_eq!(
+        reply["pending"],
+        json!(true),
+        "重入 ctx_abort 已通过 OP_CALLBACK 结算后，host_ctx_call_iface 必须返回 pending=true 而非二次内联结算: {reply}"
+    );
+}
+
+// R3 P3-8: During `drain_timed_out` window (`closed == true` and `record.stream == None`),
+// `host_stream_close`/`fail`/`fail_payload` must return `STATUS_STREAM_GONE` (idempotent), not `STATUS_ERR`.
+#[tokio::test]
+async fn r3_p3_stream_close_and_fail_during_closed_drain_return_stream_gone() {
+    let f = Fixture::new(None).await;
+    f.instance.dispatches.lock().unwrap().insert(
+        600,
+        DispatchRecord {
+            parent: None,
+            sink: None,
+            frame: None,
+            outbound: None,
+            stream: None, // cleared by `drain_timed_out` before `HostStreamObserver::finished` removes the key
+        },
+    );
+    f.instance.closed.store(true, Ordering::SeqCst);
+
+    let mut buf = [0u8; 256];
+    let mut out = Out {
+        ptr: buf.as_mut_ptr(),
+        cap: buf.len(),
+        len: 0,
+    };
+    assert_eq!(
+        unsafe { host_stream_close(f.handle, 600, &mut out) },
+        STATUS_STREAM_GONE,
+        "实例已关闭排水窗口内 stream_close 必须返回 STATUS_STREAM_GONE"
+    );
+    assert_eq!(
+        unsafe { host_stream_fail(f.handle, 600, Blob::new(b"err"), &mut out) },
+        STATUS_STREAM_GONE,
+        "实例已关闭排水窗口内 stream_fail 必须返回 STATUS_STREAM_GONE"
+    );
+    let payload = ErrorPayload::new("err").to_json();
+    assert_eq!(
+        unsafe { host_stream_fail_payload(f.handle, 600, Blob::new(payload.as_bytes()), &mut out) },
+        STATUS_STREAM_GONE,
+        "实例已关闭排水窗口内 stream_fail_payload 必须返回 STATUS_STREAM_GONE"
+    );
+}

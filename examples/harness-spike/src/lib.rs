@@ -207,11 +207,12 @@ pub trait Agent {
 /// 谓词的入参是**注册者**的 ctx（对齐上游 `events.ts:76-85`）；`None`（没有作用域）
 /// 的注册由内核的规则 2 兜底（永远参与）——全局拦截器就注册在无作用域的 ctx 上。
 pub fn agent_scope(base: &Ctx) -> Ctx {
-    // 谓词需要锚点本身，而锚点由 `filter` 造出来 ⇒ 先建槽、再回填（同 `filter_subtree`）。
-    let slot: Arc<Mutex<Option<Arc<ScopeAnchor>>>> = Arc::new(Mutex::new(None));
+    // 谓词只持 `Weak<ScopeAnchor>`：打破 `ScopeAnchor -> Filter -> Arc<ScopeAnchor>` 强引用环，
+    // 确保作用域 Ctx 释放后 ScopeAnchor 可被正常回收。
+    let slot: Arc<Mutex<Option<Weak<ScopeAnchor>>>> = Arc::new(Mutex::new(None));
     let slot_in = slot.clone();
     let scoped = base.filter(Arc::new(move |hook_ctx: &Ctx| {
-        let Some(mine) = slot_in.lock().unwrap().clone() else {
+        let Some(mine) = slot_in.lock().unwrap().as_ref().and_then(Weak::upgrade) else {
             return false;
         };
         match hook_ctx.scope() {
@@ -221,7 +222,7 @@ pub fn agent_scope(base: &Ctx) -> Ctx {
             None => false,
         }
     }));
-    *slot.lock().unwrap() = scoped.scope();
+    *slot.lock().unwrap() = scoped.scope().map(|anchor| Arc::downgrade(&anchor));
     scoped
 }
 
@@ -552,18 +553,59 @@ pub fn tool_plugin(agent: &str, tool: &str) -> Arc<dyn Plugin> {
                     )
                     .await?;
 
+                // 卸载时自动从目录撤销登记，避免残留幽灵条目并允许重新挂载同名工具。
+                let unregister_tools = tools.clone();
+                let unregister_name = tool.clone();
+                let _ = ctx.effect(move |_| {
+                    let unregister_tools = unregister_tools.clone();
+                    let unregister_name = unregister_name.clone();
+                    cordis::core::Disposable::new(move || {
+                        Box::pin(async move {
+                            let _ = unregister_tools.unregister(owner, unregister_name).await;
+                        })
+                    })
+                });
+
                 let mine = tool.clone();
-                HarnessEvents::on_run_tool(&ctx, move |payload: Invoke| {
+                let check_tools = tools.clone();
+                ctx.on(HarnessEvents::RUN_TOOL, move |call| {
                     let mine = mine.clone();
                     let owner_label = owner_label.clone();
+                    let check_tools = check_tools.clone();
                     Box::pin(async move {
+                        let raw = call
+                            .args
+                            .first()
+                            .and_then(|arg| arg.downcast::<ExternValue>())
+                            .map(|v| v.0.clone())?;
+                        let payload: Invoke = serde_json::from_value(raw).ok()?;
                         if payload.tool != mine {
-                            return Ok(None); // 不是我的工具 ⇒ 不表态（bail 继续往后走）
+                            return None; // 不是我的工具 ⇒ 不表态（bail 继续往后走）
+                        }
+                        // 作用域遮蔽优先（内层优先于外层、非 0 优先于全局 0）：
+                        // 若调用方作用域链上存在比当前 `owner` 更近的同名登记，则主动让位。
+                        let chain = owner_chain(&call.ctx);
+                        let closer: Vec<u64> = if owner == 0 {
+                            chain.into_iter().filter(|&uid| uid != 0).collect()
+                        } else {
+                            chain
+                                .into_iter()
+                                .filter(|&uid| uid != 0)
+                                .take_while(|&uid| uid != owner)
+                                .collect()
+                        };
+                        if !closer.is_empty()
+                            && check_tools
+                                .names(closer)
+                                .await
+                                .is_ok_and(|names| names.iter().any(|n| n == &mine))
+                        {
+                            return None;
                         }
                         let input = payload.input.clone();
                         let mut done = payload;
                         done.output = json!({ "tool": done.tool.clone(), "owner": owner_label, "input": input });
-                        Ok(Some(done))
+                        Some(Dyn::new(ExternValue(done.json())))
                     })
                 });
                 Ok(())
@@ -725,11 +767,13 @@ impl Agent for AgentDriver {
             }
             collect(&mut stages, &invoke.stages);
 
-            // ③ 执行（bail）：同步的监听器与挂起的监听器都算"表态"。
-            let ret = HarnessEvents::run_tool(&ctx, invoke.clone()).await;
-            match decode_ret::<Invoke>(ret).map_err(|err| err.to_string())? {
-                Some(done) => {
-                    collect(&mut stages, &done.stages);
+            // ③ 执行：先按最内层作用域查目录 iface 转发面（避免外层钩子抢跑遮蔽内层 iface 工具）；
+            //    若最内层登记为钩子型工具（无 iface）或未在目录登记（如 T2 异步钩子），再派发 `tools/invoke`。
+            match self
+                .call_catalog(&ctx, &invoke.tool, invoke.input.clone())
+                .await
+            {
+                Ok(output) => {
                     tools.push(invoke.tool.clone());
                     let seq = self
                         .append(
@@ -740,19 +784,22 @@ impl Agent for AgentDriver {
                                 "round": round,
                                 "tool": invoke.tool,
                                 "input": invoke.input,
-                                "output": done.output,
-                                "stages": done.stages,
+                                "output": output,
+                                "stages": invoke.stages,
+                                "via": "catalog",
                             }),
                         )
                         .await?;
                     seqs.push(seq);
                 }
-                None => {
-                    // 事件上没人应答 ⇒ 问**目录**：带 iface 的工具（T2 提供者）从这条路走
-                    // （D2：T1 侧持引用、把 T2 的注册转发进来的那个面）。
-                    let input = invoke.input.clone();
-                    match self.call_catalog(&ctx, &invoke.tool, input).await {
-                        Ok(output) => {
+                Err(catalog_err)
+                    if catalog_err.contains("找不到工具")
+                        || catalog_err.contains("没有 iface 转发面") =>
+                {
+                    let ret = HarnessEvents::run_tool(&ctx, invoke.clone()).await;
+                    match decode_ret::<Invoke>(ret).map_err(|err| err.to_string())? {
+                        Some(done) => {
+                            collect(&mut stages, &done.stages);
                             tools.push(invoke.tool.clone());
                             let seq = self
                                 .append(
@@ -763,25 +810,34 @@ impl Agent for AgentDriver {
                                         "round": round,
                                         "tool": invoke.tool,
                                         "input": invoke.input,
-                                        "output": output,
-                                        "stages": invoke.stages,
-                                        "via": "catalog",
+                                        "output": done.output,
+                                        "stages": done.stages,
                                     }),
                                 )
                                 .await?;
                             seqs.push(seq);
                         }
-                        Err(err) => {
+                        None => {
                             unanswered.push(invoke.tool.clone());
                             let seq = self
                                 .append(
                                     &ctx,
-                                    json!({ "kind": "tool", "agent": self.agent, "round": round, "tool": invoke.tool, "unanswered": true, "catalog": err }),
+                                    json!({ "kind": "tool", "agent": self.agent, "round": round, "tool": invoke.tool, "unanswered": true, "catalog": catalog_err }),
                                 )
                                 .await?;
                             seqs.push(seq);
                         }
                     }
+                }
+                Err(err) => {
+                    unanswered.push(invoke.tool.clone());
+                    let seq = self
+                        .append(
+                            &ctx,
+                            json!({ "kind": "tool", "agent": self.agent, "round": round, "tool": invoke.tool, "unanswered": true, "catalog": err }),
+                        )
+                        .await?;
+                    seqs.push(seq);
                 }
             }
         }
