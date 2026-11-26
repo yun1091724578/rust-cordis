@@ -402,6 +402,7 @@ pub enum Level {
 
 pub type LogSink = Arc<dyn Fn(Level, &str, &str) + Send + Sync>;
 type AsyncCommitObserver = Arc<dyn Fn(Arc<Fiber>, Config, bool) -> BoxFuture<()> + Send + Sync>;
+type AsyncPluginObserver = Arc<dyn Fn(Arc<Fiber>) -> BoxFuture<()> + Send + Sync>;
 
 type CleanupErrorLog = Mutex<Vec<(u64, crate::fiber::CleanupError)>>;
 
@@ -438,6 +439,7 @@ pub struct Store {
     /// 把这条链路做成 async 会引入一个"依赖还没追加就算完依赖状态"的竞态窗口。
     /// `internal/commit` 同理——它是"配置被改了就落盘"的同步通知。
     plugin_observers: Mutex<Vec<(u64, PluginObserver)>>,
+    async_plugin_dispose_observers: Mutex<Vec<(u64, AsyncPluginObserver)>>,
     commit_observers: Mutex<Vec<(u64, CommitObserver)>>,
     async_commit_observers: Mutex<Vec<(u64, AsyncCommitObserver)>>,
     /// **同步监听器钩子**：`ctx.on` 每次注册前先咨询它们（`internal/listener` 的 Rust 形态）。
@@ -490,6 +492,7 @@ impl Store {
             hooks: Mutex::new(HashMap::new()),
             root_fiber: Mutex::new(None),
             plugin_observers: Mutex::new(Vec::new()),
+            async_plugin_dispose_observers: Mutex::new(Vec::new()),
             commit_observers: Mutex::new(Vec::new()),
             async_commit_observers: Mutex::new(Vec::new()),
             listener_hooks: Mutex::new(Vec::new()),
@@ -993,6 +996,34 @@ impl Store {
         })
     }
 
+    /// 异步观察“插件被处置收尾”（例如 loader 在插件自我卸载时将阻塞磁盘落盘移交 `spawn_blocking`）。
+    ///
+    /// 在 `Fiber::finish_dispose` 中被 await（位于 `dispose()` 返回之前），
+    /// 既保证 `fiber.dispose().await` 返回时落盘已完成，又不阻塞 Tokio async worker 线程。
+    pub fn on_plugin_dispose_async<F>(self: &Arc<Self>, ctx: &Ctx, observer: F) -> crate::Disposable
+    where
+        F: Fn(Arc<Fiber>) -> BoxFuture<()> + Send + Sync + 'static,
+    {
+        let store = self.clone();
+        let observer: AsyncPluginObserver = Arc::new(observer);
+        ctx.fiber().effect(move |_| {
+            let sn = store.observer_sn.fetch_add(1, Ordering::SeqCst);
+            store
+                .async_plugin_dispose_observers
+                .lock()
+                .unwrap()
+                .push((sn, observer));
+            let store2 = store.clone();
+            crate::Disposable::sync(move || {
+                store2
+                    .async_plugin_dispose_observers
+                    .lock()
+                    .unwrap()
+                    .retain(|(s, _)| *s != sn);
+            })
+        })
+    }
+
     pub(crate) fn fire_plugin(&self, fiber: &Arc<Fiber>) {
         let observers: Vec<_> = self
             .plugin_observers
@@ -1003,6 +1034,19 @@ impl Store {
             .collect();
         for observer in observers {
             observer(fiber);
+        }
+    }
+
+    pub(crate) async fn fire_plugin_dispose_async(&self, fiber: &Arc<Fiber>) {
+        let observers: Vec<_> = self
+            .async_plugin_dispose_observers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, f)| f.clone())
+            .collect();
+        for observer in observers {
+            observer(fiber.clone()).await;
         }
     }
 
@@ -1094,6 +1138,11 @@ impl Store {
     pub fn resolve(&self, ctx: &Ctx, name: &str) -> std::result::Result<Dyn, ResolveError> {
         let initial_fiber = match ctx.fiber_opt() {
             Some(fiber) => {
+                // 即使外部仍持有 `Arc<Fiber>`，已处置完（`FiberState::Disposed`）的陈旧上下文也必须 fail-closed；
+                // `Unloading` 阶段仍允许本 fiber 的 disposer 读取 `self.committed`。
+                if fiber.state() == crate::fiber::FiberState::Disposed {
+                    return Err(ResolveError::Inactive(name.into()));
+                }
                 if fiber.runtime.is_none() {
                     return self
                         .try_get(ctx, name, false)
@@ -1184,19 +1233,23 @@ impl Store {
         value: Dyn,
         check: Option<Check>,
     ) -> Result<Disposable> {
+        let Some(fiber) = ctx.fiber_opt() else {
+            return Err(format!("cannot provide service \"{name}\" on inactive context").into());
+        };
         let store = Arc::clone(self);
         let ctx_in = ctx.clone();
         let name_owned: Box<str> = name.into();
+        let fiber_for_setup = fiber.clone();
         // setup 是同步执行的，所以冲突结果立刻可见；失败时直接返回 `Err`，
         // **不产生恢复栈登记**（`effect_result` 的语义）——曾经这里先登记一条
         // 空壳、再在外层返回错误，调用方拿不到句柄，于是每次撞名都欠一笔永久条目。
-        let disposable = ctx.fiber().effect_result(move |_| {
+        let disposable = fiber.effect_result(move |_| {
             let ctx = ctx_in;
             let realm = store.realm_of(&ctx, &name_owned);
             let impl_ = Arc::new(Impl::new(
                 name_owned.clone(),
                 value,
-                Arc::downgrade(&ctx.fiber()),
+                Arc::downgrade(&fiber_for_setup),
                 check,
                 realm,
             ));
@@ -1216,11 +1269,10 @@ impl Store {
                 impls.insert(realm, impl_.clone());
             }
             // 提供者自己的依赖表也要有它，否则它自己读不到自己的服务。
-            ctx.fiber().set_dep(name_owned.clone(), impl_.clone());
+            fiber_for_setup.set_dep(name_owned.clone(), impl_.clone());
             // 提交视图同样要登记——这是 `reflect.ts:193` 那一行：
             // `this.ctx.fiber.store![name] = impl`。
-            ctx.fiber()
-                .committed_insert(name_owned.clone(), impl_.clone());
+            fiber_for_setup.committed_insert(name_owned.clone(), impl_.clone());
             let store2 = Arc::clone(&store);
             let ctx2 = ctx.clone();
             let name2 = name_owned.clone();
@@ -1228,47 +1280,126 @@ impl Store {
                 Box::pin(async move {
                     // 顺序与 `reflect.ts:197-203` 逐行一致：
                     //   ① 先摘全局表条目 → ② 通知依赖者 → ③ 等它们拆完 → ④ 才摘自己的提交视图。
-                    //（早先这里的注释写成"先等依赖者收敛、再摘除自己"，与代码相反；
-                    //  代码一直是对的。两种顺序其实都安全——`check_impl` 要求提供者处于
-                    //  ACTIVE，已进入 UNLOADING 的提供者本来就不再"提供"，见原理.md §6.3。）
-                    store2.impls.lock().unwrap().remove(&realm);
+                    // 先放锁再析构取出的 `Arc<Impl>`，避免用户值 `Drop` 重入 `Store` 导致自锁或锁中毒。
+                    let removed = { store2.impls.lock().unwrap().remove(&realm) };
+                    drop(removed);
                     let dependents = store2.notify(&[&name2], &ctx2, true);
                     let provider_fiber = ctx2.fiber_opt();
                     let provider_tearing_down = provider_fiber.as_ref().is_none_or(|p| {
                         p.is_disposed() || p.state() == crate::fiber::FiberState::Unloading
                     });
-                    for fiber in dependents {
-                        if provider_fiber
+                    // 若提供者正在卸载/处置且 `wait_for_dependents` 已耗尽 `drain_timeout_ms` 预算
+                    // 并将剩余消费者移交后台，此处不再对仍在 `Loading`/`Active`/`Pending` 的
+                    // 同一批消费者进行第二次无界等待。
+                    let skip_all_after_drain_timeout = provider_tearing_down
+                        && provider_fiber
                             .as_ref()
-                            .is_some_and(|provider| Arc::ptr_eq(provider, &fiber))
-                        {
-                            continue;
-                        }
-                        // 依赖者如果正在拆自己（尤其它是 provider 的祖先），等它 settle
-                        // 会回头抢父 fiber 已持有的 driver：父 unload 等子 dispose、
-                        // 子 provide disposer 又等父 settle，形成死锁。
-                        // 若提供者自身正在卸载/处置，`wait_for_dependents` 已按 `drain_timeout_ms`
-                        // 处理过依赖等待，此处不再无界等待已进入 Unloading 的依赖者。
-                        let ancestor_consumer = provider_fiber
-                            .as_ref()
-                            .is_some_and(|provider| fiber.is_ancestor_of(provider));
-                        if fiber.is_cycle_blocked(&name2)
-                            || ancestor_consumer
-                            || (provider_tearing_down
-                                && (fiber.is_disposed()
-                                    || fiber.state() == crate::fiber::FiberState::Unloading))
-                        {
-                            if ancestor_consumer {
-                                if let Some(provider) = &provider_fiber {
-                                    provider.warn_ancestor_consumer(&fiber);
+                            .is_some_and(|p| p.unload_drain_timed_out());
+                    if !skip_all_after_drain_timeout {
+                        let mut to_wait: Vec<Arc<Fiber>> = Vec::new();
+                        let mut seen: std::collections::HashSet<u64> =
+                            std::collections::HashSet::new();
+                        for fiber in dependents {
+                            if provider_fiber
+                                .as_ref()
+                                .is_some_and(|provider| Arc::ptr_eq(provider, &fiber))
+                            {
+                                continue;
+                            }
+                            if fiber.is_cycle_blocked(&name2) {
+                                continue;
+                            }
+                            if let Some(provider) = &provider_fiber {
+                                if let Some(cycle) = provider.detect_teardown_wait_cycle(&fiber) {
+                                    match cycle {
+                                        crate::fiber::TeardownWaitCycle::Ancestor(ancestor) => {
+                                            provider.warn_ancestor_consumer(&ancestor);
+                                        }
+                                        crate::fiber::TeardownWaitCycle::CrossSubtree(blocking) => {
+                                            provider.warn_teardown_cycle(&blocking);
+                                        }
+                                    }
+                                    continue;
                                 }
                             }
-                            continue;
+                            if provider_tearing_down
+                                && (fiber.is_disposed()
+                                    || fiber.state() == crate::fiber::FiberState::Unloading)
+                            {
+                                continue;
+                            }
+                            if seen.insert(fiber.fiber_id()) {
+                                to_wait.push(fiber);
+                            }
                         }
-                        if fiber.is_disposed() {
-                            fiber.wait_disposed().await;
-                        } else {
-                            fiber.settle().await;
+                        let drain_budget = store2
+                            .lifecycle_policy()
+                            .drain_timeout_ms
+                            .map(std::time::Duration::from_millis);
+                        let deadline = drain_budget
+                            .filter(|_| tokio::runtime::Handle::try_current().is_ok())
+                            .map(|limit| tokio::time::Instant::now() + limit);
+                        match deadline {
+                            None => {
+                                for fiber in to_wait {
+                                    if fiber.is_disposed() {
+                                        fiber.wait_disposed().await;
+                                    } else {
+                                        fiber.settle().await;
+                                    }
+                                }
+                            }
+                            Some(deadline) => {
+                                let mut iter = to_wait.into_iter();
+                                while let Some(fiber) = iter.next() {
+                                    let mut wait_fut: BoxFuture<()> = if fiber.is_disposed() {
+                                        let target = fiber.clone();
+                                        Box::pin(async move { target.wait_disposed().await })
+                                    } else {
+                                        fiber.settle()
+                                    };
+                                    if tokio::time::timeout_at(deadline, &mut wait_fut)
+                                        .await
+                                        .is_err()
+                                    {
+                                        let rest: Vec<Arc<Fiber>> = iter.collect();
+                                        let budget_ms =
+                                            drain_budget.map(|d| d.as_millis()).unwrap_or(0);
+                                        let reason = format!(
+                                            "等待依赖者 <{}#{}> 卸载超时（预算 {budget_ms} ms，仍有 {} 个依赖者在后台清理）",
+                                            fiber.name(),
+                                            fiber.fiber_id(),
+                                            rest.len() + 1
+                                        );
+                                        if let Some(provider) = &provider_fiber {
+                                            provider.record_cleanup_error(
+                                                crate::fiber::CleanupErrorKind::Timeout,
+                                                reason.clone(),
+                                            );
+                                            store2.log(Level::Error, &provider.name(), &reason);
+                                        } else {
+                                            store2.log(Level::Error, &name2, &reason);
+                                        }
+                                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                                            let guard = provider_fiber
+                                                .as_ref()
+                                                .map(|p| p.defer_background_cleanup());
+                                            handle.spawn(async move {
+                                                let _guard = guard;
+                                                wait_fut.await;
+                                                for other in rest {
+                                                    if other.is_disposed() {
+                                                        other.wait_disposed().await;
+                                                    } else {
+                                                        other.settle().await;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     // 最后才从**自己的提交视图**里摘掉自己那条（`reflect.ts:202`）。
@@ -1284,7 +1415,7 @@ impl Store {
         })?;
         // 放到 `effect_result` 成功注册 disposer 之后再 `notify`：即使依赖者的 `Check` 谓词
         // 在 `notify` 内 panic，已插入的 `store.impls` 条目也已挂入恢复栈，不会永久泄漏。
-        if ctx.fiber().state() == crate::fiber::FiberState::Active {
+        if fiber.state() == crate::fiber::FiberState::Active {
             self.notify(&[name], ctx, true);
         }
         Ok(disposable)
@@ -1307,16 +1438,30 @@ impl Store {
                 return result;
             }
         }
+        let Some(caller_fiber) = ctx.fiber_opt() else {
+            return Err(format!("cannot set property \"{name}\" on inactive context").into());
+        };
         let realm = self.realm_of(ctx, name);
-        let impls = self.impls.lock().unwrap();
-        let impl_ = impls
-            .get(&realm)
-            .ok_or_else(|| format!("cannot set property \"{name}\" without provide"))?;
-        let owner_uid = impl_.fiber.upgrade().map(|f| f.uid());
-        if owner_uid != Some(ctx.fiber().uid()) {
+        let impl_ = {
+            let impls = self.impls.lock().unwrap();
+            impls
+                .get(&realm)
+                .cloned()
+                .ok_or_else(|| format!("cannot set property \"{name}\" without provide"))?
+        };
+        let same_owner = impl_
+            .fiber
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &caller_fiber));
+        if !same_owner {
             return Err(format!("cannot set property \"{name}\" in multiple fibers").into());
         }
-        *impl_.value.lock().unwrap() = value;
+        // 先放锁再 drop 旧值：避免用户值的 `Drop` 重入 `Store`（死锁）或 panic（中毒锁）。
+        let old = {
+            let mut slot = impl_.value.lock().unwrap();
+            std::mem::replace(&mut *slot, value)
+        };
+        drop(old);
         Ok(())
     }
 
@@ -1456,6 +1601,57 @@ impl Store {
             })
             .map(|impl_| (impl_.name.clone(), impl_.realm))
             .collect()
+    }
+
+    /// 当前所有已注册 fiber 的快照（供卸载等待图的环路检测遍历）。
+    pub(crate) fn all_registered_fibers(&self) -> Vec<Arc<Fiber>> {
+        let runtimes: Vec<Arc<Runtime>> = self.runtimes.lock().unwrap().clone();
+        let mut out = Vec::new();
+        for runtime in runtimes {
+            let fibers: Vec<Arc<Fiber>> = runtime.fibers.lock().unwrap().clone();
+            out.extend(fibers);
+        }
+        out
+    }
+
+    /// 直接依赖 `provider` 的所有消费者 fiber（用于检测直接/传递祖先消费者及跨子树等待环）。
+    ///
+    /// 同时检查 `deps`、`committed` 以及 `(store.impls ∪ provider.committed)` 对应的同域 `inject` 声明，
+    /// 确保在 `provide` disposer 摘除 `store.impls` 之后仍能看到完整的卸载等待边。
+    pub(crate) fn direct_dependents_of(&self, provider: &Arc<Fiber>) -> Vec<Arc<Fiber>> {
+        let mut owned = self.impls_owned_by_with_realm(provider);
+        for item in provider.committed_owned_with_realm() {
+            if !owned.contains(&item) {
+                owned.push(item);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for fiber in self.all_registered_fibers() {
+            if Arc::ptr_eq(&fiber, provider) {
+                continue;
+            }
+            let mut depends = fiber.has_recorded_dep_on(provider);
+            if !depends && !owned.is_empty() {
+                let fctx = fiber.ctx_opt();
+                for (name, realm) in &owned {
+                    if !fiber.declares_inject(name) || fiber.is_cycle_blocked(name) {
+                        continue;
+                    }
+                    if fctx
+                        .as_ref()
+                        .is_none_or(|ctx| self.realm_of(ctx, name) == *realm)
+                    {
+                        depends = true;
+                        break;
+                    }
+                }
+            }
+            if depends && seen.insert(fiber.fiber_id()) {
+                out.push(fiber);
+            }
+        }
+        out
     }
 
     /// 本 fiber 注册的**可调用服务**（`provide_iface` / 带 JSON 面的值）。
@@ -1971,17 +2167,20 @@ impl Store {
             .collect()
     }
 
-    /// 一次性卸载某插件的所有实例（HMR / 卸载插件用）。
+    /// 一次性返回某插件当前的所有实例供调用方依次 `dispose()`（HMR / 卸载插件用）。
+    ///
+    /// 注意：只要仍有活跃 fiber，不提前把 `Runtime` 移出 `self.runtimes`，确保期间上游提供者
+    /// 卸载等待与环检测仍能观察到这些实例；每个实例在 `dispose()` 完成后由 `DisposeDone` 统一摘除。
     pub fn delete_plugin(&self, key: &str) -> Vec<Arc<Fiber>> {
-        let removed = {
-            let mut runtimes = self.runtimes.lock().unwrap();
-            let idx = runtimes.iter().position(|r| &*r.key == key);
-            idx.map(|i| runtimes.remove(i))
+        let mut runtimes = self.runtimes.lock().unwrap();
+        let Some(idx) = runtimes.iter().position(|r| &*r.key == key) else {
+            return Vec::new();
         };
-        match removed {
-            Some(runtime) => runtime.fibers.lock().unwrap().clone(),
-            None => Vec::new(),
+        let fibers = runtimes[idx].fibers.lock().unwrap().clone();
+        if fibers.is_empty() {
+            runtimes.remove(idx);
         }
+        fibers
     }
 
     pub(crate) fn register_fiber(&self, runtime: &Arc<Runtime>, fiber: &Arc<Fiber>) {

@@ -16,6 +16,16 @@
 use std::ffi::c_void;
 use std::path::Path;
 
+/// 裸文件名统一补 `.` 前缀：POSIX `dlopen` 与 Windows `LoadLibraryW` 对裸文件名都会搜索系统/PATH
+/// 目录而非显式限定当前目录路径。
+fn normalize_open_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    if path.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        std::borrow::Cow::Owned(Path::new(".").join(path))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -37,7 +47,14 @@ mod imp {
 
     impl DynLib {
         pub fn open(path: &Path) -> Result<Self, String> {
-            let mut wide: Vec<u16> = OsStr::new(path).encode_wide().collect();
+            let effective = normalize_open_path(path);
+            let mut wide: Vec<u16> = OsStr::new(effective.as_os_str()).encode_wide().collect();
+            if wide.contains(&0) {
+                return Err(format!(
+                    "动态库路径包含非法内部 NUL 字符 ({})",
+                    path.display()
+                ));
+            }
             wide.push(0);
             let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
             if handle.is_null() {
@@ -105,7 +122,8 @@ mod imp {
 
     impl DynLib {
         pub fn open(path: &Path) -> Result<Self, String> {
-            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            let effective = normalize_open_path(path);
+            let c_path = std::ffi::CString::new(effective.as_os_str().as_bytes())
                 .map_err(|err| err.to_string())?;
             let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW) };
             if handle.is_null() {
@@ -141,3 +159,40 @@ mod imp {
 }
 
 pub use imp::DynLib;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r2_p3_dylib_open_rejects_interior_nul() {
+        #[cfg(windows)]
+        let bad = {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            let wide: Vec<u16> = "foo\0bar.dll".encode_utf16().collect();
+            std::path::PathBuf::from(OsString::from_wide(&wide))
+        };
+        #[cfg(unix)]
+        let bad = {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            std::path::PathBuf::from(OsStr::from_bytes(b"foo\0bar.so"))
+        };
+        let err = DynLib::open(&bad)
+            .err()
+            .expect("含内部 NUL 的动态库路径必须被显式拒绝");
+        assert!(
+            err.to_ascii_lowercase().contains("nul"),
+            "错误必须明确指出 NUL 字节，而非交给系统截断加载：{err}"
+        );
+    }
+
+    #[test]
+    fn r2_p3_normalize_open_path_prefixes_bare_filename() {
+        let bare = normalize_open_path(Path::new("plugin.dll"));
+        assert_eq!(bare.as_ref(), Path::new(".").join("plugin.dll"));
+        let nested = normalize_open_path(Path::new("dir/plugin.dll"));
+        assert_eq!(nested.as_ref(), Path::new("dir/plugin.dll"));
+    }
+}

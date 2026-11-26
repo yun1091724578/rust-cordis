@@ -566,20 +566,126 @@ fn contains_version_token(haystack: &str, expected_version: &str) -> bool {
     false
 }
 
-fn suppresses_failure(line: &str) -> bool {
-    if let Some((_, rhs)) = line.split_once("||") {
-        let rhs = rhs.trim();
-        if rhs == "true"
-            || rhs == ":"
-            || rhs.starts_with("true ")
-            || rhs.starts_with(": ")
-            || rhs.starts_with("echo ")
-            || rhs.starts_with("printf ")
-        {
-            return true;
+/// 检查 `|| <rhs>` 后的兜底子句是否**显式以非零状态失败**。
+///
+/// 采用严格白名单并检查每一条分号子句：
+/// - 任何子句若为 `return ...` 或 `exit <256 的整数倍>`（如 `exit 0`、`exit 256`、`exit -256`）
+///   都会令 shell 以退出码 0 提前返回，直接判为不安全；
+/// - 末尾有效子句必须是 `false` 或 `exit <n>` 且 `n.rem_euclid(256) != 0`。
+fn fallback_explicitly_fails(rhs: &str) -> bool {
+    let rhs = rhs.trim();
+    if rhs.ends_with('&') && !rhs.ends_with("&&") {
+        return false;
+    }
+    let body = rhs
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .or_else(|| rhs.strip_prefix('(').and_then(|s| s.strip_suffix(')')))
+        .unwrap_or(rhs)
+        .trim();
+    let clauses: Vec<&str> = body
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if clauses.is_empty() {
+        return false;
+    }
+    let parse_nonzero_exit = |stmt: &str| -> Option<bool> {
+        let code = stmt.strip_prefix("exit")?;
+        if !code.is_empty() && !code.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
+            // 裸 `exit` 沿用 `$?`：在 `||` 兜底块里，若前面已有 `echo ...` 会把 `$?` 改成 0。
+            return Some(false);
+        }
+        let n = trimmed.parse::<i32>().ok()?;
+        Some(n.rem_euclid(256) != 0)
+    };
+    let is_return_stmt = |stmt: &str| -> bool {
+        stmt.strip_prefix("return")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    };
+    for &clause in &clauses[..clauses.len() - 1] {
+        if is_return_stmt(clause) {
+            return false;
+        }
+        if let Some(nonzero) = parse_nonzero_exit(clause) {
+            if !nonzero {
+                return false;
+            }
+        }
+    }
+    let last = *clauses.last().unwrap();
+    if last == "false" {
+        return true;
+    }
+    parse_nonzero_exit(last).unwrap_or(false)
+}
+
+fn contains_unquoted_semicolon(s: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for b in s.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match b {
+            b'\\' if !in_single => escaped = true,
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b';' if !in_single && !in_double => return true,
+            _ => {}
         }
     }
     false
+}
+
+fn suppresses_failure(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.ends_with('&') && !trimmed.ends_with("&&") {
+        return true;
+    }
+    if let Some((lhs, rhs)) = trimmed.split_once("||") {
+        if contains_unquoted_semicolon(lhs) {
+            return true;
+        }
+        return !fallback_explicitly_fails(rhs);
+    }
+    if contains_unquoted_semicolon(trimmed) {
+        return true;
+    }
+    false
+}
+
+/// 判断 workflow 是否由主 CI / 合并队列 / 可复用 CI 门禁触发（不因改名、merge_group 或
+/// reusable workflow 而绕过 `rustc --version` 守卫）。
+fn workflow_triggers_on_push_or_pr(root_map: &serde_yaml::Mapping) -> bool {
+    let on_val = root_map
+        .get(YamlValue::String("on".to_string()))
+        .or_else(|| root_map.get(YamlValue::Bool(true)));
+    let is_ci_event = |s: &str| {
+        matches!(
+            s,
+            "push" | "pull_request" | "pull_request_target" | "merge_group" | "workflow_call"
+        )
+    };
+    match on_val {
+        Some(YamlValue::String(s)) => is_ci_event(s.trim()),
+        Some(YamlValue::Sequence(seq)) => seq
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .any(|s| is_ci_event(s.trim())),
+        Some(YamlValue::Mapping(map)) => map
+            .keys()
+            .filter_map(YamlValue::as_str)
+            .any(|s| is_ci_event(s.trim())),
+        _ => false,
+    }
 }
 
 fn strip_inline_comment(line: &str) -> &str {
@@ -621,11 +727,48 @@ fn is_grep_assertion(rhs: &str, expected_version: &str) -> bool {
     contains_version_token(rest, expected_version)
 }
 
+fn line_disables_errexit(line: &str) -> bool {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.first().copied() != Some("set") {
+        return false;
+    }
+    tokens.iter().skip(1).any(|&tok| tok == "+e")
+        || tokens.windows(2).any(|w| w[0] == "+o" && w[1] == "errexit")
+}
+
+fn line_enables_errexit(line: &str) -> bool {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.first().copied() != Some("set") {
+        return false;
+    }
+    tokens
+        .iter()
+        .skip(1)
+        .any(|&tok| tok.starts_with('-') && !tok.starts_with("--") && tok[1..].contains('e'))
+        || tokens.windows(2).any(|w| w[0] == "-o" && w[1] == "errexit")
+}
+
 fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool {
     let mut captured_vars: Vec<String> = Vec::new();
+    let mut errexit_disabled = false;
     for raw_line in run_script.lines() {
         let line = strip_inline_comment(raw_line).trim();
-        if line.is_empty() || suppresses_failure(line) {
+        if line.is_empty() {
+            continue;
+        }
+        if line_disables_errexit(line) {
+            errexit_disabled = true;
+            continue;
+        }
+        if line_enables_errexit(line) {
+            errexit_disabled = false;
+            continue;
+        }
+        if suppresses_failure(line) {
+            continue;
+        }
+        // `set +e` / `set +o errexit` 生效期间，裸断言失败不会终止步骤，必须带显式失败的 `||` 兜底。
+        if errexit_disabled && !line.contains("||") {
             continue;
         }
         // 记录 `VAR=$(rustc --version)` 或 `VAR="$(rustc --version)"` 赋值。
@@ -897,12 +1040,14 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                     }
                 }
 
-                if name == "ci.yml"
+                let requires_rustc_check =
+                    name == "ci.yml" || workflow_triggers_on_push_or_pr(root_map);
+                if requires_rustc_check
                     && job_toolchain_from_action.is_some()
                     && !has_rustc_version_check
                 {
                     problems.push(format!(
-                        "{name}:{job_name}: ci.yml 中安装 Rust 工具链的 job 必须显式校验实际生效的 `rustc --version` 为 `{expected_job_tc}`"
+                        "{name}:{job_name}: CI workflow 中安装 Rust 工具链的 job 必须显式校验实际生效的 `rustc --version` 为 `{expected_job_tc}`"
                     ));
                 }
             }
@@ -1718,6 +1863,10 @@ version = "0.1.3"
             "ver=\"$(rustc --version)\"\n[[ \"$ver\" == \"rustc 1.98.1 \"* ]] || exit 1",
             "1.98.1"
         ));
+        assert!(step_verifies_rustc_version(
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || { echo bad >&2; exit 1; }",
+            "1.98.1"
+        ));
 
         // 任何不会失败的提示、注释、吞错、取反或前缀误匹配都必须拒绝。
         for bad in [
@@ -1725,6 +1874,10 @@ version = "0.1.3"
             "printf 'rustc --version | grep -q \"^rustc 1.98.1 \"\\n'",
             "# rustc --version | grep -q '^rustc 1\\.98\\.1 '",
             "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || true",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || exit 0",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || sleep 0",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || { exit 0; }",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || return 0",
             "rustc --version | grep -q '^rustc 1\\.98\\.1 ' | cat",
             "rustc --version | grep -qv '^rustc 1\\.98\\.1 '",
             "rustc --version | grep -q '^rustc 1\\.98\\.10 '",
@@ -1815,5 +1968,83 @@ version = "0.1.3"
             ok_problems.is_empty(),
             "显式 continue-on-error: false 的阻断断言应放行：{ok_problems:?}"
         );
+
+        // 改名后的 push / pull_request CI workflow 也必须强制校验 rustc --version；
+        // 仅 workflow_dispatch 的手工任务不受该条约束。
+        let tmp_renamed = TempDir::new("renamed-pr-workflow");
+        let wf_renamed = tmp_renamed.path.join(".github").join("workflows");
+        std::fs::create_dir_all(&wf_renamed).unwrap();
+        std::fs::write(
+            tmp_renamed.path.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.98.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf_renamed.join("rust-ci.yml"),
+            "on: [push, pull_request]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo test\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf_renamed.join("manual.yml"),
+            "on: workflow_dispatch\npermissions:\n  contents: read\njobs:\n  manual:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo test\n",
+        )
+        .unwrap();
+        let renamed_problems = check_toolchain_pin_and_ci_sync(&tmp_renamed.path, &wf_renamed);
+        assert!(
+            renamed_problems
+                .iter()
+                .any(|p| p.contains("rust-ci.yml") && p.contains("rustc --version")),
+            "改名的 push/pull_request workflow 必须受 rustc --version 守卫约束：{renamed_problems:?}"
+        );
+        assert!(
+            !renamed_problems.iter().any(|p| p.contains("manual.yml")),
+            "仅 workflow_dispatch 的 workflow 不应被误报：{renamed_problems:?}"
+        );
+    }
+
+    #[test]
+    fn r2_p2_rustc_guard_rejects_early_exit0_mod256_semicolon_bg_and_set_plus_e() {
+        for bypass in [
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || { exit 0; exit 1; }",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || exit 256",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || exit -256",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 '; true",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 '; exit 0",
+            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' &",
+            "set +e\nrustc --version | grep -q '^rustc 1\\.98\\.1 '",
+            "set +o errexit\nrustc --version | grep -q '^rustc 1\\.98\\.1 '",
+        ] {
+            assert!(
+                !step_verifies_rustc_version(bypass, "1.98.1"),
+                "绕过写法 `{bypass}` 必须被 rustc --version 守卫拒绝"
+            );
+        }
+
+        // merge_group 与 workflow_call 触发的 CI workflow 也必须强制校验 rustc --version。
+        for (name, trigger) in [
+            ("merge-group.yml", "on: merge_group"),
+            ("reusable.yml", "on: workflow_call"),
+        ] {
+            let tmp = TempDir::new(name);
+            let wf_dir = tmp.path.join(".github").join("workflows");
+            std::fs::create_dir_all(&wf_dir).unwrap();
+            std::fs::write(
+                tmp.path.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"1.98.1\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                wf_dir.join(name),
+                format!("{trigger}\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo test\n"),
+            )
+            .unwrap();
+            let problems = check_toolchain_pin_and_ci_sync(&tmp.path, &wf_dir);
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains(name) && p.contains("rustc --version")),
+                "{trigger} workflow 必须受 rustc --version 守卫约束：{problems:?}"
+            );
+        }
     }
 }

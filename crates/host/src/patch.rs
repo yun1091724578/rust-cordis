@@ -1319,7 +1319,7 @@ pub fn collect_js_capabilities(entries: &[Entry]) -> Vec<(String, crate::js::JsC
     out
 }
 
-fn collect_entry_capabilities(entry: &Entry, out: &mut Vec<(String, crate::js::JsCapabilities)>) {
+pub(crate) fn entry_js_capabilities(entry: &Entry) -> crate::js::JsCapabilities {
     let mut caps = crate::js::JsCapabilities::default();
     if let Some(expr) = &entry.disabled_expr {
         if let Ok(text) = expr.expression() {
@@ -1338,7 +1338,11 @@ fn collect_entry_capabilities(entry: &Entry, out: &mut Vec<(String, crate::js::J
         );
     }
     caps.normalize();
-    out.push((entry_label(entry), caps));
+    caps
+}
+
+fn collect_entry_capabilities(entry: &Entry, out: &mut Vec<(String, crate::js::JsCapabilities)>) {
+    out.push((entry_label(entry), entry_js_capabilities(entry)));
     for child in &entry.children {
         collect_entry_capabilities(child, out);
     }

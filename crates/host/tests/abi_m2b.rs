@@ -703,3 +703,77 @@ async fn plain_native_waterfall_is_unchanged() {
         "原生链：tail 给 41，外层 +1 ⇒ 42（与 M2b 之前逐字一致）"
     );
 }
+
+/// 回归（#11）：T2 waterfall 监听器同步失败（`STATUS_ERR`）时，宿主不得吞掉尚未消费的 `frame`，
+/// 必须记录错误并继续执行下游监听器与 `tail`。
+#[tokio::test]
+async fn waterfall_listener_status_err_continues_downstream_chain() {
+    use cordis_abi::STATUS_ERR;
+
+    unsafe extern "C" fn failing_waterfall_listener(
+        handle: u64,
+        op: u32,
+        _: Blob,
+        _: Blob,
+        out: *mut Out,
+    ) -> i32 {
+        match op {
+            OP_APPLY => {
+                let _ = on_event(handle, "w_err_continue", 1);
+                (*out).write(b"")
+            }
+            OP_CALLBACK => {
+                let _ = (*out).write(b"listener exploded");
+                STATUS_ERR
+            }
+            OP_DISPOSE => (*out).write(b""),
+            _ => STATUS_UNSUPPORTED,
+        }
+    }
+
+    let app = App::new();
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let errors_c = errors.clone();
+    app.store.set_log_sink(Arc::new(move |level, _name, msg| {
+        if level == cordis_core::Level::Error {
+            errors_c.lock().unwrap().push(msg.to_string());
+        }
+    }));
+
+    let fiber = app.root.plugin(
+        abi_plugin("m2b-failing-listener", failing_waterfall_listener),
+        Config::Null,
+    );
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    let downstream_ran = Arc::new(AtomicBool::new(false));
+    let ds = downstream_ran.clone();
+    app.root.on("w_err_continue", move |call| {
+        let ds = ds.clone();
+        Box::pin(async move {
+            ds.store(true, Ordering::SeqCst);
+            call.next.call(call.args.clone()).await
+        })
+    });
+
+    let ret = run_waterfall(&app, "w_err_continue", vec![], tail_of(json!("tail-ok"))).await;
+    assert_eq!(
+        json_of(ret),
+        Some(json!("tail-ok")),
+        "上游 T2 waterfall 监听器返回 STATUS_ERR 时，下游链和 tail 必须继续执行"
+    );
+    assert!(
+        downstream_ran.load(Ordering::SeqCst),
+        "下游监听器必须被继续调用"
+    );
+    assert!(
+        errors
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|msg| msg.contains("listener exploded")),
+        "失败监听器的错误信息必须记录到日志"
+    );
+    app.close().await;
+}

@@ -435,17 +435,68 @@ pub fn inspect_in(config_path: &Path, search: &[PathBuf]) -> Result<InspectRepor
     inspect_entries(&entries, search)
 }
 
+/// 按装载器同一套结构行标走法遍历配置树：
+/// 1. 组行与静态禁用行同样推进匿名序号，确保 `name#N` 行标与装载器完全一致；
+/// 2. 在整棵树上检测重复行标（重复 `id` 或与生成行标碰撞），立即返回可读错误；
+/// 3. 跳过静态 `disabled: true` 行及其子树下的叶子行（与装载器预检及 `status`/`run` 对齐），
+///    仅返回需要探测的叶子行（含动态 `disabled: !!js` 行，因为静态阶段无法求值）。
+fn collect_inspectable_entries(entries: &[Entry]) -> Result<Vec<(String, &Entry)>, String> {
+    fn stable_label(
+        entry: &Entry,
+        ordinals: &mut std::collections::HashMap<String, usize>,
+    ) -> String {
+        if let Some(id) = &entry.id {
+            return id.clone();
+        }
+        let counter = ordinals.entry(entry.name.clone()).or_insert(0);
+        let label = format!("{}#{}", entry.name, *counter);
+        *counter += 1;
+        label
+    }
+
+    fn visit<'a>(
+        entries: &'a [Entry],
+        disabled_by_ancestor: bool,
+        ordinals: &mut std::collections::HashMap<String, usize>,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<(String, &'a Entry)>,
+    ) -> Result<(), String> {
+        for entry in entries {
+            let label = stable_label(entry, ordinals);
+            if !seen.insert(label.clone()) {
+                return Err(format!(
+                    "配置包含重复行标识 \"{label}\"（两行解析成同一个 label，请给它们不同的 id）"
+                ));
+            }
+            let disabled = disabled_by_ancestor || entry.disabled;
+            if entry.group {
+                visit(&entry.children, disabled, ordinals, seen, out)?;
+                continue;
+            }
+            if disabled {
+                continue;
+            }
+            out.push((label, entry));
+        }
+        Ok(())
+    }
+
+    let mut ordinals = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    visit(entries, false, &mut ordinals, &mut seen, &mut out)?;
+    Ok(out)
+}
+
 /// [`inspect`] 的内核：直接给条目与搜索目录（测试与将来 `cordis validate` 共用）。
 pub fn inspect_entries(entries: &[Entry], search: &[PathBuf]) -> Result<InspectReport, String> {
     let mut rows = Vec::new();
     let mut undeclared = Vec::new();
-    // 与装载器共用 `stable_label`：组行已被展开，空组也不会被当成插件。
-    for (index, labeled) in cordis_host::loader::labeled_entries(entries)
+    // 与装载器共用 `stable_label` 规则：展开组行、拒绝重复行标、跳过静态 disabled 行。
+    for (index, (label, entry)) in collect_inspectable_entries(entries)?
         .into_iter()
         .enumerate()
     {
-        let entry = &labeled.entry;
-        let label = labeled.label;
         let caps = cordis_host::probe_capabilities_in(Path::new(&entry.name), search)
             .map_err(|err| format!("第 {} 行（{label}）探测失败: {err}", index + 1))?;
         // 与装载器共用同一份解析：`{required, optional}` 是**声明形状**，
@@ -553,7 +604,13 @@ pub fn validate_in(
         entries = apply_entry_patches(entries, &layer, &mut warn);
     }
 
-    let inspect = inspect_entries(&entries, search)?;
+    let inspect = inspect_entries(&entries, search).map_err(|err| {
+        if warnings.is_empty() {
+            err
+        } else {
+            format!("{err}\npatch warnings:\n- {}", warnings.join("\n- "))
+        }
+    })?;
     Ok(ValidateReport { inspect, warnings })
 }
 

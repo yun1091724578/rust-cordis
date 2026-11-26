@@ -155,14 +155,60 @@ impl ConfigLock {
                     if err.kind() == std::io::ErrorKind::AlreadyExists
                         || err.kind() == std::io::ErrorKind::PermissionDenied =>
                 {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|time| time.elapsed().ok())
-                        .is_some_and(|age| age > Duration::from_secs(30));
-                    if stale {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
+                    let is_stale = |p: &Path, max_age: Duration| {
+                        std::fs::metadata(p)
+                            .and_then(|meta| meta.modified())
+                            .ok()
+                            .and_then(|time| time.elapsed().ok())
+                            .is_some_and(|age| age > max_age)
+                    };
+                    if is_stale(&path, Duration::from_secs(30)) {
+                        // 用独立 `.reclaim` 互斥锁串行化陈旧锁回收，并在持锁后二次确认
+                        // mtime 仍已陈旧，防止并发等待者在另一方刚创建新锁后误删新锁。
+                        let reclaim_path = dir.join(format!(".{name}.lock.reclaim"));
+                        match std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&reclaim_path)
+                        {
+                            Ok(reclaim_file) => {
+                                drop(reclaim_file);
+                                struct ReclaimGuard(PathBuf);
+                                impl Drop for ReclaimGuard {
+                                    fn drop(&mut self) {
+                                        for _ in 0..50 {
+                                            match std::fs::remove_file(&self.0) {
+                                                Ok(()) => return,
+                                                Err(e)
+                                                    if e.kind() == std::io::ErrorKind::NotFound =>
+                                                {
+                                                    return;
+                                                }
+                                                Err(_) => {
+                                                    std::thread::sleep(Duration::from_millis(1));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let _reclaim = ReclaimGuard(reclaim_path);
+                                if is_stale(&path, Duration::from_secs(30)) {
+                                    let _ = std::fs::remove_file(&path);
+                                }
+                                continue;
+                            }
+                            Err(reclaim_err)
+                                if reclaim_err.kind() == std::io::ErrorKind::AlreadyExists
+                                    || reclaim_err.kind()
+                                        == std::io::ErrorKind::PermissionDenied =>
+                            {
+                                // 极端崩溃遗留的陈旧 `.reclaim`（>60s）才清理；正常竞争直接退让。
+                                if is_stale(&reclaim_path, Duration::from_secs(60)) {
+                                    let _ = std::fs::remove_file(&reclaim_path);
+                                }
+                            }
+                            Err(_) => {}
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -264,4 +310,60 @@ pub(super) async fn read_settled_with(
     tokio::time::sleep(settle).await;
     let second = read_files(files, read)?;
     Ok((first == second).then_some(first))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn r2_p2_config_lock_stale_reclaim_preserves_mutual_exclusion() {
+        let dir =
+            std::env::temp_dir().join(format!("cordis-config-lock-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cordis.yml");
+        let lock_path = dir.join(".cordis.yml.lock");
+
+        for round in 0..25 {
+            let _ = std::fs::remove_file(&lock_path);
+            let f = std::fs::File::create(&lock_path).unwrap();
+            let old = std::time::SystemTime::now() - Duration::from_secs(120);
+            f.set_modified(old).unwrap();
+            drop(f);
+
+            let active = Arc::new(AtomicUsize::new(0));
+            let violations = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(6));
+            let mut handles = Vec::new();
+            for _ in 0..6 {
+                let target = target.clone();
+                let active = active.clone();
+                let violations = violations.clone();
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    let _guard = ConfigLock::acquire(&target).expect("acquire lock");
+                    let prev = active.fetch_add(1, Ordering::SeqCst);
+                    if prev != 0 {
+                        violations.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                violations.load(Ordering::SeqCst),
+                0,
+                "round {round}: 并发回收陈旧锁时破坏了互斥性（多个线程同时持有 ConfigLock）"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

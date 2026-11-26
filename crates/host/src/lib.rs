@@ -110,6 +110,8 @@ pub const DERIVED_HANDLE_TAG: u64 = 1 << 63;
 #[cfg(test)]
 type ObserverGate = Arc<(std::sync::Barrier, std::sync::Barrier)>;
 
+type DeferredOutboundQueue = Mutex<Vec<(Outbound, Arc<AtomicBool>)>>;
+
 #[derive(Clone)]
 struct Instance {
     ctx: Ctx,
@@ -160,6 +162,9 @@ struct Instance {
     close_drained: Arc<tokio::sync::Notify>,
     /// 独立于业务记录的任务退出凭证；锁序为 dispatches → tasks。
     tasks: Arc<Mutex<HashMap<u64, DispatchTask>>>,
+    /// 关闭窗口期间任务先于排水退出时保留的未交付取消续延（如 `ctx_next` 的 `on_done`），
+    /// 由 `finish_teardown_ffi_phase` 在 `OP_DISPOSE` 前原子认领并投递一次。
+    deferred_outbounds: Arc<DeferredOutboundQueue>,
     /// 注册时从所属 App 的 per-App 策略（或进程级回落）取下的**快照**。
     ///
     /// 快照而不是每次读注册表：已注册实例的策略不因后来调用
@@ -180,6 +185,7 @@ type PendingSink = tokio::sync::oneshot::Sender<std::result::Result<Value, Error
 enum ContinuationKind {
     Iface,
     Dispatch,
+    Next,
 }
 
 impl ContinuationKind {
@@ -187,6 +193,7 @@ impl ContinuationKind {
         match self {
             Self::Iface => KIND_IFACE,
             Self::Dispatch => KIND_DISPATCH,
+            Self::Next => KIND_NEXT,
         }
     }
 }
@@ -227,10 +234,15 @@ struct DispatchTask {
     dispatch_id: u64,
     cancel: CancelToken,
     done: tokio::sync::oneshot::Receiver<()>,
+    /// 与任务绑定的续延取消通知（如 `ctx_next` 的 `on_done`）：
+    /// 取消或卸载排水时若尚未交付，则原子认领并投递一次错误，保证“恰好一次”。
+    cancel_outbound: Option<(Outbound, Arc<AtomicBool>)>,
 }
 
 struct TaskExit {
     registry: Weak<Mutex<HashMap<u64, DispatchTask>>>,
+    closed: Weak<AtomicBool>,
+    deferred_outbounds: Weak<DeferredOutboundQueue>,
     id: u64,
     done: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -239,17 +251,44 @@ impl Drop for TaskExit {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade() {
             let mut tasks = registry.lock().unwrap();
+            let removed = tasks.remove(&self.id);
+            // 若任务在 `instance.closed == true` 之后、卸载排水摘表之前自然退出（例如
+            // `deliver_next` 见到 `closed` 放弃投递），把尚未认领的 `cancel_outbound` 转交
+            // `deferred_outbounds`，确保卸载收尾仍能在 `OP_DISPOSE` 前交付恰好一次。
+            if let Some(DispatchTask {
+                cancel_outbound: Some((entry, delivered)),
+                ..
+            }) = removed
+            {
+                let is_closed = self
+                    .closed
+                    .upgrade()
+                    .is_some_and(|flag| flag.load(Ordering::SeqCst));
+                if is_closed && !delivered.load(Ordering::SeqCst) {
+                    if let Some(deferred) = self.deferred_outbounds.upgrade() {
+                        deferred.lock().unwrap().push((entry, delivered));
+                    }
+                }
+            }
             // 与 close 取走凭证互斥；close 已摘走时也必须发布退出。
             if let Some(done) = self.done.take() {
                 let _ = done.send(());
             }
-            tasks.remove(&self.id);
         }
     }
 }
 
 /// 调用者持有 dispatches 锁，且已确认 closed 与业务记录准入。
 fn dispatch_task(instance: &Instance, dispatch_id: u64) -> (CancelToken, TaskExit) {
+    dispatch_task_with_cancel(instance, dispatch_id, None)
+}
+
+/// 与 [`dispatch_task`] 相同，但附带取消/卸载排水时需要交付错误的一次性续延（如 `ctx_next` 的 `on_done`）。
+fn dispatch_task_with_cancel(
+    instance: &Instance,
+    dispatch_id: u64,
+    cancel_outbound: Option<(Outbound, Arc<AtomicBool>)>,
+) -> (CancelToken, TaskExit) {
     static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
     let id = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
     let cancel = CancelToken::new();
@@ -260,12 +299,15 @@ fn dispatch_task(instance: &Instance, dispatch_id: u64) -> (CancelToken, TaskExi
             dispatch_id,
             cancel: cancel.clone(),
             done: rx,
+            cancel_outbound,
         },
     );
     (
         cancel,
         TaskExit {
             registry: Arc::downgrade(&instance.tasks),
+            closed: Arc::downgrade(&instance.closed),
+            deferred_outbounds: Arc::downgrade(&instance.deferred_outbounds),
             id,
             done: Some(done),
         },
@@ -463,6 +505,7 @@ fn register_instance_with_keepalive(
         #[cfg(test)]
         cancel_gate: Arc::new(Mutex::new(None)),
         tasks: Arc::new(Mutex::new(HashMap::new())),
+        deferred_outbounds: Arc::new(Mutex::new(Vec::new())),
         dispatch_policy,
         host_limits,
     };
@@ -1016,9 +1059,9 @@ unsafe extern "C" fn host_stream_push(
     on_credit: u64,
     out: *mut Out,
 ) -> i32 {
-    let value: Value = match serde_json::from_slice(chunk.as_bytes()) {
+    let value: Value = match blob_to_json(chunk, "流数据块") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("流数据块不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     with_stream_instance(handle, out, move |instance| {
         let table = instance.dispatches.lock().unwrap();
@@ -1082,7 +1125,10 @@ unsafe extern "C" fn host_stream_fail(
     reason: Blob,
     out: *mut Out,
 ) -> i32 {
-    let reason = String::from_utf8_lossy(reason.as_bytes()).into_owned();
+    let reason = match blob_as_bytes(reason, "stream_fail 的原因") {
+        Ok(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        Err(err) => return fail(out, &err),
+    };
     with_stream_instance(handle, out, move |instance| {
         match stream_of(instance, dispatch_id) {
             None => Ok(STATUS_STREAM_GONE),
@@ -1110,7 +1156,13 @@ unsafe extern "C" fn host_stream_fail_payload(
     payload: Blob,
     out: *mut Out,
 ) -> i32 {
-    let parsed = payload.try_as_str().ok().and_then(ErrorPayload::from_json);
+    let bytes = match blob_as_bytes(payload, "ctx_stream_fail_payload 的载荷") {
+        Ok(bytes) => bytes,
+        Err(err) => return fail(out, &err),
+    };
+    let parsed = std::str::from_utf8(bytes)
+        .ok()
+        .and_then(ErrorPayload::from_json);
     with_stream_instance(handle, out, move |instance| {
         let Some(payload) = parsed else {
             return Err(stream_protocol_error(
@@ -1147,6 +1199,7 @@ fn revoke_dispatch(instance: &Instance, dispatch_id: u64, payload: &ErrorPayload
 fn drain_dispatch_tree(instance: &Instance, root: u64, payload: &ErrorPayload) -> Option<usize> {
     let _active;
     let mut removed = Vec::new();
+    let mut task_outbounds = Vec::new();
     {
         let mut table = instance.dispatches.lock().unwrap();
         if instance.closed.load(Ordering::SeqCst) || !table.contains_key(&root) {
@@ -1172,14 +1225,21 @@ fn drain_dispatch_tree(instance: &Instance, root: u64, payload: &ErrorPayload) -
             }
             index += 1;
         }
-        let cancellations: Vec<_> = instance
-            .tasks
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|task| victims.contains(&task.dispatch_id))
-            .map(|task| task.cancel.clone())
-            .collect();
+        let cancellations: Vec<_> = {
+            let mut tasks = instance.tasks.lock().unwrap();
+            let mut cancels = Vec::new();
+            for task in tasks.values_mut() {
+                if victims.contains(&task.dispatch_id) {
+                    cancels.push(task.cancel.clone());
+                    if let Some((outbound, delivered)) = task.cancel_outbound.take() {
+                        if !delivered.swap(true, Ordering::SeqCst) {
+                            task_outbounds.push(outbound);
+                        }
+                    }
+                }
+            }
+            cancels
+        };
         if _active.lease.is_err() {
             instance
                 .credits
@@ -1219,6 +1279,11 @@ fn drain_dispatch_tree(instance: &Instance, root: u64, payload: &ErrorPayload) -
             }
         }
         // `record.frame` 随记录一起被丢：剩余链的 future 在这里释放。
+    }
+    if _active.lease.is_ok() {
+        for outbound in task_outbounds {
+            deliver_abort_direct(instance, outbound, payload);
+        }
     }
     Some(count)
 }
@@ -1687,9 +1752,15 @@ impl PendingContinuation {
                     .with_code("HOST_TIMEOUT")
                     .with_category("timeout")
                     .with_certainty("unknown");
+                let leftover_frame = instance
+                    .dispatches
+                    .lock()
+                    .unwrap()
+                    .get_mut(&dispatch_id)
+                    .and_then(|record| record.frame.take());
                 revoke_dispatch(&instance, dispatch_id, &payload);
                 emit(cordis_core::Outcome::Err("HOST_TIMEOUT".into()));
-                Err(CallFailure::from_payload(payload))
+                Err(CallFailure::from_payload(payload).with_frame(leftover_frame))
             }
         }
     }
@@ -1745,14 +1816,15 @@ unsafe fn call_inbound(
     } else {
         (0, None, (0, Box::from("")), Box::from(""))
     };
-    let _lifecycle = admit_call(instance).ok_or_else(|| {
-        CallFailure::new(
+    let Some(_lifecycle) = admit_call(instance) else {
+        return Err(CallFailure::new(
             format!("ctx 句柄 {handle} 已失效（插件正在卸载或库已释放）"),
             "host_lifecycle",
             "lifecycle",
             "unknown",
         )
-    })?;
+        .with_frame(frame));
+    };
     {
         let live = instances().read().unwrap().get(handle);
         if !live
@@ -1764,7 +1836,8 @@ unsafe fn call_inbound(
                 "host_lifecycle",
                 "lifecycle",
                 "unknown",
-            ));
+            )
+            .with_frame(frame));
         }
     }
     let dispatch_id = next_dispatch_id();
@@ -1822,7 +1895,8 @@ unsafe fn call_inbound(
     };
     match status {
         STATUS_OK => {
-            let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let mut removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let leftover_frame = removed.as_mut().and_then(|record| record.frame.take());
             drop(removed);
             if text.is_empty() {
                 emit(cordis_core::Outcome::Ok);
@@ -1837,7 +1911,8 @@ unsafe fn call_inbound(
                         "plugin_protocol",
                         "protocol",
                         "unknown",
-                    ));
+                    )
+                    .with_frame(leftover_frame));
                 }
             };
             emit(cordis_core::Outcome::Ok);
@@ -1863,16 +1938,18 @@ unsafe fn call_inbound(
             started,
         }))),
         STATUS_ERR => {
-            let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let mut removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let leftover_frame = removed.as_mut().and_then(|record| record.frame.take());
             drop(removed);
             let payload = decode_plugin_error(instance.error_format, &text);
             emit(cordis_core::Outcome::Err(
                 payload.code.clone().into_boxed_str(),
             ));
-            Err(CallFailure::from_payload(payload))
+            Err(CallFailure::from_payload(payload).with_frame(leftover_frame))
         }
         STATUS_UNSUPPORTED => {
-            let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let mut removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let leftover_frame = removed.as_mut().and_then(|record| record.frame.take());
             drop(removed);
             emit(cordis_core::Outcome::Err("plugin_unsupported".into()));
             Err(CallFailure::new(
@@ -1880,10 +1957,12 @@ unsafe fn call_inbound(
                 "plugin_unsupported",
                 "protocol",
                 "unknown",
-            ))
+            )
+            .with_frame(leftover_frame))
         }
         other => {
-            let removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let mut removed = instance.dispatches.lock().unwrap().remove(&dispatch_id);
+            let leftover_frame = removed.as_mut().and_then(|record| record.frame.take());
             drop(removed);
             emit(cordis_core::Outcome::Err(
                 format!("status_{other}").into_boxed_str(),
@@ -1897,7 +1976,8 @@ unsafe fn call_inbound(
                 "plugin_protocol",
                 "protocol",
                 "unknown",
-            ))
+            )
+            .with_frame(leftover_frame))
         }
     }
 }
@@ -2238,6 +2318,7 @@ fn complete_or_defer<T: Send + 'static>(
 ///
 /// waterfall next 和取消交付经此准入；普通出站完成由 `deliver_outbound`
 /// 将摘表与准入合并。直接使用快照里的裸 `CallFn` 会打进已释放的库。
+#[cfg(test)]
 unsafe fn call_live(handle: u64, op: u32, payload: &str) -> std::result::Result<Value, String> {
     let instance =
         instances().read().unwrap().get(handle).ok_or_else(|| {
@@ -2469,21 +2550,58 @@ impl LoadedPlugin {
         Ok(plugin)
     }
 
-    /// 先校验 sidecar manifest 与来源 allow-list，再加载动态库。
+    /// 先校验 sidecar manifest 与来源 allow-list，再复制到宿主私有暂存目录并二次校验后加载。
+    ///
+    /// 通过「先暂存到宿主隔离目录 → 二次比对暂存副本 SHA256 → 打开隔离副本」消除源路径在
+    /// `verify` 与 `LoadLibrary`/`dlopen` 之间的 TOCTOU 替换窗口。
     pub fn open_verified(
         path: impl AsRef<Path>,
         policy: &PluginSourcePolicy,
     ) -> Result<LoadedPlugin> {
+        static OPEN_VERIFIED_REV: AtomicU64 = AtomicU64::new(1);
         let path = path.as_ref();
         let verified = policy.verify(path)?;
-        let plugin = Self::open(&verified.path)?;
-        if plugin.name != verified.manifest.id {
+        let revision = OPEN_VERIFIED_REV.fetch_add(1, Ordering::SeqCst);
+        let staged = stage_plugin(&verified.path, revision)?;
+        let discard_staged = || {
+            drop(StagedFile::new(&staged));
+        };
+        let staged_hash = match crate::source::sha256_file(&staged) {
+            Ok(hash) => hash,
+            Err(err) => {
+                discard_staged();
+                return Err(err.into());
+            }
+        };
+        if staged_hash != verified.sha256 {
+            discard_staged();
             return Err(format!(
-                "插件 id 与 manifest 不匹配: manifest={} plugin={}",
-                verified.manifest.id, plugin.name
+                "暂存副本 SHA256 与已校验 artifact 不匹配: staged={staged_hash} verified={}",
+                verified.sha256
             )
             .into());
         }
+        let mut plugin = match Self::open(&staged) {
+            Ok(plugin) => plugin,
+            Err(err) => {
+                discard_staged();
+                return Err(err);
+            }
+        };
+        if plugin.name != verified.manifest.id {
+            let plugin_id = plugin.name.clone();
+            drop(plugin);
+            discard_staged();
+            return Err(format!(
+                "插件 id 与 manifest 不匹配: manifest={} plugin={plugin_id}",
+                verified.manifest.id
+            )
+            .into());
+        }
+        Arc::get_mut(&mut plugin.library)
+            .expect("新打开的 LoadedPlugin 独占 library")
+            ._staged = Some(StagedFile::new(&staged));
+        plugin.source = verified.path;
         Ok(plugin)
     }
 
@@ -3011,10 +3129,17 @@ async fn finish_instance_teardown_unbounded(
                 outbound.push(entry);
             }
         }
-        for task in &tasks {
+        let mut pending_rx = Vec::with_capacity(tasks.len());
+        for mut task in tasks {
+            if let Some((entry, delivered)) = task.cancel_outbound.take() {
+                if !delivered.swap(true, Ordering::SeqCst) {
+                    outbound.push(entry);
+                }
+            }
             task.cancel.cancel();
+            pending_rx.push(task.done);
         }
-        for rx in tasks.into_iter().map(|task| task.done) {
+        for rx in pending_rx {
             let _ = rx.await;
         }
     }
@@ -3040,10 +3165,16 @@ async fn finish_teardown_ffi_phase(
     error_format: u32,
     fiber: Option<&Arc<Fiber>>,
     offload_dispose: bool,
-    outbound: Vec<Outbound>,
+    mut outbound: Vec<Outbound>,
 ) {
     // 出站续延、credit 驳回、延迟 OP_CLEANUP 与 OP_DISPOSE 均在持有 close_lease 下按序执行；
     // 开启 dispose 等待预算时整体移交 blocking 线程池，避免任意插件同步阻塞拖死 async worker。
+    let deferred = std::mem::take(&mut *instance.deferred_outbounds.lock().unwrap());
+    for (entry, delivered) in deferred {
+        if !delivered.swap(true, Ordering::SeqCst) {
+            outbound.push(entry);
+        }
+    }
     let credits = std::mem::take(&mut *instance.credits.lock().unwrap());
     let deferred_cleanups = std::mem::take(&mut *instance.deferred_cleanups.lock().unwrap());
     let run_dispose = applied_flag.load(Ordering::SeqCst);
@@ -3178,11 +3309,17 @@ async fn finish_instance_teardown(
                 outbound.push(entry);
             }
         }
-        for task in &tasks {
-            task.cancel.cancel();
-        }
         let mut pending_rx: Vec<tokio::sync::oneshot::Receiver<()>> =
-            tasks.into_iter().map(|task| task.done).collect();
+            Vec::with_capacity(tasks.len());
+        for mut task in tasks {
+            if let Some((entry, delivered)) = task.cancel_outbound.take() {
+                if !delivered.swap(true, Ordering::SeqCst) {
+                    outbound.push(entry);
+                }
+            }
+            task.cancel.cancel();
+            pending_rx.push(task.done);
+        }
         let mut idx = 0usize;
         while idx < pending_rx.len() {
             if tokio::time::timeout_at(deadline, &mut pending_rx[idx])
@@ -3329,32 +3466,65 @@ fn apply_via_with_keepalive_and_format(
                                 // 先就地结算宿主侧等待者（流与入站挂起续延）并取消宿主后台任务，
                                 // 避免外部调用方一直挂起；涉及插件 FFI 的回调、OP_DISPOSE 与
                                 // 实例注销/动态库卸载必须严格等到最后一次原生调用退出后由后台任务完成。
-                                {
+                                //
+                                // 必须先在锁内摘取流、续延和取消令牌，释放 `dispatches` 与 `tasks`
+                                // 锁之后再调用 `fail_error` / `send` / `cancel`：`StreamSink::fail_error`
+                                // 会同步回调 `HostStreamObserver::finished` 并重取 `instance.dispatches`
+                                // 锁，持锁调用会立刻同线程重入 `std::sync::Mutex` 死锁。
+                                let (streams, sinks, cancels, deferred_outbounds) = {
                                     let mut table = instance.dispatches.lock().unwrap();
+                                    let mut streams = Vec::new();
+                                    let mut sinks = Vec::new();
                                     for record in table.values_mut() {
-                                        if let Some(sink) = &record.stream {
-                                            sink.fail_error(
-                                                ErrorPayload::new(
-                                                    "插件已卸载：这条流没有收尾就被收回",
-                                                )
-                                                .with_code("host_lifecycle")
-                                                .with_category("lifecycle")
-                                                .with_certainty("unknown"),
-                                            );
+                                        if let Some(sink) = record.stream.take() {
+                                            streams.push(sink);
                                         }
                                         if let Some(tx) = record.sink.take() {
-                                            let _ = tx.send(Err(ErrorPayload::new(
-                                                "插件已卸载：挂起的入站续延被结算",
-                                            )
-                                            .with_code("host_lifecycle")
-                                            .with_category("lifecycle")
-                                            .with_certainty("unknown")));
+                                            sinks.push(tx);
                                         }
                                     }
-                                    let tasks = instance.tasks.lock().unwrap();
-                                    for task in tasks.values() {
-                                        task.cancel.cancel();
-                                    }
+                                    // 取消后台任务前必须先认领 `cancel_outbound`（如 `host_ctx_next` 的 `on_done`）：
+                                    // `cancel.cancel()` 会让任务退出并在 `TaskExit::drop` 里删掉 `tasks` 表项，
+                                    // 若不提前摘出并交给后台收尾，`on_done` 会在 `OP_DISPOSE` 前彻底丢失。
+                                    let mut deferred_outbounds = Vec::new();
+                                    let cancels: Vec<_> = instance
+                                        .tasks
+                                        .lock()
+                                        .unwrap()
+                                        .values_mut()
+                                        .map(|task| {
+                                            if let Some((entry, delivered)) =
+                                                task.cancel_outbound.take()
+                                            {
+                                                if !delivered.swap(true, Ordering::SeqCst) {
+                                                    deferred_outbounds.push(entry);
+                                                }
+                                            }
+                                            task.cancel.clone()
+                                        })
+                                        .collect();
+                                    (streams, sinks, cancels, deferred_outbounds)
+                                };
+                                for sink in streams {
+                                    sink.fail_error(
+                                        ErrorPayload::new(
+                                            "插件已卸载：这条流没有收尾就被收回",
+                                        )
+                                        .with_code("host_lifecycle")
+                                        .with_category("lifecycle")
+                                        .with_certainty("unknown"),
+                                    );
+                                }
+                                for tx in sinks {
+                                    let _ = tx.send(Err(ErrorPayload::new(
+                                        "插件已卸载：挂起的入站续延被结算",
+                                    )
+                                    .with_code("host_lifecycle")
+                                    .with_category("lifecycle")
+                                    .with_certainty("unknown")));
+                                }
+                                for cancel in cancels {
+                                    cancel.cancel();
                                 }
                                 let bg_guard = fiber.as_ref().map(|f| f.defer_background_cleanup());
                                 rt.spawn(async move {
@@ -3368,7 +3538,7 @@ fn apply_via_with_keepalive_and_format(
                                         error_format,
                                         fiber.as_ref(),
                                         true,
-                                        Vec::new(),
+                                        deferred_outbounds,
                                     )
                                     .await;
                                     unregister_instance(handle);
@@ -3590,9 +3760,12 @@ impl Capabilities {
             desc,
             std::mem::offset_of!(crate::PluginDesc, provision),
         )
-        .map(|blob| String::from_utf8_lossy(blob.as_bytes()).into_owned())
+        .and_then(|blob| blob_as_bytes(blob, "PluginDesc.provision").ok())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
         .unwrap_or_default();
-        let inject_raw = String::from_utf8_lossy((*desc).inject.as_bytes());
+        let inject_raw = blob_as_bytes((*desc).inject, "PluginDesc.inject")
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default();
         let inject = parse_inject(&inject_raw);
         // 与 `Capabilities::of_plugin` 保持一致：保留插件声明顺序，不在这里排序。
         let inject: Vec<String> = inject.0.iter().map(|(name, _)| name.to_string()).collect();
@@ -3626,7 +3799,9 @@ impl Capabilities {
         };
         let schema = schema_from_blob((*desc).schema);
         Self {
-            plugin: String::from_utf8_lossy((*desc).id.as_bytes()).into_owned(),
+            plugin: blob_as_bytes((*desc).id, "PluginDesc.id")
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default(),
             // 冻结的 PluginDesc 没有 semver 字段；sidecar 版本不会从这里冒充。
             version: None,
             inject,

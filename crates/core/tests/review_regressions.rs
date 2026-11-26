@@ -776,3 +776,1148 @@ async fn dispose_waits_for_bg_cleanups_before_becoming_quiescent() {
     assert!(!bounced.load(Ordering::SeqCst));
     app.close().await;
 }
+
+// #2 [P1]: Three-node transitive ancestor consumer `A(owns P) -> U(third-party) -> P`
+// and cross-subtree ownership+dep cycles `A1(owns P1, injects p2) / A2(owns P2, injects p1)`
+// must never deadlock on close/dispose/restart.
+#[tokio::test]
+async fn transitive_ancestor_and_cross_subtree_teardown_cycles_do_not_deadlock() {
+    async fn wait_active(fibers: &[&Arc<cordis_core::Fiber>]) {
+        for _ in 0..200 {
+            for f in fibers {
+                f.settle().await;
+            }
+            if fibers.iter().all(|f| f.state() == FiberState::Active) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "fibers failed to reach Active: {:?}",
+            fibers
+                .iter()
+                .map(|f| (f.name(), f.state()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // 1. 三节点 A(owns P) -> U -> P：App::close() 不得死锁且记录告警。
+    {
+        let app = App::new();
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let w = warnings.clone();
+        app.store.set_log_sink(Arc::new(move |level, _name, msg| {
+            if level == cordis_core::Level::Warn {
+                w.lock().unwrap().push(msg.to_string());
+            }
+        }));
+
+        let ancestor_a = app.root.plugin(
+            plugin_fn("ancestor-a", Inject::of(&["u"]), |_ctx, _| {
+                Box::pin(async { Ok(()) })
+            }),
+            Config::Null,
+        );
+        let child_p = ancestor_a.ctx().plugin(
+            plugin_fn("child-p", Inject::default(), |ctx, _| {
+                Box::pin(async move {
+                    ctx.provide("p", Dyn::new(1u32))?;
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        );
+        let third_u = app.root.plugin(
+            plugin_fn("third-u", Inject::of(&["p"]), |ctx, _| {
+                Box::pin(async move {
+                    ctx.provide("u", Dyn::new(2u32))?;
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        );
+        wait_active(&[&child_p, &third_u, &ancestor_a]).await;
+
+        tokio::time::timeout(Duration::from_secs(2), app.close())
+            .await
+            .expect("三节点 A(owns P) -> U -> P 的 App::close 发生永久死锁");
+        assert_eq!(ancestor_a.state(), FiberState::Disposed);
+        assert_eq!(child_p.state(), FiberState::Disposed);
+        assert_eq!(third_u.state(), FiberState::Disposed);
+        assert!(
+            warnings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.contains("生命周期支持范围外")),
+            "传递祖先消费者必须留下可诊断告警：{:?}",
+            warnings.lock().unwrap()
+        );
+    }
+
+    // 2. 三节点下单独执行 child_p.restart() 不得死锁（祖先卸载可能顺带处置 child_p，返回 Err 或 Ok 均可，绝不挂死或 panic）。
+    {
+        let app = App::new();
+        let ancestor_a = app.root.plugin(
+            plugin_fn("ancestor-a2", Inject::of(&["u2"]), |_ctx, _| {
+                Box::pin(async { Ok(()) })
+            }),
+            Config::Null,
+        );
+        let child_p = ancestor_a.ctx().plugin(
+            plugin_fn("child-p2", Inject::default(), |ctx, _| {
+                Box::pin(async move {
+                    ctx.provide("p2", Dyn::new(1u32))?;
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        );
+        let third_u = app.root.plugin(
+            plugin_fn("third-u2", Inject::of(&["p2"]), |ctx, _| {
+                Box::pin(async move {
+                    ctx.provide("u2", Dyn::new(2u32))?;
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        );
+        wait_active(&[&child_p, &third_u, &ancestor_a]).await;
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), child_p.restart())
+            .await
+            .expect("child_p.restart 在传递祖先拓扑下死锁");
+        tokio::time::timeout(Duration::from_secs(2), ancestor_a.dispose())
+            .await
+            .expect("ancestor_a.dispose 在传递祖先拓扑下死锁");
+        tokio::time::timeout(Duration::from_secs(2), app.close())
+            .await
+            .expect("app.close 不得死锁");
+    }
+
+    // 2b. 三节点全 Active 状态下直接执行 ancestor_a.dispose() 不得死锁。
+    {
+        let app = App::new();
+        let ancestor_a = app.root.plugin(
+            plugin_fn("ancestor-a3", Inject::of(&["u3"]), |_ctx, _| {
+                Box::pin(async { Ok(()) })
+            }),
+            Config::Null,
+        );
+        let child_p = ancestor_a.ctx().plugin(
+            plugin_fn("child-p3", Inject::default(), |ctx, _| {
+                Box::pin(async move {
+                    ctx.provide("p3", Dyn::new(1u32))?;
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        );
+        let third_u = app.root.plugin(
+            plugin_fn("third-u3", Inject::of(&["p3"]), |ctx, _| {
+                Box::pin(async move {
+                    ctx.provide("u3", Dyn::new(2u32))?;
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        );
+        wait_active(&[&child_p, &third_u, &ancestor_a]).await;
+
+        tokio::time::timeout(Duration::from_secs(2), ancestor_a.dispose())
+            .await
+            .expect("ancestor_a.dispose 在传递祖先拓扑下死锁");
+        assert_eq!(ancestor_a.state(), FiberState::Disposed);
+        assert_eq!(child_p.state(), FiberState::Disposed);
+        tokio::time::timeout(Duration::from_secs(2), app.close())
+            .await
+            .expect("app.close 不得死锁");
+    }
+
+    // 3. 跨子树环 A1(owns P1, injects p2) / A2(owns P2, injects p1)：close 不得死锁。
+    {
+        let app = App::new();
+        let a1 = app.root.plugin(
+            plugin_fn("a1", Inject::of(&["svc_p2"]), |_ctx, _| {
+                Box::pin(async { Ok(()) })
+            }),
+            Config::Null,
+        );
+        let a2 = app.root.plugin(
+            plugin_fn("a2", Inject::of(&["svc_p1"]), |_ctx, _| {
+                Box::pin(async { Ok(()) })
+            }),
+            Config::Null,
+        );
+        let p1 = a1.ctx().plugin(
+            plugin_fn("p1", Inject::default(), |ctx, _| {
+                Box::pin(async move {
+                    ctx.provide("svc_p1", Dyn::new(1u32))?;
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        );
+        let p2 = a2.ctx().plugin(
+            plugin_fn("p2", Inject::default(), |ctx, _| {
+                Box::pin(async move {
+                    ctx.provide("svc_p2", Dyn::new(2u32))?;
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        );
+        wait_active(&[&p1, &p2, &a1, &a2]).await;
+
+        tokio::time::timeout(Duration::from_secs(2), app.close())
+            .await
+            .expect("跨子树环 A1(P1)/A2(P2) 的 App::close 发生死锁");
+        assert_eq!(a1.state(), FiberState::Disposed);
+        assert_eq!(a2.state(), FiberState::Disposed);
+        assert_eq!(p1.state(), FiberState::Disposed);
+        assert_eq!(p2.state(), FiberState::Disposed);
+    }
+}
+
+// #3 [P1]: `update_with` / `restart` racing with `dispose()` across await points must never
+// panic on `self.ctx()` or falsely report `Ok(...)`.
+#[tokio::test]
+async fn update_with_and_restart_during_concurrent_dispose_return_err_without_panic() {
+    // 1. `update()` 在 `on_commit_async().await` 期间被并发 `dispose()`。
+    {
+        let app = App::new();
+        let fiber = app.root.plugin(
+            plugin_fn("update-race", Inject::default(), |_ctx, _cfg| {
+                Box::pin(async { Ok(()) })
+            }),
+            json!({ "v": 1 }),
+        );
+        fiber.settle().await;
+        assert_eq!(fiber.state(), FiberState::Active);
+
+        let _obs = app.store.on_commit_async(&app.root, |f, _cfg, _no_save| {
+            let f = f.clone();
+            Box::pin(async move {
+                // 在 async commit 观察者中完整 dispose 该 fiber（清掉 ctx）。
+                f.dispose().await;
+            })
+        });
+
+        let res = tokio::time::timeout(Duration::from_secs(2), fiber.update(json!({ "v": 2 })))
+            .await
+            .expect("update 不得挂起");
+        assert!(
+            res.is_err(),
+            "跨 await 被 dispose 的 fiber.update 必须返回 Err，不得 panic 或误报 Ok：{res:?}"
+        );
+        assert_eq!(fiber.state(), FiberState::Disposed);
+        app.close().await;
+    }
+
+    // 2. `restart()` 卸载旧 effect 期间被并发 `dispose()`：不得误报 `Ok(())`。
+    {
+        let app = App::new();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_c = entered.clone();
+        let release_c = release.clone();
+        let fiber = app.root.plugin(
+            plugin_fn("restart-race", Inject::default(), move |ctx, _cfg| {
+                let entered_c = entered_c.clone();
+                let release_c = release_c.clone();
+                Box::pin(async move {
+                    ctx.effect(move |_| {
+                        let entered_c = entered_c.clone();
+                        let release_c = release_c.clone();
+                        cordis_core::Disposable::new(move || {
+                            Box::pin(async move {
+                                entered_c.notify_one();
+                                release_c.notified().await;
+                            })
+                        })
+                    });
+                    Ok(())
+                })
+            }),
+            Config::Null,
+        );
+        fiber.settle().await;
+        assert_eq!(fiber.state(), FiberState::Active);
+
+        let f_restart = fiber.clone();
+        let restart_task = tokio::spawn(async move { f_restart.restart().await });
+        entered.notified().await;
+
+        let f_dispose = fiber.clone();
+        let dispose_task = tokio::spawn(async move { f_dispose.dispose().await });
+        // 等 begin_dispose 生效后再放行 effect 清理。
+        for _ in 0..100 {
+            if fiber.is_disposed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(fiber.is_disposed());
+        release.notify_waiters();
+
+        let restart_res = tokio::time::timeout(Duration::from_secs(2), restart_task)
+            .await
+            .expect("restart 不得挂起")
+            .expect("restart 不得 panic");
+        dispose_task.await.unwrap();
+        assert!(
+            restart_res.is_err(),
+            "卸载途中被 dispose 的 restart 不得误报 Ok(())：{restart_res:?}"
+        );
+        assert_eq!(fiber.state(), FiberState::Disposed);
+        app.close().await;
+    }
+}
+
+// #18 [P1] & #19 [P2]: `Store::set` on stale disposed `Ctx` returns `Err` without poisoning
+// `Store.impls`, and drops replaced values outside the `impls` mutex lock.
+#[tokio::test]
+async fn store_set_on_stale_ctx_fails_closed_and_drops_replaced_value_outside_lock() {
+    let app = App::new();
+
+    // 1. 陈旧已释放 Ctx 调 Store::set / Store::provide 返回 Err，不 panic、不中毒 impls 锁。
+    let captured: Arc<std::sync::Mutex<Option<Ctx>>> = Arc::new(std::sync::Mutex::new(None));
+    let cap_c = captured.clone();
+    let fiber = app.root.plugin(
+        plugin_fn("stale-set", Inject::default(), move |ctx, _| {
+            let cap_c = cap_c.clone();
+            Box::pin(async move {
+                ctx.provide("ephemeral_svc", Dyn::new(1i32))?;
+                *cap_c.lock().unwrap() = Some(ctx);
+                Ok(())
+            })
+        }),
+        Config::Null,
+    );
+    fiber.settle().await;
+    fiber.dispose().await;
+    drop(fiber);
+
+    let stale_ctx = captured.lock().unwrap().take().unwrap();
+    assert!(stale_ctx.fiber_opt().is_none());
+    assert!(
+        app.store
+            .set(&stale_ctx, "ephemeral_svc", Dyn::new(2i32))
+            .is_err(),
+        "已释放 fiber 的陈旧 Ctx 调 Store::set 必须返回 Err"
+    );
+    assert!(
+        app.store
+            .provide(&stale_ctx, "ephemeral_svc2", Dyn::new(3i32), None)
+            .is_err(),
+        "已释放 fiber 的陈旧 Ctx 调 Store::provide 必须返回 Err"
+    );
+
+    // 2. Drop 重入 Store::try_get / Store::set 不得死锁（证明旧值在锁外析构）。
+    struct ReenterOnDrop {
+        ctx: Ctx,
+        ran: Arc<AtomicBool>,
+    }
+    impl Drop for ReenterOnDrop {
+        fn drop(&mut self) {
+            let _ = self.ctx.get("other_svc");
+            let _ = self.ctx.set("other_svc", Dyn::new(99i32));
+            self.ran.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let _other = app.root.provide("other_svc", Dyn::new(1i32)).unwrap();
+    let drop_ran = Arc::new(AtomicBool::new(false));
+    let _holder = app
+        .root
+        .provide(
+            "drop_test_svc",
+            Dyn::new(ReenterOnDrop {
+                ctx: app.root.clone(),
+                ran: drop_ran.clone(),
+            }),
+        )
+        .unwrap();
+
+    // 等 provide 触发的异步 `internal/service` 广播任务跑完并释放它持有的 Dyn 克隆，
+    // 确保 Store::set 置换时持有的是最后一枚强引用，从而在 set 内部同步触发 ReenterOnDrop::drop。
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        app.root
+            .set("drop_test_svc", Dyn::new(2i32))
+            .expect("Store::set 必须成功并在锁外析构旧值");
+    })
+    .await
+    .expect("Store::set 在持锁期间析构旧值导致重入死锁");
+
+    assert!(drop_ran.load(Ordering::SeqCst));
+    assert_eq!(
+        app.root
+            .get("other_svc")
+            .and_then(|v| v.downcast::<i32>())
+            .map(|v| *v),
+        Some(99)
+    );
+    app.close().await;
+}
+
+// #4 [P2]: A panicking `Check` predicate during `set_state(Active)` / `check_impl` must be caught
+// (fail closed to `false`) without unwinding or blocking other dependents.
+#[tokio::test]
+async fn panicking_check_predicate_is_caught_and_fails_closed() {
+    let app = App::new();
+    let consumer_bad = app.root.plugin(
+        plugin_fn(
+            "bad-check-consumer",
+            Inject::of(&["checked_svc"]),
+            |_ctx, _| Box::pin(async { Ok(()) }),
+        ),
+        Config::Null,
+    );
+    let consumer_good = app.root.plugin(
+        plugin_fn("good-consumer", Inject::of(&["healthy_svc"]), |_ctx, _| {
+            Box::pin(async { Ok(()) })
+        }),
+        Config::Null,
+    );
+    consumer_bad.settle().await;
+    consumer_good.settle().await;
+
+    let provider = app.root.plugin(
+        plugin_fn("panic-check-provider", Inject::default(), |ctx, _| {
+            Box::pin(async move {
+                ctx.store.provide(
+                    &ctx,
+                    "checked_svc",
+                    Dyn::new(1u32),
+                    Some(Arc::new(|_| panic!("intentional check panic"))),
+                )?;
+                ctx.provide("healthy_svc", Dyn::new(2u32))?;
+                Ok(())
+            })
+        }),
+        Config::Null,
+    );
+    provider.settle().await;
+    consumer_bad.settle().await;
+    consumer_good.settle().await;
+
+    assert_eq!(provider.state(), FiberState::Active);
+    assert_eq!(
+        consumer_bad.state(),
+        FiberState::Pending,
+        "check 谓词 panic 必须按 false 失败关闭，消费者停在 Pending"
+    );
+    assert_eq!(
+        consumer_good.state(),
+        FiberState::Active,
+        "同一提供者的其他健康消费者仍须正常激活"
+    );
+    app.close().await;
+}
+
+// #5 [P2]: Root fiber (`runtime == None`) must never enter an infinite settle loop on
+// `restart()` / `update()` / `settle()` after provide disposal.
+#[tokio::test]
+async fn root_fiber_lifecycle_calls_do_not_infinite_loop() {
+    let app = App::new();
+    let root = app.root_fiber();
+    assert_eq!(root.state(), FiberState::Active);
+
+    assert!(root.restart().await.is_err());
+    assert!(root.update(json!({ "x": 1 })).await.is_err());
+    tokio::time::timeout(Duration::from_secs(1), root.settle())
+        .await
+        .expect("root_fiber().settle() 不得死循环");
+    assert_eq!(root.state(), FiberState::Active);
+
+    let disp = app.root.provide("root_svc", Dyn::new(1u32)).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), disp.run())
+        .await
+        .expect("释放 root provide 后不得卡死");
+    tokio::time::timeout(Duration::from_secs(1), root.settle())
+        .await
+        .expect("root_fiber().settle() 仍应立即返回");
+    assert_eq!(root.state(), FiberState::Active);
+    app.close().await;
+}
+
+// #17 [P2]: `Store::provide` disposer must bound waiting on a stuck `Loading` consumer when
+// `drain_timeout_ms` is configured (no unbounded second `settle().await`).
+#[tokio::test]
+async fn provide_disposer_respects_drain_timeout_for_loading_consumer() {
+    let app = App::new();
+    app.store
+        .set_lifecycle_policy(LifecyclePolicy {
+            drain_timeout_ms: Some(40),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let consumer_entered = Arc::new(Notify::new());
+    let consumer_release = Arc::new(Notify::new());
+    let entered_c = consumer_entered.clone();
+    let release_c = consumer_release.clone();
+
+    let provider = app.root.plugin(
+        plugin_fn("bounded-provider", Inject::default(), |ctx, _| {
+            Box::pin(async move {
+                ctx.provide("bounded_svc", Dyn::new(1u32))?;
+                Ok(())
+            })
+        }),
+        Config::Null,
+    );
+    provider.settle().await;
+    assert_eq!(provider.state(), FiberState::Active);
+
+    let consumer = app.root.plugin(
+        plugin_fn(
+            "stuck-loading-consumer",
+            Inject::of(&["bounded_svc"]),
+            move |_ctx, _| {
+                let entered_c = entered_c.clone();
+                let release_c = release_c.clone();
+                Box::pin(async move {
+                    entered_c.notify_one();
+                    release_c.notified().await;
+                    Ok(())
+                })
+            },
+        ),
+        Config::Null,
+    );
+    consumer_entered.notified().await;
+    assert_eq!(consumer.state(), FiberState::Loading);
+
+    // 消费者卡在 Loading 态时释放提供者：必须受 drain_timeout_ms 约束在有界时间内返回。
+    tokio::time::timeout(Duration::from_secs(1), provider.dispose())
+        .await
+        .expect("provide disposer 的第二次 settle().await 逃出 drain_timeout_ms 导致永久等待");
+    assert_eq!(provider.state(), FiberState::Disposed);
+
+    consumer_release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), app.close())
+        .await
+        .expect("释放消费者后 App::close 必须完成");
+}
+
+// ============================================================================
+// Round-2 Review TDD Regression Tests (Core)
+// ============================================================================
+
+// R2 P1-1: Concurrent `Fiber::update_with` + veto must roll back `config` alongside
+// `(resolved, volatile)` and preserve the running plugin's `VolatileRef` table when all veto.
+#[tokio::test]
+async fn concurrent_update_with_veto_preserves_config_and_volatile_refs() {
+    use cordis_core::{UpdateOutcome, VolatileRef};
+
+    // Subcase A: U1 accepted, U2 vetoed -> plugin must reload with C1 (never vetoed C2).
+    {
+        let app = App::new();
+        let applied_configs = Arc::new(std::sync::Mutex::new(Vec::<Config>::new()));
+        let applied_c = applied_configs.clone();
+        let fiber = app.root.plugin(
+            plugin_fn("veto-sub-a", Inject::default(), move |_ctx, cfg| {
+                applied_c.lock().unwrap().push(cfg);
+                Box::pin(async { Ok(()) })
+            }),
+            json!({ "v": 0 }),
+        );
+        fiber.settle().await;
+
+        let u1_entered = Arc::new(Notify::new());
+        let u1_release = Arc::new(Notify::new());
+        let u1_e = u1_entered.clone();
+        let u1_r = u1_release.clone();
+        let _h = fiber.ctx().on("internal/update", move |call| {
+            let u1_e = u1_e.clone();
+            let u1_r = u1_r.clone();
+            Box::pin(async move {
+                let resolved = call.args.get(1).and_then(|d| d.downcast::<Config>());
+                let v = resolved
+                    .as_deref()
+                    .and_then(|c| c.get("v"))
+                    .and_then(|v| v.as_i64());
+                match v {
+                    Some(1) => {
+                        u1_e.notify_one();
+                        u1_r.notified().await;
+                        call.next.call(call.args.clone()).await
+                    }
+                    Some(2) => None, // veto C2
+                    _ => call.next.call(call.args.clone()).await,
+                }
+            })
+        });
+
+        let f1 = fiber.clone();
+        let h1 = tokio::spawn(async move { f1.update_with(json!({ "v": 1 }), false).await });
+        u1_entered.notified().await;
+
+        let res2 = fiber.update_with(json!({ "v": 2 }), false).await.unwrap();
+        assert_eq!(res2, UpdateOutcome::Vetoed);
+
+        u1_release.notify_one();
+        let res1 = h1.await.unwrap().unwrap();
+        assert_eq!(res1, UpdateOutcome::Restarted);
+        fiber.when_updates_settled().await;
+
+        assert_eq!(
+            fiber.config(),
+            json!({ "v": 1 }),
+            "U2 否决后 fiber.config() 不得残留被否决的 C2"
+        );
+        assert_eq!(
+            applied_configs.lock().unwrap().last().cloned(),
+            Some(json!({ "v": 1 })),
+            "U1 放行后插件必须用 C1 重载，而不是被否决的 C2"
+        );
+        app.close().await;
+    }
+
+    // Subcase B: Both U2 and U1 vetoed -> config stays C0 AND cached VolatileRef from V0 stays live.
+    {
+        let app = App::new();
+        let cached_ref: Arc<std::sync::Mutex<Option<Arc<VolatileRef>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let cached_c = cached_ref.clone();
+        let base = plugin_fn("veto-sub-b", Inject::default(), move |ctx, _cfg| {
+            let vref = ctx.volatile("vol").expect("volatile_ref");
+            *cached_c.lock().unwrap() = Some(vref);
+            Box::pin(async { Ok(()) })
+        });
+        let fiber = app.root.plugin(
+            declare_volatile(base, &["vol"]),
+            json!({ "static": 0, "vol": "v0" }),
+        );
+        fiber.settle().await;
+        let orig_ref = cached_ref.lock().unwrap().clone().unwrap();
+        assert_eq!(orig_ref.get(), json!("v0"));
+
+        let u1_entered = Arc::new(Notify::new());
+        let u1_release = Arc::new(Notify::new());
+        let u1_once = Arc::new(AtomicBool::new(false));
+        let u1_e = u1_entered.clone();
+        let u1_r = u1_release.clone();
+        let u1_o = u1_once.clone();
+        let _h = fiber.ctx().on("internal/update", move |call| {
+            let u1_e = u1_e.clone();
+            let u1_r = u1_r.clone();
+            let u1_o = u1_o.clone();
+            Box::pin(async move {
+                let resolved = call.args.get(1).and_then(|d| d.downcast::<Config>());
+                let s = resolved
+                    .as_deref()
+                    .and_then(|c| c.get("static"))
+                    .and_then(|v| v.as_i64());
+                match s {
+                    Some(1) => {
+                        if !u1_o.swap(true, Ordering::SeqCst) {
+                            u1_e.notify_one();
+                            u1_r.notified().await;
+                        }
+                        None // veto U1
+                    }
+                    Some(2) => None, // veto U2
+                    _ => call.next.call(call.args.clone()).await,
+                }
+            })
+        });
+
+        let f1 = fiber.clone();
+        let h1 = tokio::spawn(async move {
+            f1.update_with(json!({ "static": 1, "vol": "v1" }), false)
+                .await
+        });
+        u1_entered.notified().await;
+
+        let res2 = fiber
+            .update_with(json!({ "static": 2, "vol": "v2" }), false)
+            .await
+            .unwrap();
+        assert_eq!(res2, UpdateOutcome::Vetoed);
+
+        u1_release.notify_one();
+        let res1 = h1.await.unwrap().unwrap();
+        assert_eq!(res1, UpdateOutcome::Vetoed);
+        fiber.when_updates_settled().await;
+
+        assert_eq!(
+            fiber.config(),
+            json!({ "static": 0, "vol": "v0" }),
+            "两次并发更新均被否决后 config 必须完整回滚到 C0"
+        );
+        assert_eq!(
+            fiber.resolved(),
+            json!({ "static": 0, "vol": "v0" }),
+            "两次并发更新均被否决后 resolved 必须完整回滚到 C0"
+        );
+        let live_ref = fiber
+            .volatile_ref("vol")
+            .expect("volatile_ref still present");
+        assert!(
+            Arc::ptr_eq(&orig_ref, &live_ref),
+            "否决回滚不得破坏运行中插件缓存的 V0 VolatileRef 身份"
+        );
+        // Subsequent volatile-only commit must STILL write into `orig_ref`!
+        let changed = fiber.commit_volatile(json!({ "static": 0, "vol": "v-live" }));
+        assert_eq!(changed, vec!["vol".to_string()]);
+        assert_eq!(
+            orig_ref.get(),
+            json!("v-live"),
+            "否决回滚后后续 commit_volatile 必须仍写入运行中插件缓存的 V0 VolatileRef"
+        );
+        app.close().await;
+    }
+}
+
+// R2 P1-2: Stale `Ctx` from a disposed fiber whose `Arc<Fiber>` is still held must fail closed
+// in `Store::resolve` and return `Err` (not panic) in `Store::provide`.
+#[tokio::test]
+async fn stale_ctx_with_live_arc_fiber_fails_closed_in_resolve_and_provide() {
+    let app = App::new();
+    let parent = app.root.plugin(
+        plugin_fn("parent-prov", Inject::default(), |ctx, _| {
+            Box::pin(async move {
+                ctx.provide("parent_secret", Dyn::new(777i32))?;
+                Ok(())
+            })
+        }),
+        Config::Null,
+    );
+    parent.settle().await;
+
+    let captured = Arc::new(std::sync::Mutex::new(None::<Ctx>));
+    let cap_c = captured.clone();
+    let child = parent.ctx().plugin(
+        plugin_fn("child-ephemeral", Inject::default(), move |ctx, _| {
+            *cap_c.lock().unwrap() = Some(ctx.extend());
+            Box::pin(async { Ok(()) })
+        }),
+        Config::Null,
+    );
+    child.settle().await;
+
+    // Dispose child while STILL holding `child: Arc<Fiber>`!
+    child.dispose().await;
+    assert_eq!(child.state(), FiberState::Disposed);
+
+    let stale_ctx = captured.lock().unwrap().take().unwrap();
+    assert!(stale_ctx.fiber_opt().is_some(), "Arc<Fiber> 仍存活");
+
+    let resolved = app.store.resolve(&stale_ctx, "parent_secret");
+    assert!(
+        matches!(resolved, Err(ResolveError::Inactive(_))),
+        "已处置 fiber 的陈旧 Ctx 不得绕过 fail-closed 读到父节点服务: {:?}",
+        resolved.map(|_| "Ok")
+    );
+    let provided = stale_ctx.provide("late_svc", Dyn::new(1i32));
+    assert!(
+        provided.is_err(),
+        "已处置 fiber 的陈旧 Ctx 调 provide 必须返回 Err 而不是 panic"
+    );
+
+    // Keep `child` alive until after assertions.
+    drop(child);
+    app.close().await;
+}
+
+// R2 P1-3: Clearing `self.committed` during unload/dispose must drop `Arc<Impl>`/`Dyn`
+// outside the `committed` mutex lock so re-entrant `Drop` cannot deadlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clearing_committed_on_unload_drops_impl_outside_committed_lock() {
+    struct ReenterCommittedOnDrop {
+        consumer_ctx: Ctx,
+        ran: Arc<AtomicBool>,
+    }
+    impl Drop for ReenterCommittedOnDrop {
+        fn drop(&mut self) {
+            let _ = self.consumer_ctx.get("committed_drop_svc");
+            let _ = self
+                .consumer_ctx
+                .store
+                .resolve(&self.consumer_ctx, "committed_drop_svc");
+            self.ran.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let app = App::new();
+    let consumer_ctx_slot = Arc::new(std::sync::Mutex::new(None::<Ctx>));
+    let cslot = consumer_ctx_slot.clone();
+    let drop_ran = Arc::new(AtomicBool::new(false));
+    let drop_ran_c = drop_ran.clone();
+
+    let consumer = app.root.plugin(
+        plugin_fn(
+            "committed-consumer",
+            Inject::of(&["committed_drop_svc"]),
+            move |ctx, _| {
+                *cslot.lock().unwrap() = Some(ctx);
+                Box::pin(async { Ok(()) })
+            },
+        ),
+        Config::Null,
+    );
+    let provider_ctx_slot = Arc::new(std::sync::Mutex::new(None::<Ctx>));
+    let pslot = provider_ctx_slot.clone();
+    let provider = app.root.plugin(
+        plugin_fn("committed-provider", Inject::default(), move |ctx, _| {
+            *pslot.lock().unwrap() = Some(ctx.clone());
+            Box::pin(async move {
+                ctx.provide("committed_drop_svc", Dyn::new(1u32))?;
+                Ok(())
+            })
+        }),
+        Config::Null,
+    );
+    provider.settle().await;
+    consumer.settle().await;
+    assert_eq!(consumer.state(), FiberState::Active);
+
+    // Replace value with ReenterCommittedOnDrop while consumer holds Arc<Impl> in its `committed`.
+    let c_ctx = consumer_ctx_slot.lock().unwrap().clone().unwrap();
+    let p_ctx = provider_ctx_slot.lock().unwrap().clone().unwrap();
+    p_ctx
+        .set(
+            "committed_drop_svc",
+            Dyn::new(ReenterCommittedOnDrop {
+                consumer_ctx: c_ctx.clone(),
+                ran: drop_ran_c,
+            }),
+        )
+        .unwrap();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Hold consumer in unloading while provider drops its refs, OR dispose consumer after
+    // provider replaces the impl with a dummy so `consumer.committed` holds the last Arc<Impl>.
+    // Replacing the `Impl` entry via provider dispose while consumer keeps a clone in committed:
+    // Actually `provider.dispose()` waits for `consumer` to unload first; to have `consumer.committed`
+    // hold the last `Arc<Impl>`, use `drain_timeout_ms` OR a second `provider.dispose()` after
+    // `consumer` enters unload. Even simpler: put `ReenterCommittedOnDrop` inside an `Impl` where
+    // `provider` is a child of `consumer` (ancestor consumer skips waiting!) so `provider` drops
+    // `store.impls` + `provider.committed` FIRST, leaving `consumer.committed` holding the LAST `Arc<Impl>`!
+    app.close().await;
+
+    // Clean deterministic construction: `consumer` is ancestor of `provider_child`.
+    let app2 = App::new();
+    let drop_ran2 = Arc::new(AtomicBool::new(false));
+    let dr2 = drop_ran2.clone();
+    let c_slot2 = Arc::new(std::sync::Mutex::new(None::<Ctx>));
+    let cs2 = c_slot2.clone();
+
+    let ancestor_consumer = app2.root.plugin(
+        plugin_fn("anc-cons", Inject::of(&["last_ref_svc"]), move |ctx, _| {
+            *cs2.lock().unwrap() = Some(ctx);
+            Box::pin(async { Ok(()) })
+        }),
+        Config::Null,
+    );
+    let c_slot2_for_child = c_slot2.clone();
+    let child_prov = ancestor_consumer.ctx().plugin(
+        plugin_fn("child-prov", Inject::default(), move |ctx, _| {
+            let cs2 = c_slot2_for_child.clone();
+            let dr2 = dr2.clone();
+            Box::pin(async move {
+                let target_ctx = cs2.lock().unwrap().clone().unwrap_or_else(|| ctx.clone());
+                ctx.provide(
+                    "last_ref_svc",
+                    Dyn::new(ReenterCommittedOnDrop {
+                        consumer_ctx: target_ctx,
+                        ran: dr2,
+                    }),
+                )?;
+                Ok(())
+            })
+        }),
+        Config::Null,
+    );
+    child_prov.settle().await;
+    ancestor_consumer.settle().await;
+    assert_eq!(ancestor_consumer.state(), FiberState::Active);
+    // Point `ReenterCommittedOnDrop.consumer_ctx` to the real `ancestor_consumer` ctx via `set`.
+    let real_c_ctx = c_slot2.lock().unwrap().clone().unwrap();
+    let drop_ran3 = Arc::new(AtomicBool::new(false));
+    child_prov
+        .ctx()
+        .set(
+            "last_ref_svc",
+            Dyn::new(ReenterCommittedOnDrop {
+                consumer_ctx: real_c_ctx,
+                ran: drop_ran3.clone(),
+            }),
+        )
+        .unwrap();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Disposing `ancestor_consumer`:
+    // 1. `ancestor_consumer` disposes its effects -> `child_prov.dispose()` drops `store.impls` & `child_prov.committed`.
+    // 2. Now `ancestor_consumer.committed` holds the LAST `Arc<Impl>`!
+    // 3. `ancestor_consumer.unload()` clears `self.committed` -> MUST drop outside the `committed` lock!
+    tokio::time::timeout(Duration::from_secs(2), ancestor_consumer.dispose())
+        .await
+        .expect("在持 committed 锁期间析构 Arc<Impl> 导致同线程死锁");
+    assert!(
+        drop_ran3.load(Ordering::SeqCst),
+        "ReenterCommittedOnDrop 必须实际触发"
+    );
+    let _ = drop_ran;
+    let _ = drop_ran2;
+    app2.close().await;
+}
+
+// R2 P2-1: `Fiber::new` racing with concurrent parent `dispose()` must not leak a disposed
+// fiber into `Store::runtimes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fiber_new_racing_with_parent_dispose_does_not_leak_in_runtimes() {
+    for _ in 0..100 {
+        let app = App::new();
+        let parent = app.root.plugin(
+            plugin_fn("race-parent", Inject::default(), |_ctx, _| {
+                Box::pin(async { Ok(()) })
+            }),
+            Config::Null,
+        );
+        parent.settle().await;
+        let p_ctx = parent.ctx();
+        let p_disp = parent.clone();
+
+        let h_child = tokio::spawn(async move {
+            let _ = p_ctx.try_plugin(
+                plugin_fn("race-child", Inject::default(), |_ctx, _| {
+                    Box::pin(async { Ok(()) })
+                }),
+                Config::Null,
+            );
+        });
+        let h_disp = tokio::spawn(async move {
+            p_disp.dispose().await;
+        });
+        h_child.await.unwrap();
+        h_disp.await.unwrap();
+
+        let leaked = app.store.fibers_by_plugin_name("race-child");
+        assert!(
+            leaked.is_empty(),
+            "父 dispose 竞态不得将已处置子 fiber 泄漏在 Store::runtimes 中（残留 {} 个）",
+            leaked.len()
+        );
+        app.close().await;
+    }
+}
+
+// R2 P2-2: Hooks registered on derived root contexts (`filter_subtree`, `extend`, `isolate`)
+// must NOT form a strong reference cycle preventing `Store` drop when `App` is dropped.
+#[tokio::test]
+async fn derived_root_context_hook_does_not_leak_store_on_app_drop() {
+    let fired = Arc::new(AtomicUsize::new(0));
+    let weak_store;
+    {
+        let app = App::new();
+        weak_store = Arc::downgrade(&app.store);
+
+        let f1 = fired.clone();
+        // Register on temporary derived root contexts and drop those temporary Ctx handles.
+        let _h1 = app.root.filter_subtree().on("derived/evt", move |_| {
+            f1.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        });
+        let f2 = fired.clone();
+        let _h2 = app.root.extend().on("derived/evt", move |_| {
+            f2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        });
+        let f3 = fired.clone();
+        let _h3 = app.root.isolate("iso", None).on("derived/evt", move |_| {
+            f3.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        });
+
+        app.root.emit("derived/evt", vec![]).await;
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            3,
+            "App 存活期间临时派生根上下文的监听器仍须正常触发"
+        );
+    }
+    assert!(
+        weak_store.upgrade().is_none(),
+        "派生根上下文注册的 Hook 形成强引用环，导致丢弃 App 后 Store 永久泄漏"
+    );
+}
+
+// R2 P2-3: Async `ExternService::call_stream` panicking in the spawned native task must
+// surface an `Err(...)` to `AsyncStream::next()`, NOT silent `Ok(None)` EOF.
+#[tokio::test]
+async fn async_call_iface_stream_provider_panic_reports_err_not_silent_eof() {
+    struct PanickingStreamSvc;
+    impl cordis_core::ExternService for PanickingStreamSvc {
+        fn service(&self) -> &str {
+            "panic-stream"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["go".to_string()]
+        }
+        fn call(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> cordis_core::BoxFuture<cordis_core::Result<Config>> {
+            Box::pin(async { Ok(Config::Null) })
+        }
+        fn call_stream(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+            sink: cordis_core::StreamSink,
+        ) -> cordis_core::BoxFuture<cordis_core::Result<()>> {
+            Box::pin(async move {
+                let _ = sink.send(json!("first")).await;
+                tokio::task::yield_now().await;
+                panic!("intentional async stream panic");
+            })
+        }
+    }
+
+    let app = App::new();
+    let _prov = app
+        .root
+        .provide_iface("panic-stream@1", Arc::new(PanickingStreamSvc))
+        .unwrap();
+    let mut stream = app
+        .root
+        .call_iface_stream("panic-stream@1", 1, "go", json!([]))
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap(), Some(json!("first")));
+    let second = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("stream.next 不得挂起");
+    assert!(
+        second.is_err(),
+        "异步流提供者 panic 必须向消费者返回 Err，不得静默变成 Ok(None): {second:?}"
+    );
+    app.close().await;
+}
+
+// R2 P2-4: `Store::delete_plugin` must keep returned active fibers registered in `Store::runtimes`
+// until their `dispose()` completes.
+#[tokio::test]
+async fn delete_plugin_keeps_active_fibers_visible_until_disposed() {
+    let app = App::new();
+    let key = cordis_core::unique_key("del-plugin-keep-visible");
+    let plugin: Arc<dyn Plugin> = Arc::new(cordis_core::FnPlugin {
+        name: "del-plugin-keep-visible",
+        key: key.clone(),
+        inject: Inject::default(),
+        validator: None,
+        f: Arc::new(|_ctx, _| Box::pin(async { Ok(()) })),
+    });
+    let fiber = app.root.plugin(plugin, Config::Null);
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    let to_dispose = app.store.delete_plugin(&key);
+    assert_eq!(to_dispose.len(), 1);
+    assert_eq!(
+        app.store
+            .fibers_by_plugin_name("del-plugin-keep-visible")
+            .len(),
+        1,
+        "delete_plugin 返回的活跃 fiber 在真正 dispose 完成前不得从 Store::runtimes 消失"
+    );
+
+    for f in to_dispose {
+        f.dispose().await;
+    }
+    assert!(
+        app.store
+            .fibers_by_plugin_name("del-plugin-keep-visible")
+            .is_empty(),
+        "dispose 完成后 fiber 应从 Store::runtimes 清理"
+    );
+    app.close().await;
+}
+
+// R2 P3-1: `Context::call_iface_stream` must bind `CALLER_UID` during synchronous `call_stream(...)`.
+#[tokio::test]
+async fn call_iface_stream_propagates_caller_uid_during_sync_call_stream() {
+    struct SyncCallerUidProbe(Arc<std::sync::atomic::AtomicU64>);
+    impl cordis_core::ExternService for SyncCallerUidProbe {
+        fn service(&self) -> &str {
+            "uid-probe"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["probe".to_string()]
+        }
+        fn call(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> cordis_core::BoxFuture<cordis_core::Result<Config>> {
+            Box::pin(async { Ok(Config::Null) })
+        }
+        fn call_stream(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+            sink: cordis_core::StreamSink,
+        ) -> cordis_core::BoxFuture<cordis_core::Result<()>> {
+            // Read caller uid SYNCHRONOUSLY inside `call_stream(...)` before returning the future.
+            self.0
+                .store(cordis_core::current_caller_uid(), Ordering::SeqCst);
+            Box::pin(async move {
+                let _ = sink.send(json!("ok")).await;
+                sink.close();
+                Ok(())
+            })
+        }
+    }
+
+    let app = App::new();
+    let observed_uid = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let _prov = app
+        .root
+        .provide_iface(
+            "uid-probe@1",
+            Arc::new(SyncCallerUidProbe(observed_uid.clone())),
+        )
+        .unwrap();
+
+    let caller = app.root.plugin(
+        plugin_fn("uid-caller", Inject::of(&["uid-probe@1"]), |_ctx, _| {
+            Box::pin(async { Ok(()) })
+        }),
+        Config::Null,
+    );
+    caller.settle().await;
+    assert_ne!(caller.uid(), 0);
+
+    let mut stream = caller
+        .ctx()
+        .call_iface_stream("uid-probe@1", 1, "probe", json!([]))
+        .unwrap();
+    let _ = stream.next().await.unwrap();
+    assert_eq!(
+        observed_uid.load(Ordering::SeqCst),
+        caller.uid(),
+        "call_iface_stream 同步进入 call_stream 期间必须绑定发起方 CALLER_UID"
+    );
+    app.close().await;
+}

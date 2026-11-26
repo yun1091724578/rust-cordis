@@ -1483,9 +1483,8 @@ async fn a_rejected_candidate_does_not_overwrite_the_adopted_preflight_report() 
 
     // 候选：预检会得到**另一种**结论（`Ok(None)` ⇒ `incomplete`），但回写版本过期
     // ⇒ `adopt` 拒绝。候选基于一棵过时的树，绝不会成为当前树。
-    let mut candidate = Candidate::local(state.tree_snapshot());
+    let mut candidate = Candidate::local(state.tree_snapshot(), state.writeback_version() + 1);
     candidate.gen = 1;
-    candidate.base_writeback = state.writeback_version() + 1;
 
     let attempt = state.reconcile_attempt(&candidate).await;
     match &attempt.rejection {
@@ -1676,4 +1675,108 @@ async fn reload_one_preflights_inside_the_mutation_critical_section() {
         .expect("reload 超时")
         .expect("reload 任务");
     assert_eq!(source.plan_calls(), 2, "临界区内重跑了一次预检");
+}
+
+/// 回归（#7）：`Candidate::local`（`gen == 0`）也必须校验 `base_writeback`，
+/// 并发回写后旧局部候选不得覆盖树；同时 `set_disabled` 必须推进 `writeback_version`。
+#[tokio::test]
+async fn adopt_rejects_local_candidate_with_stale_writeback_and_set_disabled_bumps_version() {
+    let app = App::new();
+    let dir = TempDir::new("local-candidate-writeback");
+    let path = dir.write("cordis.yml", &yaml_row("single", "svc", 1));
+    let source = ScriptSource::new(Vec::new());
+    let state = load_scripted(&app, &path, source).await;
+
+    let stale_tree = state.tree_snapshot();
+    let stale_wb = state.writeback_version();
+
+    // 一次运行时回写推进了 writeback_version。
+    writeback(&state, "single", 9).await;
+    assert!(state.writeback_version() > stale_wb);
+
+    // gen == 0 的局部候选携带旧的 base_writeback，必须被拒绝而不得把值退回 1。
+    let local_candidate = Candidate::local(stale_tree, stale_wb);
+    assert_eq!(local_candidate.gen, 0);
+    let attempt = state.reconcile_attempt(&local_candidate).await;
+    assert!(
+        matches!(attempt.rejection, Some(AdoptRejection::StaleWriteback(_))),
+        "gen == 0 的过期局部候选必须被 StaleWriteback 拒绝：{:?}",
+        attempt.rejection.as_ref().map(AdoptRejection::message)
+    );
+    assert_eq!(tree_value(&state, "single"), json!(9));
+    assert_eq!(service_of(&app, "svc"), Some(9));
+
+    // set_disabled 同样必须推进 writeback_version，使之前的候选失效。
+    let before_disable = state.writeback_version();
+    let pre_disable_tree = state.tree_snapshot();
+    state
+        .set_disabled("single", Some(true))
+        .await
+        .expect("disable");
+    assert!(
+        state.writeback_version() > before_disable,
+        "set_disabled 必须推进 writeback_version"
+    );
+    let stale_after_disable = Candidate::local(pre_disable_tree, before_disable);
+    let attempt = state.reconcile_attempt(&stale_after_disable).await;
+    assert!(
+        matches!(attempt.rejection, Some(AdoptRejection::StaleWriteback(_))),
+        "set_disabled 之后的旧局部候选必须被拒绝：{:?}",
+        attempt.rejection.as_ref().map(AdoptRejection::message)
+    );
+    assert!(state.mounted_labels().is_empty());
+}
+
+/// 回归（#22）：文件来源瞬时读取失败时，`advance_fingerprint` 不得把已知指纹清空为 `None`，
+/// 从而确保文件恢复后 `stale_labels()` 仍能继续跟踪该行。
+#[tokio::test]
+async fn advance_fingerprint_preserves_tracking_across_transient_read_failure() {
+    let app = App::new();
+    let dir = TempDir::new("hmr-transient-fp");
+    let path = dir.write("cordis.yml", &yaml_row("single", "svc", 1));
+    let plugin_file = dir.write("fake_plugin.bin", "v1-content");
+    let initial_fp = fingerprint(&plugin_file).expect("初始指纹");
+
+    let source = ScriptSource::new(Vec::new());
+    let state = load_scripted(&app, &path, source).await;
+    {
+        let mut mounted = state.mounted.lock().unwrap();
+        let record = mounted.get_mut("single").expect("single 已挂载");
+        record.source = plugin_file.clone();
+        record.fingerprint = Some(initial_fp);
+    }
+
+    // 模拟构建工具原子替换瞬间原文件短暂消失。
+    std::fs::remove_file(&plugin_file).expect("删除源文件模拟瞬时缺失");
+    advance_fingerprint(&state, "single");
+    {
+        let mounted = state.mounted.lock().unwrap();
+        let record = mounted.get("single").expect("single 仍在");
+        assert_eq!(
+            record.fingerprint.as_ref(),
+            Some(&initial_fp),
+            "瞬时读失败不得将已有指纹清空为 None"
+        );
+    }
+
+    // 新产物落地后，stale_labels 必须仍能检测到该行已过期。
+    std::fs::write(&plugin_file, "v2-updated-content-longer").expect("写入新产物");
+    assert_eq!(
+        state.stale_labels(),
+        vec!["single".to_string()],
+        "保留旧指纹后，文件恢复变更必须重新命中 stale_labels"
+    );
+}
+
+/// 回归（#6）：裸文件名配置路径的 `parent()` 为 `Some("")`，计算 `base_dir` 必须过滤空父路径并回落到 `"."`。
+#[test]
+fn bare_config_filename_parent_resolves_to_dot_not_empty() {
+    let main_path = PathBuf::from("cordis.yml");
+    assert_eq!(main_path.parent(), Some(Path::new("")));
+    let base_dir = main_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    assert_eq!(base_dir, PathBuf::from("."));
 }

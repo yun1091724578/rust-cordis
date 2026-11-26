@@ -339,25 +339,7 @@ pub fn command(args: Vec<String>) -> i32 {
     }
     if let Some(dir) = verify {
         let dir = crate::resolve_repo_path(dir);
-        if require_v2 {
-            let format = fs::read_to_string(dir.join(SEAL_FILE))
-                .ok()
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .and_then(|value| {
-                    value
-                        .get("format")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
-            if format.as_deref() != Some(SEAL_FORMAT) {
-                eprintln!(
-                    "封存校验失败：{} 的 format 不是 {SEAL_FORMAT}（--require-v2）",
-                    dir.display()
-                );
-                return 1;
-            }
-        }
-        return match verify_dir(&dir) {
+        return match verify_dir_with_mode(&dir, require_v2) {
             Ok(manifest) => {
                 println!("封存校验通过：{}", dir.display());
                 print_manifest(&manifest);
@@ -961,20 +943,45 @@ fn write_manifest_files(dir: &Path, manifest: &SealManifest) -> Result<(), Strin
     fs::write(dir.join(SUMS_FILE), sums).map_err(|err| format!("写 {SUMS_FILE} 失败：{err}"))
 }
 
+/// 发布门禁消费前校验：强制要求 `/2` 格式（含 sidecar / `allow-list.json` provenance 校验），
+/// 防止通过把 `seal.json` 的 `format` 降级为 `/1` 绕过 provenance 校验。
 pub(crate) fn verify_for_consume(dir: &Path) -> Result<(), Vec<String>> {
-    verify_dir(dir).map(|_| ())
+    verify_dir_with_mode(dir, true).map(|_| ())
+}
+
+fn read_regular_root_file(dir: &Path, file_name: &str) -> Result<String, String> {
+    let path = dir.join(file_name);
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|err| format!("读取 {file_name} 失败：{err}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{file_name} 不能是符号链接"));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{file_name} 不是普通文件"));
+    }
+    fs::read_to_string(&path).map_err(|err| format!("读取 {file_name} 失败：{err}"))
 }
 
 fn verify_dir(dir: &Path) -> Result<SealManifest, Vec<String>> {
+    verify_dir_with_mode(dir, false)
+}
+
+fn verify_dir_with_mode(dir: &Path, require_v2: bool) -> Result<SealManifest, Vec<String>> {
     let mut errors = Vec::new();
-    let text = match fs::read_to_string(dir.join(SEAL_FILE)) {
+    let text = match read_regular_root_file(dir, SEAL_FILE) {
         Ok(text) => text,
-        Err(err) => return Err(vec![format!("读取 {SEAL_FILE} 失败：{err}")]),
+        Err(err) => return Err(vec![err]),
     };
     let value: Value = match serde_json::from_str(&text) {
         Ok(value) => value,
         Err(err) => return Err(vec![format!("解析 {SEAL_FILE} 失败：{err}")]),
     };
+    if require_v2 && value.get("format").and_then(Value::as_str) != Some(SEAL_FORMAT) {
+        return Err(vec![format!(
+            "{} 的 format 不是 {SEAL_FORMAT}（--require-v2）",
+            dir.display()
+        )]);
+    }
     let manifest = match SealManifest::from_json(&value) {
         Ok(manifest) => manifest,
         Err(err) => return Err(vec![err]),
@@ -1356,7 +1363,9 @@ fn verify_root_files(seal_dir: &Path, expected: &BTreeSet<String>, errors: &mut 
                 continue;
             }
         };
-        if file_type.is_dir() {
+        if file_type.is_symlink() {
+            errors.push(format!("封存根目录项不能是符号链接：{name}"));
+        } else if file_type.is_dir() {
             if name != "plugins" && name != "smoke" {
                 errors.push(format!("封存根目录多出未登记目录：{name}"));
             }
@@ -1509,10 +1518,10 @@ fn collect_relative_files(
 }
 
 fn verify_sums(dir: &Path, expected: &BTreeMap<String, String>, errors: &mut Vec<String>) {
-    let text = match fs::read_to_string(dir.join(SUMS_FILE)) {
+    let text = match read_regular_root_file(dir, SUMS_FILE) {
         Ok(text) => text,
         Err(err) => {
-            errors.push(format!("读取 {SUMS_FILE} 失败：{err}"));
+            errors.push(err);
             return;
         }
     };
@@ -2243,6 +2252,92 @@ mod tests {
             assert!(is_plugin_file(Path::new("libgreeting.dylib")));
         } else {
             assert!(is_plugin_file(Path::new("libgreeting.so")));
+        }
+    }
+
+    #[test]
+    fn verify_for_consume_rejects_downgraded_v1_seal() {
+        let tree = TempTree::new("consume-rejects-v1");
+        let manifest = fixture(&tree.path);
+        // 正常 /2 封存可以通过 verify_for_consume。
+        verify_for_consume(&tree.path).expect("完整 /2 封存应通过消费校验");
+
+        // 把 format 降级为 /1 并移除 sidecar 与 allow-list.json（同步更新 SHA256SUMS 使只读 /1 复验可通过）。
+        let mut raw: Value =
+            serde_json::from_str(&fs::read_to_string(tree.path.join(SEAL_FILE)).unwrap()).unwrap();
+        raw["format"] = json!(SEAL_FORMAT_V1);
+        fs::write(
+            tree.path.join(SEAL_FILE),
+            format!("{}\n", serde_json::to_string_pretty(&raw).unwrap()),
+        )
+        .unwrap();
+        let _ = fs::remove_file(tree.path.join(ALLOW_LIST_FILE));
+        let mut sums = String::new();
+        for artifact in &manifest.artifacts {
+            let _ = fs::remove_file(tree.path.join(sidecar_path(artifact)));
+            sums.push_str(&format!("{}  {}\n", artifact.sha256, artifact.path));
+        }
+        sums.push_str(&format!(
+            "{}  {}\n{}  {}\n",
+            manifest.smoke_config_sha256,
+            manifest.smoke_config,
+            manifest.smoke_evidence_sha256,
+            manifest.smoke_evidence
+        ));
+        fs::write(tree.path.join(SUMS_FILE), sums).unwrap();
+
+        // 只读 verify_dir 保留对历史 /1 封存的复验兼容；但发布门禁 verify_for_consume 必须拒绝。
+        verify_dir(&tree.path).expect("历史 /1 封存仍支持只读复验");
+        let errors = verify_for_consume(&tree.path)
+            .expect_err("verify_for_consume 必须拒绝降级为 /1 的封存目录");
+        assert!(
+            errors.iter().any(|e| e.contains(SEAL_FORMAT)),
+            "报错应明确要求 {SEAL_FORMAT}：{errors:?}"
+        );
+    }
+
+    #[test]
+    fn r2_p3_seal_verify_rejects_symlink_or_non_regular_seal_and_sums() {
+        // Case 1: Replacing `seal.json` or `SHA256SUMS` with a symlink must be rejected explicitly
+        // as a symlink (when the OS allows creating file symlinks), and replacing with a directory
+        // must be rejected as not a regular file (universal on all OSes).
+        let tree_dir = TempTree::new("non-regular-sums");
+        let _ = fixture(&tree_dir.path);
+        fs::remove_file(tree_dir.path.join(SUMS_FILE)).unwrap();
+        fs::create_dir(tree_dir.path.join(SUMS_FILE)).unwrap();
+        let errs = verify_dir(&tree_dir.path).expect_err("目录冒充 SHA256SUMS 必须失败");
+        assert!(
+            errs.iter().any(|e| e.contains("不是普通文件")),
+            "SHA256SUMS 必须先做普通文件/符号链接校验，而非直接 read_to_string：{errs:?}"
+        );
+
+        let tree_seal = TempTree::new("non-regular-seal");
+        let _ = fixture(&tree_seal.path);
+        fs::remove_file(tree_seal.path.join(SEAL_FILE)).unwrap();
+        fs::create_dir(tree_seal.path.join(SEAL_FILE)).unwrap();
+        let errs_seal = verify_dir(&tree_seal.path).expect_err("目录冒充 seal.json 必须失败");
+        assert!(
+            errs_seal.iter().any(|e| e.contains("不是普通文件")),
+            "seal.json 必须先做普通文件/符号链接校验，而非直接 read_to_string：{errs_seal:?}"
+        );
+
+        // If the platform permits creating file symlinks, verify symlink rejection end-to-end too.
+        let tree_sym = TempTree::new("symlink-sums");
+        let _ = fixture(&tree_sym.path);
+        let outside = TempTree::new("symlink-outside");
+        let real_sums = outside.path.join("real-sums");
+        fs::copy(tree_sym.path.join(SUMS_FILE), &real_sums).unwrap();
+        fs::remove_file(tree_sym.path.join(SUMS_FILE)).unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&real_sums, tree_sym.path.join(SUMS_FILE));
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&real_sums, tree_sym.path.join(SUMS_FILE));
+        if linked.is_ok() {
+            let sym_errs = verify_dir(&tree_sym.path).expect_err("符号链接 SHA256SUMS 必须失败");
+            assert!(
+                sym_errs.iter().any(|e| e.contains("符号链接")),
+                "符号链接 SHA256SUMS 必须显式报符号链接错误：{sym_errs:?}"
+            );
         }
     }
 }

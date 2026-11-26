@@ -218,6 +218,28 @@ impl Context {
         });
     }
 
+    /// 为根纤维上的派生上下文构造“脱父”副本与指向根上下文的弱引用，
+    /// 供 `HookCtx::DerivedRoot` 保留派生作用域而不强持 `root_keepalive`。
+    pub(crate) fn detach_root_for_hook(self: &Ctx) -> (Ctx, Weak<Context>) {
+        let mut cursor = self.clone();
+        while let Some(parent) = cursor.parent.clone() {
+            cursor = parent;
+        }
+        let fiber = self.fiber.lock().unwrap().clone();
+        let detached = Self::assemble(
+            self.store.clone(),
+            None,
+            self.isolate.clone(),
+            self.intercept.clone(),
+            self.declare.clone(),
+            self.hook_scope.clone(),
+            self.correlation_id.clone(),
+            fiber,
+            self.base_url.clone(),
+        );
+        (detached, Arc::downgrade(&cursor))
+    }
+
     pub fn fiber(&self) -> Arc<Fiber> {
         self.fiber_opt()
             .expect("context has no fiber（没有绑定过，或它的 fiber 已经走了）")
@@ -718,19 +740,16 @@ impl Context {
                 return Err(err as crate::Error);
             }
         }
-        let caller_uid = if traced {
-            self.fiber_opt()
-                .map(|fiber| fiber.uid())
-                .unwrap_or_else(|| {
-                    if self.has_attached_fiber() {
-                        crate::fiber::UID_DISPOSED
-                    } else {
-                        crate::fiber::UID_ROOT
-                    }
-                })
-        } else {
-            crate::fiber::UID_ROOT
-        };
+        let caller_uid = self
+            .fiber_opt()
+            .map(|fiber| fiber.uid())
+            .unwrap_or_else(|| {
+                if self.has_attached_fiber() {
+                    crate::fiber::UID_DISPOSED
+                } else {
+                    crate::fiber::UID_ROOT
+                }
+            });
         let (iface, caller_meta) = match self.iface_target(service) {
             Ok(pair) => pair,
             Err(err) => {
@@ -762,12 +781,13 @@ impl Context {
         }
         let (sink, mut stream) = crate::StreamSink::new(crate::STREAM_WINDOW);
         let mut future: BoxFuture<Result<()>> = {
+            let _caller_guard = crate::trace::enter_caller_uid(caller_uid);
             let _guard = correlation_id
                 .as_ref()
                 .map(|cid| crate::trace::enter_correlation(Some(cid.clone())));
             iface.call_stream(caller_meta, method.to_string(), args, sink.clone())
         };
-        if traced || correlation_id.is_some() {
+        if traced || correlation_id.is_some() || caller_uid != crate::fiber::UID_ROOT {
             future = crate::trace::scope_caller(future, caller_uid, correlation_id);
         }
         // 提供者的前半段要**现在就跑到第一个挂起点**：同步实现的提供者（含一切跨 ABI 的）
@@ -792,24 +812,43 @@ impl Context {
                 let task_sink = sink.clone();
                 // 提供者任务归属于**调用点 fiber**：
                 // - 丢弃流 ⇒ `AsyncStream::drop` 发取消，不再让它跑副作用；
-                // - `App::close` / 卸载 ⇒ `Fiber::dispose_native_tasks` 取消并等待。
+                // - `App::close` / 卸载 ⇒ `Fiber::dispose_native_tasks` 取消并等待；
+                // - future 在后台任务中 panic ⇒ 守卫自动 `fail` 流，避免静默变成 `Ok(None)` EOF。
                 if let Err(err) = fiber.spawn_native_task(cancel.clone(), async move {
+                    struct StreamTaskPanicGuard {
+                        sink: crate::StreamSink,
+                        settled: bool,
+                    }
+                    impl Drop for StreamTaskPanicGuard {
+                        fn drop(&mut self) {
+                            if !self.settled && !self.sink.is_finished() {
+                                self.sink.fail("流式服务执行异常终止（panic 或任务被中止）");
+                            }
+                        }
+                    }
+                    let mut guard = StreamTaskPanicGuard {
+                        sink: task_sink.clone(),
+                        settled: false,
+                    };
                     // 取消是**已经发生的事实**时必须先结算：`select!` 默认随机轮询，
                     // 取消与结果同时就绪时可能先跑业务 future，让已经丢弃的流继续
                     // 执行副作用。先同步检查一次，再让 select 的取消分支固定优先。
                     if task_cancel.is_cancelled() {
                         task_sink.fail("流式调用已取消：调用方或生命周期已关闭");
+                        guard.settled = true;
                         return;
                     }
                     tokio::select! {
                         biased;
                         _ = task_cancel.cancelled() => {
                             task_sink.fail("流式调用已取消：调用方或生命周期已关闭");
+                            guard.settled = true;
                         }
                         result = future => {
                             if let Err(err) = result {
                                 task_sink.fail_error(err);
                             }
+                            guard.settled = true;
                         }
                     }
                 }) {

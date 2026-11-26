@@ -77,4 +77,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - shell: bash
         run: rustc --version | grep -q '^rustc 1\.98\.1 '
-      - run: cargo package -p rust-cordis-core -p rust-cordis-abi -p rust-cordis-host -p rust-cordis-macros -p rust-cordis-sdk --no-verify --locked
+      - name: Package publishable crates
+        shell: bash
+        run: |
+          cargo package -p rust-cordis-core -p rust-cordis-abi -p rust-cordis-macros --no-verify --locked
+          # host / sdk 的路径依赖在打包时会被改写成同版本 registry 依赖（如 ^0.1.7），
+          # 新版本发布到 crates.io 前必须指向工作区源码以通过依赖图解析（与 xtask package-check 一致）。
+          cargo package -p rust-cordis-host -p rust-cordis-sdk --no-verify --locked \
+            --config 'patch.crates-io.rust-cordis-core.path="crates/core"' \
+            --config 'patch.crates-io.rust-cordis-abi.path="crates/abi"' \
+            --config 'patch.crates-io.rust-cordis-macros.path="crates/macros"'

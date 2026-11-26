@@ -130,6 +130,23 @@ fn open_verified_rejects_a_tampered_artifact_before_dlopen() {
 }
 
 #[test]
+fn r2_p2_open_verified_stages_isolated_copy_before_opening() {
+    let path = fixture("open-verified-isolated", b"abc");
+    write_manifest(&path, SHA_ABC, "abc123");
+    let policy = PluginSourcePolicy::new(vec![allowed(SHA_ABC)]);
+    let error = match LoadedPlugin::open_verified(&path, &policy) {
+        Ok(_) => panic!("non-DLL bytes must not load"),
+        Err(error) => error.to_string(),
+    };
+    let source_str = path.to_string_lossy().into_owned();
+    assert!(
+        !error.contains(&source_str),
+        "open_verified 必须从隔离暂存副本打开，而不是直接打开源路径 {source_str}：{error}"
+    );
+    assert_no_staged_copy(&path);
+}
+
+#[test]
 fn open_staged_verified_refuses_to_delete_the_original_artifact() {
     let path = fixture("same-path", b"not a dynamic library");
     write_manifest(&path, SHA_ABC, "abc123");

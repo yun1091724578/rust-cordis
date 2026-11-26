@@ -240,7 +240,6 @@ pub fn owner_chain(ctx: &Ctx) -> Vec<u64> {
 
 #[derive(Clone)]
 struct ToolEntry {
-    name: String,
     desc: String,
     iface: Option<String>,
     /// T2 转发面（D2）：**T1 侧持引用**，T2 卸载后调用会得到可读错误。
@@ -299,9 +298,8 @@ impl Tools for ToolsImpl {
             ));
         }
         entries.insert(
-            (owner, name.clone()),
+            (owner, name),
             ToolEntry {
-                name,
                 desc,
                 iface,
                 target,
@@ -332,13 +330,15 @@ impl Tools for ToolsImpl {
 
     async fn call(&self, owners: Vec<u64>, name: String, input: Config) -> Result<Config, String> {
         // 取锁期间只做"挑一个候选项"，调用发生在锁外（D10：锁不跨宿主回调）。
+        // 作用域优先级：按 `owners` 中非 0 作用域由内到外查找，最后才回退到全局 owner=0。
         let found: Option<ToolEntry> = {
             let entries = self.entries.lock().unwrap();
-            entries
+            owners
                 .iter()
-                .filter(|((owner, _), _)| owners.contains(owner))
-                .find(|(_, entry)| entry.name == name)
-                .map(|(_, entry)| (*entry).clone())
+                .copied()
+                .filter(|&owner| owner != 0)
+                .chain(owners.contains(&0).then_some(0))
+                .find_map(|owner| entries.get(&(owner, name.clone())).cloned())
         };
         let Some(entry) = found else {
             let visible = self.names(owners).await?;

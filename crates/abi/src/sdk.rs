@@ -1368,6 +1368,9 @@ struct Registry {
     /// 回调 id → 注册它的实例句柄。`OP_DISPOSE` 只清这个实例的登记，
     /// 同一个 cdylib 挂多个实例时不会互相拆台。
     owners: Mutex<HashMap<u64, u64>>,
+    /// `OP_APPLY` 失败但仍保留待宿主 `OP_CLEANUP` 执行的清理闭包的实例句柄集合；
+    /// 最后一条 cleanup 跑完后自动回收该实例的 volatile 副本。
+    failed_apply_owners: Mutex<std::collections::HashSet<u64>>,
     next: AtomicU64,
 }
 
@@ -1447,7 +1450,11 @@ impl Registry {
     }
 
     /// 清掉某个实例注册的全部回调（`OP_DISPOSE` 的收尾）。
+    ///
+    /// 逐条在 `catch_unwind` 内释放用户闭包，避免单个闭包的 `Drop` panic 中止剩余回调
+    /// 与 `forget_volatile` 清理。
     fn dispose_owner(&self, owner: u64) {
+        self.failed_apply_owners.lock().unwrap().remove(&owner);
         let ids: Vec<u64> = self
             .owners
             .lock()
@@ -1457,8 +1464,55 @@ impl Registry {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            self.forget(id);
+            self.forget_catching_panic(id);
         }
+    }
+
+    /// `OP_APPLY` 失败（返回 `Err` 或 panic）时的实例回收：
+    /// 立即释放 `on` / `provide_iface` / 续延等回调，但**保留 `ctx.effect` 登记的清理闭包**，
+    /// 让宿主 `Fiber::fail` 回滚恢复栈按严格 LIFO 投递 `OP_CLEANUP` 真正执行它们（与 T1 一致）。
+    ///
+    /// 返回 `true` 表示该实例没有待运行的 cleanup，调用方可立即回收 volatile 副本；
+    /// 返回 `false` 表示仍有待运行 cleanup，由最后一条 `run_cleanup` 结束后回收 volatile。
+    fn dispose_owner_on_apply_failure(&self, owner: u64) -> bool {
+        let cleanup_ids: std::collections::HashSet<u64> =
+            self.cleanups.lock().unwrap().keys().copied().collect();
+        let (non_cleanup_ids, has_cleanups) = {
+            let owners = self.owners.lock().unwrap();
+            let mut non_cleanups = Vec::new();
+            let mut has_cleanups = false;
+            for (&id, &registered) in owners.iter() {
+                if registered == owner {
+                    if cleanup_ids.contains(&id) {
+                        has_cleanups = true;
+                    } else {
+                        non_cleanups.push(id);
+                    }
+                }
+            }
+            (non_cleanups, has_cleanups)
+        };
+        // 先更新失败账本再析构用户闭包，确保账本状态与清理结果完全一致。
+        if has_cleanups {
+            self.failed_apply_owners.lock().unwrap().insert(owner);
+        } else {
+            self.failed_apply_owners.lock().unwrap().remove(&owner);
+        }
+        for id in non_cleanup_ids {
+            self.forget_catching_panic(id);
+        }
+        !has_cleanups
+    }
+
+    fn has_cleanups_for(&self, owner: u64) -> bool {
+        let cleanup_ids: Vec<u64> = self.cleanups.lock().unwrap().keys().copied().collect();
+        if cleanup_ids.is_empty() {
+            return false;
+        }
+        let owners = self.owners.lock().unwrap();
+        cleanup_ids
+            .iter()
+            .any(|id| owners.get(id).copied() == Some(owner))
     }
 
     /// 先查一次性续延，再查长期 handler。取出来后**立即放锁再执行**，
@@ -1575,9 +1629,50 @@ impl Registry {
         ));
     }
 
+    /// 与 [`Self::forget`] 相同的摘表与锁外析构语义，但每个用户对象的 `Drop` 均包在独立
+    /// `catch_unwind` 内，供批量回收（`OP_DISPOSE` / `OP_APPLY` 失败）防单点 panic 中断。
+    fn forget_catching_panic(&self, id: u64) {
+        let handler = self.handlers.lock().unwrap().remove(&id);
+        let async_handler = self.async_handlers.lock().unwrap().remove(&id);
+        let async_iface = self.async_ifaces.lock().unwrap().remove(&id);
+        let continuation = self.continuations.lock().unwrap().remove(&id);
+        let cleanup = self.cleanups.lock().unwrap().remove(&id);
+        let _owner = self.owners.lock().unwrap().remove(&id);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(handler)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(async_handler)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(async_iface)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(continuation)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(cleanup)));
+    }
+
     fn run_cleanup(&self, id: u64) {
+        struct ApplyFailureVolatileGuard<'a> {
+            registry: &'a Registry,
+            owner: Option<u64>,
+        }
+        impl Drop for ApplyFailureVolatileGuard<'_> {
+            fn drop(&mut self) {
+                let Some(owner) = self.owner else { return };
+                let should_forget = {
+                    let mut failed = self.registry.failed_apply_owners.lock().unwrap();
+                    if failed.contains(&owner) && !self.registry.has_cleanups_for(owner) {
+                        failed.remove(&owner);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_forget {
+                    forget_volatile(owner);
+                }
+            }
+        }
         let cleanup = self.cleanups.lock().unwrap().remove(&id);
         let owner = self.owners.lock().unwrap().remove(&id);
+        let _volatile_guard = ApplyFailureVolatileGuard {
+            registry: self,
+            owner,
+        };
         if let Some(cleanup) = cleanup {
             let _owner = VolatileOwner::enter(owner);
             cleanup();
@@ -2000,13 +2095,14 @@ unsafe extern "C" fn call(ctx: u64, op: u32, a: Blob, b: Blob, out: *mut Out) ->
     })) {
         Ok(status) => {
             // 初始化失败（含 panic）时宿主不会给这个实例发 OP_DISPOSE（它从未成功
-            // apply 过），但 apply 里已经注册的回调必须在这里回收，否则它们会
-            // 永远持有插件捕获的对象。volatile 副本同理。
+            // apply 过），但 apply 里已经注册的事件/接口/续延回调必须在这里回收；
+            // 已登记的 `ctx.effect` 清理闭包保留给宿主 `Fiber::fail` 经 `OP_CLEANUP` 按 LIFO 真正执行。
             // 回收过程会运行用户闭包的 Drop，必须同样包在 catch_unwind 内，防止跨 extern "C" abort。
             if op == OP_APPLY && status != STATUS_OK {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    registry().dispose_owner(ctx);
-                    forget_volatile(ctx);
+                    if registry().dispose_owner_on_apply_failure(ctx) {
+                        forget_volatile(ctx);
+                    }
                 }));
             }
             status
@@ -2014,8 +2110,9 @@ unsafe extern "C" fn call(ctx: u64, op: u32, a: Blob, b: Blob, out: *mut Out) ->
         Err(payload) => {
             if op == OP_APPLY {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    registry().dispose_owner(ctx);
-                    forget_volatile(ctx);
+                    if registry().dispose_owner_on_apply_failure(ctx) {
+                        forget_volatile(ctx);
+                    }
                 }));
             }
             let message = format!(
@@ -3728,6 +3825,124 @@ mod tests {
         assert_eq!(
             wire, "plain human error",
             "0.1.5 宿主即使声明 ERROR_FORMAT_V1，也必须收到纯文本而非 JSON"
+        );
+    }
+
+    #[test]
+    fn r2_p3_dispose_owner_and_apply_failure_survive_panicking_closure_drop() {
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("boom in closure drop");
+            }
+        }
+        struct MarkOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for MarkOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        // Case 1: dispose_owner_on_apply_failure with a panicking handler Drop must still drop
+        // all other non-cleanup handlers AND mark `failed_apply_owners` when a cleanup exists.
+        let owner1 = 0x5EED_0001u64;
+        let dropped_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard_panic = PanicOnDrop;
+        let _h_panic = registry().register_handler_for(
+            owner1,
+            Arc::new(move |_| {
+                let _keep = &guard_panic;
+                Ok(Json::Null)
+            }),
+        );
+        let mark_a = MarkOnDrop(dropped_a.clone());
+        let _h_a = registry().register_handler_for(
+            owner1,
+            Arc::new(move |_| {
+                let _keep = &mark_a;
+                Ok(Json::Null)
+            }),
+        );
+        let mark_b = MarkOnDrop(dropped_b.clone());
+        let _h_b = registry().register_handler_for(
+            owner1,
+            Arc::new(move |_| {
+                let _keep = &mark_b;
+                Ok(Json::Null)
+            }),
+        );
+        let cleanup_id = registry().register_cleanup_for(owner1, Box::new(|| {}));
+        seed_volatile(owner1, &serde_json::json!({ "k": 1 }));
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry().dispose_owner_on_apply_failure(owner1)
+        }));
+        assert!(
+            res.is_ok(),
+            "dispose_owner_on_apply_failure 不得因单个回调 Drop panic 而中断展开"
+        );
+        assert!(!res.unwrap(), "仍有待运行的 cleanup，必须返回 false");
+        assert!(
+            dropped_a.load(Ordering::SeqCst) && dropped_b.load(Ordering::SeqCst),
+            "其余非 cleanup 回调必须全部被 drop"
+        );
+        assert!(
+            registry()
+                .failed_apply_owners
+                .lock()
+                .unwrap()
+                .contains(&owner1),
+            "failed_apply_owners 必须登记 owner1"
+        );
+        // Clean up owner1's remaining cleanup + volatile.
+        registry().forget(cleanup_id);
+        registry()
+            .failed_apply_owners
+            .lock()
+            .unwrap()
+            .remove(&owner1);
+        forget_volatile(owner1);
+
+        // Case 2: dispose_owner with a panicking handler Drop must still drop all remaining handlers.
+        let owner2 = 0x5EED_0002u64;
+        let dropped_c = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_d = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard_panic2 = PanicOnDrop;
+        let _h_panic2 = registry().register_handler_for(
+            owner2,
+            Arc::new(move |_| {
+                let _keep = &guard_panic2;
+                Ok(Json::Null)
+            }),
+        );
+        let mark_c = MarkOnDrop(dropped_c.clone());
+        let _h_c = registry().register_handler_for(
+            owner2,
+            Arc::new(move |_| {
+                let _keep = &mark_c;
+                Ok(Json::Null)
+            }),
+        );
+        let mark_d = MarkOnDrop(dropped_d.clone());
+        let _h_d = registry().register_handler_for(
+            owner2,
+            Arc::new(move |_| {
+                let _keep = &mark_d;
+                Ok(Json::Null)
+            }),
+        );
+
+        let res2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry().dispose_owner(owner2);
+        }));
+        assert!(
+            res2.is_ok(),
+            "dispose_owner 不得因单个回调 Drop panic 而中止其余清理"
+        );
+        assert!(
+            dropped_c.load(Ordering::SeqCst) && dropped_d.load(Ordering::SeqCst),
+            "dispose_owner 必须释放剩余全部回调"
         );
     }
 }

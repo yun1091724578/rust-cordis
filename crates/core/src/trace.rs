@@ -149,12 +149,17 @@ impl<F> ScopedCaller<F> {
     }
 }
 
-struct RestoreCaller(u64);
+pub(crate) struct RestoreCaller(u64);
 
 impl Drop for RestoreCaller {
     fn drop(&mut self) {
         CALLER_UID.with(|cell| cell.set(self.0));
     }
+}
+
+pub(crate) fn enter_caller_uid(uid: u64) -> RestoreCaller {
+    let prev = CALLER_UID.with(|cell| cell.replace(uid));
+    RestoreCaller(prev)
 }
 
 impl<F: Future + Unpin> Future for ScopedCaller<F> {

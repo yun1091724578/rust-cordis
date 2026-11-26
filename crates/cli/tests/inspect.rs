@@ -265,3 +265,82 @@ fn inspect_empty_group_never_probes_and_reports_no_rows() {
     assert_eq!(report.mounted, 0, "inspect 永不挂载（A5 的语义字段）");
     assert_eq!(cordis_host::loaded_instances(), 0, "空组也不得注册实例");
 }
+
+/// 回归（#14）：静态 `disabled: true` 行（含被禁用组内的子行）不得触发探测失败，
+/// 同时重复行标（重复 `id` 或匿名序号碰撞）必须被拒绝。
+#[test]
+fn inspect_and_validate_skip_static_disabled_rows_and_reject_duplicate_ids() {
+    cordis_host::source::set_allow_unverified(true);
+    cordis_host::set_plugin_source(Arc::new(FakeSource));
+
+    let yaml = concat!(
+        "- id: disabled-leaf\n",
+        "  name: missing-plugin-never-probed\n",
+        "  disabled: true\n",
+        "- id: disabled-group\n",
+        "  name: grp\n",
+        "  group: true\n",
+        "  disabled: true\n",
+        "  config:\n",
+        "    - id: inside-disabled-group\n",
+        "      name: also-missing-plugin\n",
+        "- id: active-agent\n",
+        "  name: agent\n",
+    );
+    let entries = cordis_host::patch::parse_entries(yaml).expect("parse");
+    let report =
+        cordis_cli::inspect_entries(&entries, &[]).expect("静态 disabled 行与禁用组子树不得被探测");
+    assert_eq!(report.rows.len(), 1);
+    assert_eq!(report.rows[0].label, "active-agent");
+
+    let path = std::env::temp_dir().join(format!(
+        "cordis-validate-disabled-{}.yml",
+        std::process::id()
+    ));
+    std::fs::write(&path, yaml).expect("write yaml");
+    let validated =
+        cordis_cli::validate_in(&path, &[], &[]).expect("validate_in 同样应跳过静态 disabled 行");
+    assert_eq!(validated.inspect.rows.len(), 1);
+    assert_eq!(validated.inspect.rows[0].label, "active-agent");
+    let _ = std::fs::remove_file(&path);
+
+    let dup_entries =
+        cordis_host::patch::parse_entries("- id: dup\n  name: agent\n- id: dup\n  name: legacy\n")
+            .expect("parse dup");
+    let err = cordis_cli::inspect_entries(&dup_entries, &[])
+        .expect_err("重复 id 必须在 inspect 阶段报错");
+    assert!(err.contains("重复"), "{err}");
+}
+
+#[test]
+fn r2_p3_validate_in_preserves_patch_warnings_when_inspect_fails() {
+    cordis_host::source::set_allow_unverified(true);
+    cordis_host::set_plugin_source(Arc::new(FakeSource));
+
+    let dir = std::env::temp_dir().join(format!(
+        "cordis-validate-warn-on-err-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("cordis.yml");
+    let patch = dir.join("patch.yml");
+    // Duplicate id forces `inspect_entries` to return `Err`, while patch targets a missing id
+    // producing a patch warning that must NOT be silently dropped on error.
+    std::fs::write(
+        &cfg,
+        "- id: dup\n  name: agent\n- id: dup\n  name: legacy\n",
+    )
+    .unwrap();
+    std::fs::write(&patch, "- op: remove\n  id: nonexistent-row-id\n").unwrap();
+
+    let err = cordis_cli::validate_in(&cfg, &[patch], &[])
+        .expect_err("duplicate id must fail validate_in");
+    assert!(err.contains("重复"), "expected inspect error: {err}");
+    assert!(
+        err.contains("nonexistent-row-id"),
+        "validate_in 失败时必须保留已收集的 patch warnings：{err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

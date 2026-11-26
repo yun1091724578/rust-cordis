@@ -34,7 +34,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "worktree add failed: $ref" }
             cargo xtask seal --root $wt --out $out
             if ($LASTEXITCODE -ne 0) { throw "seal failed: $ref" }
-            cargo xtask seal --verify $out
+            cargo xtask seal --verify $out --require-v2
             if ($LASTEXITCODE -ne 0) { throw "seal verify failed: $ref" }
           }
       - name: Run adjacent host/plugin matrix

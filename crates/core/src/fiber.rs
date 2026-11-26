@@ -47,6 +47,12 @@ use std::task::Poll;
 pub const UID_ROOT: u64 = 0;
 pub const UID_DISPOSED: u64 = u64::MAX;
 
+/// 卸载等待环的分类：直接/传递祖先消费者 vs 跨子树组合环。
+pub(crate) enum TeardownWaitCycle {
+    Ancestor(Arc<Fiber>),
+    CrossSubtree(Arc<Fiber>),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FiberState {
     /// 有 `inject` 未满足（不是"正在排队"，是"依赖没齐"）。
@@ -421,6 +427,130 @@ impl Drop for BackgroundCleanupGuard {
     }
 }
 
+struct UpdateSnapshot {
+    config: Config,
+    resolved: Config,
+    volatile: crate::volatile::VolatileTable,
+}
+
+#[derive(Default)]
+struct UpdateRollbackState {
+    /// 上一份已接受（或本轮并发 update 开始前）的基线 `(rev, snapshot)`。
+    baseline: Option<(u64, UpdateSnapshot)>,
+    in_flight: Vec<(u64, UpdateSnapshot)>,
+    /// 最新一次“已提交且尚未被否决”的 update_rev；用于 quiescence replay 判定与
+    /// 否决回滚归属判定，避免陈旧否决覆盖新提交或被否决提交触发多余 replay。
+    live_rev: u64,
+}
+
+/// 一次 `internal/update` 在飞链的 RAII 守卫（覆盖正常返回、否决、取消与 panic）。
+struct UpdateChain {
+    fiber: Arc<Fiber>,
+    rev: u64,
+    snapshot: Option<UpdateSnapshot>,
+    settled: bool,
+}
+
+impl UpdateChain {
+    fn mark_accepted(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let mut state = self.fiber.update_rollback.lock().unwrap();
+        state.in_flight.retain(|(r, _)| *r != self.rev);
+        if state.in_flight.is_empty() {
+            state.baseline = None;
+        } else if let Some(snap) = self.snapshot.take() {
+            let replace_baseline = state
+                .baseline
+                .as_ref()
+                .map(|(rev, _)| self.rev > *rev)
+                .unwrap_or(true);
+            if replace_baseline {
+                state.baseline = Some((self.rev, snap));
+            }
+        }
+    }
+
+    fn mark_vetoed(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let restore = {
+            let mut state = self.fiber.update_rollback.lock().unwrap();
+            let was_live = state.live_rev == self.rev;
+            state.in_flight.retain(|(r, _)| *r != self.rev);
+            let restore = if was_live {
+                let candidate = match (state.in_flight.last(), state.baseline.as_ref()) {
+                    (Some((r1, s1)), Some((r2, s2))) => {
+                        if r1 >= r2 {
+                            Some((*r1, s1))
+                        } else {
+                            Some((*r2, s2))
+                        }
+                    }
+                    (Some((r1, s1)), None) => Some((*r1, s1)),
+                    (None, Some((r2, s2))) => Some((*r2, s2)),
+                    (None, None) => None,
+                }
+                .map(|(target_rev, s)| {
+                    (
+                        target_rev,
+                        UpdateSnapshot {
+                            config: s.config.clone(),
+                            resolved: s.resolved.clone(),
+                            volatile: s.volatile.clone(),
+                        },
+                    )
+                });
+                if let Some((target_rev, snap)) = candidate {
+                    state.live_rev = target_rev;
+                    Some(snap)
+                } else {
+                    state.live_rev = 0;
+                    None
+                }
+            } else {
+                None
+            };
+            if state.in_flight.is_empty() {
+                state.baseline = None;
+            }
+            restore
+        };
+        if let Some(snap) = restore {
+            if !self.fiber.is_disposed() {
+                *self.fiber.config.lock().unwrap() = snap.config;
+                *self.fiber.resolved.lock().unwrap() = snap.resolved;
+                *self.fiber.volatile.lock().unwrap() = snap.volatile;
+            }
+        }
+    }
+    fn cleanup_aborted(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let mut state = self.fiber.update_rollback.lock().unwrap();
+        state.in_flight.retain(|(r, _)| *r != self.rev);
+        if state.in_flight.is_empty() {
+            state.baseline = None;
+        }
+    }
+}
+
+impl Drop for UpdateChain {
+    fn drop(&mut self) {
+        if !self.settled {
+            // 异常展开（如 on_commit panic 或 Future 取消）：只清在飞记录，不回滚已提交 config。
+            self.cleanup_aborted();
+        }
+        self.fiber.finish_update_chain(self.rev);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettleDisposition {
     /// 本次调用已同步等到状态机收敛。
@@ -625,21 +755,6 @@ impl Drop for EffectRegistration<'_> {
     }
 }
 
-/// 一条正在执行的 `internal/update` chain。
-///
-/// Drop 时递减在飞计数；如果这条 chain 已被更晚的 update 超越，标记需要
-/// quiescence replay。真正的 replay 只在最后一个 chain 结束时调度。
-struct UpdateChain {
-    fiber: Arc<Fiber>,
-    rev: u64,
-}
-
-impl Drop for UpdateChain {
-    fn drop(&mut self) {
-        self.fiber.finish_update_chain(self.rev);
-    }
-}
-
 pub struct Fiber {
     uid: AtomicU64,
     /// 创建时固定的唯一编号（不会被 `dispose()` 覆写成 `UID_DISPOSED`），用于错误归因与收集器路由。
@@ -739,6 +854,9 @@ pub struct Fiber {
     budgeted_dispose: AtomicBool,
     /// 每次 `load()` 递增的装载代次，防止上一代失败后台清理误清下一代的 `committed` 视图。
     load_gen: AtomicU64,
+    /// `unload()` 中 `wait_for_dependents` 是否已耗尽 `drain_timeout_ms` 预算并将剩余等待移交后台。
+    /// `provide` disposer 据此避免对 `Loading`/`Active`/`Pending` 消费者再次无界等待。
+    unload_drain_timed_out: AtomicBool,
     /// 前置 `dispose_effects_bounded` 超时移交后台的恢复栈计数（仅限恢复栈，不含 drain/close 观察者）。
     effect_bg_cleanups: AtomicUsize,
     effect_bg_notify: tokio::sync::Notify,
@@ -755,6 +873,8 @@ pub struct Fiber {
     update_rev: AtomicU64,
     /// 最后一个真正提交 config 的 `update_rev`。
     committed_rev: Mutex<u64>,
+    /// 并发 `update_with` 的回滚基线与在飞提交栈（保证并发否决时 `config`/`resolved`/`volatile` 原子回滚）。
+    update_rollback: Mutex<UpdateRollbackState>,
     /// 提交闸门：把“比较 update_rev + fire_commit + 赋值 + adopt”串行化。
     /// 不覆盖 `internal/update`，因此 handler 重入 update 不会死锁。
     commit_gate: tokio::sync::Mutex<()>,
@@ -820,6 +940,7 @@ impl Fiber {
             cleanup_errors: Mutex::new(Vec::new()),
             budgeted_dispose: AtomicBool::new(false),
             load_gen: AtomicU64::new(0),
+            unload_drain_timed_out: AtomicBool::new(false),
             effect_bg_cleanups: AtomicUsize::new(0),
             effect_bg_notify: tokio::sync::Notify::new(),
             cleanup_retry_scheduled: AtomicBool::new(false),
@@ -828,6 +949,7 @@ impl Fiber {
             revision: AtomicU64::new(0),
             update_rev: AtomicU64::new(0),
             committed_rev: Mutex::new(0),
+            update_rollback: Mutex::new(UpdateRollbackState::default()),
             commit_gate: tokio::sync::Mutex::new(()),
             active_chains: AtomicUsize::new(0),
             replay_owed: AtomicBool::new(false),
@@ -912,6 +1034,7 @@ impl Fiber {
             cleanup_errors: Mutex::new(Vec::new()),
             budgeted_dispose: AtomicBool::new(false),
             load_gen: AtomicU64::new(0),
+            unload_drain_timed_out: AtomicBool::new(false),
             effect_bg_cleanups: AtomicUsize::new(0),
             effect_bg_notify: tokio::sync::Notify::new(),
             cleanup_retry_scheduled: AtomicBool::new(false),
@@ -920,6 +1043,7 @@ impl Fiber {
             revision: AtomicU64::new(0),
             update_rev: AtomicU64::new(0),
             committed_rev: Mutex::new(0),
+            update_rollback: Mutex::new(UpdateRollbackState::default()),
             commit_gate: tokio::sync::Mutex::new(()),
             active_chains: AtomicUsize::new(0),
             replay_owed: AtomicBool::new(false),
@@ -934,6 +1058,10 @@ impl Fiber {
         *fiber.ctx.lock().unwrap() = Some(ctx.clone());
 
         if let Some(runtime) = &runtime {
+            // 先登记到 `Store::runtimes`，再向父 fiber 挂入子生命周期 effect：
+            // 若父 fiber 在 `try_effect_registered` 之后并发 `dispose()`，`child.dispose()`
+            // 的 `DisposeDone` 一定能在 `runtimes` 中摘除该子 fiber，避免永久泄漏。
+            store.register_fiber(runtime, &fiber);
             // 关键：**插件的生命周期本身就是父 fiber 的一个 effect**。
             // 这一行同时买到两件事：① 父卸载 → 子递归卸载；
             // ② 父子卸载顺序自动满足 LIFO（对应 JS 的 `fiber.ts:171-199`）。
@@ -966,6 +1094,7 @@ impl Fiber {
                         *fiber.parent_effect.lock().unwrap() = Some(registered);
                     }
                     Err(err) => {
+                        store.unregister_fiber(runtime, &fiber);
                         fiber.mark_effects_closed();
                         *fiber.error.lock().unwrap() = Some(err);
                         fiber.set_state(FiberState::Failed);
@@ -973,7 +1102,9 @@ impl Fiber {
                     }
                 }
             }
-            store.register_fiber(runtime, &fiber);
+            if fiber.is_disposed() {
+                return fiber;
+            }
             store.fire_plugin(&fiber);
             // ↑ 派发之后 inject 可能已被 loader 追加过，这时候才能算依赖。
             for name in fiber.inject_names() {
@@ -1316,17 +1447,9 @@ impl Fiber {
 
     /// `self` 是否是 `other` 的祖先（含父链上的任意一层）。
     ///
-    /// provide 的 disposer 用它避免"等待一个正在卸载自己的祖先"：祖先已经
-    /// 持有 driver 在等子 fiber 拆除，再回头等祖先的 `settle()` 就是死锁。
+    /// 基于创建时固化的 `ancestor_ids` 判断，无锁且不受中间节点 `clear_context()` 影响。
     pub fn is_ancestor_of(&self, other: &Arc<Fiber>) -> bool {
-        let mut cursor = other.parent_ctx().and_then(|ctx| ctx.fiber_opt());
-        while let Some(fiber) = cursor {
-            if std::ptr::eq(fiber.as_ref(), self) {
-                return true;
-            }
-            cursor = fiber.parent_ctx().and_then(|ctx| ctx.fiber_opt());
-        }
-        false
+        self.id != other.id && other.ancestor_ids.contains(&self.id)
     }
 
     /// 明确记录“祖先消费者”这一支持范围外拓扑；每个提供者只告警一次。
@@ -1349,6 +1472,165 @@ impl Fiber {
                 consumer.uid()
             ),
         );
+    }
+
+    /// 明确记录跨子树卸载等待环（所有权边与服务依赖边组合后成环）；每个提供者只告警一次。
+    pub(crate) fn warn_teardown_cycle(&self, consumer: &Arc<Fiber>) {
+        if self
+            .unsupported_ancestor_logged
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        self.store.log(
+            Level::Warn,
+            &self.name(),
+            &format!(
+                "生命周期支持范围外：提供者 <{}#{}> 等待消费者 <{}#{}> 会沿所有权与服务依赖形成卸载等待环，跳过等待；\
+                 提供者资源可能早于该消费者剩余的恢复栈关闭",
+                self.name(),
+                self.uid(),
+                consumer.name(),
+                consumer.uid()
+            ),
+        );
+    }
+
+    /// 检查 `consumer` 是否是 `self` 的直接或传递祖先消费者（沿服务依赖链 `provider -> consumer` 追溯）。
+    pub(crate) fn find_transitive_ancestor_consumer(
+        self: &Arc<Self>,
+        consumer: &Arc<Fiber>,
+    ) -> Option<Arc<Fiber>> {
+        let mut stack = vec![consumer.clone()];
+        let mut visited = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur.id) {
+                continue;
+            }
+            if cur.is_ancestor_of(self) {
+                return Some(cur);
+            }
+            for next in self.store.direct_dependents_of(&cur) {
+                if !visited.contains(&next.id) {
+                    stack.push(next);
+                }
+            }
+        }
+        None
+    }
+
+    /// 检查 `self` 在卸载时等待 `consumer` 是否会在“所有权边（父→子）∪ 有效服务依赖边（提供者→消费者）”
+    /// 的组合等待图中形成环。
+    ///
+    /// - 优先识别直接或传递祖先消费者（如 `A(父) -> U(第三方) -> P(子)`）：只在后代 `P -> U` 处断开，
+    ///   同时保留第三方提供者 `U -> A` 的正常等待顺序；
+    /// - 其次识别跨子树组合环（如 `A1(P1)` 依赖 `P2` 且 `A2(P2)` 依赖 `P1`），在组合图有效边上检测可达性。
+    pub(crate) fn detect_teardown_wait_cycle(
+        self: &Arc<Self>,
+        consumer: &Arc<Fiber>,
+    ) -> Option<TeardownWaitCycle> {
+        if let Some(ancestor) = self.find_transitive_ancestor_consumer(consumer) {
+            return Some(TeardownWaitCycle::Ancestor(ancestor));
+        }
+        let all_fibers = self.store.all_registered_fibers();
+        let mut stack = vec![consumer.clone()];
+        let mut visited = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur.id) {
+                continue;
+            }
+            for candidate in &all_fibers {
+                if cur.is_ancestor_of(candidate) {
+                    if Arc::ptr_eq(candidate, self) {
+                        return Some(TeardownWaitCycle::CrossSubtree(consumer.clone()));
+                    }
+                    if !visited.contains(&candidate.id) {
+                        stack.push(candidate.clone());
+                    }
+                }
+            }
+            for dep in self.store.direct_dependents_of(&cur) {
+                if cur.find_transitive_ancestor_consumer(&dep).is_some() {
+                    continue;
+                }
+                if Arc::ptr_eq(&dep, self) {
+                    return Some(TeardownWaitCycle::CrossSubtree(consumer.clone()));
+                }
+                if !visited.contains(&dep.id) {
+                    stack.push(dep);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn fiber_id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn unload_drain_timed_out(&self) -> bool {
+        self.unload_drain_timed_out.load(Ordering::SeqCst)
+    }
+
+    /// 读取本 fiber 的 `deps` 或 `committed` 中指向 `provider` 且未被 `cycle_blocked` 的依赖边。
+    pub(crate) fn has_recorded_dep_on(&self, provider: &Arc<Fiber>) -> bool {
+        let cycle_blocked = self.cycle_blocked.lock().unwrap().clone();
+        {
+            let deps = self.deps.lock().unwrap();
+            for (name, impl_) in deps.iter() {
+                if cycle_blocked.contains(name.as_ref()) {
+                    continue;
+                }
+                if impl_
+                    .fiber
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, provider))
+                {
+                    return true;
+                }
+            }
+        }
+        {
+            let committed = self.committed.lock().unwrap();
+            if let Some(map) = committed.as_ref() {
+                for realm_map in map.values() {
+                    for (name, impl_) in realm_map {
+                        if cycle_blocked.contains(name.as_ref()) {
+                            continue;
+                        }
+                        if impl_
+                            .fiber
+                            .upgrade()
+                            .is_some_and(|owner| Arc::ptr_eq(&owner, provider))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// 本 fiber 仍在提交视图中持有的自有 `(name, realm)` 实现（用于 `impls.remove` 后的依赖图追溯）。
+    pub(crate) fn committed_owned_with_realm(self: &Arc<Self>) -> Vec<(Box<str>, RealmId)> {
+        let committed = self.committed.lock().unwrap();
+        let Some(map) = committed.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (realm, realm_map) in map {
+            for (name, impl_) in realm_map {
+                if impl_
+                    .fiber
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, self))
+                {
+                    out.push((name.clone(), *realm));
+                }
+            }
+        }
+        out
     }
 
     /// 最近的具名祖先，否则 `"root"`（对应 JS 的 `get name()`）。
@@ -1385,8 +1667,11 @@ impl Fiber {
     }
 
     pub(crate) fn set_dep(&self, name: Box<str>, impl_: Arc<Impl>) {
-        let _graph = self.store.dependency_lock.lock().unwrap();
-        self.deps.lock().unwrap().insert(name, impl_);
+        let old = {
+            let _graph = self.store.dependency_lock.lock().unwrap();
+            self.deps.lock().unwrap().insert(name, impl_)
+        };
+        drop(old);
     }
 
     pub(crate) fn remove_dep(&self, name: &str) {
@@ -1395,8 +1680,11 @@ impl Fiber {
     }
 
     fn remove_dependency(&self, name: &str) {
-        let _graph = self.store.dependency_lock.lock().unwrap();
-        self.deps.lock().unwrap().remove(name);
+        let removed = {
+            let _graph = self.store.dependency_lock.lock().unwrap();
+            self.deps.lock().unwrap().remove(name)
+        };
+        drop(removed);
     }
 
     /// `self` 是否可以沿已解析的依赖边走到 `target`。
@@ -1437,21 +1725,26 @@ impl Fiber {
 
     /// 在全局依赖图锁内插入一条依赖边；若会形成环则拒绝。
     pub(crate) fn insert_dependency(&self, name: &str, impl_: Arc<Impl>) -> bool {
-        let _graph = self.store.dependency_lock.lock().unwrap();
-        if let Some(existing) = self.deps.lock().unwrap().get(name) {
-            if Arc::ptr_eq(existing, &impl_) {
-                return true;
+        let removed = {
+            let _graph = self.store.dependency_lock.lock().unwrap();
+            if let Some(existing) = self.deps.lock().unwrap().get(name) {
+                if Arc::ptr_eq(existing, &impl_) {
+                    return true;
+                }
             }
-        }
-        if let Some(provider) = impl_.fiber.upgrade() {
-            if !std::ptr::eq(provider.as_ref(), self)
-                && provider.dependency_reaches(std::ptr::from_ref(self))
-            {
-                self.deps.lock().unwrap().remove(name);
-                return false;
+            if let Some(provider) = impl_.fiber.upgrade() {
+                if !std::ptr::eq(provider.as_ref(), self)
+                    && provider.dependency_reaches(std::ptr::from_ref(self))
+                {
+                    let old = self.deps.lock().unwrap().remove(name);
+                    drop(_graph);
+                    drop(old);
+                    return false;
+                }
             }
-        }
-        self.deps.lock().unwrap().insert(name.into(), impl_);
+            self.deps.lock().unwrap().insert(name.into(), impl_)
+        };
+        drop(removed);
         true
     }
 
@@ -1484,14 +1777,19 @@ impl Fiber {
 
     /// 从提交视图里摘掉一条（`reflect.ts:202`，在依赖者全部拆完之后才调用）。
     pub(crate) fn committed_remove(&self, name: &str, realm: RealmId) {
-        if let Some(map) = self.committed.lock().unwrap().as_mut() {
-            if let Some(realm_map) = map.get_mut(&realm) {
-                realm_map.remove(name);
-                if realm_map.is_empty() {
+        let removed = {
+            let mut committed = self.committed.lock().unwrap();
+            committed.as_mut().and_then(|map| {
+                let removed = map
+                    .get_mut(&realm)
+                    .and_then(|realm_map| realm_map.remove(name));
+                if map.get(&realm).is_some_and(HashMap::is_empty) {
                     map.remove(&realm);
                 }
-            }
-        }
+                removed
+            })
+        };
+        drop(removed);
     }
 
     /// 重拍提交视图：把当前的实时解析表按域分组冻结一份（`fiber.ts:421`）。
@@ -1503,7 +1801,8 @@ impl Fiber {
         for (name, impl_) in snapshot {
             view.entry(impl_.realm).or_default().insert(name, impl_);
         }
-        *self.committed.lock().unwrap() = Some(view);
+        let old = self.committed.lock().unwrap().replace(view);
+        drop(old);
     }
 
     /// 是否声明了**必需**依赖。依赖解析、通知与激活判定只认这一种。
@@ -1574,7 +1873,23 @@ impl Fiber {
                     match impl_.check.clone() {
                         Some(check) => {
                             let value = impl_.get();
-                            check(&value)
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                check(&value)
+                            })) {
+                                Ok(passed) => passed,
+                                Err(payload) => {
+                                    let reason = format!(
+                                        "服务 \"{name}\" 的 Check 谓词 panic: {}",
+                                        crate::panic_message(&*payload)
+                                    );
+                                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                        || {
+                                            self.store.log(Level::Error, &self.name(), &reason);
+                                        },
+                                    ));
+                                    false
+                                }
+                            }
                         }
                         None => true,
                     }
@@ -1628,7 +1943,7 @@ impl Fiber {
     /// 如果不挡住，就会出现"已 dispose 的提供者被复活、把服务重新注册回来、
     /// 依赖者跟着复活"的幽灵重载。
     pub fn refresh_desired(&self) {
-        if self.is_disposed() {
+        if self.is_disposed() || self.runtime.is_none() {
             *self.desired.lock().unwrap() = None;
             return;
         }
@@ -1690,14 +2005,13 @@ impl Fiber {
         F: FnOnce(Ctx) -> Result<Disposable> + Send + 'static,
     {
         let state = self.state();
-        assert!(
-            state != FiberState::Disposed && state != FiberState::Unloading,
-            "cannot create effect on inactive context"
-        );
-        let _registration = self.begin_effect().unwrap_or_else(|err| panic!("{err}"));
-        let ctx = self
-            .ctx_opt()
-            .expect("fiber is disposed: its context is gone");
+        if state == FiberState::Disposed || state == FiberState::Unloading {
+            return Err("cannot create effect on inactive context".into());
+        }
+        let _registration = self.begin_effect()?;
+        let Some(ctx) = self.ctx_opt() else {
+            return Err("fiber is disposed: its context is gone".into());
+        };
         Ok(self.track_effect(setup(ctx)?).disposable)
     }
 
@@ -2161,6 +2475,9 @@ impl Fiber {
                 if this.error.lock().unwrap().is_some() {
                     break;
                 }
+                if this.runtime.is_none() {
+                    break;
+                }
                 let desired = *this.desired.lock().unwrap();
                 let running = *this.running.lock().unwrap();
                 if desired == running {
@@ -2182,7 +2499,8 @@ impl Fiber {
                         this.close_effects().await;
                         this.dispose_native_tasks(None, None).await;
                         this.dispose_effects().await;
-                        *this.committed.lock().unwrap() = None;
+                        let old_committed = this.committed.lock().unwrap().take();
+                        drop(old_committed);
                         this.set_state(FiberState::Failed);
                     }
                 } else {
@@ -2224,6 +2542,9 @@ impl Fiber {
     }
 
     async fn load(self: &Arc<Self>, epoch: u64) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
         let gen = self.load_gen.fetch_add(1, Ordering::SeqCst) + 1;
         // 上一轮卸载/失败会关闭闸门；新装载重新开放 effect 登记（已处置则直接退出）。
         if !self.open_effects() {
@@ -2240,9 +2561,6 @@ impl Fiber {
             return;
         }
         let Some(ctx) = self.ctx_opt() else { return };
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
         let raw = self.config.lock().unwrap().clone();
         let resolved = match self.store.resolve_config(&ctx, &runtime, raw).await {
             Ok(config) => config,
@@ -2351,14 +2669,16 @@ impl Fiber {
         }) else {
             self.dispose_effects().await;
             if self.load_gen.load(Ordering::SeqCst) == gen {
-                *self.committed.lock().unwrap() = None;
+                let old_committed = self.committed.lock().unwrap().take();
+                drop(old_committed);
             }
             return Ok(());
         };
         let mut entries = std::mem::take(&mut *self.disposables.lock().unwrap());
         if entries.is_empty() {
             if self.load_gen.load(Ordering::SeqCst) == gen {
-                *self.committed.lock().unwrap() = None;
+                let old_committed = self.committed.lock().unwrap().take();
+                drop(old_committed);
             }
             return Ok(());
         }
@@ -2383,7 +2703,8 @@ impl Fiber {
             let _effect_bg = effect_bg_guard;
             this.run_disposable_entries(entries).await;
             if this.load_gen.load(Ordering::SeqCst) == gen {
-                *this.committed.lock().unwrap() = None;
+                let old_committed = this.committed.lock().unwrap().take();
+                drop(old_committed);
             }
             // 先销账再唤醒 `done_rx`，消除未超时路径上 `pending_background_cleanups() > 0` 的竞态窗。
             drop(bg_guard);
@@ -2442,6 +2763,7 @@ impl Fiber {
         if self.is_disposed_quiescent() {
             return;
         }
+        self.unload_drain_timed_out.store(false, Ordering::SeqCst);
         self.set_state(FiberState::Unloading);
         // 先关门，确保没有迟到的 effect / 原生任务登记；再取消并等待本 fiber
         // 自己的后台任务（它们可能正调用即将拆除的依赖），然后等依赖者拆完，
@@ -2460,7 +2782,8 @@ impl Fiber {
             self.dispose_effects().await;
             self.wait_effect_background_cleanups().await;
             // 提交视图在**所有 disposer（含前置超时移交后台的恢复栈）都跑完之后**才清空（`fiber.ts:459`）。
-            *self.committed.lock().unwrap() = None;
+            let old_committed = self.committed.lock().unwrap().take();
+            drop(old_committed);
             *self.running.lock().unwrap() = None;
             self.set_state(FiberState::Disposed);
             return;
@@ -2518,8 +2841,15 @@ impl Fiber {
                 if Arc::ptr_eq(&fiber, self) || fiber.is_cycle_blocked(name.as_ref()) {
                     continue;
                 }
-                if fiber.is_ancestor_of(self) {
-                    self.warn_ancestor_consumer(&fiber);
+                if let Some(cycle) = self.detect_teardown_wait_cycle(&fiber) {
+                    match cycle {
+                        TeardownWaitCycle::Ancestor(ancestor) => {
+                            self.warn_ancestor_consumer(&ancestor);
+                        }
+                        TeardownWaitCycle::CrossSubtree(blocking) => {
+                            self.warn_teardown_cycle(&blocking);
+                        }
+                    }
                     continue;
                 }
                 if seen.insert(fiber.id) {
@@ -2559,6 +2889,7 @@ impl Fiber {
                 .is_err()
             {
                 let rest: Vec<Arc<Fiber>> = iter.collect();
+                self.unload_drain_timed_out.store(true, Ordering::SeqCst);
                 let budget_ms = budget.map(|d| d.as_millis()).unwrap_or(0);
                 let reason = format!(
                     "等待依赖者 <{}#{}> 卸载超时（预算 {budget_ms} ms，仍有 {} 个依赖者在后台清理）",
@@ -2671,13 +3002,21 @@ impl Fiber {
         if self.is_disposed() {
             return Err("cannot restart disposed fiber".into());
         }
+        if self.runtime.is_none() {
+            return Err("cannot restart root fiber".into());
+        }
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.refresh_desired();
         match self.settle_inner().await {
-            SettleDisposition::Completed => match self.error() {
-                Some(err) => Err(err.into()),
-                None => Ok(()),
-            },
+            SettleDisposition::Completed => {
+                if self.is_disposed() {
+                    return Err("cannot restart disposed fiber".into());
+                }
+                match self.error() {
+                    Some(err) => Err(err.into()),
+                    None => Ok(()),
+                }
+            }
             SettleDisposition::Deferred => Err(Box::new(ReloadDeferred::scheduled(self.name()))),
             SettleDisposition::DeferredNoRuntime => {
                 Err(Box::new(ReloadDeferred::unscheduled(self.name())))
@@ -2716,6 +3055,9 @@ impl Fiber {
         if self.is_disposed() {
             return Err("cannot update disposed fiber".into());
         }
+        if self.runtime.is_none() {
+            return Err("cannot update root fiber".into());
+        }
         // 同步取号：并发 update 的“新旧”由此决定，而不是由解析/派发完成顺序决定。
         let my_rev = self.update_rev.fetch_add(1, Ordering::SeqCst) + 1;
         let loaded = self.running.lock().unwrap().is_some();
@@ -2741,12 +3083,15 @@ impl Fiber {
         // `update_rev` 更大的那一份能落地。被超越的调用返回 Superseded，不派发
         // handler，避免它把旧配置写进插件状态。
         let mut did_commit = false;
-        let mut previous = None;
+        let mut chain: Option<UpdateChain> = None;
         {
             // 串行化提交，避免两个 resolve 乱序完成后“旧值后写”。committed_rev
             // 只在这一小段内持有；fire_commit/adopt 不持 committed_rev 锁，
             // 防止提交观察者重入 update 时自锁。
             let _commit = self.commit_gate.lock().await;
+            if self.is_disposed() {
+                return Err("cannot update disposed fiber".into());
+            }
             let latest = {
                 let mut committed_rev = self.committed_rev.lock().unwrap();
                 if my_rev > *committed_rev {
@@ -2757,23 +3102,52 @@ impl Fiber {
                 }
             };
             if latest {
+                // `adopt_resolved` 会重建 volatile 引用表；若并发 `internal/update` 随后否决，
+                // 必须把前一份（或基线）的 `(config, resolved, volatile)` 原子还原。
+                let pre_commit = loaded.then(|| UpdateSnapshot {
+                    config: self.config.lock().unwrap().clone(),
+                    resolved: self.resolved.lock().unwrap().clone(),
+                    volatile: self.volatile.lock().unwrap().clone(),
+                });
                 // 赋值在派发之前（上游 `fiber.ts:492`），避免 `fire_commit` 观察者 panic 导致
                 // `committed_rev` 已推进但 `config`/`resolved`/`error` 仍停在旧值。
                 *self.config.lock().unwrap() = config.clone();
-                // `adopt_resolved` 会重建 volatile 引用表；若 `internal/update` 随后否决，
-                // 必须把**旧表原样**放回去——重建会换 `Arc`，插件缓存的引用就再也写不到了。
-                previous = loaded.then(|| {
-                    (
-                        self.resolved.lock().unwrap().clone(),
-                        self.volatile.lock().unwrap().clone(),
-                    )
-                });
                 // 已解析的那一份同样推进（volatile 的候选比较拿它当基准，M4-5）。
                 if loaded {
                     let runtime = self.runtime.clone();
                     if let Some(runtime) = runtime {
                         self.adopt_resolved(&resolved, &runtime);
                     }
+                    let snap = UpdateSnapshot {
+                        config: config.clone(),
+                        resolved: self.resolved.lock().unwrap().clone(),
+                        volatile: self.volatile.lock().unwrap().clone(),
+                    };
+                    {
+                        let mut rb = self.update_rollback.lock().unwrap();
+                        if rb.in_flight.is_empty() {
+                            let base_rev = rb.live_rev;
+                            rb.baseline = pre_commit.map(|s| (base_rev, s));
+                        }
+                        rb.in_flight.push((
+                            my_rev,
+                            UpdateSnapshot {
+                                config: snap.config.clone(),
+                                resolved: snap.resolved.clone(),
+                                volatile: snap.volatile.clone(),
+                            },
+                        ));
+                        rb.live_rev = my_rev;
+                    }
+                    // 立即建立 RAII 守卫：即便 `fire_commit_async` 被取消/panic 或并发 dispose，
+                    // 也能及时清理 `in_flight` 与 `active_chains`。
+                    self.active_chains.fetch_add(1, Ordering::SeqCst);
+                    chain = Some(UpdateChain {
+                        fiber: self.clone(),
+                        rev: my_rev,
+                        snapshot: Some(snap),
+                        settled: false,
+                    });
                 }
                 *self.error.lock().unwrap() = None; // FAILED 的唯一恢复路径
                 did_commit = true;
@@ -2785,16 +3159,18 @@ impl Fiber {
         if !did_commit {
             return Ok(UpdateOutcome::Superseded);
         }
+        if self.is_disposed() {
+            if let Some(mut chain) = chain {
+                chain.mark_vetoed();
+            }
+            return Err("cannot update disposed fiber".into());
+        }
 
-        if loaded {
-            // RAII：无论 handler 正常返回、否决还是 panic 展开，都会递减在飞计数
-            // 并在被超越时标记 replay。
-            self.active_chains.fetch_add(1, Ordering::SeqCst);
-            let _chain = UpdateChain {
-                fiber: self.clone(),
-                rev: my_rev,
+        if let Some(mut chain) = chain {
+            let Some(ctx) = self.ctx_opt() else {
+                chain.mark_vetoed();
+                return Err("cannot update disposed fiber".into());
             };
-            let ctx = self.ctx();
             let tail_resolved = resolved.clone();
             let tail: BoxFuture<Ret> = Box::pin(async move { Some(Dyn::new(tail_resolved)) });
             let args: Args = vec![
@@ -2813,27 +3189,34 @@ impl Fiber {
                     None,
                 )
                 .await;
+            if self.is_disposed() {
+                chain.mark_vetoed();
+                return Err("cannot update disposed fiber".into());
+            }
             if result.is_none() {
                 // 被 update 钩子否决：不重启，也不报错（上游 `fiber.ts:499`）。
-                // 只有这次提交仍是最新提交时才回滚；否则旧否决会把新 update
-                // 已经 adopt 的 resolved/volatile 一起打回去。
-                if *self.committed_rev.lock().unwrap() == my_rev {
-                    if let Some((old_resolved, old_volatile)) = previous {
-                        *self.resolved.lock().unwrap() = old_resolved;
-                        *self.volatile.lock().unwrap() = old_volatile;
-                    }
-                }
+                // 回滚 `config` / `resolved` / `volatile` 到最新仍在飞的前置提交或基线。
+                chain.mark_vetoed();
                 return Ok(UpdateOutcome::Vetoed);
             }
+            chain.mark_accepted();
         }
 
+        if self.is_disposed() {
+            return Err("cannot update disposed fiber".into());
+        }
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.refresh_desired();
         match self.settle_inner().await {
-            SettleDisposition::Completed => match self.error() {
-                Some(err) => Err(err.into()),
-                None => Ok(UpdateOutcome::Restarted),
-            },
+            SettleDisposition::Completed => {
+                if self.is_disposed() {
+                    return Err("cannot update disposed fiber".into());
+                }
+                match self.error() {
+                    Some(err) => Err(err.into()),
+                    None => Ok(UpdateOutcome::Restarted),
+                }
+            }
             SettleDisposition::Deferred => Err(Box::new(ReloadDeferred::scheduled(self.name()))),
             SettleDisposition::DeferredNoRuntime => {
                 Err(Box::new(ReloadDeferred::unscheduled(self.name())))
@@ -2872,7 +3255,8 @@ impl Fiber {
             .active_chains
             .fetch_sub(1, Ordering::SeqCst)
             .saturating_sub(1);
-        if rev < self.update_rev.load(Ordering::SeqCst) {
+        let live_rev = self.update_rollback.lock().unwrap().live_rev;
+        if rev < live_rev {
             self.replay_owed.store(true, Ordering::SeqCst);
         }
         if remaining == 0 {
@@ -3154,6 +3538,7 @@ impl Fiber {
 
     async fn finish_dispose(self: &Arc<Self>) {
         self.settle().await;
+        self.store.fire_plugin_dispose_async(self).await;
         // `unload` 已按终态收敛；这里再确认一次，避免未来改动把终态次序改坏。
         self.set_state(FiberState::Disposed);
         self.clear_context();
@@ -3191,7 +3576,8 @@ impl Fiber {
         } else {
             drain.dispose_effects().await;
         }
-        *self.committed.lock().unwrap() = None;
+        let old_committed = self.committed.lock().unwrap().take();
+        drop(old_committed);
         *self.running.lock().unwrap() = None;
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.set_state(FiberState::Disposed);

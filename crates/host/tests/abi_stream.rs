@@ -852,3 +852,137 @@ async fn sync_status_err_on_t2_call_and_call_stream_preserves_error_payload() {
 
     app.close().await;
 }
+
+/// 回归（#8）：当流窗口已满（STREAM_WINDOW 块均未读出）时，提供者调用 `ctx_fulfill`
+/// 或直接返回最终 `{"ret": ...}` 必须把最后一件尾随送达消费者，不得因忽略 `PushOutcome::Full` 而静默丢弃。
+#[tokio::test]
+async fn fulfill_and_ready_on_full_stream_window_deliver_final_value() {
+    use cordis_abi::STATUS_OK;
+
+    static FULL_DISPATCH: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+    unsafe extern "C" fn full_window_plugin(
+        handle: u64,
+        op: u32,
+        a: Blob,
+        _: Blob,
+        out: *mut Out,
+    ) -> i32 {
+        match op {
+            OP_APPLY => {
+                let mut raw = [0u8; 256];
+                let mut probe = Out {
+                    ptr: raw.as_mut_ptr(),
+                    cap: raw.len(),
+                    len: 0,
+                };
+                match host_api().ctx_provide_iface {
+                    Some(provide) => provide(
+                        handle,
+                        Blob::new(b"full@1"),
+                        1,
+                        Blob::new(br#"["fulfill_full","ready_full"]"#),
+                        41,
+                        &mut probe,
+                    ),
+                    None => STATUS_UNSUPPORTED,
+                }
+            }
+            OP_CALLBACK => {
+                let payload: Value = serde_json::from_slice(a.as_bytes()).unwrap_or(Value::Null);
+                let method = payload.get("method").and_then(Value::as_str).unwrap_or("");
+                let dispatch = payload
+                    .get("dispatch_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                // 连续推满 STREAM_WINDOW 块（消费者尚未取走任何一块）。
+                if let Some(push) = host_api().ctx_stream_push {
+                    for idx in 1..=STREAM_WINDOW {
+                        let body = json!(idx).to_string();
+                        let mut raw = [0u8; 128];
+                        let mut probe = Out {
+                            ptr: raw.as_mut_ptr(),
+                            cap: raw.len(),
+                            len: 0,
+                        };
+                        let status =
+                            push(handle, dispatch, Blob::new(body.as_bytes()), 42, &mut probe);
+                        if status != STATUS_OK {
+                            return status;
+                        }
+                    }
+                }
+                if method == "fulfill_full" {
+                    *FULL_DISPATCH.lock().unwrap() = (handle, dispatch);
+                    STATUS_PENDING
+                } else {
+                    (*out).write(br#"{"ret":"ready-tail"}"#)
+                }
+            }
+            OP_DISPOSE => (*out).write(b""),
+            _ => STATUS_UNSUPPORTED,
+        }
+    }
+
+    let app = App::new();
+    let fiber = app.root.plugin(
+        abi_plugin("full-window-stream", full_window_plugin),
+        Config::Null,
+    );
+    fiber.settle().await;
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    // 1. 满窗 + 同步 Ready 返回值。
+    let mut ready_stream = app
+        .root
+        .call_iface_stream("full@1", 1, "ready_full", json!([]))
+        .expect("ready_full stream");
+    let mut got_ready = Vec::new();
+    while let Some(item) = ready_stream.next().await.expect("ready_full next") {
+        got_ready.push(item);
+    }
+    assert_eq!(
+        got_ready,
+        vec![json!(1), json!(2), json!(3), json!(4), json!("ready-tail")],
+        "满窗同步 Ready 必须把最后一件尾随送达"
+    );
+
+    // 2. 满窗 + 异步 ctx_fulfill。
+    let mut fulfill_stream = app
+        .root
+        .call_iface_stream("full@1", 1, "fulfill_full", json!([]))
+        .expect("fulfill_full stream");
+    let (handle, dispatch) = *FULL_DISPATCH.lock().unwrap();
+    assert_ne!(dispatch, 0);
+    let mut raw = [0u8; 256];
+    let mut out = Out {
+        ptr: raw.as_mut_ptr(),
+        cap: raw.len(),
+        len: 0,
+    };
+    let status = unsafe {
+        (host_api().ctx_fulfill.unwrap())(
+            handle,
+            dispatch,
+            Blob::new(br#""fulfill-tail""#),
+            &mut out,
+        )
+    };
+    assert_eq!(status, STATUS_OK);
+    let mut got_fulfill = Vec::new();
+    while let Some(item) = fulfill_stream.next().await.expect("fulfill_full next") {
+        got_fulfill.push(item);
+    }
+    assert_eq!(
+        got_fulfill,
+        vec![
+            json!(1),
+            json!(2),
+            json!(3),
+            json!(4),
+            json!("fulfill-tail")
+        ],
+        "满窗 ctx_fulfill 必须把最后一件尾随送达"
+    );
+    app.close().await;
+}

@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex, Weak};
 struct Probe;
 
 static WEAK: Mutex<Option<Weak<Probe>>> = Mutex::new(None);
+static EFFECT_WEAK: Mutex<Option<Weak<Probe>>> = Mutex::new(None);
+static CLEANUP_ORDER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
 #[tokio::test]
 async fn failed_apply_releases_sdk_callbacks_registered_before_the_error() {
@@ -34,6 +36,15 @@ async fn failed_apply_releases_sdk_callbacks_registered_before_the_error() {
             ctx.on("apply/fail", move |_args| {
                 let _held = probe.clone();
                 Ok(json!(null))
+            })?;
+            let effect_probe = Arc::new(Probe);
+            *EFFECT_WEAK.lock().unwrap() = Some(Arc::downgrade(&effect_probe));
+            ctx.effect(move || {
+                let _held = &effect_probe;
+                CLEANUP_ORDER.lock().unwrap().push("first");
+            })?;
+            ctx.effect(move || {
+                CLEANUP_ORDER.lock().unwrap().push("second");
             })?;
             Err("intentional apply failure".to_string())
         },
@@ -76,6 +87,20 @@ async fn failed_apply_releases_sdk_callbacks_registered_before_the_error() {
             .and_then(Weak::upgrade)
             .is_none(),
         "失败 apply 注册的 SDK 回调必须释放它捕获的对象"
+    );
+    assert_eq!(
+        *CLEANUP_ORDER.lock().unwrap(),
+        vec!["second", "first"],
+        "失败 apply 注册的 ctx.effect 清理闭包必须按 LIFO 顺序真正执行而非静默丢弃"
+    );
+    assert!(
+        EFFECT_WEAK
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_none(),
+        "ctx.effect 清理闭包执行完毕后必须释放其捕获的对象"
     );
 
     fiber.dispose().await;

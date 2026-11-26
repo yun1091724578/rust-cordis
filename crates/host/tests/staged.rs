@@ -154,3 +154,27 @@ fn staged_ledger_returns_to_baseline_across_many_rounds() {
     assert_eq!(staged_leaked(), before, "64 轮后台账必须回到基线");
     let _ = std::fs::remove_file(&source);
 }
+
+/// R2 P2: `stage_plugin` 必须把暂存副本写入宿主私有的隔离目录，而不是插件源目录旁边。
+#[test]
+fn r2_p2_stage_plugin_uses_private_dir_outside_source_dir() {
+    let _serial = serial();
+    let before = staged_leaked();
+    let source = fixture_source("private-stage-dir");
+    let staged = stage_plugin(&source, unique_revision()).expect("暂存假文件必然成功");
+    assert_ne!(
+        staged.parent(),
+        source.parent(),
+        "暂存副本不得落在插件源目录旁边（防止 TOCTOU / 只读源目录失败）：staged={} source={}",
+        staged.display(),
+        source.display()
+    );
+    assert_eq!(
+        std::fs::read(&staged).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    drop(StagedFile::new(&staged));
+    assert!(!staged.exists());
+    assert_eq!(staged_leaked(), before);
+    let _ = std::fs::remove_file(&source);
+}

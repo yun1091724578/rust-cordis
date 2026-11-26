@@ -60,13 +60,60 @@ impl Drop for StagedFile {
     }
 }
 
-/// 插件名 → 动态库路径，带**版本化的临时副本**。
+/// 创建或复用当前进程独占的私有暂存目录（Unix 上强制 `0o700`，非递归原子建目录，
+/// 防止在共享临时目录中被预先占位或符号链接劫持，也避免污染只读/可被外部篡改的插件源目录）。
+fn private_staging_dir() -> Result<PathBuf> {
+    static STAGING_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    static DIR_NONCE: AtomicU64 = AtomicU64::new(0);
+    let slot = STAGING_DIR.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(dir) = guard.as_ref() {
+        if let Ok(meta) = std::fs::symlink_metadata(dir) {
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                return Ok(dir.clone());
+            }
+        }
+    }
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for _ in 0..64 {
+        let seq = DIR_NONCE.fetch_add(1, Ordering::SeqCst);
+        let candidate = base.join(format!("cordis-stage-{pid}-{nanos:x}-{seq}"));
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&candidate) {
+            Ok(()) => {
+                *guard = Some(candidate.clone());
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(
+                    format!("创建宿主私有暂存目录 {} 失败: {err}", candidate.display()).into(),
+                );
+            }
+        }
+    }
+    Err("创建宿主私有暂存目录失败：连续命名冲突".into())
+}
+
+/// 插件名 → 动态库路径，带**版本化的临时副本**（落在宿主私有暂存目录内）。
 ///
 /// # 为什么要有副本
 /// Windows 上已加载的 DLL 被文件系统锁住，无法原地覆盖；Linux 上覆盖已映射的
 /// `.so` 也会让进程处于未定义状态。热重载因此必须把新库落到一个**新文件名**，
 /// 让旧句柄继续指向旧文件、新句柄指向新文件，等旧 fiber 全部卸载后旧文件才可回收。
-/// 这不是技巧，是动态加载的硬约束——任何支持热重载的插件系统都会撞上它。
+/// 把副本落在宿主私有暂存目录（而非源插件目录旁边），既允许源目录只读，也防止同目录
+/// 竞态篡改（TOCTOU）。
 pub fn stage_plugin(path: &Path, revision: u64) -> Result<PathBuf> {
     let stem = path
         .file_stem()
@@ -88,9 +135,26 @@ pub fn stage_plugin(path: &Path, revision: u64) -> Result<PathBuf> {
         Some(extension) => format!("{stem}.{unique}.r{revision}.{extension}"),
         None => format!("{stem}.{unique}.r{revision}"),
     };
-    let target = path.with_file_name(file_name);
-    std::fs::copy(path, &target)
-        .map_err(|err| format!("复制插件到 {} 失败: {err}", target.display()))?;
+    let stage_dir = private_staging_dir()?;
+    let target = stage_dir.join(file_name);
+    let mut src = std::fs::File::open(path)
+        .map_err(|err| format!("打开源插件 {} 失败: {err}", path.display()))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut dst = opts
+        .open(&target)
+        .map_err(|err| format!("创建暂存副本 {} 失败: {err}", target.display()))?;
+    if let Err(err) = std::io::copy(&mut src, &mut dst) {
+        drop(dst);
+        let _ = std::fs::remove_file(&target);
+        return Err(format!("复制插件到 {} 失败: {err}", target.display()).into());
+    }
+    drop(dst);
     // 副本落地即入泄漏台账（G11）：在它被 `StagedFile` 认领之前，
     // 它就是一笔潜在的泄漏——认领发生在 `LoadedPlugin::open_staged`。
     staged_unadopted().lock().unwrap().insert(target.clone());

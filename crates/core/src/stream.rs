@@ -118,6 +118,8 @@ struct Life {
     outcome: Option<StreamOutcome>,
     /// 失败/放弃时给消费者看的错误（保留首次读取的具体错误类型）。
     fault: Option<StreamFault>,
+    /// 窗口已满时随 `close_with` 附带的最后一件值（流同时进入 `Closed`，不再接受新块）。
+    trailing: Option<Value>,
     /// 等待中的 credit 回调 id（"满了 ⇒ 记下它 ⇒ 每取走一块唤醒一个"）。
     waiting: VecDeque<u64>,
 }
@@ -133,6 +135,7 @@ impl StreamState {
             life.outcome = Some(outcome.clone());
             if fault.is_some() {
                 life.fault = fault;
+                life.trailing = None;
             }
             life.waiting.drain(..).collect::<Vec<_>>()
         };
@@ -176,6 +179,7 @@ impl StreamSink {
             life: Mutex::new(Life {
                 outcome: None,
                 fault: None,
+                trailing: None,
                 waiting: VecDeque::new(),
             }),
             gone: AtomicBool::new(false),
@@ -207,7 +211,8 @@ impl StreamSink {
 
     /// 缓冲里当前的块数（诊断用）。
     pub fn buffered(&self) -> usize {
-        self.tx.max_capacity() - self.tx.capacity()
+        let trailing = usize::from(self.state.life.lock().unwrap().trailing.is_some());
+        (self.tx.max_capacity() - self.tx.capacity()) + trailing
     }
 
     /// 还有几个等待中的 credit 回调（诊断用）。
@@ -316,6 +321,38 @@ impl StreamSink {
         }
     }
 
+    /// 原子补上最后一件值并正常收尾（用于 `ctx_fulfill` / 同步返回值的流路径）。
+    ///
+    /// 若通道缓冲此刻已满，最后一件值保存在流终态的单一 `trailing` 槽位中，
+    /// 由消费者读完通道缓冲后紧接着读出，再收到 `Ok(None)`——绝不因窗口满而静默丢件；
+    /// 流同时立即进入 `Closed`，不会绕过背压上限。
+    pub fn close_with(&self, chunk: Value) -> PushOutcome {
+        let waiting = {
+            let mut life = self.state.life.lock().unwrap();
+            if life.outcome.is_some() || self.state.gone.load(Ordering::SeqCst) {
+                return PushOutcome::Gone;
+            }
+            match self.tx.try_send(chunk) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(chunk)) => {
+                    life.trailing = Some(chunk);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    drop(life);
+                    self.state.gone.store(true, Ordering::SeqCst);
+                    return PushOutcome::Gone;
+                }
+            }
+            life.outcome = Some(StreamOutcome::Closed);
+            life.waiting.drain(..).collect::<Vec<_>>()
+        };
+        self.state.done.send_replace(true);
+        if let Some(observer) = self.state.observer.get() {
+            observer.finished(&StreamOutcome::Closed, waiting);
+        }
+        PushOutcome::Sent
+    }
+
     /// 失败收尾：消费者**立刻**读到这条理由（缓冲丢弃）。
     pub fn fail(&self, reason: impl Into<String>) -> PushOutcome {
         let reason = reason.into();
@@ -383,6 +420,7 @@ impl AsyncStream {
             // 的窗口，或"看到 EOF ⇒ 发送者提交一块"的倒序。
             enum Step {
                 Data(Value),
+                Trailing(Value),
                 End,
                 Fault(crate::Error),
                 Wait,
@@ -394,9 +432,17 @@ impl AsyncStream {
                 } else {
                     match self.rx.try_recv() {
                         Ok(chunk) => Step::Data(chunk),
-                        Err(mpsc::error::TryRecvError::Disconnected) => Step::End,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            if let Some(last) = life.trailing.take() {
+                                Step::Trailing(last)
+                            } else {
+                                Step::End
+                            }
+                        }
                         Err(mpsc::error::TryRecvError::Empty) => {
-                            if life.outcome.is_some() {
+                            if let Some(last) = life.trailing.take() {
+                                Step::Trailing(last)
+                            } else if life.outcome.is_some() {
                                 Step::End
                             } else {
                                 Step::Wait
@@ -410,6 +456,7 @@ impl AsyncStream {
                     self.credit();
                     return Ok(Some(chunk));
                 }
+                Step::Trailing(chunk) => return Ok(Some(chunk)),
                 Step::End => return self.end(),
                 Step::Fault(fault) => return Err(fault),
                 Step::Wait => {}
@@ -426,7 +473,15 @@ impl AsyncStream {
                         self.credit();
                         return Ok(Some(chunk));
                     }
-                    None => return self.end(),
+                    None => {
+                        if let Some(fault) = self.state.take_fault() {
+                            return Err(fault);
+                        }
+                        if let Some(last) = self.state.life.lock().unwrap().trailing.take() {
+                            return Ok(Some(last));
+                        }
+                        return self.end();
+                    }
                 },
                 _ = done.changed() => continue,
             }

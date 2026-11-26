@@ -546,9 +546,19 @@ impl Parser<'_> {
         Ok(cond)
     }
 
+    fn push_chain_depth(&mut self) -> std::result::Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(format!("表达式嵌套过深（超过 {MAX_DEPTH} 层）"));
+        }
+        Ok(())
+    }
+
     fn parse_nullish(&mut self) -> std::result::Result<Node, String> {
+        let start_depth = self.depth;
         let mut left = self.parse_or()?;
         while self.eat_punct("??") {
+            self.push_chain_depth()?;
             let right = self.parse_or()?;
             left = Node::Binary {
                 op: BinOp::Coalesce,
@@ -556,12 +566,15 @@ impl Parser<'_> {
                 right: Box::new(right),
             };
         }
+        self.depth = start_depth;
         Ok(left)
     }
 
     fn parse_or(&mut self) -> std::result::Result<Node, String> {
+        let start_depth = self.depth;
         let mut left = self.parse_and()?;
         while self.eat_punct("||") {
+            self.push_chain_depth()?;
             let right = self.parse_and()?;
             left = Node::Binary {
                 op: BinOp::Or,
@@ -569,12 +582,15 @@ impl Parser<'_> {
                 right: Box::new(right),
             };
         }
+        self.depth = start_depth;
         Ok(left)
     }
 
     fn parse_and(&mut self) -> std::result::Result<Node, String> {
+        let start_depth = self.depth;
         let mut left = self.parse_equality()?;
         while self.eat_punct("&&") {
+            self.push_chain_depth()?;
             let right = self.parse_equality()?;
             left = Node::Binary {
                 op: BinOp::And,
@@ -582,10 +598,12 @@ impl Parser<'_> {
                 right: Box::new(right),
             };
         }
+        self.depth = start_depth;
         Ok(left)
     }
 
     fn parse_equality(&mut self) -> std::result::Result<Node, String> {
+        let start_depth = self.depth;
         let mut left = self.parse_relational()?;
         loop {
             let op = if self.eat_punct("===") {
@@ -597,8 +615,10 @@ impl Parser<'_> {
             } else if self.eat_punct("!=") {
                 BinOp::Ne
             } else {
+                self.depth = start_depth;
                 return Ok(left);
             };
+            self.push_chain_depth()?;
             let right = self.parse_relational()?;
             left = Node::Binary {
                 op,
@@ -609,6 +629,7 @@ impl Parser<'_> {
     }
 
     fn parse_relational(&mut self) -> std::result::Result<Node, String> {
+        let start_depth = self.depth;
         let mut left = self.parse_additive()?;
         loop {
             let op = if self.eat_punct("<=") {
@@ -620,8 +641,10 @@ impl Parser<'_> {
             } else if self.eat_punct(">") {
                 BinOp::Gt
             } else {
+                self.depth = start_depth;
                 return Ok(left);
             };
+            self.push_chain_depth()?;
             let right = self.parse_additive()?;
             left = Node::Binary {
                 op,
@@ -632,6 +655,7 @@ impl Parser<'_> {
     }
 
     fn parse_additive(&mut self) -> std::result::Result<Node, String> {
+        let start_depth = self.depth;
         let mut left = self.parse_multiplicative()?;
         loop {
             let op = if self.eat_punct("+") {
@@ -639,8 +663,10 @@ impl Parser<'_> {
             } else if self.eat_punct("-") {
                 BinOp::Sub
             } else {
+                self.depth = start_depth;
                 return Ok(left);
             };
+            self.push_chain_depth()?;
             let right = self.parse_multiplicative()?;
             left = Node::Binary {
                 op,
@@ -651,6 +677,7 @@ impl Parser<'_> {
     }
 
     fn parse_multiplicative(&mut self) -> std::result::Result<Node, String> {
+        let start_depth = self.depth;
         let mut left = self.parse_unary()?;
         loop {
             let op = if self.eat_punct("*") {
@@ -660,8 +687,10 @@ impl Parser<'_> {
             } else if self.eat_punct("%") {
                 BinOp::Rem
             } else {
+                self.depth = start_depth;
                 return Ok(left);
             };
+            self.push_chain_depth()?;
             let right = self.parse_unary()?;
             left = Node::Binary {
                 op,
@@ -705,14 +734,16 @@ impl Parser<'_> {
     }
 
     fn parse_postfix(&mut self) -> std::result::Result<Node, String> {
+        let start_depth = self.depth;
         let mut base = self.parse_primary()?;
         let mut steps = 0usize;
         loop {
-            steps += 1;
-            if steps > MAX_DEPTH {
-                return Err(format!("成员访问链过长（超过 {MAX_DEPTH} 步）"));
-            }
             if self.eat_punct(".") {
+                steps += 1;
+                if steps > MAX_DEPTH {
+                    return Err(format!("成员访问链过长（超过 {MAX_DEPTH} 步）"));
+                }
+                self.push_chain_depth()?;
                 let name = self.expect_ident("成员访问")?;
                 base = Node::Member {
                     base: Box::new(base),
@@ -722,6 +753,11 @@ impl Parser<'_> {
                     },
                 };
             } else if self.eat_punct("?.") {
+                steps += 1;
+                if steps > MAX_DEPTH {
+                    return Err(format!("成员访问链过长（超过 {MAX_DEPTH} 步）"));
+                }
+                self.push_chain_depth()?;
                 if self.eat_punct("[") {
                     let index = self.parse_expr()?;
                     self.expect_punct("]")?;
@@ -743,6 +779,11 @@ impl Parser<'_> {
                     };
                 }
             } else if self.eat_punct("[") {
+                steps += 1;
+                if steps > MAX_DEPTH {
+                    return Err(format!("成员访问链过长（超过 {MAX_DEPTH} 步）"));
+                }
+                self.push_chain_depth()?;
                 let index = self.parse_expr()?;
                 self.expect_punct("]")?;
                 base = Node::Member {
@@ -753,6 +794,11 @@ impl Parser<'_> {
                     },
                 };
             } else if self.eat_punct("(") {
+                steps += 1;
+                if steps > MAX_DEPTH {
+                    return Err(format!("成员访问链过长（超过 {MAX_DEPTH} 步）"));
+                }
+                self.push_chain_depth()?;
                 let mut args = Vec::new();
                 if !self.eat_punct(")") {
                     loop {
@@ -769,6 +815,7 @@ impl Parser<'_> {
                     args,
                 };
             } else {
+                self.depth = start_depth;
                 return Ok(base);
             }
         }
@@ -1600,5 +1647,22 @@ mod tests {
             .evaluate("({}).a", &app.root)
             .expect_err("对象字面量不在子集里");
         assert!(err.contains("对象字面量"), "{err}");
+    }
+
+    #[test]
+    fn long_binary_chain_returns_error_instead_of_stack_overflow() {
+        let app = App::new();
+        let js = BuiltinJs;
+        for expr in [
+            format!("1{}", "+1".repeat(5_000)),
+            format!("false{}", "||false".repeat(5_000)),
+            format!("null{}", "??null".repeat(5_000)),
+            format!("true{}", "&&true".repeat(5_000)),
+        ] {
+            let err = js
+                .evaluate(&expr, &app.root)
+                .expect_err("超长左结合二元链必须受 MAX_DEPTH 约束并安全报错");
+            assert!(err.contains("嵌套过深"), "{err}");
+        }
     }
 }

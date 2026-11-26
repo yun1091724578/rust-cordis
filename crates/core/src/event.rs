@@ -69,6 +69,13 @@ pub type Handler = Arc<dyn Fn(Call) -> BoxFuture<Ret> + Send + Sync>;
 pub enum HookCtx {
     Strong(Ctx),
     Weak(Weak<crate::Context>),
+    /// 根上下文的派生上下文（如 `app.root.filter_subtree()` / `extend()` / `isolate()`）：
+    /// 保留剥离了 `parent` 的派生视图（维持临时作用域身份），同时仅弱持真正的根 `Context`，
+    /// 防止 `Store → Hook → derived_ctx → root → RootKeepalive → Store` 形成强引用环。
+    DerivedRoot {
+        ctx: Ctx,
+        root: Weak<crate::Context>,
+    },
 }
 
 impl HookCtx {
@@ -76,6 +83,7 @@ impl HookCtx {
         match self {
             Self::Strong(ctx) => Some(ctx.clone()),
             Self::Weak(ctx) => ctx.upgrade(),
+            Self::DerivedRoot { ctx, root } => root.upgrade().map(|_| ctx.clone()),
         }
     }
 }
@@ -292,14 +300,17 @@ fn run_waterfall_rev(
 /// `Store → Hook → root ctx → Store`。普通（有 fiber 的）注册仍强持，派生作用域
 /// ctx 的生命周期因此与 hook 一致。
 pub fn owned(ctx: &Ctx, handler: Handler, global: bool, sn: u64) -> Hook {
-    // 只弱持**真正的根 ctx**；`root.filter_subtree()` 这类派生 ctx 仍强持，
-    // 因为作用域身份可能只由 hook 本身持有（调用方常常丢掉临时 ctx）。
-    let is_root_ctx = ctx.parent.is_none()
-        && ctx
-            .fiber_opt()
-            .is_some_and(|fiber| fiber.uid() == crate::fiber::UID_ROOT);
-    let owner = if is_root_ctx {
+    let is_root_fiber = ctx
+        .fiber_opt()
+        .is_some_and(|fiber| fiber.uid() == crate::fiber::UID_ROOT);
+    let owner = if is_root_fiber && ctx.parent.is_none() {
         HookCtx::Weak(Arc::downgrade(ctx))
+    } else if is_root_fiber {
+        let (detached, root) = ctx.detach_root_for_hook();
+        HookCtx::DerivedRoot {
+            ctx: detached,
+            root,
+        }
     } else {
         HookCtx::Strong(ctx.clone())
     };

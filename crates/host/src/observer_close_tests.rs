@@ -527,7 +527,7 @@ async fn cancel_close_window(close_first: bool, format: u32, kind: ContinuationK
         .iter()
         .filter(|(op, _, _)| *op == OP_CALLBACK)
         .collect();
-    assert_gone_before_dispose(&events, &[9, 99]);
+    assert_gone_before_dispose(&events, &[9, 98, 99]);
     let credit = callbacks
         .iter()
         .find(|(_, payload, _)| payload["id"] == 9)
@@ -540,11 +540,6 @@ async fn cancel_close_window(close_first: bool, format: u32, kind: ContinuationK
         })
     );
     assert!(f.instance.credits.lock().unwrap().is_empty());
-    let callbacks: Vec<_> = callbacks
-        .into_iter()
-        .filter(|(_, payload, _)| payload["id"] == 99)
-        .collect();
-    assert_eq!(callbacks.len(), 1, "{events:?}");
     let error = if close_first {
         "插件已卸载：等待中的调用被结算"
     } else {
@@ -555,6 +550,20 @@ async fn cancel_close_window(close_first: bool, format: u32, kind: ContinuationK
         arg = json!({ "error": error, "code": if close_first { "host_lifecycle" } else { "host_cancel" },
             "category": if close_first { "lifecycle" } else { "cancel" }, "certainty": "unknown", "retry": "unknown", "detail": null });
     }
+    let next_callbacks: Vec<_> = callbacks
+        .iter()
+        .filter(|(_, payload, _)| payload["id"] == 98)
+        .collect();
+    assert_eq!(next_callbacks.len(), 1, "{events:?}");
+    assert_eq!(
+        next_callbacks[0].1,
+        json!({ "kind": KIND_NEXT, "id": 98, "args": [arg.clone()] })
+    );
+    let callbacks: Vec<_> = callbacks
+        .into_iter()
+        .filter(|(_, payload, _)| payload["id"] == 99)
+        .collect();
+    assert_eq!(callbacks.len(), 1, "{events:?}");
     assert_eq!(
         callbacks[0].1,
         json!({ "kind": kind.wire_name(), "id": 99, "args": [arg] })
@@ -788,10 +797,7 @@ async fn o1d_outbound_terminal_window() {
                 *f.instance.outbound_gate.lock().unwrap() = Some(gate.clone());
             }
             let expected = json!({
-                "kind": match kind {
-                    ContinuationKind::Iface => KIND_IFACE,
-                    ContinuationKind::Dispatch => KIND_DISPATCH,
-                },
+                "kind": kind.wire_name(),
                 "id": 99,
                 "args": [{ "result": 42 }],
             });
@@ -891,10 +897,7 @@ async fn o1d_close_wins_keeps_outbound_for_abort() {
             }
         })
         .await;
-        let expected_kind = match kind {
-            ContinuationKind::Iface => KIND_IFACE,
-            ContinuationKind::Dispatch => KIND_DISPATCH,
-        };
+        let expected_kind = kind.wire_name();
         let payload = json!({
             "kind": expected_kind,
             "id": 99,
@@ -1206,4 +1209,146 @@ fn o1c_reentrant_close_has_no_lock_or_self_wait() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn r2_p1_drain_timed_out_still_delivers_pending_next_on_done_before_dispose() {
+    let mut f = Fixture::new(None).await;
+    f.instance
+        .ctx
+        .store
+        .set_lifecycle_policy(cordis_core::LifecyclePolicy {
+            drain_timeout_ms: Some(30),
+            ..Default::default()
+        })
+        .unwrap();
+    let (_sink, _stream) = f.stream();
+    let (_dropped, _cancel) = f.pending_next();
+
+    // Simulate an in-flight native call that outlives `drain_timeout_ms` so close takes
+    // the `drain_timed_out` handoff branch while a `host_ctx_next` task is still pending.
+    *f.instance.lifecycle.lock().unwrap() += 1;
+    let instance_release = f.instance.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let mut active = instance_release.lifecycle.lock().unwrap();
+        *active -= 1;
+        if *active == 0 {
+            instance_release.calls_changed.notify_waiters();
+        }
+    });
+
+    let _report = f.app.take().unwrap().close_with_report(None).await;
+    // Wait for background teardown to complete OP_DISPOSE.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if f.events().iter().any(|(op, _, _)| *op == OP_DISPOSE) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "background teardown did not finish OP_DISPOSE in time: {:?}",
+            f.events()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let events = f.events();
+    let dispose_idx = events
+        .iter()
+        .position(|(op, _, _)| *op == OP_DISPOSE)
+        .expect("OP_DISPOSE must be delivered");
+    let next_callbacks: Vec<_> = events[..dispose_idx]
+        .iter()
+        .filter(|(op, payload, _)| {
+            *op == OP_CALLBACK && payload["kind"] == KIND_NEXT && payload["id"].as_u64() == Some(98)
+        })
+        .collect();
+    assert_eq!(
+        next_callbacks.len(),
+        1,
+        "drain_timed_out must still deliver pending next on_done once before OP_DISPOSE: {events:?}"
+    );
+    assert!(
+        next_callbacks[0].1["args"][0]["error"].is_string(),
+        "on_done abort must carry error payload: {:?}",
+        next_callbacks[0].1
+    );
+}
+
+#[tokio::test]
+async fn r2_p1_deliver_next_racing_with_close_delivers_on_done_exactly_once() {
+    let mut f = Fixture::new(None).await;
+    let (_sink, _stream) = f.stream();
+    let release_next = Arc::new(tokio::sync::Notify::new());
+    let release_for_frame = release_next.clone();
+    f.instance
+        .dispatches
+        .lock()
+        .unwrap()
+        .get_mut(&71)
+        .unwrap()
+        .frame = Some(Next::some(move |_| {
+        let release = release_for_frame.clone();
+        Box::pin(async move {
+            release.notified().await;
+            Some(Dyn::new(ExternValue(json!("downstream-ok"))))
+        })
+    }));
+    let mut buffer = [0u8; 1024];
+    let mut out = Out {
+        ptr: buffer.as_mut_ptr(),
+        cap: buffer.len(),
+        len: 0,
+    };
+    assert_eq!(
+        unsafe { host_ctx_next(f.handle, 71, Blob::new(b"[]"), 98, &mut out) },
+        STATUS_OK
+    );
+
+    // Pause close right after `instance.closed = true` (inside `wait_lifecycle_exclusive`),
+    // BEFORE `finish_instance_teardown` drains `instance.tasks`.
+    *f.instance.lifecycle.lock().unwrap() += 1;
+    let mut close = Box::pin(f.app.take().unwrap().close());
+    std::future::poll_fn(|cx| {
+        let _ = close.as_mut().poll(cx);
+        if f.instance.closed.load(Ordering::SeqCst) {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+
+    // Now let the downstream `next` future finish while `instance.closed == true`!
+    release_next.notify_one();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Release the artificial active call so close finishes teardown.
+    {
+        let mut active = f.instance.lifecycle.lock().unwrap();
+        *active -= 1;
+        f.instance.calls_changed.notify_waiters();
+    }
+    close.await;
+
+    let events = f.events();
+    let dispose_idx = events
+        .iter()
+        .position(|(op, _, _)| *op == OP_DISPOSE)
+        .expect("OP_DISPOSE must be delivered");
+    let next_callbacks: Vec<_> = events[..dispose_idx]
+        .iter()
+        .filter(|(op, payload, _)| {
+            *op == OP_CALLBACK && payload["kind"] == KIND_NEXT && payload["id"].as_u64() == Some(98)
+        })
+        .collect();
+    assert_eq!(
+        next_callbacks.len(),
+        1,
+        "deliver_next racing with close must deliver on_done exactly once before OP_DISPOSE: {events:?}"
+    );
 }

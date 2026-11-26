@@ -27,7 +27,11 @@ mod windows {
     use std::os::windows::ffi::OsStrExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicIsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    const PENDING_WAIT_HINT_MS: u32 = 30_000;
+    const PENDING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
     const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
     const SERVICE_STOPPED: u32 = 0x0000_0001;
@@ -185,15 +189,18 @@ mod windows {
         }
         crate::shutdown::reset();
         STATUS_HANDLE.store(handle, Ordering::SeqCst);
-        set_status(SERVICE_START_PENDING, 0, 1, 30_000);
+        set_status(SERVICE_START_PENDING, 0, 1, PENDING_WAIT_HINT_MS);
 
         let exit_code = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let start_heartbeat =
+                PendingHeartbeat::start(SERVICE_START_PENDING, PENDING_HEARTBEAT_INTERVAL);
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
             {
                 Ok(runtime) => runtime,
                 Err(err) => {
+                    drop(start_heartbeat);
                     eprintln!("cordis service: 无法创建 tokio runtime: {err}");
                     return 4;
                 }
@@ -202,9 +209,16 @@ mod windows {
             runtime.block_on(async {
                 match RunSession::start(&args.config, args.options.clone(), disk_source()).await {
                     Ok(session) => {
+                        drop(start_heartbeat);
                         set_running_if_not_stopping();
                         crate::shutdown::wait_service().await;
+                        ensure_stop_pending();
+                        let stop_heartbeat = PendingHeartbeat::start(
+                            SERVICE_STOP_PENDING,
+                            PENDING_HEARTBEAT_INTERVAL,
+                        );
                         let report = session.shutdown().await;
+                        drop(stop_heartbeat);
                         crate::shutdown::complete();
                         if report.close_report.status != cordis_core::CloseStatus::Completed {
                             eprintln!(
@@ -228,6 +242,7 @@ mod windows {
                         }
                     }
                     Err(err) => {
+                        drop(start_heartbeat);
                         eprintln!("cordis service: {err}");
                         err.exit_code() as u32
                     }
@@ -242,7 +257,20 @@ mod windows {
             }
         };
 
-        set_status(SERVICE_STOPPED, exit_code, 0, 0);
+        set_stopped_and_clear_handle(exit_code);
+    }
+
+    /// 原子完成终态上报并清零 `STATUS_HANDLE`，避免 `control_handler` 在 `SERVICE_STOPPED`
+    /// 与清句柄之间插队覆盖终态。
+    fn set_stopped_and_clear_handle(exit_code: u32) {
+        let mut guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        *guard = ServiceState {
+            state: SERVICE_STOPPED,
+            exit_code,
+            checkpoint: 0,
+            wait_hint: 0,
+        };
+        report(ServiceStatus::new(SERVICE_STOPPED, exit_code, 0, 0));
         STATUS_HANDLE.store(0, Ordering::SeqCst);
     }
 
@@ -254,7 +282,7 @@ mod windows {
     ) -> u32 {
         match control {
             SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-                set_status(SERVICE_STOP_PENDING, 0, 1, 30_000);
+                ensure_stop_pending();
                 crate::shutdown::request_shutdown();
                 NO_ERROR
             }
@@ -263,6 +291,88 @@ mod windows {
                 NO_ERROR
             }
             _ => ERROR_CALL_NOT_IMPLEMENTED,
+        }
+    }
+
+    /// 保证在进入关闭清理阶段时 SCM 至少已收到 `SERVICE_STOP_PENDING`（不覆盖已推进的 checkpoint）。
+    fn ensure_stop_pending() {
+        let mut guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.state == SERVICE_STOP_PENDING || guard.state == SERVICE_STOPPED {
+            return;
+        }
+        *guard = ServiceState {
+            state: SERVICE_STOP_PENDING,
+            exit_code: 0,
+            checkpoint: 1,
+            wait_hint: PENDING_WAIT_HINT_MS,
+        };
+        report(ServiceStatus::new(
+            SERVICE_STOP_PENDING,
+            0,
+            1,
+            PENDING_WAIT_HINT_MS,
+        ));
+    }
+
+    /// 在 `START_PENDING` / `STOP_PENDING` 期间按周期递增 `dwCheckPoint` 上报 SCM，
+    /// 避免启动或排水超过 `dwWaitHint`（30s）时被 SCM 以 `ERROR_SERVICE_NOT_RESPONDING (1053)` 强杀。
+    fn advance_pending_checkpoint(expected_state: u32) -> bool {
+        let mut guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.state != expected_state {
+            return false;
+        }
+        guard.checkpoint = guard.checkpoint.saturating_add(1).max(1);
+        report(ServiceStatus::new(
+            guard.state,
+            guard.exit_code,
+            guard.checkpoint,
+            guard.wait_hint,
+        ));
+        true
+    }
+
+    /// 独立 OS 线程心跳守卫：不依赖 Tokio worker 是否阻塞；Drop 时同步停止并 `join`，
+    /// 确保不会在切换到 `RUNNING` / `STOPPED` 之后再发出陈旧的 `PENDING` 状态。
+    struct PendingHeartbeat {
+        stop: Arc<(Mutex<bool>, Condvar)>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl PendingHeartbeat {
+        fn start(expected_state: u32, interval: Duration) -> Self {
+            let stop = Arc::new((Mutex::new(false), Condvar::new()));
+            let signal = Arc::clone(&stop);
+            let thread = std::thread::Builder::new()
+                .name("cordis-scm-heartbeat".to_string())
+                .spawn(move || {
+                    let (lock, cvar) = &*signal;
+                    let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while !*stopped {
+                        let (guard, _) = cvar
+                            .wait_timeout(stopped, interval)
+                            .unwrap_or_else(|e| e.into_inner());
+                        stopped = guard;
+                        if *stopped {
+                            break;
+                        }
+                        if !advance_pending_checkpoint(expected_state) {
+                            break;
+                        }
+                    }
+                })
+                .ok();
+            Self { stop, thread }
+        }
+    }
+
+    impl Drop for PendingHeartbeat {
+        fn drop(&mut self) {
+            let (lock, cvar) = &*self.stop;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cvar.notify_all();
+            if let Some(handle) = self.thread.take() {
+                let _ = handle.join();
+            }
         }
     }
 
@@ -315,6 +425,9 @@ mod windows {
     mod tests {
         use super::*;
 
+        /// 串行化访问进程级全局 `SERVICE_STATE` 的单元测试，避免并行测试互相踩状态。
+        static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
         #[test]
         fn stopped_status_carries_service_specific_exit() {
             let status = ServiceStatus::new(SERVICE_STOPPED, 4, 0, 0);
@@ -332,6 +445,90 @@ mod windows {
                 SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
             );
             assert_eq!(status.win32_exit_code, NO_ERROR);
+        }
+
+        #[test]
+        fn pending_heartbeat_advances_checkpoint_and_stops_on_state_transition() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            // STATUS_HANDLE 为 0，SetServiceStatus 不会被实际调用，可安全单测状态机与心跳线程。
+            set_status(SERVICE_START_PENDING, 0, 1, PENDING_WAIT_HINT_MS);
+            let hb = PendingHeartbeat::start(SERVICE_START_PENDING, Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(60));
+            drop(hb);
+
+            let snap = *state_lock().lock().unwrap();
+            assert_eq!(snap.state, SERVICE_START_PENDING);
+            assert!(
+                snap.checkpoint > 1,
+                "START_PENDING 期间心跳必须递增 checkpoint，实际 {}",
+                snap.checkpoint
+            );
+
+            // 切到 RUNNING 后，旧 START_PENDING 推进必须自动停止且不覆盖 RUNNING。
+            set_status(SERVICE_RUNNING, 0, 0, 0);
+            assert!(!advance_pending_checkpoint(SERVICE_START_PENDING));
+            assert_eq!(state_lock().lock().unwrap().state, SERVICE_RUNNING);
+
+            // ensure_stop_pending 切入 STOP_PENDING，且不重置已推进的 checkpoint。
+            ensure_stop_pending();
+            assert_eq!(state_lock().lock().unwrap().state, SERVICE_STOP_PENDING);
+            assert_eq!(state_lock().lock().unwrap().checkpoint, 1);
+            assert!(advance_pending_checkpoint(SERVICE_STOP_PENDING));
+            assert_eq!(state_lock().lock().unwrap().checkpoint, 2);
+            ensure_stop_pending();
+            assert_eq!(
+                state_lock().lock().unwrap().checkpoint,
+                2,
+                "重复 ensure_stop_pending 不得把已推进的 checkpoint 回退到 1"
+            );
+            set_status(SERVICE_STOPPED, 0, 0, 0);
+        }
+
+        #[test]
+        fn r2_p1_control_handler_preserves_stopped_state_and_stop_pending_checkpoint() {
+            let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            // Advance STOP_PENDING checkpoint to 3, then simulate duplicate SHUTDOWN/STOP controls.
+            set_status(SERVICE_STOP_PENDING, 0, 1, PENDING_WAIT_HINT_MS);
+            assert!(advance_pending_checkpoint(SERVICE_STOP_PENDING));
+            assert!(advance_pending_checkpoint(SERVICE_STOP_PENDING));
+            assert_eq!(state_lock().lock().unwrap().checkpoint, 3);
+
+            let rc = unsafe {
+                control_handler(
+                    SERVICE_CONTROL_SHUTDOWN,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, NO_ERROR);
+            {
+                let snap = *state_lock().lock().unwrap();
+                assert_eq!(snap.state, SERVICE_STOP_PENDING);
+                assert_eq!(
+                    snap.checkpoint, 3,
+                    "control_handler 不得将已推进的 STOP_PENDING checkpoint 回退到 1"
+                );
+            }
+
+            // Once SERVICE_STOPPED is reported, late STOP control must NEVER overwrite it.
+            set_status(SERVICE_STOPPED, 4, 0, 0);
+            let rc2 = unsafe {
+                control_handler(
+                    SERVICE_CONTROL_STOP,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc2, NO_ERROR);
+            let snap = *state_lock().lock().unwrap();
+            assert_eq!(
+                snap.state, SERVICE_STOPPED,
+                "control_handler 不得将 SERVICE_STOPPED 覆盖回 SERVICE_STOP_PENDING"
+            );
+            assert_eq!(snap.exit_code, 4);
+            crate::shutdown::reset();
         }
     }
 }

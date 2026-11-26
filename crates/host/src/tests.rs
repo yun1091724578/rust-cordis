@@ -658,6 +658,7 @@ fn dummy_instance(name: &str) -> Instance {
         #[cfg(test)]
         cancel_gate: Arc::new(Mutex::new(None)),
         tasks: Arc::new(Mutex::new(HashMap::new())),
+        deferred_outbounds: Arc::new(Mutex::new(Vec::new())),
         error_format: 0,
         dispatch_policy: DispatchPolicy::default(),
         host_limits: HostLimits::default(),
@@ -2408,4 +2409,139 @@ fn no_runtime_with_outbound_timeout_is_still_recorded_as_host_call() {
     );
     drop(records);
     unregister_instance(handle);
+}
+
+// #10 [P1]: `drain_timeout_ms` 触发时若 `dispatches` 中存在带 `HostStreamObserver` 的流，
+// 不得在持有 `instance.dispatches` 互斥锁期间调用 `sink.fail_error`（同线程重入死锁）。
+#[tokio::test]
+async fn drain_timeout_with_active_stream_does_not_deadlock_dispatches_mutex() {
+    let app = cordis_core::App::new();
+    app.store
+        .set_lifecycle_policy(cordis_core::LifecyclePolicy {
+            drain_timeout_ms: Some(40),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let plugin: Arc<dyn cordis_core::Plugin> = Arc::new(cordis_core::FnPlugin {
+        name: "drain-stream-owner",
+        key: cordis_core::unique_key("drain-stream-owner"),
+        inject: cordis_core::Inject::default(),
+        validator: None,
+        f: Arc::new(|ctx, config| apply_via(task_test_call, ctx, config, "drain-stream-owner")),
+    });
+    let fiber = app.root.plugin(plugin, Value::Null);
+    fiber.settle().await;
+    let handle = TASK_TEST_HANDLE.get();
+    let instance = instances().read().unwrap().get(handle).unwrap();
+
+    let (sink, mut stream) = StreamSink::new(1);
+    sink.observe(Arc::new(HostStreamObserver {
+        handle,
+        dispatch_id: 777,
+    }));
+    insert_dispatch(
+        &instance,
+        777,
+        DispatchRecord {
+            sink: None,
+            frame: None,
+            parent: None,
+            outbound: None,
+            stream: Some(sink),
+        },
+    )
+    .unwrap_or_else(|_| panic!("admission"));
+
+    // 占住一枚在飞调用租约，强制卸载排水超时进入 drain_timed_out 分支。
+    let active = admit_call(&instance).expect("admit_call");
+    tokio::time::timeout(std::time::Duration::from_secs(2), fiber.dispose())
+        .await
+        .expect("drain_timed_out 持 dispatches 锁调 sink.fail_error 导致同线程死锁");
+
+    let err = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("stream.next 不得挂起")
+        .expect_err("流必须以卸载错误收尾");
+    assert!(
+        err.to_string().contains("插件已卸载"),
+        "预期卸载收尾错误，实际：{err}"
+    );
+
+    // 释放调用租约后，后台移交的收尾任务必须完成并注销实例。
+    drop(active);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while instances().read().unwrap().get(handle).is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("后台移交任务必须在调用退出后注销实例");
+
+    app.close().await;
+}
+
+// #13 [P2]: FFI JSON 载荷与描述表入口必须拒绝 `len > isize::MAX` 与 `{ null, non-zero }` Blob，
+// 返回 STATUS_ERR（或安全跳过）而不是触发 `Blob::as_bytes()` UB/panic。
+#[test]
+fn ffi_json_entries_reject_invalid_blobs_without_ub() {
+    let bad_blobs = [
+        Blob {
+            ptr: b"{\"a\":1}".as_ptr(),
+            len: (isize::MAX as usize) + 1,
+        },
+        Blob {
+            ptr: std::ptr::null(),
+            len: 1,
+        },
+    ];
+    let mut buf = [0u8; 256];
+    let mut out = Out {
+        ptr: buf.as_mut_ptr(),
+        cap: buf.len(),
+        len: 0,
+    };
+
+    for bad in bad_blobs {
+        assert_eq!(
+            unsafe { host_ctx_set(0, Blob::new(b"svc"), bad, &mut out) },
+            STATUS_ERR
+        );
+        assert_eq!(
+            unsafe { host_ctx_provide(0, Blob::new(b"svc"), bad, &mut out) },
+            STATUS_ERR
+        );
+        assert_eq!(unsafe { host_ctx_fulfill(0, 1, bad, &mut out) }, STATUS_ERR);
+        assert_eq!(unsafe { host_ctx_next(0, 1, bad, 1, &mut out) }, STATUS_ERR);
+        assert_eq!(
+            unsafe { host_ctx_provide_iface(0, Blob::new(b"s@1"), 1, bad, 1, &mut out) },
+            STATUS_ERR
+        );
+        assert_eq!(
+            unsafe { host_stream_push(0, 1, bad, 1, &mut out) },
+            STATUS_ERR
+        );
+        assert_eq!(unsafe { host_stream_fail(0, 1, bad, &mut out) }, STATUS_ERR);
+        assert_eq!(
+            unsafe { host_stream_fail_payload(0, 1, bad, &mut out) },
+            STATUS_ERR
+        );
+
+        let desc = PluginDesc {
+            abi_version: ABI_VERSION,
+            size: std::mem::size_of::<PluginDesc>() as u32,
+            id: bad,
+            inject: bad,
+            schema: bad,
+            attach: fake_attach,
+            call: fake_call,
+            provision: bad,
+            error_format: 0,
+            tail_reserved: 0,
+        };
+        let caps = unsafe { Capabilities::of_desc(&desc) };
+        assert!(caps.plugin.is_empty());
+        assert!(caps.inject.is_empty());
+        assert!(caps.provision.is_empty());
+    }
 }

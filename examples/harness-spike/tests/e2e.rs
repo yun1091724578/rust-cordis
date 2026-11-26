@@ -370,3 +370,76 @@ async fn replacing_the_llm_adapter_keeps_the_consumer_epoch() {
     assert!(report.tools.is_empty(), "replay 的录制是空的 ⇒ 一步都不跑");
     assert_eq!(report.rounds, 0);
 }
+
+#[tokio::test]
+async fn r2_p2_scoped_tool_shadows_global_tool_with_same_name() {
+    use cordis_core::{BoxFuture, Config, ExternService, Result as CoreResult};
+
+    struct ConstTool(&'static str);
+    impl ExternService for ConstTool {
+        fn service(&self) -> &str {
+            "const-tool"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["call".to_string()]
+        }
+        fn call(
+            &self,
+            _meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> BoxFuture<CoreResult<Config>> {
+            let label = self.0;
+            Box::pin(async move { Ok(json!(label)) })
+        }
+    }
+
+    let harness = boot(&["alpha"], scripted_llm("s", vec![])).await.unwrap();
+    let alpha = harness.agent_ctx("alpha");
+    let alpha_uid = alpha.scope().expect("agent has scope").uid();
+
+    let _g_iface = harness
+        .app
+        .root
+        .provide_iface("tool.global-echo@1", Arc::new(ConstTool("global")))
+        .unwrap();
+    let _s_iface = harness
+        .app
+        .root
+        .provide_iface("tool.scoped-echo@1", Arc::new(ConstTool("scoped")))
+        .unwrap();
+
+    let tools = ToolsService::of(&alpha).expect("tools@1");
+    tools
+        .register(
+            0,
+            "echo".into(),
+            "global echo".into(),
+            Some("tool.global-echo@1".into()),
+        )
+        .await
+        .unwrap();
+    tools
+        .register(
+            alpha_uid,
+            "echo".into(),
+            "scoped echo".into(),
+            Some("tool.scoped-echo@1".into()),
+        )
+        .await
+        .unwrap();
+
+    let owners = vec![0, alpha_uid];
+    let out = tools
+        .call(owners, "echo".into(), json!({}))
+        .await
+        .expect("call echo");
+    assert_eq!(
+        out,
+        json!("scoped"),
+        "作用域同名工具必须覆盖全局工具（内层作用域优先于 owner=0）"
+    );
+}

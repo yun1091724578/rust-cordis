@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 cordis_plugin! {
@@ -335,14 +335,13 @@ fn apply(ctx: &sdk::Ctx, config: Value) -> PluginResult {
             "stream",
             Arc::new(move |args: Value, _meta: Option<Value>, dispatch_id: u64| {
                 let total = args.get("n").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let streamer = Arc::new(Streamer {
-                    ctx,
+                let streamer = Arc::new(Streamer::new(
+                    CtxStreamOut(ctx),
                     dispatch_id,
                     total,
-                    sent: stream_sent.clone(),
-                    blocked: stream_blocked.clone(),
-                    done: AtomicBool::new(false),
-                });
+                    stream_sent.clone(),
+                    stream_blocked.clone(),
+                ));
                 Ok(if streamer.pump() {
                     // 被窗口挡住：挂起，等宿主把额度送回来（`on_credit`）。
                     sdk::AsyncReply::Pending
@@ -359,55 +358,173 @@ fn apply(ctx: &sdk::Ctx, config: Value) -> PluginResult {
     Ok(())
 }
 
-/// 一次流式调用的推进器（真 DLL 侧）：拿到一个额度就推一块。
-///
-/// 递归形态不是巧合：**额度回调就是"又能推了"的信号**，所以推进就发生在回调里
-/// （消费者取走一块 ⇒ 宿主回调 ⇒ 这里推下一块）。`Arc<Self>` + `AtomicU64`
-/// 让它能被回调闭包反复进入，而 `Fn` 闭包不能 move 出捕获值（E0507）的坑也避开了。
-struct Streamer {
-    ctx: sdk::Ctx,
-    dispatch_id: u64,
-    total: usize,
-    sent: Arc<AtomicU64>,
-    blocked: Arc<AtomicU64>,
-    done: AtomicBool,
+/// 最小流输出抽象：生产走 `sdk::Ctx`，单测可注入可控窗口/并发 `on_credit` 的假宿主。
+trait StreamOut: Send + Sync + 'static {
+    fn push(
+        &self,
+        dispatch_id: u64,
+        value: Value,
+        on_credit: Box<dyn FnOnce(sdk::StreamCredit) + Send + 'static>,
+    ) -> Result<sdk::StreamPush, String>;
+    fn close(&self, dispatch_id: u64);
 }
 
-impl Streamer {
+#[derive(Clone, Copy)]
+struct CtxStreamOut(sdk::Ctx);
+
+impl StreamOut for CtxStreamOut {
+    fn push(
+        &self,
+        dispatch_id: u64,
+        value: Value,
+        on_credit: Box<dyn FnOnce(sdk::StreamCredit) + Send + 'static>,
+    ) -> Result<sdk::StreamPush, String> {
+        self.0.stream_push(dispatch_id, value, on_credit)
+    }
+
+    fn close(&self, dispatch_id: u64) {
+        let _ = self.0.stream_close(dispatch_id);
+    }
+}
+
+struct StreamState {
+    /// **每条流独立**的已发送块计数（避免多条流复用同一计数器导致第二条流发 0 块）。
+    sent: usize,
+    done: bool,
+    /// 单飞推进标志：防止 `pump` 与并发 `on_credit` 回调同时推进同一条流造成重复/跳号。
+    pumping: bool,
+    pending_pump: bool,
+}
+
+/// 一次流式调用的推进器（真 DLL 侧）：拿到一个额度就推一块。
+///
+/// 每条流拥有独立的 `Mutex<StreamState>` 串行化推进序号与单飞状态；
+/// `total_sent` / `blocked` 仅用于插件级全局诊断遥测。
+struct Streamer<O: StreamOut> {
+    out: O,
+    dispatch_id: u64,
+    total: usize,
+    total_sent: Arc<AtomicU64>,
+    blocked: Arc<AtomicU64>,
+    state: Mutex<StreamState>,
+}
+
+impl<O: StreamOut> Streamer<O> {
+    fn new(
+        out: O,
+        dispatch_id: u64,
+        total: usize,
+        total_sent: Arc<AtomicU64>,
+        blocked: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            out,
+            dispatch_id,
+            total,
+            total_sent,
+            blocked,
+            state: Mutex::new(StreamState {
+                sent: 0,
+                done: false,
+                pumping: false,
+                pending_pump: false,
+            }),
+        }
+    }
+
+    fn mark_done(&self) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        st.done = true;
+    }
+
     /// 尽量把窗口灌满。返回 `true` = 被窗口挡住（这次调用要挂起）。
     fn pump(self: &Arc<Self>) -> bool {
+        {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if st.done {
+                return false;
+            }
+            if st.pumping {
+                st.pending_pump = true;
+                return false;
+            }
+            st.pumping = true;
+        }
         loop {
-            if self.done.load(Ordering::SeqCst) {
+            let next = {
+                let mut st = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if st.done {
+                    st.pumping = false;
+                    return false;
+                }
+                let next = st.sent + 1;
+                if next > self.total {
+                    st.done = true;
+                    st.pumping = false;
+                    None
+                } else {
+                    Some(next)
+                }
+            };
+            let Some(next) = next else {
+                self.out.close(self.dispatch_id);
                 return false;
-            }
-            let next = self.sent.load(Ordering::SeqCst) as usize + 1;
-            if next > self.total {
-                self.done.store(true, Ordering::SeqCst);
-                let _ = self.ctx.stream_close(self.dispatch_id);
-                return false;
-            }
+            };
             let me = self.clone();
-            let outcome = self
-                .ctx
-                .stream_push(self.dispatch_id, json!(next), move |credit| match credit {
+            let outcome = self.out.push(
+                self.dispatch_id,
+                json!(next),
+                Box::new(move |credit| match credit {
                     // 又有位置了：接着推（回调发生在宿主归还额度的那一刻）。
                     sdk::StreamCredit::Window(_) => {
                         me.pump();
                     }
                     // 流已经不在了（消费者收场 / 插件被卸载）：停手，也别再收尾。
-                    sdk::StreamCredit::Gone => me.done.store(true, Ordering::SeqCst),
-                });
+                    sdk::StreamCredit::Gone => me.mark_done(),
+                }),
+            );
             match outcome {
                 Ok(sdk::StreamPush::Sent) => {
-                    self.sent.fetch_add(1, Ordering::SeqCst);
+                    let mut st = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    st.sent += 1;
+                    st.pending_pump = false;
+                    drop(st);
+                    self.total_sent.fetch_add(1, Ordering::SeqCst);
                 }
                 Ok(sdk::StreamPush::Pending) => {
                     self.blocked.fetch_add(1, Ordering::SeqCst);
+                    let mut st = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if st.pending_pump && !st.done {
+                        // `on_credit` 在 `push` 返回之前已经并发到达：立即重推当前序号。
+                        st.pending_pump = false;
+                        continue;
+                    }
+                    st.pumping = false;
                     return true;
                 }
                 // Gone（流没了）或错误（宿主太旧）：停手。
                 _ => {
-                    self.done.store(true, Ordering::SeqCst);
+                    let mut st = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    st.done = true;
+                    st.pumping = false;
                     return false;
                 }
             }
@@ -583,5 +700,131 @@ impl SessionLog {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicBool;
+
+    type CreditCallback = Box<dyn FnOnce(sdk::StreamCredit) + Send + 'static>;
+
+    struct MockStreamOut {
+        capacity: usize,
+        items: Mutex<Vec<Value>>,
+        in_window: Mutex<usize>,
+        waiters: Mutex<VecDeque<CreditCallback>>,
+        closed: AtomicBool,
+        reentrant_credit_on_first_pending: AtomicBool,
+    }
+
+    impl MockStreamOut {
+        fn new(capacity: usize, reentrant_credit: bool) -> Arc<Self> {
+            Arc::new(Self {
+                capacity,
+                items: Mutex::new(Vec::new()),
+                in_window: Mutex::new(0),
+                waiters: Mutex::new(VecDeque::new()),
+                closed: AtomicBool::new(false),
+                reentrant_credit_on_first_pending: AtomicBool::new(reentrant_credit),
+            })
+        }
+
+        fn drain_one(&self) {
+            let waiter = {
+                let mut w = self.in_window.lock().unwrap();
+                if *w > 0 {
+                    *w -= 1;
+                }
+                self.waiters.lock().unwrap().pop_front()
+            };
+            if let Some(cb) = waiter {
+                cb(sdk::StreamCredit::Window(1));
+            }
+        }
+    }
+
+    impl StreamOut for Arc<MockStreamOut> {
+        fn push(
+            &self,
+            _dispatch_id: u64,
+            value: Value,
+            on_credit: Box<dyn FnOnce(sdk::StreamCredit) + Send + 'static>,
+        ) -> Result<sdk::StreamPush, String> {
+            let mut w = self.in_window.lock().unwrap();
+            if *w < self.capacity {
+                *w += 1;
+                self.items.lock().unwrap().push(value);
+                Ok(sdk::StreamPush::Sent)
+            } else {
+                // Simulate reentrant/concurrent `on_credit` arriving BEFORE `push` returns `Pending`.
+                if self
+                    .reentrant_credit_on_first_pending
+                    .swap(false, Ordering::SeqCst)
+                {
+                    *w -= 1;
+                    drop(w);
+                    on_credit(sdk::StreamCredit::Window(1));
+                } else {
+                    drop(w);
+                    self.waiters.lock().unwrap().push_back(on_credit);
+                }
+                Ok(sdk::StreamPush::Pending)
+            }
+        }
+
+        fn close(&self, _dispatch_id: u64) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn r2_p2_multiple_streams_have_independent_counters_and_serialized_pumps() {
+        let total_sent = Arc::new(AtomicU64::new(0));
+        let blocked = Arc::new(AtomicU64::new(0));
+
+        // Stream 1: n=3 with window=2 (exercises backpressure + on_credit).
+        let out1 = MockStreamOut::new(2, false);
+        let s1 = Arc::new(Streamer::new(
+            out1.clone(),
+            1,
+            3,
+            total_sent.clone(),
+            blocked.clone(),
+        ));
+        assert!(s1.pump(), "stream 1 must pause on full window");
+        assert_eq!(*out1.items.lock().unwrap(), vec![json!(1), json!(2)]);
+        out1.drain_one();
+        assert_eq!(
+            *out1.items.lock().unwrap(),
+            vec![json!(1), json!(2), json!(3)]
+        );
+        assert!(out1.closed.load(Ordering::SeqCst));
+
+        // Stream 2: n=3 sharing global `total_sent` MUST ALSO emit [1, 2, 3] (not 0 items!).
+        let out2 = MockStreamOut::new(2, true);
+        let s2 = Arc::new(Streamer::new(
+            out2.clone(),
+            2,
+            5,
+            total_sent.clone(),
+            blocked.clone(),
+        ));
+        let _ = s2.pump();
+        for _ in 0..10 {
+            if out2.closed.load(Ordering::SeqCst) {
+                break;
+            }
+            out2.drain_one();
+        }
+        assert_eq!(
+            *out2.items.lock().unwrap(),
+            vec![json!(1), json!(2), json!(3), json!(4), json!(5)],
+            "第二条流及并发 on_credit 重入不得丢号、重号或提前结束"
+        );
+        assert!(out2.closed.load(Ordering::SeqCst));
+        assert_eq!(total_sent.load(Ordering::SeqCst), 8);
     }
 }

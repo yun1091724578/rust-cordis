@@ -610,7 +610,7 @@ pub enum ReloadOutcome {
     Reconciled(ReconcileOutcome),
 }
 
-/// 装载器看到的配置文件集合（主配置 + patch 层，均为绝对路径）。
+/// 装载器看到的配置文件集合（主配置 + patch 层；可为相对或绝对路径）。
 #[derive(Debug, Clone)]
 struct ConfigFiles {
     main: PathBuf,
@@ -662,7 +662,7 @@ struct Candidate {
     /// 登记代次（[`LoaderState::next_candidate_gen`]）：**请求登记顺序**，不是解析完成顺序。
     ///
     /// `0` 表示本地候选（`sync` / `set_disabled` / 显式 `reconcile_once`）：它们在
-    /// `mutation` 下立即执行，目标就是"当前状态"，不参与代次比较。
+    /// `mutation` 下立即执行，不参与代次比较，但仍校验 `base_writeback` 防止覆盖并发回写。
     gen: u64,
     /// 候选构造时的**回写版本**（[`LoaderState::writeback`]）。
     ///
@@ -689,11 +689,11 @@ struct Candidate {
 }
 
 impl Candidate {
-    /// 本地候选：只换树，不动回写元数据、不参与代次与回写版本比较。
-    fn local(entries: Vec<Entry>) -> Self {
+    /// 本地候选：只换树，不动回写元数据、不参与代次比较，但仍校验 `base_writeback`。
+    fn local(entries: Vec<Entry>, base_writeback: u64) -> Self {
         Self {
             gen: 0,
-            base_writeback: 0,
+            base_writeback,
             entries,
             adopt_metadata: false,
             main: Vec::new(),
@@ -708,8 +708,7 @@ impl Candidate {
     fn queued(entries: Vec<Entry>, gen: u64, base_writeback: u64) -> Self {
         Self {
             gen,
-            base_writeback,
-            ..Self::local(entries)
+            ..Self::local(entries, base_writeback)
         }
     }
 }
@@ -778,6 +777,8 @@ struct ScopeInput {
 /// "运行期启停"要求**装载之后**还能改一行的 `disabled` 并立刻装卸——这需要条目树、
 /// 装载表、派生域缓存与修订号落在同一处（M4-2 之前它们是 `load()` 的局部量，
 /// 于是"装完就定死"）。热重载与对账状态机（M4-3）共用同一份状态。
+type PendingSelfDispose = (Arc<Fiber>, String, Option<Mounted>);
+
 pub struct LoaderState {
     /// 装载器自己的上下文：派生行 ctx、写日志、发事件都以它为根。
     ///
@@ -838,6 +839,9 @@ pub struct LoaderState {
     writeback: AtomicU64,
     /// 装载器**有意**卸载中的行：`internal/plugin` 观察者据此把它与"插件自我卸载"区分开。
     disposing: Mutex<HashSet<String>>,
+    /// 插件自我卸载在同步 `on_plugin` 阶段暂存的 `(fiber, label, record)`，
+    /// 供 `on_plugin_dispose_async` 在 `spawn_blocking` 中持 `config_gate` 完成落盘而不阻塞 Tokio worker。
+    pending_self_disposes: Mutex<Vec<PendingSelfDispose>>,
     /// 卸载超时后仍在后台清理中的旧实例（`label -> Arc<Fiber>`）：
     /// 在 `pending_background_cleanups()` 归零之前拒绝 `Action::Mount` 旁路重挂，
     /// 后台清理完成时由弱引用监听任务自动摘除并释放 `Arc<Fiber>`。
@@ -1238,6 +1242,7 @@ impl LoaderState {
             adopted_gen: AtomicU64::new(0),
             writeback: AtomicU64::new(0),
             disposing: Mutex::new(HashSet::new()),
+            pending_self_disposes: Mutex::new(Vec::new()),
             draining: Mutex::new(HashMap::new()),
             last: Mutex::new(None),
             last_reload: Mutex::new(None),
@@ -1643,11 +1648,29 @@ impl LoaderState {
     /// 想看**挂载之前**的能力面（含还没挂的行）用
     /// [`crate::probe_capabilities`]——那是 A5 的机制。
     pub fn capabilities(&self) -> Vec<serde_json::Value> {
-        // 行的 `!!js` 能力面来自**条目树**（挂载记录里只有解析后的配置，标记已经求过值）。
-        let caps_by_label: std::collections::HashMap<String, crate::js::JsCapabilities> =
-            crate::patch::collect_js_capabilities(&self.tree.lock().unwrap())
-                .into_iter()
-                .collect();
+        // 行的 `!!js` 能力面来自**条目树**（挂载记录里只有解析后的配置，标记已经求过值），
+        // 且必须按 `stable_label`（`id` 或 `name#N`）建索引，避免同名无 id 的多行互相覆盖。
+        let caps_by_label: HashMap<String, crate::js::JsCapabilities> = {
+            fn walk(
+                entries: &[Entry],
+                ordinals: &mut HashMap<String, usize>,
+                out: &mut HashMap<String, crate::js::JsCapabilities>,
+            ) {
+                for entry in entries {
+                    let label = stable_label(entry, ordinals);
+                    if entry.group {
+                        walk(&entry.children, ordinals, out);
+                    } else {
+                        out.insert(label, crate::patch::entry_js_capabilities(entry));
+                    }
+                }
+            }
+            let tree = self.tree.lock().unwrap();
+            let mut ordinals = HashMap::new();
+            let mut out = HashMap::new();
+            walk(&tree, &mut ordinals, &mut out);
+            out
+        };
         let mut rows: Vec<serde_json::Value> = self
             .mounted
             .lock()
@@ -1669,15 +1692,8 @@ impl LoaderState {
                 let mut provision = record.plugin.provision();
                 provision.sort();
                 provision.dedup();
-                // `collect_js_capabilities` 的键是配置里的 `id`，无 id 时是裸 `name`；
-                // `record.label` 是内部稳定行标（`name#N`），不能直接当键。
-                let cap_key = record
-                    .declared
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| record.declared.name.clone());
                 let js = caps_by_label
-                    .get(&cap_key)
+                    .get(&record.label)
                     .cloned()
                     .unwrap_or_default()
                     .to_json();
@@ -2221,7 +2237,9 @@ impl LoaderState {
         // 整段"改树 → 对账"必须在互斥闸门内：否则并发的对账会中途覆盖树，
         // 刚禁用的行在下一轮里复活（或被挂成第二份）。
         let _guard = self.mutation.lock().await;
+        let previous_last = self.last.lock().unwrap().clone();
         let (old_disabled, old_expr) = {
+            let _gate = self.config_gate.lock().unwrap();
             let mut tree = self.tree.lock().unwrap();
             let entry = find_by_label(&mut tree, label)
                 .ok_or_else(|| format!("没有 label 为 \"{label}\" 的配置行"))?;
@@ -2229,6 +2247,7 @@ impl LoaderState {
             entry.disabled = value.unwrap_or(false);
             // 静态选项覆盖表达式：上游把选项设成布尔值时，表达式形态被整体替换。
             entry.disabled_expr = None;
+            self.bump_writeback();
             old
         };
         let outcome = self.sync_inner().await;
@@ -2247,6 +2266,7 @@ impl LoaderState {
                         entry.disabled = old_disabled;
                         entry.disabled_expr = old_expr;
                     }
+                    self.bump_writeback();
                 }
                 // 回滚后对齐 `disabled`、`failed_rows` 与 `loader.report`，
                 // 避免报告仍残留已被撤回的启停状态或已回滚为禁用行的失败台账。
@@ -2263,6 +2283,7 @@ impl LoaderState {
                     enabled_labels.contains(row_label)
                         || restored_issue_keys.contains(row_label.as_str())
                 });
+                *self.last.lock().unwrap() = previous_last;
                 self.publish_report();
             }
             return Err(format!(
@@ -2292,9 +2313,24 @@ impl LoaderState {
 
     /// [`sync`] 的无锁内核：调用方已经持有 `mutation`。
     async fn sync_inner(self: &Arc<Self>) -> ReconcileOutcome {
-        // 本地候选：目标就是**当前**树，不改回写元数据（运行期启停不改文件基线）。
-        let candidate = Candidate::local(self.tree_snapshot());
-        self.reconcile_once_inner(&candidate).await
+        // 本地候选：在同一 `config_gate` 临界区内原子快照 `(tree, writeback)`。
+        // 若在预检/对账期间发生并发回写（`fiber.update` / `mark_self_disposed`），
+        // `adopt` 会返回 `StaleWriteback`，此处按最新树重采重试（有界），绝不用旧快照覆盖回写。
+        for attempt_idx in 0..=MAX_STALE_REBUILDS {
+            let (entries, base_writeback) = {
+                let _gate = self.config_gate.lock().unwrap();
+                (self.tree.lock().unwrap().clone(), self.writeback())
+            };
+            let candidate = Candidate::local(entries, base_writeback);
+            let attempt = self.reconcile_attempt(&candidate).await;
+            if matches!(attempt.rejection, Some(AdoptRejection::StaleWriteback(_)))
+                && attempt_idx < MAX_STALE_REBUILDS
+            {
+                continue;
+            }
+            return attempt.outcome;
+        }
+        unreachable!("loop returns on final attempt")
     }
 
     /// 以**给定的新树**为目标对账一次（文件驱动的唯一驱动器）。
@@ -2305,7 +2341,8 @@ impl LoaderState {
     /// 只把问题写进对账产物。
     pub async fn reconcile_once(self: &Arc<Self>, entries: Vec<Entry>) -> ReconcileOutcome {
         let _guard = self.mutation.lock().await;
-        let candidate = Candidate::local(entries);
+        let base_writeback = self.writeback();
+        let candidate = Candidate::local(entries, base_writeback);
         self.reconcile_once_inner(&candidate).await
     }
 
@@ -3112,14 +3149,15 @@ impl LoaderState {
                     candidate.gen, adopted
                 )));
             }
-            // 回写版本：运行时回写已经改过已采纳目标 ⇒ 本候选基于一棵过时的树。
-            let current = self.writeback.load(Ordering::SeqCst);
-            if candidate.base_writeback != current {
-                return Err(AdoptRejection::StaleWriteback(format!(
-                    "配置候选已过期（构造时回写版本 {} ≠ 当前 {}）：运行时回写已修改已采纳目标，不采纳旧候选",
-                    candidate.base_writeback, current
-                )));
-            }
+        }
+        // 回写版本（对排队候选与本地候选一律生效）：运行时回写已经改过已采纳目标
+        // ⇒ 本候选基于一棵过时的树，绝不用旧快照整份覆盖并发回写或自我卸载。
+        let current = self.writeback.load(Ordering::SeqCst);
+        if candidate.base_writeback != current {
+            return Err(AdoptRejection::StaleWriteback(format!(
+                "配置候选已过期（构造时回写版本 {} ≠ 当前 {}）：运行时回写已修改已采纳目标，不采纳旧候选",
+                candidate.base_writeback, current
+            )));
         }
         // 测试闸门：钉住"校验通过、还没写树"这个瞬间（此刻已持 `config_gate`）。
         // 回写方若不在闸门内改树，就能从这里插进来，让下面的整份覆盖把它退回去。
@@ -3206,6 +3244,9 @@ impl LoaderState {
         &self,
         gen: u64,
     ) -> std::result::Result<Option<Candidate>, BuildCandidateError> {
+        // 回写版本必须在读盘之前快照：否则读盘之后、解析/预检期间发生的运行时回写会被
+        // 误记进候选的新回写版本，使旧磁盘快照逃过 `adopt` 的 `StaleWriteback` 校验。
+        let base_writeback = self.writeback();
         let snapshot = match self.read_settled().await {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => return Ok(None),
@@ -3230,8 +3271,7 @@ impl LoaderState {
         }
         Ok(Some(Candidate {
             gen,
-            // 回写版本在这里快照：此后任何运行时回写都会让这份候选过期。
-            base_writeback: self.writeback(),
+            base_writeback,
             entries: parsed.entries,
             adopt_metadata: true,
             main: parsed.main,
@@ -3572,18 +3612,24 @@ impl LoaderState {
         report
     }
 
-    /// 插件**自己**把这一行卸载了（上游 `loader/src/index.ts:137-145` 的 case 7）。
-    ///
-    /// 处理：从装载表摘掉 + 树侧标 `disabled: true` + **落盘**。不落盘的话，
-    /// 下一次读取配置时这一行会悄悄回来——用户看到的现象是"我明明卸掉了它，重启后又活了"。
+    /// 插件**自己**把这一行卸载了（上游 `loader/src/index.ts:137-145` 的 case 7）：
+    /// 同步阶段只从装载表摘除并暂存记录，绝不在这里持 `config_gate` 或做磁盘 I/O。
+    fn enqueue_self_dispose(&self, fiber: &Arc<Fiber>, label: &str) {
+        let record = self.mounted.lock().unwrap().remove(label);
+        self.pending_self_disposes
+            .lock()
+            .unwrap()
+            .push((fiber.clone(), label.to_string(), record));
+    }
+
+    /// 在阻塞线程池（或无运行时时的同步路径）里完成自我卸载的树更新与磁盘落盘。
     ///
     /// # 落盘必须落到行**真正所在的那一层**（P1）
     /// `self.tree` 是主配置 + patch 的合并结果。把它写回主配置会把 patch 插入的行
     /// 固化进主配置（下次读取时 patch 再插一遍 ⇒ 重复），还会把 patch 的改动
     /// 写进错误的文件。所以：主配置里的行走 [`persist`]；patch 插入的行走
     /// [`persist_overlay`]（追加一条 overlay 到最后一个 patch 文件）。
-    fn mark_self_disposed(&self, label: &str) {
-        let record = self.mounted.lock().unwrap().remove(label);
+    fn persist_self_disposed(&self, label: &str, record: Option<Mounted>) {
         // 闸门**先**取：从"改树"到"落盘"整段必须在同一个临界区里。与 [`adopt`] 的
         // "校验 + 整份写树"互斥——否则采纳可以在两者之间插进来，把这次回写盖回去
         // （树退回旧内容，而记录与磁盘是新值；watcher 指纹已对齐，不会补偿）。
@@ -3596,7 +3642,7 @@ impl LoaderState {
             .map(|record| record.declared.name.clone())
             .unwrap_or_default();
         let result = {
-            let gate = self.config_gate.lock().unwrap();
+            let _gate = self.config_gate.lock().unwrap();
             // 合并树（内存）先标上：下一轮对账不会把它再挂回来。
             let marked = {
                 let mut tree = self.tree.lock().unwrap();
@@ -3619,11 +3665,10 @@ impl LoaderState {
                 .id
                 .as_deref()
                 .and_then(|id| self.owners.lock().unwrap().disabled_layer(id));
+            // 所有回写路径（含 overlay）均在同一个 `config_gate` 临界区内落盘，
+            // 防止并发 `adopt` 或过期候选重建读到尚未落盘的旧 overlay 并覆盖内存树。
             match owner_layer {
-                Some(layer) => {
-                    drop(gate);
-                    self.persist_overlay(layer, label, &marked, None, Some(true))
-                }
+                Some(layer) => self.persist_overlay(layer, label, &marked, None, Some(true)),
                 None => match origin {
                     RowOrigin::Main => {
                         // `main_only` 的读改写与落盘落在上面取的同一个 `config_gate` 里
@@ -3641,14 +3686,10 @@ impl LoaderState {
                         if found {
                             self.persist()
                         } else {
-                            drop(gate);
                             self.persist_overlay_last(label, &marked, None, Some(true))
                         }
                     }
-                    RowOrigin::Patch => {
-                        drop(gate);
-                        self.persist_overlay_last(label, &marked, None, Some(true))
-                    }
+                    RowOrigin::Patch => self.persist_overlay_last(label, &marked, None, Some(true)),
                 },
             }
         };
@@ -4907,6 +4948,7 @@ pub async fn load_with_source(
     let main_path = PathBuf::from(&config.path);
     let base_dir = main_path
         .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
@@ -5429,18 +5471,21 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
                 // 测试报到点：这一行确实有一次提交进了观察者，**还没**取 `config_gate`。
                 #[cfg(test)]
                 state.hooks.pass_commit_entered();
-                if let Some(record) = state.mounted.lock().unwrap().get_mut(&label) {
-                    record.config = config.clone();
-                }
 
                 // 阻塞磁盘 I/O（`ConfigLock::acquire` 自旋等待 + `std::fs` + 原子替换）
                 // 移交 `spawn_blocking`，避免堵死 Tokio async worker 线程。
+                // `record.config`、内存树、回写版本与落盘（含 overlay）全部落在同一个
+                // `config_gate` 临界区内，避免并发 `diff` 看到新 `record.config` 但 `adopt`
+                // 尚未看到推进后的 `writeback` 而将新配置回滚为旧值。
                 let write_job = {
                     let state = state.clone();
                     let label = label.clone();
                     let config = config.clone();
                     move || -> Option<std::result::Result<(), String>> {
-                        let gate = state.config_gate.lock().unwrap();
+                        let _gate = state.config_gate.lock().unwrap();
+                        if let Some(record) = state.mounted.lock().unwrap().get_mut(&label) {
+                            record.config = config.clone();
+                        }
                         let tree_entry = {
                             let mut tree = state.tree.lock().unwrap();
                             match find_by_label(&mut tree, &label) {
@@ -5466,16 +5511,13 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
                             .as_deref()
                             .and_then(|id| state.owners.lock().unwrap().config_layer(id));
                         let res = match owner_layer {
-                            Some(layer) => {
-                                drop(gate);
-                                state.persist_overlay(
-                                    layer,
-                                    &label,
-                                    &tree_entry,
-                                    Some(&config),
-                                    None,
-                                )
-                            }
+                            Some(layer) => state.persist_overlay(
+                                layer,
+                                &label,
+                                &tree_entry,
+                                Some(&config),
+                                None,
+                            ),
                             None => match origin {
                                 RowOrigin::Main => {
                                     // `main_only` 的读改写 + 落盘落在上面取的同一个 `config_gate` 里
@@ -5492,7 +5534,6 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
                                     if found {
                                         state.persist()
                                     } else {
-                                        drop(gate);
                                         state.persist_overlay_last(
                                             &label,
                                             &tree_entry,
@@ -5501,15 +5542,12 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
                                         )
                                     }
                                 }
-                                RowOrigin::Patch => {
-                                    drop(gate);
-                                    state.persist_overlay_last(
-                                        &label,
-                                        &tree_entry,
-                                        Some(&config),
-                                        None,
-                                    )
-                                }
+                                RowOrigin::Patch => state.persist_overlay_last(
+                                    &label,
+                                    &tree_entry,
+                                    Some(&config),
+                                    None,
+                                ),
                             },
                         };
                         Some(res)
@@ -5553,6 +5591,7 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
 /// 下次读取时它还是禁用的）。
 fn attach_self_dispose_observer(ctx: &Ctx, state: Arc<LoaderState>) {
     let loader_ctx = ctx.clone();
+    let sync_state = state.clone();
     ctx.store.clone().on_plugin(ctx, move |fiber| {
         if !fiber.is_disposed() {
             return;
@@ -5563,14 +5602,49 @@ fn attach_self_dispose_observer(ctx: &Ctx, state: Arc<LoaderState>) {
         {
             return;
         }
-        let Some(label) = state.label_of_fiber(fiber) else {
+        let Some(label) = sync_state.label_of_fiber(fiber) else {
             return;
         };
-        if state.disposing.lock().unwrap().contains(&label) {
+        if sync_state.disposing.lock().unwrap().contains(&label) {
             return;
         }
-        state.mark_self_disposed(&label);
+        sync_state.enqueue_self_dispose(fiber, &label);
     });
+    ctx.store
+        .clone()
+        .on_plugin_dispose_async(ctx, move |fiber| {
+            let state = state.clone();
+            Box::pin(async move {
+                let pending = {
+                    let mut list = state.pending_self_disposes.lock().unwrap();
+                    list.iter()
+                        .position(|(f, _, _)| Arc::ptr_eq(f, &fiber))
+                        .map(|idx| {
+                            let (_, label, record) = list.swap_remove(idx);
+                            (label, record)
+                        })
+                };
+                let Some((label, record)) = pending else {
+                    return;
+                };
+                let write_state = state.clone();
+                let write_label = label.clone();
+                let write_job = move || {
+                    write_state.persist_self_disposed(&write_label, record);
+                };
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    if let Err(err) = handle.spawn_blocking(write_job).await {
+                        state.record_persisted_error(
+                            &label,
+                            "",
+                            format!("插件自我卸载后台回写线程异常: {err}"),
+                        );
+                    }
+                } else {
+                    write_job();
+                }
+            })
+        });
 }
 
 /// 热重载监听：一轮里看两件事——**配置文件**变了没有、**插件文件**变了没有。
@@ -5847,7 +5921,13 @@ impl Mounted {
     ///   ⇒ 新实例 provide 失败 ⇒ 回滚也失败）；
     /// - `Lost`：条目没有可用实例，调用方应把它移出装载表并告警。
     fn commit_outcome(&mut self, outcome: SwapOutcome, staged: Option<PathBuf>) -> bool {
-        self.fingerprint = fingerprint(&self.source);
+        if self.file_source {
+            if let Some(fp) = fingerprint(&self.source) {
+                self.fingerprint = Some(fp);
+            }
+        } else {
+            self.fingerprint = None;
+        }
         match outcome {
             SwapOutcome::Ok { fiber, plugin, .. } => {
                 self.fiber = Arc::downgrade(&fiber);
@@ -6119,6 +6199,9 @@ async fn finish_reload_swap(
         );
     } else {
         state.clear_failed_row(label);
+        if matches!(report.status, ReloadStatus::Active | ReloadStatus::Pending) {
+            clear_reload_failures(state, label);
+        }
         state
             .mounted
             .lock()
@@ -6359,9 +6442,16 @@ pub async fn reload_one_with_plugin(
 }
 
 /// 预检失败时也要把指纹推进到装载表：不然 HMR 每 500ms 重试同一个坏库（重试风暴）。
+///
+/// 若源文件此刻短暂缺失或不可读（`fingerprint` 返回 `None`），必须保留原 `Some(...)` 指纹，
+/// 绝不写成 `None`——`stale_labels` 会跳过 `fingerprint == None` 的行，写成 `None` 会让该行永久退出 HMR。
 fn advance_fingerprint(state: &Arc<LoaderState>, label: &str) {
     if let Some(record) = state.mounted.lock().unwrap().get_mut(label) {
-        record.fingerprint = fingerprint(&record.source);
+        if record.fingerprint.is_some() {
+            if let Some(fp) = fingerprint(&record.source) {
+                record.fingerprint = Some(fp);
+            }
+        }
     }
 }
 
@@ -6376,6 +6466,14 @@ fn record_reload_failure(state: &Arc<LoaderState>, label: &str, failure: &str) {
     let line = format!("{label}: {failure}");
     if !outcome.failures.contains(&line) {
         outcome.failures.push(line);
+    }
+}
+
+/// 热重载成功恢复到 `Active` / `Pending` 后，清理该行残留的陈旧失败条目。
+fn clear_reload_failures(state: &Arc<LoaderState>, label: &str) {
+    let prefix = format!("{label}: ");
+    if let Some(last) = state.last.lock().unwrap().as_mut() {
+        last.failures.retain(|line| !line.starts_with(&prefix));
     }
 }
 

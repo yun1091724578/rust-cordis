@@ -26,6 +26,11 @@ pub(crate) unsafe fn blob_to_string(
         .map_err(|err| format!("{field} 不是合法 UTF-8: {err}"))
 }
 
+pub(crate) unsafe fn blob_to_json(blob: Blob, field: &str) -> std::result::Result<Value, String> {
+    let bytes = blob_as_bytes(blob, field)?;
+    serde_json::from_slice(bytes).map_err(|err| format!("{field}不是合法 JSON: {err}"))
+}
+
 pub(crate) unsafe extern "C" fn host_ctx_get(handle: u64, name: Blob, out: *mut Out) -> i32 {
     let name = match blob_to_string(name, "get 的服务名") {
         Ok(value) => value,
@@ -104,9 +109,9 @@ pub(crate) unsafe extern "C" fn host_ctx_set(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    let parsed: Value = match serde_json::from_slice(value_json.as_bytes()) {
+    let parsed: Value = match blob_to_json(value_json, "set 的载荷") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("set 的载荷不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     with_instance(handle, out, |instance| {
         instance
@@ -165,9 +170,9 @@ pub(crate) unsafe extern "C" fn host_ctx_intercept(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    let metadata: Value = match serde_json::from_slice(metadata.as_bytes()) {
+    let metadata: Value = match blob_to_json(metadata, "intercept 的 metadata ") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("intercept 的 metadata 不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     with_resolved(handle, out, |resolved| {
         let derived = resolved.ctx.intercept(&key, metadata);
@@ -192,9 +197,9 @@ pub(crate) unsafe extern "C" fn host_ctx_use(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    let config: Value = match serde_json::from_slice(config.as_bytes()) {
+    let config: Value = match blob_to_json(config, "use 的 config ") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("use 的 config 不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     with_resolved(handle, out, |resolved| {
         let plugin = resolve_component(&url)?;
@@ -215,9 +220,9 @@ pub(crate) unsafe extern "C" fn host_ctx_use(
 /// 子 fiber 条目会真的 dispose 那个 fiber（loader 行因此走既有的自我卸载
 /// 识别链）；isolate/intercept 条目只是撤销句柄（域不回收，与上游一致）。
 pub(crate) unsafe extern "C" fn host_ctx_dispose(handle: u64, target: Blob, out: *mut Out) -> i32 {
-    let parsed: Value = match serde_json::from_slice(target.as_bytes()) {
+    let parsed: Value = match blob_to_json(target, "dispose 的 target ") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("dispose 的 target 不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     let Some(raw) = parsed.get("handle").and_then(Value::as_u64) else {
         return fail(
@@ -327,9 +332,9 @@ pub(crate) unsafe extern "C" fn host_ctx_provide(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    let parsed: Value = match serde_json::from_slice(value_json.as_bytes()) {
+    let parsed: Value = match blob_to_json(value_json, "provide 的载荷") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("provide 的载荷不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     with_instance(handle, out, |instance| {
         // 整个 provide 是调用者 fiber 的一个 effect：插件卸载时自动摘除，
@@ -474,8 +479,7 @@ impl ExternService for PluginIface {
             } {
                 Ok(Inbound::Ready(value)) => {
                     if !sink.is_finished() {
-                        sink.push(value);
-                        sink.close();
+                        sink.close_with(value);
                     }
                     Ok(())
                 }
@@ -545,9 +549,9 @@ pub(crate) unsafe extern "C" fn host_ctx_provide_iface(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    let parsed: Value = match serde_json::from_slice(methods.as_bytes()) {
+    let parsed: Value = match blob_to_json(methods, "方法清单") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("方法清单不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     let methods: Vec<String> = parsed
         .as_array()
@@ -591,9 +595,9 @@ pub(crate) unsafe extern "C" fn host_ctx_call_iface(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    let parsed: Value = match serde_json::from_slice(args.as_bytes()) {
+    let parsed: Value = match blob_to_json(args, "call_iface 的 args ") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("call_iface 的 args 不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     // M3：走 [`with_resolved_payload`] 而不是 [`with_instance`]——调用点上叠的
     // intercept 层挂在**派生 ctx** 上，用实例 ctx 调用等于把它丢掉（"use-site
@@ -788,9 +792,9 @@ pub(crate) unsafe extern "C" fn host_ctx_fulfill(
     let value: Value = if payload.len == 0 {
         Value::Null
     } else {
-        match serde_json::from_slice(payload.as_bytes()) {
+        match blob_to_json(payload, "fulfill 的载荷") {
             Ok(value) => value,
-            Err(err) => return fail(out, &format!("fulfill 的载荷不是合法 JSON: {err}")),
+            Err(err) => return fail(out, &err),
         }
     };
     with_instance_as(handle, out, "host_fulfill", "lifecycle", move |instance| {
@@ -818,8 +822,7 @@ pub(crate) unsafe extern "C" fn host_ctx_fulfill(
         // 于是"值路径"与"流路径"在提供者看来是同一件事（长度 1 的流的推广）。
         if let Some(sink) = &record.stream {
             if !sink.is_finished() {
-                sink.push(value.clone());
-                sink.close();
+                sink.close_with(value.clone());
             }
         }
         if let Some(tx) = record.sink {
@@ -896,9 +899,9 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
     on_done: u64,
     out: *mut Out,
 ) -> i32 {
-    let parsed: Value = match serde_json::from_slice(args.as_bytes()) {
+    let parsed: Value = match blob_to_json(args, "next 的 args ") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("next 的 args 不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     let new_args = json_to_args(
         &parsed
@@ -913,16 +916,30 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
                 .with_category("lifecycle")
         };
         let error_format = instance.error_format;
+        let delivered = Arc::new(AtomicBool::new(false));
+        let cancel_outbound = Outbound {
+            owner: handle,
+            continuation: on_done,
+            kind: ContinuationKind::Next,
+            trace_parent: None,
+            trace_correlation: None,
+        };
         let frame = {
             let mut table = instance.dispatches.lock().unwrap();
             if instance.closed.load(Ordering::SeqCst) {
                 return Err(closed_admission_payload());
             }
             match table.get_mut(&dispatch_id) {
-                Some(record) => record
-                    .frame
-                    .take()
-                    .map(|frame| (frame, dispatch_task(instance, dispatch_id))),
+                Some(record) => record.frame.take().map(|frame| {
+                    (
+                        frame,
+                        dispatch_task_with_cancel(
+                            instance,
+                            dispatch_id,
+                            Some((cancel_outbound, delivered.clone())),
+                        ),
+                    )
+                }),
                 None => None,
             }
         };
@@ -938,9 +955,17 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
             scope: (handle, dispatch_id),
         });
         let scoped = with_next_timeout(scoped, dispatch_id, instance.dispatch_policy);
+        let deliver_flag = delivered.clone();
         let deliver: Arc<dyn Fn(std::result::Result<Ret, ErrorPayload>) + Send + Sync> =
             Arc::new(move |result| {
-                deliver_next(handle, dispatch_id, on_done, error_format, result);
+                deliver_next(
+                    handle,
+                    dispatch_id,
+                    on_done,
+                    error_format,
+                    &deliver_flag,
+                    result,
+                );
             });
         let deferred = {
             let deliver = deliver.clone();
@@ -960,22 +985,55 @@ pub(crate) unsafe extern "C" fn host_ctx_next(
         match deferred {
             Ok(Some(result)) => deliver(result),
             Ok(None) => {}
-            Err(DeferFailure::NoRuntime(message)) => return Err(next_error(message)),
+            Err(DeferFailure::NoRuntime(message)) => {
+                // 返回 Err 时 SDK 会立刻 `forget(cb)`，置位避免并发取消再投递一次。
+                delivered.store(true, Ordering::SeqCst);
+                return Err(next_error(message));
+            }
             // 首 poll panic：**不摘入站记录**（它由事件派发/取消路径收尾），只返回错误。
-            Err(DeferFailure::Panic(payload)) => return Err(payload),
+            Err(DeferFailure::Panic(payload)) => {
+                delivered.store(true, Ordering::SeqCst);
+                return Err(payload);
+            }
         }
         Ok(String::new())
     })
 }
 
 /// 把下游结果投递给插件的 `on_done` 续延（`kind:"next"`）。
+///
+/// 与 [`deliver_outbound`] 同口径：`closed` 检查、`delivered` 终态认领与 `ActiveCall`
+/// 准入在同一把 `dispatches` 锁内原子完成——若关闭已经先赢，不置位 `delivered`，
+/// 留给卸载收尾经 `cancel_outbound` 投递 `host_lifecycle`（恰好一次，绝不丢失）。
 fn deliver_next(
     handle: u64,
     dispatch_id: u64,
     on_done: u64,
     error_format: u32,
+    delivered: &AtomicBool,
     result: std::result::Result<Ret, ErrorPayload>,
 ) {
+    let Some(instance) = instances().read().unwrap().get(handle) else {
+        return;
+    };
+    let _active = {
+        let _table = instance.dispatches.lock().unwrap();
+        if instance.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(lease) = call_lease(&instance) else {
+            return;
+        };
+        if delivered.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        *instance.lifecycle.lock().unwrap() += 1;
+        ActiveCall {
+            active: instance.lifecycle.clone(),
+            changed: instance.calls_changed.clone(),
+            lease: Ok(lease),
+        }
+    };
     let args = match result {
         Ok(ret) => json!({ "result": ret_to_json(ret) }),
         Err(err) => error_arg(error_format, &err),
@@ -988,8 +1046,15 @@ fn deliver_next(
     .to_string();
     // 交付期间让"这次派发"留在作用域里：插件在 on_done 里再发派发时父节点仍是它。
     let _scope = scope_push(handle, dispatch_id);
-    // `call_live` 短锁登记后调用；插件可重入宿主（fulfill / 再 next）。
-    if let Err(message) = unsafe { call_live(handle, OP_CALLBACK, &payload) } {
+    if let Err(message) = unsafe {
+        call_plugin(
+            instance.call,
+            handle,
+            OP_CALLBACK,
+            &payload,
+            instance.error_format,
+        )
+    } {
         eprintln!("[cordis] waterfall 的 on_done 交付失败: {message}");
     }
 }
@@ -1063,7 +1128,8 @@ pub(crate) unsafe extern "C" fn host_ctx_on(
                     "host_lifecycle",
                     "lifecycle",
                     "unknown",
-                )),
+                )
+                .with_frame(frame)),
             };
             Box::pin(async move {
                 let settled = match result {
@@ -1075,21 +1141,21 @@ pub(crate) unsafe extern "C" fn host_ctx_on(
                     Ok(Value::Null) => None,
                     Ok(value) => Some(Dyn::new(ExternValue(value))),
                     Err(message) => {
-                        // 容量拒绝不是“监听器没有意见”：把剩余 waterfall 链继续跑完，
-                        // 否则事件派发会静默吞掉下游。
-                        if message.payload.code == "host_capacity" {
-                            let frame = message
-                                .frame
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .take();
-                            if let Some(frame) = frame {
-                                return frame.call(next_args).await;
-                            }
+                        // 非容量拒绝类失败留下一条错误日志；无论哪种失败（容量拒绝、句柄失效、
+                        // 回调报错/panic/不支持/非合法 JSON、或挂起超时），只要 waterfall 剩余链
+                        // 尚未被插件消费，都把剩余链继续跑完——这才是 waterfall 模式下的“没有意见”，
+                        // 而不是返回 `None` 静默截断下游与 tail。
+                        if message.payload.code != "host_capacity" {
+                            call_ctx.log(Level::Error, &format!("事件监听器失败: {message}"));
                         }
-                        // 其他监听器失败：记日志并当作"没有意见"。
-                        // 内核的 handler 签名不可失败（见 `cordis_core::event` 的说明）。
-                        call_ctx.log(Level::Error, &format!("事件监听器失败: {message}"));
+                        let frame = message
+                            .frame
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        if let Some(frame) = frame {
+                            return frame.call(next_args).await;
+                        }
                         None
                     }
                 }
@@ -1239,9 +1305,9 @@ pub(crate) unsafe fn dispatch_impl(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    let parsed: Value = match serde_json::from_slice(payload.as_bytes()) {
+    let parsed: Value = match blob_to_json(payload, "dispatch 的载荷") {
         Ok(value) => value,
-        Err(err) => return fail(out, &format!("dispatch 的载荷不是合法 JSON: {err}")),
+        Err(err) => return fail(out, &err),
     };
     let args = json_to_args(&parsed.get("args").cloned().unwrap_or(Value::Null));
     let mode = parsed
