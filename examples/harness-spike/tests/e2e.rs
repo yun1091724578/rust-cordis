@@ -598,3 +598,109 @@ async fn r3_p2_child_scope_tool_shadows_parent_and_global_across_hooks_and_catal
         tool_records[2]
     );
 }
+
+#[tokio::test]
+async fn r4_p1_tool_plugin_rolls_back_catalog_entry_on_concurrent_dispose() {
+    use cordis::core::Fiber;
+    use cordis::service_impl;
+    use harness_spike::{tool_plugin, Tools};
+    use std::collections::BTreeMap;
+    use tokio::sync::Notify;
+
+    struct RaceTools {
+        entries: Mutex<BTreeMap<(u64, String), String>>,
+        registered_notify: Arc<Notify>,
+        release_register: Arc<Notify>,
+    }
+
+    #[service_impl]
+    impl Tools for RaceTools {
+        async fn register(
+            &self,
+            owner: u64,
+            name: String,
+            desc: String,
+            _iface: Option<String>,
+        ) -> Result<(), String> {
+            self.entries.lock().unwrap().insert((owner, name), desc);
+            self.registered_notify.notify_one();
+            self.release_register.notified().await;
+            Ok(())
+        }
+
+        async fn unregister(&self, owner: u64, name: String) -> Result<(), String> {
+            self.entries.lock().unwrap().remove(&(owner, name));
+            Ok(())
+        }
+
+        async fn names(&self, owners: Vec<u64>) -> Result<Vec<String>, String> {
+            let guard = self.entries.lock().unwrap();
+            let mut out: Vec<String> = guard
+                .keys()
+                .filter(|(o, _)| owners.contains(o))
+                .map(|(_, n)| n.clone())
+                .collect();
+            out.sort();
+            Ok(out)
+        }
+
+        async fn call(
+            &self,
+            _owners: Vec<u64>,
+            _name: String,
+            _input: Value,
+        ) -> Result<Value, String> {
+            Err("unused".into())
+        }
+    }
+
+    let app = App::new();
+    let registered_notify = Arc::new(Notify::new());
+    let release_register = Arc::new(Notify::new());
+    let tools = Arc::new(RaceTools {
+        entries: Mutex::new(BTreeMap::new()),
+        registered_notify: registered_notify.clone(),
+        release_register: release_register.clone(),
+    });
+    let tools_for_plugin = tools.clone();
+    app.plugin(
+        plugin_fn("race-tools", Inject::default(), move |ctx: Ctx, _| {
+            let tools = tools_for_plugin.clone();
+            Box::pin(async move {
+                ToolsService::provide(&ctx, tools)?;
+                Ok(())
+            })
+        }),
+        Config::Null,
+    )
+    .await
+    .unwrap();
+
+    let scoped = agent_scope(&app.root);
+    let owner = scoped.scope().unwrap().uid();
+    let fiber: Arc<Fiber> = scoped.plugin(tool_plugin("alpha", "racy"), Config::Null);
+
+    // Wait until `tool_plugin` has inserted into `tools` and is suspended inside `register().await`.
+    registered_notify.notified().await;
+
+    // Trigger concurrent dispose while `register()` is still returning, then release `register()`.
+    let dispose_fiber = fiber.clone();
+    let dispose_task = tokio::spawn(async move {
+        dispose_fiber.dispose().await;
+    });
+    // Wait until fiber enters Unloading so effect registration will fail.
+    for _ in 0..100 {
+        if matches!(fiber.state(), FiberState::Unloading | FiberState::Disposed) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    release_register.notify_one();
+    dispose_task.await.unwrap();
+
+    let remaining = tools.names(vec![owner]).await.unwrap();
+    assert!(
+        remaining.is_empty(),
+        "并发 dispose 后 tool_plugin 必须回滚目录登记，不得残留幽灵条目: {remaining:?}"
+    );
+}

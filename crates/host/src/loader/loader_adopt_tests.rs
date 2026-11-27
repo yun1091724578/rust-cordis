@@ -1740,18 +1740,19 @@ async fn advance_fingerprint_preserves_tracking_across_transient_read_failure() 
     let source = ScriptSource::new(Vec::new());
     let state = load_scripted(&app, &path, source).await;
     {
-        let mut mounted = state.mounted.lock().unwrap();
-        let record = mounted.get_mut("single").expect("single 已挂载");
-        record.source = plugin_file.clone();
-        record.fingerprint = Some(initial_fp);
+        state
+            .with_mounted_mut("single", |record| {
+                record.source = plugin_file.clone();
+                record.fingerprint = Some(initial_fp);
+            })
+            .expect("single 已挂载");
     }
 
     // 模拟构建工具原子替换瞬间原文件短暂消失。
     std::fs::remove_file(&plugin_file).expect("删除源文件模拟瞬时缺失");
     advance_fingerprint(&state, "single");
     {
-        let mounted = state.mounted.lock().unwrap();
-        let record = mounted.get("single").expect("single 仍在");
+        let record = state.mounted_record_clone("single").expect("single 仍在");
         assert_eq!(
             record.fingerprint.as_ref(),
             Some(&initial_fp),
@@ -1779,4 +1780,99 @@ fn bare_config_filename_parent_resolves_to_dot_not_empty() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     assert_eq!(base_dir, PathBuf::from("."));
+}
+
+/// R4 P1-12 (reload path): `reload_one_report` 在预检/打开新库窗口期间，若原实例发生自我卸载，
+/// `finish_reload_swap` 必须通过原子认领发现该行已进入 `SelfDisposing`（或已卸载），返回
+/// `NotMounted` 而不复活该行、不覆盖磁盘 `disabled: true`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_p1_dispose_self_during_reload_one_aborts_with_not_mounted() {
+    let app = App::new();
+    let dir = TempDir::new("r4-reload-selfdisp");
+    let path = dir.write(
+        "cordis.yml",
+        "- id: victim\n  name: suicidal\n  config:\n    service: r4-reload-svc\n    value: 1\n",
+    );
+    let source = ScriptSource::new(Vec::new());
+    let state = load_scripted(&app, &path, source.clone()).await;
+    assert_eq!(state.mounted_labels(), ["victim"]);
+    let victim_fiber = source.stashed_fiber();
+
+    // 使用 `reload_one_with_plugin` 在并发自我卸载后验证：先挂住 `mutation` 模拟窗口？
+    // 更直接：先触发 self-dispose（进入 SelfDisposing），再用一个慢 async disposer 阻塞它，
+    // 确保 `reload_one_with_plugin` 和 `finish_reload_swap` 在 `SelfDisposing` 期间拒绝换入！
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    {
+        let entered = entered.clone();
+        let release = release.clone();
+        let _ = victim_fiber.ctx().effect(move |_| {
+            let entered = entered.clone();
+            let release = release.clone();
+            cordis_core::Disposable::new(move || {
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                })
+            })
+        });
+    }
+
+    // 模拟 `reload_one_report` 拿到 `record` 快照之后、调用 `finish_reload_swap` 之前发生自我卸载！
+    let guard = state.mutation.lock().await;
+    let stale_record = state.mounted_record_clone("victim").expect("victim record");
+
+    let dispose_task = tokio::spawn(async move {
+        victim_fiber.dispose().await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("victim entered self-dispose");
+
+    let replacement_mounts = Arc::new(AtomicUsize::new(0));
+    let rm = replacement_mounts.clone();
+    let new_plugin: Arc<dyn Plugin> =
+        cordis_core::plugin_fn("v2", Inject::default(), move |_, _| {
+            let rm = rm.clone();
+            Box::pin(async move {
+                rm.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(3),
+        finish_reload_swap(
+            &app.root,
+            &state,
+            "victim",
+            stale_record,
+            new_plugin,
+            None,
+            None,
+            guard,
+        ),
+    )
+    .await
+    .expect("finish_reload_swap 不得在 SelfDisposing 窗口内卡死等待旧实例");
+
+    assert_eq!(
+        report.status,
+        ReloadStatus::NotMounted,
+        "自我卸载窗口内的 finish_reload_swap 必须返回 NotMounted 而不复活该行: {report:?}"
+    );
+    assert_eq!(
+        replacement_mounts.load(Ordering::SeqCst),
+        0,
+        "不得把新插件挂载到正在自我卸载的行上"
+    );
+    assert!(state.fiber_of("victim").is_none());
+
+    release.notify_waiters();
+    dispose_task.await.unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("disabled: true"),
+        "自我卸载落盘必须保留 disabled: true:\n{on_disk}"
+    );
 }

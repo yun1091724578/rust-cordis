@@ -724,10 +724,10 @@ async fn commit_outcome_refreshes_the_volatile_declaration_cache() {
         false,
     );
     state
-        .mounted
+        .rows
         .lock()
         .unwrap()
-        .insert("entry".into(), record.clone());
+        .insert("entry".into(), RowSlot::Mounted(Box::new(record.clone())));
     let entries = crate::patch::parse_entries(
         "- id: entry\n  name: entry\n  config:\n    data: 1\n    next: 2\n",
     )

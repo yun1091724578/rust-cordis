@@ -585,47 +585,119 @@ impl Drop for NativeTaskDone {
 }
 
 thread_local! {
-    /// 当前 poll 窗口内正在执行的受管原生后台任务所属 fiber（`spawn_scoped` / `spawn_native_task`）。
+    /// 当前 poll 窗口内正在执行的受管原生任务 / `load()` / `disposer` / `Mode::Parallel` 所属 fiber 栈。
     ///
-    /// 公开生命周期入口靠它识别“任务正在等待自己的 fiber（或其祖先/提供者）收敛/关闭”，
-    /// 避免清理等任务、任务等清理的自锁。
-    static CURRENT_NATIVE_TASK_FIBER: std::cell::RefCell<Option<Weak<Fiber>>> =
-        const { std::cell::RefCell::new(None) };
+    /// 公开生命周期入口靠它识别“当前任务正在等待自己（或其祖先/提供者）收敛/关闭”，
+    /// 避免清理等任务、任务等清理或 `Fiber::driver` 重入自锁。
+    static CURRENT_EXECUTION_FIBERS: std::cell::RefCell<Vec<Weak<Fiber>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
-struct NativeTaskGuard {
-    previous: Option<Weak<Fiber>>,
+struct ExecutionFrameGuard {
+    prev_len: usize,
 }
 
-impl Drop for NativeTaskGuard {
+impl Drop for ExecutionFrameGuard {
     fn drop(&mut self) {
-        let previous = self.previous.take();
-        CURRENT_NATIVE_TASK_FIBER.with(|cell| {
-            *cell.borrow_mut() = previous;
+        CURRENT_EXECUTION_FIBERS.with(|cell| {
+            cell.borrow_mut().truncate(self.prev_len);
         });
     }
 }
 
-fn enter_native_task(owner: Weak<Fiber>) -> NativeTaskGuard {
-    let previous = CURRENT_NATIVE_TASK_FIBER.with(|cell| cell.borrow_mut().replace(owner));
-    NativeTaskGuard { previous }
+fn enter_execution_fiber(owner: Weak<Fiber>) -> ExecutionFrameGuard {
+    let prev_len = CURRENT_EXECUTION_FIBERS.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        let len = stack.len();
+        stack.push(owner);
+        len
+    });
+    ExecutionFrameGuard { prev_len }
 }
 
-fn current_native_task_fiber() -> Option<Arc<Fiber>> {
-    CURRENT_NATIVE_TASK_FIBER.with(|cell| cell.borrow().as_ref().and_then(Weak::upgrade))
+fn enter_execution_fibers(owners: &[Weak<Fiber>]) -> ExecutionFrameGuard {
+    let prev_len = CURRENT_EXECUTION_FIBERS.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        let len = stack.len();
+        stack.extend(owners.iter().cloned());
+        len
+    });
+    ExecutionFrameGuard { prev_len }
 }
 
-/// 当前线程是否正在执行一条由 `target` 卸载/处置时会等待退出的受管原生任务。
+pub(crate) fn snapshot_execution_fibers() -> Vec<Weak<Fiber>> {
+    CURRENT_EXECUTION_FIBERS.with(|cell| cell.borrow().clone())
+}
+
+/// 统一的 poll 级执行帧包装器：在每次 `poll` 期间压入执行中的 fiber 栈及可选调用方/关联标识，
+/// 离开或 unwind 时由 RAII 守卫恢复，彻底消除 `apply` / `disposer` / `Mode::Parallel` 重入死锁。
+pub(crate) struct ExecutionFrameFuture<F> {
+    fibers: Vec<Weak<Fiber>>,
+    caller_uid: Option<u64>,
+    correlation_id: Option<Arc<str>>,
+    inner: F,
+}
+
+impl<F> ExecutionFrameFuture<F> {
+    pub(crate) fn with_fiber(fiber: Weak<Fiber>, inner: F) -> Self {
+        Self {
+            fibers: vec![fiber],
+            caller_uid: None,
+            correlation_id: None,
+            inner,
+        }
+    }
+
+    pub(crate) fn inherited(
+        fibers: Vec<Weak<Fiber>>,
+        caller_uid: u64,
+        correlation_id: Option<Arc<str>>,
+        inner: F,
+    ) -> Self {
+        Self {
+            fibers,
+            caller_uid: (caller_uid != 0).then_some(caller_uid),
+            correlation_id,
+            inner,
+        }
+    }
+}
+
+impl<F: std::future::Future + Unpin> std::future::Future for ExecutionFrameFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let _fiber_guard = enter_execution_fibers(&this.fibers);
+        let _caller_guard = this.caller_uid.map(crate::trace::enter_caller_uid);
+        let _corr_guard = this
+            .correlation_id
+            .as_ref()
+            .map(|cid| crate::trace::enter_correlation(Some(cid.clone())));
+        Pin::new(&mut this.inner).poll(cx)
+    }
+}
+
+fn current_execution_fibers() -> Vec<Arc<Fiber>> {
+    CURRENT_EXECUTION_FIBERS.with(|cell| {
+        cell.borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>()
+    })
+}
+
+/// 当前线程是否正在执行一条由 `target` 卸载/处置时会等待退出的受管任务/装载/清理帧。
 ///
-/// 只要当前任务所属 fiber 沿「父链（祖先 dispose 递归 dispose 子 fiber）」或
+/// 只要当前帧栈上任意所属 fiber 沿「父链（祖先 dispose 递归 dispose 子 fiber）」或
 /// 「依赖边（提供者 unload/dispose 等待依赖者卸载）」可达 `target`，
 /// `target` 的清理/卸载就必须等当前任务退出；当前任务绝不能反向等待 `target` 收敛。
 fn current_task_waited_by(target: &Arc<Fiber>) -> bool {
-    let Some(owner) = current_native_task_fiber() else {
+    let mut stack = current_execution_fibers();
+    if stack.is_empty() {
         return false;
-    };
+    }
     let target_ptr = Arc::as_ptr(target);
-    let mut stack = vec![owner];
     let mut seen = HashSet::new();
     while let Some(fiber) = stack.pop() {
         let ptr = Arc::as_ptr(&fiber);
@@ -701,7 +773,7 @@ impl std::future::Future for ScopedTaskFuture {
         let Some(fut) = this.future.as_mut() else {
             return Poll::Ready(());
         };
-        let _task_guard = enter_native_task(this.owner.clone());
+        let _task_guard = enter_execution_fiber(this.owner.clone());
         let _corr_guard = this
             .correlation_id
             .as_ref()
@@ -730,6 +802,18 @@ type HookTable = HashMap<Box<str>, Vec<(u64, Handler)>>;
 
 /// 提交视图：隔离域 → 服务名 → 实现。按域分组是跨域读取不串线的关键。
 type CommittedView = HashMap<RealmId, HashMap<Box<str>, Arc<Impl>>>;
+
+/// 统一管理 `internal/update` 在飞链计数与 quiescence replay 状态，消除分散原子变量的非法组合。
+///
+/// 不变量：一旦 `disposed == true`，`replay_owed` 强制为 `false` 且禁止再置位，
+/// 确保 `when_updates_settled()` 在并发 `dispose()` 或 `run_replay()` panic 后永不挂死。
+#[derive(Default)]
+struct UpdateQuiescence {
+    active_chains: usize,
+    replay_owed: bool,
+    replay_scheduled: bool,
+    disposed: bool,
+}
 
 /// 一次正在进行的 effect 登记。Drop 时递减 `in_flight` 并唤醒卸载等待者；
 /// 即使 setup panic，也不会把闸门永久卡住。
@@ -871,12 +955,8 @@ pub struct Fiber {
     /// 提交闸门：把“比较 update_rev + fire_commit + 赋值 + adopt”串行化。
     /// 不覆盖 `internal/update`，因此 handler 重入 update 不会死锁。
     commit_gate: tokio::sync::Mutex<()>,
-    /// 正在执行的 `internal/update` chain 数（不含 replay）。
-    active_chains: AtomicUsize,
-    /// 有被超越的 chain 需要在所有 chain 静默后对最新配置 replay 一次。
-    replay_owed: AtomicBool,
-    /// 是否已经有一个 replay 任务在飞，避免重复调度。
-    replay_scheduled: AtomicBool,
+    /// 统一管理在飞 `internal/update` 链计数与 quiescence replay 状态。
+    quiescence: Mutex<UpdateQuiescence>,
     /// replay 单飞锁：即使调度竞争，也只允许一个 replay 循环。
     replay_gate: tokio::sync::Mutex<()>,
     /// update 收敛通知：`when_updates_settled` 等 active/replay 全部结束。
@@ -944,9 +1024,7 @@ impl Fiber {
             committed_rev: Mutex::new(0),
             update_rollback: Mutex::new(UpdateRollbackState::default()),
             commit_gate: tokio::sync::Mutex::new(()),
-            active_chains: AtomicUsize::new(0),
-            replay_owed: AtomicBool::new(false),
-            replay_scheduled: AtomicBool::new(false),
+            quiescence: Mutex::new(UpdateQuiescence::default()),
             replay_gate: tokio::sync::Mutex::new(()),
             updates_settled: tokio::sync::Notify::new(),
             state: AtomicU8::new(FiberState::Active as u8),
@@ -1038,9 +1116,7 @@ impl Fiber {
             committed_rev: Mutex::new(0),
             update_rollback: Mutex::new(UpdateRollbackState::default()),
             commit_gate: tokio::sync::Mutex::new(()),
-            active_chains: AtomicUsize::new(0),
-            replay_owed: AtomicBool::new(false),
-            replay_scheduled: AtomicBool::new(false),
+            quiescence: Mutex::new(UpdateQuiescence::default()),
             replay_gate: tokio::sync::Mutex::new(()),
             updates_settled: tokio::sync::Notify::new(),
             state: AtomicU8::new(FiberState::Pending as u8),
@@ -1052,9 +1128,16 @@ impl Fiber {
 
         if let Some(runtime) = &runtime {
             // 先登记到 `Store::runtimes`，再向父 fiber 挂入子生命周期 effect：
-            // 若父 fiber 在 `try_effect_registered` 之后并发 `dispose()`，`child.dispose()`
-            // 的 `DisposeDone` 一定能在 `runtimes` 中摘除该子 fiber，避免永久泄漏。
-            store.register_fiber(runtime, &fiber);
+            // 1) 若 `runtime` 已被并发 `delete_plugin` 退役，立即 fail-closed 绝不复活僵尸 fiber；
+            // 2) 若父 fiber 已被释放（`parent.fiber_opt().is_none()`）或正在卸载，同样 fail-closed，
+            //    绝不产生逃逸 `App::close()` 的孤儿活 fiber。
+            if !store.register_fiber(runtime, &fiber) {
+                fiber.mark_effects_closed();
+                *fiber.error.lock().unwrap() =
+                    Some("plugin runtime was retired before mount".into());
+                fiber.set_state(FiberState::Failed);
+                return fiber;
+            }
             // 关键：**插件的生命周期本身就是父 fiber 的一个 effect**。
             // 这一行同时买到两件事：① 父卸载 → 子递归卸载；
             // ② 父子卸载顺序自动满足 LIFO（对应 JS 的 `fiber.ts:171-199`）。
@@ -1094,6 +1177,13 @@ impl Fiber {
                         return fiber;
                     }
                 }
+            } else {
+                store.unregister_fiber(runtime, &fiber);
+                fiber.mark_effects_closed();
+                *fiber.error.lock().unwrap() =
+                    Some("cannot mount plugin on disposed parent context".into());
+                fiber.set_state(FiberState::Failed);
+                return fiber;
             }
             if fiber.is_disposed() {
                 return fiber;
@@ -2573,23 +2663,36 @@ impl Fiber {
         }
         let Some(ctx) = self.ctx_opt() else { return };
         // 若仍有尚未被 `internal/update` 批准的在飞更新（`in_flight` 非空），装载只能采用
-        // 最新已批准的 `baseline` 配置，绝不把未批准/可能被否决的 `self.config` 交给 `plugin.apply`。
-        let (raw, loading_from_baseline) = {
+        // 最新已批准的 `baseline` 配置；无论 `in_flight` 是否为空都记录 `loaded_rev`，
+        // 确保 `resolve_config().await` 期间若有并发更新写入 `rb.baseline`，下方仍能刷新其活 `VolatileRef`。
+        let (raw, loaded_rev) = {
             let rb = self.update_rollback.lock().unwrap();
             if !rb.in_flight.is_empty() {
                 if let Some((base_rev, snap)) = &rb.baseline {
-                    (snap.config.clone(), Some(*base_rev))
+                    (snap.config.clone(), *base_rev)
                 } else {
-                    (self.config.lock().unwrap().clone(), None)
+                    (self.config.lock().unwrap().clone(), rb.live_rev)
                 }
             } else {
-                (self.config.lock().unwrap().clone(), None)
+                (self.config.lock().unwrap().clone(), rb.live_rev)
             }
         };
-        let resolved = match self.store.resolve_config(&ctx, &runtime, raw).await {
-            Ok(config) => config,
-            Err(err) => {
+        let resolve_fut = ExecutionFrameFuture::with_fiber(
+            Arc::downgrade(self),
+            self.store.resolve_config(&ctx, &runtime, raw),
+        );
+        let resolved = match CatchPanic::new(resolve_fut).await {
+            Ok(Ok(config)) => config,
+            Ok(Err(err)) => {
                 self.fail(&ctx, err, gen).await;
+                return;
+            }
+            Err(payload) => {
+                let reason = format!(
+                    "插件配置解析或校验 panic: {}",
+                    crate::panic_message(&*payload)
+                );
+                self.fail(&ctx, reason.into(), gen).await;
                 return;
             }
         };
@@ -2598,20 +2701,31 @@ impl Fiber {
         }
         // 已解析配置与 volatile 引用都是"装载的一部分"（M4-5）：引用在**插件跑之前**建好，
         // 插件的 `apply` 里就能 `ctx.volatile("data")` 取到——对应上游"校验期创建引用"。
-        let live_table = self.build_volatile_table(&resolved, &runtime);
+        let live_table = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _frame = enter_execution_fiber(Arc::downgrade(self));
+            self.build_volatile_table(&resolved, &runtime)
+        })) {
+            Ok(table) => table,
+            Err(payload) => {
+                let reason = format!(
+                    "插件 volatile_paths panic: {}",
+                    crate::panic_message(&*payload)
+                );
+                self.fail(&ctx, reason.into(), gen).await;
+                return;
+            }
+        };
         {
             let mut rb = self.update_rollback.lock().unwrap();
             *self.volatile.lock().unwrap() = live_table.clone();
             if rb.in_flight.is_empty() {
                 *self.resolved.lock().unwrap() = resolved.clone();
-            } else if let Some(base_rev) = loading_from_baseline {
+            } else if let Some((rev, snap)) = rb.baseline.as_mut() {
                 // 同步刷新 baseline 里的存活 VolatileRef 表，确保后续在飞更新被否决回滚时
                 // 恢复的正是当前运行中插件持有的那份 live VolatileRef。
-                if let Some((rev, snap)) = rb.baseline.as_mut() {
-                    if *rev == base_rev {
-                        snap.resolved = resolved.clone();
-                        snap.volatile = live_table;
-                    }
+                if *rev == loaded_rev {
+                    snap.resolved = resolved.clone();
+                    snap.volatile = live_table;
                 }
             }
         }
@@ -2622,9 +2736,10 @@ impl Fiber {
         //（`FnPlugin` 直接调用闭包，自定义实现也可能在返回 future 前失败）。
         // 只包 `CatchPanic` 的 `poll` 不够——panic 会在 `CatchPanic::new` 之前逃出去。
         let apply = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _frame = enter_execution_fiber(Arc::downgrade(self));
             runtime.plugin.apply(ctx.clone(), resolved)
         })) {
-            Ok(future) => future,
+            Ok(future) => ExecutionFrameFuture::with_fiber(Arc::downgrade(self), future),
             Err(payload) => {
                 let reason = format!("插件 apply panic: {}", crate::panic_message(&*payload));
                 self.fail(&ctx, reason.into(), gen).await;
@@ -3013,9 +3128,16 @@ impl Fiber {
             // 句柄已被手动执行（登记随后会被摘除）；这里只可能是极窄的竞态窗口。
             return;
         };
+        let owner = Arc::downgrade(self);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                if let Err(err) = handle.spawn(async move { item.run().await }).await {
+                if let Err(err) = handle
+                    .spawn(ExecutionFrameFuture::with_fiber(
+                        owner,
+                        Box::pin(async move { item.run().await }),
+                    ))
+                    .await
+                {
                     let reason = if err.is_panic() {
                         format!(
                             "disposer panicked: {}",
@@ -3030,7 +3152,12 @@ impl Fiber {
             }
             // 没有运行时（同步上下文）：仍捕获 panic 并记账，不让单条 disposer 中断整条恢复栈。
             Err(_) => {
-                if let Err(payload) = CatchPanic::new(item.run()).await {
+                if let Err(payload) = CatchPanic::new(ExecutionFrameFuture::with_fiber(
+                    owner,
+                    Box::pin(item.run()),
+                ))
+                .await
+                {
                     let reason = format!("disposer panicked: {}", crate::panic_message(&*payload));
                     self.record_cleanup_error(CleanupErrorKind::DisposerPanic, reason.clone());
                     self.store.log(Level::Error, name, &reason);
@@ -3108,38 +3235,54 @@ impl Fiber {
         }
         // 同步取号：并发 update 的“新旧”由此决定，而不是由解析/派发完成顺序决定。
         let my_rev = self.update_rev.fetch_add(1, Ordering::SeqCst) + 1;
-        let loaded = self.running.lock().unwrap().is_some();
-        let resolved = if loaded {
-            // 解析失败 ⇒ 什么都不动（上游把 `_resolve` 放在赋值之前）。
+        let mut resolved_for_loaded: Option<Config> = if self.running.lock().unwrap().is_some() {
             let Some(runtime) = self.runtime.clone() else {
                 return Err("fiber 没有 runtime：无法解析配置".into());
             };
             let Some(ctx) = self.ctx_opt() else {
                 return Err("cannot update disposed fiber".into());
             };
-            self.store
-                .resolve_config(&ctx, &runtime, config.clone())
-                .await?
+            Some(
+                self.store
+                    .resolve_config(&ctx, &runtime, config.clone())
+                    .await?,
+            )
         } else {
-            config.clone()
+            None
         };
 
         // 提交闸门只保护“比较 + 赋值 + adopt”这一小段；不跨 await，也不包住
         // `internal/update`，否则 handler 重入 update 会死锁。
         //
-        // 先解析、后比较：两个 update 的 resolve 可以并发/乱序完成，但只有
-        // `update_rev` 更大的那一份能落地。被超越的调用返回 Superseded，不派发
-        // handler，避免它把旧配置写进插件状态。
+        // 在锁内复查 `running.is_some()`，消除“未装载快照 → 并发装载完成 → 跳过校验/否决”与
+        // “已装载快照 → 并发卸载 → 用死 VolatileRef 污染回滚基线”两类竞态。
         let mut did_commit = false;
         let mut chain: Option<UpdateChain> = None;
-        {
-            // 串行化提交，避免两个 resolve 乱序完成后“旧值后写”。committed_rev
-            // 只在这一小段内持有；fire_commit/adopt 不持 committed_rev 锁，
-            // 防止提交观察者重入 update 时自锁。
+        let resolved: Config;
+        loop {
             let _commit = self.commit_gate.lock().await;
             if self.is_disposed() {
                 return Err("cannot update disposed fiber".into());
             }
+            let now_loaded = self.running.lock().unwrap().is_some();
+            if now_loaded && resolved_for_loaded.is_none() {
+                drop(_commit);
+                let Some(runtime) = self.runtime.clone() else {
+                    return Err("fiber 没有 runtime：无法解析配置".into());
+                };
+                let Some(ctx) = self.ctx_opt() else {
+                    return Err("cannot update disposed fiber".into());
+                };
+                resolved_for_loaded = Some(
+                    self.store
+                        .resolve_config(&ctx, &runtime, config.clone())
+                        .await?,
+                );
+                continue;
+            }
+            let current_resolved = resolved_for_loaded
+                .clone()
+                .unwrap_or_else(|| config.clone());
             let latest = {
                 let mut committed_rev = self.committed_rev.lock().unwrap();
                 if my_rev > *committed_rev {
@@ -3151,19 +3294,19 @@ impl Fiber {
             };
             if latest {
                 // 在 `update_rollback` 锁外构造新 volatile 表（避免持锁记日志）。
-                let new_volatile = if loaded {
+                let new_volatile = if now_loaded {
                     self.runtime
                         .as_ref()
-                        .map(|runtime| self.build_volatile_table(&resolved, runtime))
+                        .map(|runtime| self.build_volatile_table(&current_resolved, runtime))
                 } else {
                     None
                 };
                 // 统一锁序：`update_rollback -> (config, resolved, volatile)`，消除与 `mark_vetoed`
-                // 的锁间隙竞态；且即便 `loaded == false` 也必须推进 `live_rev`，防止更早的在飞否决覆盖新提交。
+                // 的锁间隙竞态；且即便 `now_loaded == false` 也必须推进 `live_rev`，防止更早的在飞否决覆盖新提交。
                 let mut snap_for_chain = None;
                 {
                     let mut rb = self.update_rollback.lock().unwrap();
-                    let pre_commit = loaded.then(|| UpdateSnapshot {
+                    let pre_commit = now_loaded.then(|| UpdateSnapshot {
                         config: self.config.lock().unwrap().clone(),
                         resolved: self.resolved.lock().unwrap().clone(),
                         volatile: self.volatile.lock().unwrap().clone(),
@@ -3171,8 +3314,8 @@ impl Fiber {
                     // 赋值在派发之前（上游 `fiber.ts:492`），避免 `fire_commit` 观察者 panic 导致
                     // `committed_rev` 已推进但 `config`/`resolved`/`error` 仍停在旧值。
                     *self.config.lock().unwrap() = config.clone();
-                    if loaded {
-                        *self.resolved.lock().unwrap() = resolved.clone();
+                    if now_loaded {
+                        *self.resolved.lock().unwrap() = current_resolved.clone();
                         if let Some(table) = new_volatile {
                             *self.volatile.lock().unwrap() = table;
                         }
@@ -3202,7 +3345,7 @@ impl Fiber {
                                 my_rev,
                                 UpdateSnapshot {
                                     config: config.clone(),
-                                    resolved: resolved.clone(),
+                                    resolved: current_resolved.clone(),
                                     volatile: self.volatile.lock().unwrap().clone(),
                                 },
                             ));
@@ -3211,8 +3354,8 @@ impl Fiber {
                 }
                 if let Some(snap) = snap_for_chain {
                     // 立即建立 RAII 守卫：即便 `fire_commit_async` 被取消/panic 或并发 dispose，
-                    // 也能及时清理 `in_flight` 与 `active_chains`。
-                    self.active_chains.fetch_add(1, Ordering::SeqCst);
+                    // 也能及时清理 `in_flight` 与 `quiescence.active_chains`。
+                    self.quiescence.lock().unwrap().active_chains += 1;
                     chain = Some(UpdateChain {
                         fiber: self.clone(),
                         rev: my_rev,
@@ -3226,6 +3369,8 @@ impl Fiber {
                 self.store.fire_commit(self, &config, no_save);
                 self.store.fire_commit_async(self, &config, no_save).await;
             }
+            resolved = current_resolved;
+            break;
         }
         if !did_commit {
             return Ok(UpdateOutcome::Superseded);
@@ -3310,38 +3455,49 @@ impl Fiber {
             let notified = self.updates_settled.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.active_chains.load(Ordering::SeqCst) == 0
-                && !self.replay_owed.load(Ordering::SeqCst)
-                && !self.replay_scheduled.load(Ordering::SeqCst)
             {
-                return;
+                let q = self.quiescence.lock().unwrap();
+                if q.active_chains == 0 && !q.replay_owed && !q.replay_scheduled {
+                    return;
+                }
             }
             notified.await;
         }
     }
 
-    /// 一条 update chain 结束：递减在飞计数，必要时调度 quiescence replay。
+    /// 一条 update chain 结束：在单锁 `quiescence` 内递减在飞计数并原子决定调度或唤醒。
     fn finish_update_chain(self: &Arc<Self>, rev: u64) {
-        let remaining = self
-            .active_chains
-            .fetch_sub(1, Ordering::SeqCst)
-            .saturating_sub(1);
         let live_rev = self.update_rollback.lock().unwrap().live_rev;
-        if rev < live_rev {
-            self.replay_owed.store(true, Ordering::SeqCst);
-        }
-        if remaining == 0 {
-            if self.replay_owed.load(Ordering::SeqCst) && !self.is_disposed() {
-                self.schedule_replay();
+        let disposed = self.is_disposed();
+        let (should_schedule, should_notify) = {
+            let mut q = self.quiescence.lock().unwrap();
+            q.active_chains = q.active_chains.saturating_sub(1);
+            if disposed || q.disposed {
+                q.disposed = true;
+                q.replay_owed = false;
+            } else if rev < live_rev {
+                q.replay_owed = true;
             }
+            if q.active_chains == 0 {
+                if q.replay_owed && !q.disposed && !q.replay_scheduled {
+                    q.replay_scheduled = true;
+                    (true, false)
+                } else {
+                    (false, !q.replay_scheduled)
+                }
+            } else {
+                (false, false)
+            }
+        };
+        if should_schedule {
+            self.spawn_replay_task();
+        } else if should_notify {
             self.updates_settled.notify_waiters();
         }
     }
 
-    fn schedule_replay(self: &Arc<Self>) {
-        if self.replay_scheduled.swap(true, Ordering::SeqCst) {
-            return;
-        }
+    /// 前置条件：调用方已在 `quiescence` 锁内把 `replay_scheduled` 置为 `true`。
+    fn spawn_replay_task(self: &Arc<Self>) {
         let this = self.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -3351,9 +3507,12 @@ impl Fiber {
             }
             Err(_) => {
                 // 没有运行时就没有 replay 的驱动器；不能把 when_updates_settled
-                // 永久挂住，清掉 owed 并通知等待者。
-                self.replay_owed.store(false, Ordering::SeqCst);
-                self.replay_scheduled.store(false, Ordering::SeqCst);
+                // 永久挂住，清掉 owed/scheduled 并通知等待者。
+                {
+                    let mut q = self.quiescence.lock().unwrap();
+                    q.replay_owed = false;
+                    q.replay_scheduled = false;
+                }
                 self.updates_settled.notify_waiters();
             }
         }
@@ -3366,21 +3525,33 @@ impl Fiber {
     /// 循环到 revision 稳定为止。
     async fn run_replay(self: &Arc<Self>) {
         // RAII 守卫：即便 `internal/update` handler panic 或任务被取消，也必定复位
-        // `replay_scheduled` 并唤醒 `when_updates_settled()`，避免永久挂起。
+        // `replay_scheduled`（并在 panic/dispose 时强制清 `replay_owed`）唤醒 `when_updates_settled()`。
         struct ReplayScheduledGuard {
             fiber: Arc<Fiber>,
         }
         impl Drop for ReplayScheduledGuard {
             fn drop(&mut self) {
-                self.fiber.replay_scheduled.store(false, Ordering::SeqCst);
-                if !std::thread::panicking()
-                    && self.fiber.replay_owed.load(Ordering::SeqCst)
-                    && self.fiber.active_chains.load(Ordering::SeqCst) == 0
-                    && !self.fiber.is_disposed()
-                {
-                    self.fiber.schedule_replay();
+                let panicking = std::thread::panicking();
+                let disposed = self.fiber.is_disposed();
+                let should_reschedule = {
+                    let mut q = self.fiber.quiescence.lock().unwrap();
+                    q.replay_scheduled = false;
+                    if panicking || disposed || q.disposed {
+                        q.disposed |= disposed;
+                        q.replay_owed = false;
+                        false
+                    } else if q.replay_owed && q.active_chains == 0 {
+                        q.replay_scheduled = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_reschedule {
+                    self.fiber.spawn_replay_task();
+                } else {
+                    self.fiber.updates_settled.notify_waiters();
                 }
-                self.fiber.updates_settled.notify_waiters();
             }
         }
         let _guard = ReplayScheduledGuard {
@@ -3388,12 +3559,18 @@ impl Fiber {
         };
         let _gate = self.replay_gate.lock().await;
         loop {
-            // 还有在飞 chain：让最后一个 chain 结束时再调度，避免与它并发写入。
-            if self.active_chains.load(Ordering::SeqCst) != 0 {
-                break;
-            }
-            if !self.replay_owed.swap(false, Ordering::SeqCst) {
-                break;
+            {
+                let mut q = self.quiescence.lock().unwrap();
+                if self.is_disposed() || q.disposed {
+                    q.disposed = true;
+                    q.replay_owed = false;
+                    break;
+                }
+                // 还有在飞 chain：让最后一个 chain 结束时再调度，避免与它并发写入。
+                if q.active_chains != 0 || !q.replay_owed {
+                    break;
+                }
+                q.replay_owed = false;
             }
             let Some(ctx) = self.ctx_opt() else { break };
             // 未装载或已处置：没有可修正的实例；下一次 update 会重新解析。
@@ -3423,7 +3600,15 @@ impl Fiber {
             if self.update_rev.load(Ordering::SeqCst) == rev {
                 break;
             }
-            self.replay_owed.store(true, Ordering::SeqCst);
+            {
+                let mut q = self.quiescence.lock().unwrap();
+                if self.is_disposed() || q.disposed {
+                    q.disposed = true;
+                    q.replay_owed = false;
+                    break;
+                }
+                q.replay_owed = true;
+            }
         }
     }
 
@@ -3564,6 +3749,16 @@ impl Fiber {
         // 先同步关门，避免 uid 已置空、但清理任务尚未被 poll 的窗口里
         // 又有 effect 通过闸门。
         self.mark_effects_closed();
+        // 已处置 fiber 绝不再调度 quiescence replay；若当前无在飞链/重放，立即唤醒 `when_updates_settled()`。
+        let notify_quiesce = {
+            let mut q = self.quiescence.lock().unwrap();
+            q.disposed = true;
+            q.replay_owed = false;
+            q.active_chains == 0 && !q.replay_scheduled
+        };
+        if notify_quiesce {
+            self.updates_settled.notify_waiters();
+        }
         // uid 已置空后才派发 internal/plugin，loader 靠这一点识别"用户手动停用了这一行"。
         // 截住用户 `on_plugin` 观察者 panic，确保后续清理任务仍会被启动，避免 dispose 永久挂起。
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

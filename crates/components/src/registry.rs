@@ -28,8 +28,7 @@
 //! - [`RegistryHandle`] 只持 `Weak<Context>`（M4 的 Weak 纪律：句柄通常被别的插件
 //!   拿在手里活得更久，不能把上下文树吊住）；注册表卸载后所有入口**优雅降级**。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use cordis_core::{
     plugin_fn, with_provision, Config, Context, Ctx, Disposable, Dyn, Error, ExternValue, Inject,
@@ -71,9 +70,9 @@ enum SlotState {
 /// 注册表卸载或重启之后，本代句柄的 `alive` 标志永久置 `false`，所有入口都会给出可读的降级结果。
 pub struct RegistryHandle {
     ctx: Weak<Context>,
-    /// 本代注册表实例的存活标记：卸载/重启时由 effect disposer 置 `false`，
-    /// 防止 `Fiber::restart` 复用同一 `Arc<Context>` 时旧句柄与新代注册表脑裂。
-    alive: Arc<AtomicBool>,
+    /// 本代注册表实例的存活读写锁：`put`/`replace` 持读锁跨越 `provide`/`set`，
+    /// 卸载/重启清理器持写锁置 `false`，彻底消除跨 `Fiber::restart()` 复用 `Context` 的跨代脑裂。
+    alive: Arc<RwLock<bool>>,
     /// 槽位名与状态（按注册顺序）。**值本身只有一份真相**——在服务表里。
     names: Mutex<Vec<(String, SlotState)>>,
 }
@@ -87,7 +86,8 @@ impl RegistryHandle {
         if name == HANDLE_KEY || name == RegistryService::KEY {
             return Err(format!("槽位 \"{name}\" 为注册表保留键，不能覆写").into());
         }
-        let ctx = self.live_ctx()?;
+        let alive = self.alive.read().unwrap();
+        let ctx = self.live_ctx_locked(*alive)?;
         {
             let mut names = self.names.lock().unwrap();
             if let Some((_, state)) = names.iter().find(|(existing, _)| existing == name) {
@@ -120,6 +120,7 @@ impl RegistryHandle {
                 *state = SlotState::Active;
             }
         }
+        drop(alive);
         let table = Arc::downgrade(self);
         let name_owned = name.to_string();
         Ok(Disposable::new(move || {
@@ -160,7 +161,8 @@ impl RegistryHandle {
     /// **原地换值**：一次同步写（[`Store::set`](cordis_core::Store::set)），
     /// 槽位在服务表里的身份不变 ⇒ 依赖者 epoch 不变，但它们读到的是新值。
     pub fn replace(&self, name: &str, value: Dyn) -> Result<(), Error> {
-        let ctx = self.live_ctx()?;
+        let alive = self.alive.read().unwrap();
+        let ctx = self.live_ctx_locked(*alive)?;
         if !self
             .names
             .lock()
@@ -175,7 +177,7 @@ impl RegistryHandle {
 
     /// 读**当下**的值（走注册表自己的提交视图，不是注册时的快照）。没有 ⇒ `None`。
     pub fn get(&self, name: &str) -> Option<Dyn> {
-        if !self.alive.load(Ordering::Acquire) {
+        if !*self.alive.read().unwrap() {
             return None;
         }
         let ctx = self.ctx.upgrade()?;
@@ -196,7 +198,7 @@ impl RegistryHandle {
 
     /// 当前槽位名（按注册顺序）。注册表已卸载 ⇒ 空表（优雅降级）。
     pub fn names(&self) -> Vec<String> {
-        if !self.alive.load(Ordering::Acquire) {
+        if !*self.alive.read().unwrap() {
             return Vec::new();
         }
         let Some(ctx) = self.ctx.upgrade() else {
@@ -216,8 +218,8 @@ impl RegistryHandle {
 
     /// 注册表自己的 ctx，且必须**在运行**：`provide` 在未激活/正在卸载的状态上会
     /// `assert`（那是内核护栏），组件不该去撞它——这里先给出可读错误。
-    fn live_ctx(&self) -> Result<Ctx, Error> {
-        if !self.alive.load(Ordering::Acquire) {
+    fn live_ctx_locked(&self, alive: bool) -> Result<Ctx, Error> {
+        if !alive {
             return Err(
                 "注册表已卸载或重启：请重新获取 cordis_components::registry::handle()".into(),
             );
@@ -254,11 +256,11 @@ pub fn plugin() -> Arc<dyn Plugin> {
             Inject::default(),
             |ctx: Ctx, _config: Config| {
                 Box::pin(async move {
-                    let alive = Arc::new(AtomicBool::new(true));
+                    let alive = Arc::new(RwLock::new(true));
                     let alive_drop = alive.clone();
                     let _retire = ctx.effect(move |_| {
                         Disposable::sync(move || {
-                            alive_drop.store(false, Ordering::Release);
+                            *alive_drop.write().unwrap() = false;
                         })
                     });
                     let handle = Arc::new(RegistryHandle {

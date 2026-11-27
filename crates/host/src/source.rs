@@ -382,6 +382,14 @@ pub(crate) fn validate_manifest(manifest: &PluginManifest) -> Result<(), String>
     Ok(())
 }
 
+/// 计算内存中字节切片的 SHA-256 十六进制摘要（与 [`sha256_file`] 逐字节同源，
+/// 供准入面在单次读取内同时完成解析与完整性校验，避免 TOCTOU 双读窗口）。
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize_hex()
+}
+
 /// 计算一个文件的 SHA-256（审计/诊断面；加载路径用 [`PluginSourcePolicy::verify`]）。
 ///
 /// 采用 64 KiB 分块流式计算，避免把整个 DLL 读进内存再拷贝一份。

@@ -535,15 +535,33 @@ fn normalize_msrv(raw: &str) -> String {
     }
 }
 
+enum YamlScalarLookup<'a> {
+    Missing,
+    Str(&'a str),
+    NonString(&'a YamlValue),
+}
+
 fn yaml_str<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a str> {
     map.get(YamlValue::String(key.to_string()))
         .and_then(YamlValue::as_str)
 }
 
-fn yaml_env_var<'a>(map: &'a serde_yaml::Mapping, var: &str) -> Option<&'a str> {
-    map.get(YamlValue::String("env".to_string()))
-        .and_then(YamlValue::as_mapping)
-        .and_then(|env| yaml_str(env, var))
+fn yaml_lookup_str<'a>(map: &'a serde_yaml::Mapping, key: &str) -> YamlScalarLookup<'a> {
+    match map.get(YamlValue::String(key.to_string())) {
+        None => YamlScalarLookup::Missing,
+        Some(YamlValue::String(s)) => YamlScalarLookup::Str(s.as_str()),
+        Some(other) => YamlScalarLookup::NonString(other),
+    }
+}
+
+fn yaml_lookup_env_var<'a>(map: &'a serde_yaml::Mapping, var: &str) -> YamlScalarLookup<'a> {
+    let Some(env_val) = map.get(YamlValue::String("env".to_string())) else {
+        return YamlScalarLookup::Missing;
+    };
+    let Some(env_map) = env_val.as_mapping() else {
+        return YamlScalarLookup::NonString(env_val);
+    };
+    yaml_lookup_str(env_map, var)
 }
 
 fn contains_version_token(haystack: &str, expected_version: &str) -> bool {
@@ -1200,11 +1218,19 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
             continue;
         };
         // Rustup 优先级：env.RUSTUP_TOOLCHAIN 高于 rust-toolchain.toml 与 rustup default。
-        // 顶层 env 若声明 RUSTUP_TOOLCHAIN，不得偏离 pinned_channel。
-        if let Some(top_tc) = yaml_env_var(root_map, "RUSTUP_TOOLCHAIN") {
-            if top_tc != pinned_channel {
+        // 顶层 env 若声明 RUSTUP_TOOLCHAIN，不得偏离 pinned_channel，且禁止非字符串 YAML 标量绕过。
+        match yaml_lookup_env_var(root_map, "RUSTUP_TOOLCHAIN") {
+            YamlScalarLookup::Missing => {}
+            YamlScalarLookup::Str(top_tc) => {
+                if top_tc != pinned_channel {
+                    problems.push(format!(
+                        "{name}: workflow 顶层 `env.RUSTUP_TOOLCHAIN` 为 `{top_tc}`，会覆盖精确锁版 `{pinned_channel}`"
+                    ));
+                }
+            }
+            YamlScalarLookup::NonString(val) => {
                 problems.push(format!(
-                    "{name}: workflow 顶层 `env.RUSTUP_TOOLCHAIN` 为 `{top_tc}`，会覆盖精确锁版 `{pinned_channel}`"
+                    "{name}: workflow 顶层 `env.RUSTUP_TOOLCHAIN` 必须是字符串，实际为非字符串 YAML 值 `{val:?}`（fail closed）"
                 ));
             }
         }
@@ -1242,20 +1268,34 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                             if !comment.is_empty() {
                                 job_toolchain_from_action = Some(comment.clone());
                             }
-                            if let Some(with_tc) = step_map
-                                .get(YamlValue::String("with".to_string()))
-                                .and_then(YamlValue::as_mapping)
-                                .and_then(|w| yaml_str(w, "toolchain"))
+                            if let Some(with_val) =
+                                step_map.get(YamlValue::String("with".to_string()))
                             {
-                                let expected = if comment.is_empty() {
-                                    pinned_channel.as_str()
-                                } else {
-                                    comment.as_str()
-                                };
-                                if with_tc != expected {
+                                let Some(with_map) = with_val.as_mapping() else {
                                     problems.push(format!(
-                                        "{name}:{job_name}: dtolnay/rust-toolchain 的 `with.toolchain` 为 `{with_tc}`，与预期锁版 `{expected}` 不一致"
+                                        "{name}:{job_name}: dtolnay/rust-toolchain 的 `with` 必须是映射，实际为 `{with_val:?}`（fail closed）"
                                     ));
+                                    continue;
+                                };
+                                match yaml_lookup_str(with_map, "toolchain") {
+                                    YamlScalarLookup::Missing => {}
+                                    YamlScalarLookup::Str(with_tc) => {
+                                        let expected = if comment.is_empty() {
+                                            pinned_channel.as_str()
+                                        } else {
+                                            comment.as_str()
+                                        };
+                                        if with_tc != expected {
+                                            problems.push(format!(
+                                                "{name}:{job_name}: dtolnay/rust-toolchain 的 `with.toolchain` 为 `{with_tc}`，与预期锁版 `{expected}` 不一致"
+                                            ));
+                                        }
+                                    }
+                                    YamlScalarLookup::NonString(val) => {
+                                        problems.push(format!(
+                                            "{name}:{job_name}: dtolnay/rust-toolchain 的 `with.toolchain` 必须是字符串，实际为非字符串 YAML 值 `{val:?}`（fail closed）"
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -1266,26 +1306,44 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                     .as_deref()
                     .unwrap_or(pinned_channel.as_str());
 
-                if let Some(job_env_tc) = yaml_env_var(job_map, "RUSTUP_TOOLCHAIN") {
-                    if job_env_tc != expected_job_tc {
+                match yaml_lookup_env_var(job_map, "RUSTUP_TOOLCHAIN") {
+                    YamlScalarLookup::Str(job_env_tc) => {
+                        if job_env_tc != expected_job_tc {
+                            problems.push(format!(
+                                "{name}:{job_name}: job 级 `env.RUSTUP_TOOLCHAIN` 为 `{job_env_tc}`，与预期工具链 `{expected_job_tc}` 不一致"
+                            ));
+                        }
+                    }
+                    YamlScalarLookup::NonString(val) => {
                         problems.push(format!(
-                            "{name}:{job_name}: job 级 `env.RUSTUP_TOOLCHAIN` 为 `{job_env_tc}`，与预期工具链 `{expected_job_tc}` 不一致"
+                            "{name}:{job_name}: job 级 `env.RUSTUP_TOOLCHAIN` 必须是字符串，实际为非字符串 YAML 值 `{val:?}`（fail closed）"
                         ));
                     }
-                } else if expected_job_tc != pinned_channel {
-                    problems.push(format!(
-                        "{name}:{job_name}: 使用非默认工具链 `{expected_job_tc}` 的 job 必须设置 `env.RUSTUP_TOOLCHAIN: {expected_job_tc}`，防止被根目录 rust-toolchain.toml (`{pinned_channel}`) 静默覆盖"
-                    ));
+                    YamlScalarLookup::Missing => {
+                        if expected_job_tc != pinned_channel {
+                            problems.push(format!(
+                                "{name}:{job_name}: 使用非默认工具链 `{expected_job_tc}` 的 job 必须设置 `env.RUSTUP_TOOLCHAIN: {expected_job_tc}`，防止被根目录 rust-toolchain.toml (`{pinned_channel}`) 静默覆盖"
+                            ));
+                        }
+                    }
                 }
 
                 for step in steps {
                     let Some(step_map) = step.as_mapping() else {
                         continue;
                     };
-                    if let Some(step_env_tc) = yaml_env_var(step_map, "RUSTUP_TOOLCHAIN") {
-                        if step_env_tc != expected_job_tc {
+                    match yaml_lookup_env_var(step_map, "RUSTUP_TOOLCHAIN") {
+                        YamlScalarLookup::Missing => {}
+                        YamlScalarLookup::Str(step_env_tc) => {
+                            if step_env_tc != expected_job_tc {
+                                problems.push(format!(
+                                    "{name}:{job_name}: step 级 `env.RUSTUP_TOOLCHAIN` 为 `{step_env_tc}`，会覆盖预期工具链 `{expected_job_tc}`"
+                                ));
+                            }
+                        }
+                        YamlScalarLookup::NonString(val) => {
                             problems.push(format!(
-                                "{name}:{job_name}: step 级 `env.RUSTUP_TOOLCHAIN` 为 `{step_env_tc}`，会覆盖预期工具链 `{expected_job_tc}`"
+                                "{name}:{job_name}: step 级 `env.RUSTUP_TOOLCHAIN` 必须是字符串，实际为非字符串 YAML 值 `{val:?}`（fail closed）"
                             ));
                         }
                     }
@@ -2330,5 +2388,58 @@ version = "0.1.3"
             "set -euo pipefail\nrustc --version | grep -q '^rustc 1\\.98\\.1 '",
             "1.98.1"
         ));
+    }
+
+    #[test]
+    fn r4_p1_toolchain_guard_fails_closed_on_non_string_yaml_scalars() {
+        // Non-string YAML scalars (e.g. float `1.90`, bool `true`, `null`) must NEVER be
+        // silently ignored by `.as_str()` when checking RUSTUP_TOOLCHAIN or `with.toolchain`.
+        let cases = [
+            (
+                "top-env-float",
+                "env:\n  RUSTUP_TOOLCHAIN: 1.90\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+            ),
+            (
+                "top-env-bool",
+                "env:\n  RUSTUP_TOOLCHAIN: true\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+            ),
+            (
+                "job-env-float",
+                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    env:\n      RUSTUP_TOOLCHAIN: 1.90\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+            ),
+            (
+                "step-env-null",
+                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - env:\n          RUSTUP_TOOLCHAIN: null\n        run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+            ),
+            (
+                "with-toolchain-float",
+                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n        with:\n          toolchain: 1.90\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+            ),
+            (
+                "with-toolchain-bool",
+                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n        with:\n          toolchain: true\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+            ),
+        ];
+
+        for (label, body) in cases {
+            let tmp = TempDir::new(label);
+            let wf_dir = tmp.path.join(".github").join("workflows");
+            std::fs::create_dir_all(&wf_dir).unwrap();
+            std::fs::write(
+                tmp.path.join("rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"1.98.1\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                wf_dir.join("ci.yml"),
+                format!("permissions:\n  contents: read\n{body}"),
+            )
+            .unwrap();
+            let problems = check_toolchain_pin_and_ci_sync(&tmp.path, &wf_dir);
+            assert!(
+                !problems.is_empty(),
+                "非字符串 YAML 标量夹具 `{label}` 必须 fail-closed 报错，实际放行"
+            );
+        }
     }
 }

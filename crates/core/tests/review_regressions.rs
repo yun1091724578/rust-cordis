@@ -2770,3 +2770,601 @@ async fn r3_p3_notify_realm_broadcast_uses_realm_override() {
     );
     app.close().await;
 }
+
+#[tokio::test]
+async fn r4_p1_when_updates_settled_does_not_hang_on_dispose_or_replay_panic() {
+    use tokio::sync::Notify;
+    const INTERNAL_UPDATE: &str = "internal/update";
+
+    // Path A: concurrent updates set `replay_owed = true`, then `dispose()` runs before chains exit.
+    let app = App::new();
+    let c1_entered = Arc::new(Notify::new());
+    let c2_entered = Arc::new(Notify::new());
+    let release_c1 = Arc::new(Notify::new());
+    let release_c2 = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let f = app.root.plugin(
+        plugin_fn("r4-quiesce-dispose", Inject::default(), {
+            let c1_entered = c1_entered.clone();
+            let c2_entered = c2_entered.clone();
+            let release_c1 = release_c1.clone();
+            let release_c2 = release_c2.clone();
+            let calls = calls.clone();
+            move |ctx, _cfg| {
+                let c1_entered = c1_entered.clone();
+                let c2_entered = c2_entered.clone();
+                let release_c1 = release_c1.clone();
+                let release_c2 = release_c2.clone();
+                let calls = calls.clone();
+                Box::pin(async move {
+                    let _ = ctx.on(INTERNAL_UPDATE, move |_call| {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        let c1_entered = c1_entered.clone();
+                        let c2_entered = c2_entered.clone();
+                        let release_c1 = release_c1.clone();
+                        let release_c2 = release_c2.clone();
+                        Box::pin(async move {
+                            if n == 0 {
+                                c1_entered.notify_one();
+                                release_c1.notified().await;
+                            } else if n == 1 {
+                                c2_entered.notify_one();
+                                release_c2.notified().await;
+                            }
+                            None
+                        })
+                    });
+                    Ok(())
+                })
+            }
+        }),
+        json!({"v": 0}),
+    );
+    f.settle().await;
+    assert_eq!(f.state(), FiberState::Active);
+
+    let f1 = f.clone();
+    let u1 = tokio::spawn(async move { f1.update_with(json!({"v": 1}), true).await });
+    c1_entered.notified().await;
+
+    let f2 = f.clone();
+    let u2 = tokio::spawn(async move { f2.update_with(json!({"v": 2}), true).await });
+    c2_entered.notified().await;
+
+    // u1 finishes while live_rev == 2 => arms `replay_owed = true`.
+    release_c1.notify_one();
+    let _ = u1.await.unwrap();
+
+    // Dispose fiber while u2 is still active; u2 finishes afterwards.
+    let f_disp = f.clone();
+    let disp = tokio::spawn(async move { f_disp.dispose().await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    release_c2.notify_one();
+    let _ = u2.await.unwrap();
+    disp.await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), f.when_updates_settled())
+        .await
+        .expect("dispose 与并发 update 竞态后 when_updates_settled 不得永久挂死");
+    app.close().await;
+
+    // Path B: `run_replay()` panics while a new update re-armed `replay_owed = true`.
+    let app2 = App::new();
+    let u1_in = Arc::new(Notify::new());
+    let u2_in = Arc::new(Notify::new());
+    let rel_u1 = Arc::new(Notify::new());
+    let rel_u2 = Arc::new(Notify::new());
+    let replay_in = Arc::new(Notify::new());
+    let rel_replay = Arc::new(Notify::new());
+    let hit = Arc::new(AtomicUsize::new(0));
+
+    let f = app2.root.plugin(
+        plugin_fn("r4-quiesce-panic", Inject::default(), {
+            let u1_in = u1_in.clone();
+            let u2_in = u2_in.clone();
+            let rel_u1 = rel_u1.clone();
+            let rel_u2 = rel_u2.clone();
+            let replay_in = replay_in.clone();
+            let rel_replay = rel_replay.clone();
+            let hit = hit.clone();
+            move |ctx, _cfg| {
+                let u1_in = u1_in.clone();
+                let u2_in = u2_in.clone();
+                let rel_u1 = rel_u1.clone();
+                let rel_u2 = rel_u2.clone();
+                let replay_in = replay_in.clone();
+                let rel_replay = rel_replay.clone();
+                let hit = hit.clone();
+                Box::pin(async move {
+                    let _ = ctx.on(INTERNAL_UPDATE, move |_call| {
+                        let idx = hit.fetch_add(1, Ordering::SeqCst);
+                        let u1_in = u1_in.clone();
+                        let u2_in = u2_in.clone();
+                        let rel_u1 = rel_u1.clone();
+                        let rel_u2 = rel_u2.clone();
+                        let replay_in = replay_in.clone();
+                        let rel_replay = rel_replay.clone();
+                        Box::pin(async move {
+                            match idx {
+                                0 => {
+                                    u1_in.notify_one();
+                                    rel_u1.notified().await;
+                                }
+                                1 => {
+                                    u2_in.notify_one();
+                                    rel_u2.notified().await;
+                                }
+                                2 => {
+                                    replay_in.notify_one();
+                                    rel_replay.notified().await;
+                                    panic!("synthetic replay panic");
+                                }
+                                _ => {}
+                            }
+                            None
+                        })
+                    });
+                    Ok(())
+                })
+            }
+        }),
+        json!({"v": 0}),
+    );
+    f.settle().await;
+
+    let f1 = f.clone();
+    let t1 = tokio::spawn(async move { f1.update_with(json!({"v": 1}), true).await });
+    u1_in.notified().await;
+    let f2 = f.clone();
+    let t2 = tokio::spawn(async move { f2.update_with(json!({"v": 2}), true).await });
+    u2_in.notified().await;
+    rel_u1.notify_one();
+    let _ = t1.await.unwrap();
+    rel_u2.notify_one();
+    let _ = t2.await.unwrap();
+
+    // Replay is now running (idx == 2) and waiting on `rel_replay`.
+    replay_in.notified().await;
+    // Two quick overlapping updates re-arm `replay_owed = true` while replay is still running.
+    let f3 = f.clone();
+    let f4 = f.clone();
+    let _ = tokio::join!(
+        f3.update_with(json!({"v": 3}), true),
+        f4.update_with(json!({"v": 4}), true)
+    );
+    // Even if only one ran or both ran, explicitly ensure a slower one finished < live_rev by
+    // letting replay panic after new update bumped `update_rev`.
+    rel_replay.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(2), f.when_updates_settled())
+        .await
+        .expect("run_replay panic 后 when_updates_settled 不得永久挂死");
+    app2.close().await;
+}
+
+#[tokio::test]
+async fn r4_p1_mount_on_dropped_parent_ctx_fails_closed_no_orphan_fiber() {
+    let app = App::new();
+    let parent = app.root.plugin(
+        plugin_fn("r4-parent", Inject::default(), |_, _| {
+            Box::pin(async { Ok(()) })
+        }),
+        Config::Null,
+    );
+    parent.settle().await;
+    let parent_ctx = parent.ctx();
+    parent.dispose().await;
+    drop(parent);
+    assert!(
+        parent_ctx.fiber_opt().is_none(),
+        "前提：父 fiber 释放后 parent_ctx.fiber_opt() 应为 None"
+    );
+
+    let applied = Arc::new(AtomicBool::new(false));
+    let applied_in = applied.clone();
+    let child = app.store.plugin(
+        &parent_ctx,
+        plugin_fn("r4-orphan-child", Inject::default(), move |_, _| {
+            let applied_in = applied_in.clone();
+            Box::pin(async move {
+                applied_in.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }),
+        Config::Null,
+        Inject::default(),
+    );
+    child.settle().await;
+    assert_eq!(
+        child.state(),
+        FiberState::Failed,
+        "已释放父 ctx 上挂载子插件必须 fail-closed 为 Failed"
+    );
+    assert!(child.error().is_some());
+    assert!(
+        !applied.load(Ordering::SeqCst),
+        "孤儿子插件不得执行 apply()"
+    );
+    assert_eq!(
+        app.store.runtime_count(),
+        0,
+        "失败的孤儿子插件不得滞留在 Store::runtimes 中"
+    );
+    app.close().await;
+}
+
+#[tokio::test]
+async fn r4_p1_delete_plugin_does_not_drop_user_plugin_under_runtimes_lock() {
+    use cordis_core::{Plugin, PluginKey, Store};
+
+    struct ReentrantDropPlugin {
+        store: Arc<Store>,
+    }
+    impl Plugin for ReentrantDropPlugin {
+        fn name(&self) -> &str {
+            "r4-drop-reentrant"
+        }
+        fn key(&self) -> PluginKey {
+            PluginKey::from("r4-drop-reentrant")
+        }
+        fn apply(
+            &self,
+            _ctx: Ctx,
+            _config: Config,
+        ) -> cordis_core::BoxFuture<cordis_core::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    impl Drop for ReentrantDropPlugin {
+        fn drop(&mut self) {
+            // Re-entering `store.runtime_count()` inside `Plugin::drop` must not deadlock!
+            let _ = self.store.runtime_count();
+        }
+    }
+
+    let app = App::new();
+    let p: Arc<dyn Plugin> = Arc::new(ReentrantDropPlugin {
+        store: app.store.clone(),
+    });
+    let f = app.root.plugin(p, Config::Null);
+    f.settle().await;
+    f.dispose().await;
+    drop(f);
+    // Re-register a plugin whose runtime has 0 fibers? Instead mount + fail on disposed parent or delete while empty:
+    // Actually trigger delete_plugin while runtime is alive with 0 fibers isn't reachable via normal drop,
+    // so stress concurrent `plugin` + `delete_plugin` to verify no retired runtime resurrection & no deadlock!
+    let store = app.store.clone();
+    let root = app.root.clone();
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        let root = root.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..25 {
+                let p: Arc<dyn Plugin> = Arc::new(ReentrantDropPlugin {
+                    store: store.clone(),
+                });
+                let f = root.plugin(p, Config::Null);
+                tokio::task::yield_now().await;
+                let victims = store.delete_plugin("r4-drop-reentrant");
+                for v in victims {
+                    v.dispose().await;
+                }
+                f.dispose().await;
+            }
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for h in handles {
+            h.await.unwrap();
+        }
+    })
+    .await
+    .expect("并发 plugin + delete_plugin 不得死锁");
+    assert_eq!(app.store.runtime_count(), 0);
+    app.close().await;
+}
+
+#[tokio::test]
+async fn r4_p1_parallel_handler_from_scoped_task_can_dispose_without_deadlock() {
+    use cordis_core::Fiber;
+    let app = App::new();
+    let seen_cid = Arc::new(Mutex::new(None::<String>));
+    let seen_cid_in = seen_cid.clone();
+    let target_fiber: Arc<Mutex<Option<Arc<Fiber>>>> = Arc::new(Mutex::new(None));
+    let target_fiber_in = target_fiber.clone();
+
+    let _h = app.root.on("r4-par-dispose", move |_call| {
+        let seen_cid_in = seen_cid_in.clone();
+        let target_fiber_in = target_fiber_in.clone();
+        Box::pin(async move {
+            *seen_cid_in.lock().unwrap() =
+                cordis_core::current_correlation_id().map(|s| s.to_string());
+            let f = target_fiber_in.lock().unwrap().clone();
+            if let Some(f) = f {
+                f.dispose().await;
+            }
+            None
+        })
+    });
+
+    let done = Arc::new(tokio::sync::Notify::new());
+    let done_in = done.clone();
+    let f = app.root.plugin(
+        plugin_fn("r4-par-owner", Inject::default(), move |ctx, _| {
+            let done_in = done_in.clone();
+            Box::pin(async move {
+                let ctx_task = ctx.clone();
+                ctx.spawn_scoped(move |_cancel| async move {
+                    cordis_core::scope_correlation(
+                        "cid-par-42",
+                        ctx_task.parallel("r4-par-dispose", vec![]),
+                    )
+                    .await;
+                    done_in.notify_one();
+                })
+                .unwrap();
+                Ok(())
+            })
+        }),
+        Config::Null,
+    );
+    *target_fiber.lock().unwrap() = Some(f.clone());
+    f.settle().await;
+
+    tokio::time::timeout(Duration::from_secs(2), done.notified())
+        .await
+        .expect("spawn_scoped 内 Mode::Parallel 回调 dispose 不得三方死锁");
+    f.dispose().await;
+    assert_eq!(
+        seen_cid.lock().unwrap().as_deref(),
+        Some("cid-par-42"),
+        "Mode::Parallel 必须向并行处理器透传 correlation_id"
+    );
+    app.close().await;
+}
+
+#[tokio::test]
+async fn r4_p1_reentrant_lifecycle_calls_in_apply_and_disposer_do_not_deadlock() {
+    // Case A: plugin calls `ctx.fiber().dispose().await` directly inside `apply()`.
+    let app = App::new();
+    let f = app.root.plugin(
+        plugin_fn("r4-self-dispose-apply", Inject::default(), |ctx, _| {
+            Box::pin(async move {
+                ctx.fiber().dispose().await;
+                Ok(())
+            })
+        }),
+        Config::Null,
+    );
+    tokio::time::timeout(Duration::from_secs(2), f.settle())
+        .await
+        .expect("apply() 内重入 fiber.dispose().await 不得在 Fiber::driver 上死锁");
+    tokio::time::timeout(Duration::from_secs(2), f.dispose())
+        .await
+        .expect("apply() 自处置后的 fiber.dispose() 必须收敛");
+    app.close().await;
+
+    // Case B: effect disposer calls `fiber.dispose().await` and `parent.dispose().await`.
+    let app2 = App::new();
+    let f2 = app2.root.plugin(
+        plugin_fn("r4-self-dispose-effect", Inject::default(), |ctx, _| {
+            Box::pin(async move {
+                let my_fiber = ctx.fiber();
+                let _ = ctx.effect(move |_| {
+                    let my_fiber = my_fiber.clone();
+                    Disposable::new(move || {
+                        Box::pin(async move {
+                            my_fiber.dispose().await;
+                        })
+                    })
+                });
+                Ok(())
+            })
+        }),
+        Config::Null,
+    );
+    f2.settle().await;
+    tokio::time::timeout(Duration::from_secs(2), f2.dispose())
+        .await
+        .expect("disposer 内重入 fiber.dispose().await 不得死锁");
+    app2.close().await;
+}
+
+#[tokio::test]
+async fn r4_p1_panic_in_validate_or_volatile_paths_does_not_wedge_loading() {
+    use cordis_core::{Plugin, PluginKey};
+
+    struct PanicValidatePlugin;
+    impl Plugin for PanicValidatePlugin {
+        fn name(&self) -> &str {
+            "r4-panic-validate"
+        }
+        fn key(&self) -> PluginKey {
+            PluginKey::from("r4-panic-validate")
+        }
+        fn validate(
+            &self,
+            _config: Config,
+        ) -> std::result::Result<Config, cordis_core::ValidationError> {
+            panic!("boom in validate");
+        }
+        fn apply(
+            &self,
+            _ctx: Ctx,
+            _config: Config,
+        ) -> cordis_core::BoxFuture<cordis_core::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct PanicVolatilePlugin;
+    impl Plugin for PanicVolatilePlugin {
+        fn name(&self) -> &str {
+            "r4-panic-volatile"
+        }
+        fn key(&self) -> PluginKey {
+            PluginKey::from("r4-panic-volatile")
+        }
+        fn volatile_paths(&self) -> Vec<String> {
+            panic!("boom in volatile_paths");
+        }
+        fn apply(
+            &self,
+            _ctx: Ctx,
+            _config: Config,
+        ) -> cordis_core::BoxFuture<cordis_core::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let app = App::new();
+    let f1 = app.root.plugin(Arc::new(PanicValidatePlugin), Config::Null);
+    f1.settle().await;
+    assert_eq!(
+        f1.state(),
+        FiberState::Failed,
+        "validate() panic 必须收敛到 Failed，不得卡死在 Loading"
+    );
+    assert!(f1.error().is_some());
+
+    let f2 = app.root.plugin(Arc::new(PanicVolatilePlugin), Config::Null);
+    f2.settle().await;
+    assert_eq!(
+        f2.state(),
+        FiberState::Failed,
+        "volatile_paths() panic 必须收敛到 Failed，不得卡死在 Loading"
+    );
+    assert!(f2.error().is_some());
+    app.close().await;
+}
+
+#[tokio::test]
+async fn r4_p1_concurrent_load_and_update_with_never_splits_volatile_or_bypasses_veto() {
+    use cordis_core::{Plugin, PluginKey, VolatileRef};
+    use tokio::sync::Notify;
+    const INTERNAL_UPDATE: &str = "internal/update";
+
+    struct VolPlugin {
+        latest_ref: Arc<Mutex<Option<Arc<VolatileRef>>>>,
+        veto_ready: Arc<Notify>,
+        release_veto: Arc<Notify>,
+    }
+    impl Plugin for VolPlugin {
+        fn name(&self) -> &str {
+            "r4-vol-race"
+        }
+        fn key(&self) -> PluginKey {
+            PluginKey::from("r4-vol-race")
+        }
+        fn volatile_paths(&self) -> Vec<String> {
+            vec!["dir".to_string()]
+        }
+        fn apply(
+            &self,
+            ctx: Ctx,
+            _config: Config,
+        ) -> cordis_core::BoxFuture<cordis_core::Result<()>> {
+            let latest_ref = self.latest_ref.clone();
+            let veto_ready = self.veto_ready.clone();
+            let release_veto = self.release_veto.clone();
+            Box::pin(async move {
+                let v = ctx.volatile("dir").expect("volatile dir");
+                *latest_ref.lock().unwrap() = Some(v);
+                let _ = ctx.on(INTERNAL_UPDATE, move |_call| {
+                    let veto_ready = veto_ready.clone();
+                    let release_veto = release_veto.clone();
+                    Box::pin(async move {
+                        veto_ready.notify_one();
+                        release_veto.notified().await;
+                        None // veto!
+                    })
+                });
+                Ok(())
+            })
+        }
+    }
+
+    let app = App::new();
+    let latest_ref = Arc::new(Mutex::new(None::<Arc<VolatileRef>>));
+    let u_in_cfg = Arc::new(Notify::new());
+    let release_u_cfg = Arc::new(Notify::new());
+    let load_in_cfg = Arc::new(Notify::new());
+    let release_load_cfg = Arc::new(Notify::new());
+    let veto_ready = Arc::new(Notify::new());
+    let release_veto = Arc::new(Notify::new());
+    let cfg_phase = Arc::new(AtomicUsize::new(0));
+
+    let _cfg_hook = app.root.on("internal/config", {
+        let u_in_cfg = u_in_cfg.clone();
+        let release_u_cfg = release_u_cfg.clone();
+        let load_in_cfg = load_in_cfg.clone();
+        let release_load_cfg = release_load_cfg.clone();
+        let cfg_phase = cfg_phase.clone();
+        move |call| {
+            let phase = cfg_phase.fetch_add(1, Ordering::SeqCst);
+            let u_in_cfg = u_in_cfg.clone();
+            let release_u_cfg = release_u_cfg.clone();
+            let load_in_cfg = load_in_cfg.clone();
+            let release_load_cfg = release_load_cfg.clone();
+            Box::pin(async move {
+                // phase 0: initial load (pass through)
+                // phase 1: update_with(C1) resolve_config
+                // phase 2: restart() load() resolve_config
+                if phase == 1 {
+                    u_in_cfg.notify_one();
+                    release_u_cfg.notified().await;
+                } else if phase == 2 {
+                    load_in_cfg.notify_one();
+                    release_load_cfg.notified().await;
+                }
+                call.next.call(call.args).await
+            })
+        }
+    });
+
+    let f = app.root.plugin(
+        Arc::new(VolPlugin {
+            latest_ref: latest_ref.clone(),
+            veto_ready: veto_ready.clone(),
+            release_veto: release_veto.clone(),
+        }),
+        json!({"dir": "v0"}),
+    );
+    f.settle().await;
+    assert_eq!(f.state(), FiberState::Active);
+
+    // 1. Start update_with(C1) while Active; let it commit and pause inside the veto hook.
+    release_u_cfg.notify_one();
+    let f_u = f.clone();
+    let u_task = tokio::spawn(async move { f_u.update_with(json!({"dir": "v1"}), true).await });
+    u_in_cfg.notified().await;
+    veto_ready.notified().await;
+
+    // 2. While C1 is in-flight in INTERNAL_UPDATE, restart() unloads and runs load() -> V_live.
+    let f_r = f.clone();
+    let r_task = tokio::spawn(async move { f_r.restart().await });
+    load_in_cfg.notified().await;
+    release_load_cfg.notify_one();
+    r_task.await.unwrap().unwrap();
+
+    // 3. Now veto C1! Rollback MUST restore V_live (not dead V0).
+    release_veto.notify_one();
+    let _ = u_task.await.unwrap();
+
+    // Subsequent volatile commit MUST reach the active plugin's `latest_ref`!
+    f.commit_volatile(json!({"dir": "v2"}));
+    let observed = latest_ref
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("live VolatileRef")
+        .get();
+    assert_eq!(
+        observed,
+        json!("v2"),
+        "并发 load + 否决 update 后，存活插件持有的 VolatileRef 不得与 fiber 撕裂"
+    );
+    app.close().await;
+}

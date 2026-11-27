@@ -1114,102 +1114,347 @@ impl JsExpr {
     }
 }
 
-/// 把标签 token `from` 改写为 `to`，**只改引号与注释之外**的文本。
-///
-/// 为什么不能盲替换：`quoted: '!!js not a tag'` 里的 `!!js` 是用户数据，
-/// `# !!js ...` 里的只是注释。这条函数同时服务于解析（`!!js` → `!cordis-js`）
-/// 与回写（反向），必须对称且无损。
-///
-/// 边界规则：`from` 整体匹配，且后面紧跟空白 / 行尾（`note!!js` 这种要放过）。
-///
-/// 已知边界：这不是完整的 YAML 词法分析器——块标量**正文**里裸写的 `!!js`
-/// 也会被改写。由于正反两个方向对称，内容不会失真；而表达式正文是 JS，
-/// 裸写 `!!js` 不构成真实场景。
-fn rewrite_tag_outside_quotes(input: &str, from: &str, to: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+/// 检查从 `rest` 开始的行尾是否是合法 YAML 块标量头（`|` / `>` + 可选 chomp/indent + 可选注释）。
+fn is_block_scalar_header(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
     let mut i = 0;
-    // 单引号内 `''` 是转义引号；双引号内 `\` 转义下一个字符。
-    let mut quote: Option<u8> = None;
-    let mut comment = false;
+    let mut seen_chomp = false;
+    let mut seen_indent = false;
     while i < bytes.len() {
-        let byte = bytes[i];
-        if byte == b'\n' {
-            comment = false;
-            out.push('\n');
-            i += 1;
-            continue;
-        }
-        if comment {
-            let (ch, next) = char_at(input, i);
-            out.push(ch);
-            i = next;
-            continue;
-        }
-        if let Some(active) = quote {
-            if byte == active {
-                if active == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
-                    out.push_str("''");
-                    i += 2;
-                } else {
-                    quote = None;
-                    out.push(active as char);
-                    i += 1;
-                }
-                continue;
+        match bytes[i] {
+            b'+' | b'-' if !seen_chomp => {
+                seen_chomp = true;
+                i += 1;
             }
-            if byte == b'\\' && active == b'"' {
-                let (ch, next) = char_at(input, i);
+            b'1'..=b'9' if !seen_indent => {
+                seen_indent = true;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    let mut saw_ws = false;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        saw_ws = true;
+        i += 1;
+    }
+    if i == bytes.len() || bytes[i] == b'\r' {
+        return true;
+    }
+    bytes[i] == b'#' && (saw_ws || i == 0)
+}
+
+/// 把标签 token `from` 改写为 `to`，按 YAML 行上下文状态机区分：
+/// - 单/双引号标量（可跨行，`''` 与 `\` 转义）；
+/// - 块标量正文（`|` / `>`，按所属键或 `-` 基准缩进整体原样透传）；
+/// - 普通标量（单行与多行续行中的 `'` / `"` 均为字面字符，绝不开启引号态）；
+/// - 注释（空白或行首后的 `#` 到行尾）。
+///
+/// 同时服务于解析（`!!js` → `!cordis-js`）与回写（反向），双向对称且无损。
+fn rewrite_tag_outside_quotes(input: &str, from: &str, to: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LineState {
+        ExpectToken,
+        PlainScalar,
+        AfterQuoted,
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut quote: Option<u8> = None;
+    let mut block_scalar: Option<usize> = None;
+    let mut plain_base_indent: Option<usize> = None;
+    let mut flow_depth: usize = 0;
+
+    for raw_line in input.split_inclusive('\n') {
+        let (line, newline) = match raw_line.strip_suffix('\n') {
+            Some(stripped) => (stripped, "\n"),
+            None => (raw_line, ""),
+        };
+        let bytes = line.as_bytes();
+
+        // 若正处于跨行引号标量内，直接在本行继续扫描直到闭合引号或行尾。
+        let mut i = 0;
+        let mut node_indent = 0usize;
+        let mut token_start_col = 0usize;
+        let mut saw_mapping_colon = false;
+        let mut saw_seq_dash = false;
+        let mut allow_block_indicator = true;
+        let mut line_has_plain_value = false;
+        let mut state = LineState::ExpectToken;
+
+        if quote.is_none() {
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            let line_indent = i;
+            let rest_trimmed = line[i..].trim_end_matches([' ', '\t', '\r']);
+            let is_blank = rest_trimmed.is_empty();
+
+            if let Some(base_indent) = block_scalar {
+                if is_blank || line_indent > base_indent {
+                    out.push_str(raw_line);
+                    continue;
+                }
+                block_scalar = None;
+            }
+
+            if flow_depth == 0 {
+                if let Some(base_indent) = plain_base_indent {
+                    if is_blank || line_indent > base_indent {
+                        // 多行普通标量续行：内部 `'`/`"` 和 `!!js` 均是字面正文。
+                        out.push_str(raw_line);
+                        continue;
+                    }
+                    plain_base_indent = None;
+                }
+            }
+
+            out.push_str(&line[..i]);
+            node_indent = line_indent;
+        }
+
+        while i < bytes.len() {
+            let byte = bytes[i];
+
+            if let Some(active) = quote {
+                if byte == active {
+                    if active == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                        out.push_str("''");
+                        i += 2;
+                    } else {
+                        quote = None;
+                        state = LineState::AfterQuoted;
+                        out.push(active as char);
+                        i += 1;
+                    }
+                    continue;
+                }
+                if byte == b'\\' && active == b'"' {
+                    let (ch, next) = char_at(line, i);
+                    out.push(ch);
+                    i = next;
+                    if i < bytes.len() {
+                        let (ch, next) = char_at(line, i);
+                        out.push(ch);
+                        i = next;
+                    }
+                    continue;
+                }
+                let (ch, next) = char_at(line, i);
                 out.push(ch);
                 i = next;
-                if i < bytes.len() {
-                    let (ch, next) = char_at(input, i);
+                continue;
+            }
+
+            // YAML 注释必须在行首或紧跟空白之后。
+            if byte == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
+                out.push_str(&line[i..]);
+                break;
+            }
+
+            match state {
+                LineState::ExpectToken => {
+                    if matches!(byte, b' ' | b'\t' | b'\r') {
+                        out.push(byte as char);
+                        i += 1;
+                        continue;
+                    }
+                    if flow_depth == 0
+                        && allow_block_indicator
+                        && matches!(byte, b'-' | b'?')
+                        && bytes
+                            .get(i + 1)
+                            .is_none_or(|next| matches!(next, b' ' | b'\t' | b'\r'))
+                    {
+                        node_indent = i;
+                        saw_seq_dash = true;
+                        out.push(byte as char);
+                        i += 1;
+                        continue;
+                    }
+                    allow_block_indicator = false;
+
+                    if byte == b'\'' || byte == b'"' {
+                        token_start_col = i;
+                        quote = Some(byte);
+                        out.push(byte as char);
+                        i += 1;
+                        continue;
+                    }
+                    if flow_depth == 0
+                        && (byte == b'|' || byte == b'>')
+                        && is_block_scalar_header(&line[i + 1..])
+                    {
+                        block_scalar = Some(node_indent);
+                        plain_base_indent = None;
+                        out.push_str(&line[i..]);
+                        break;
+                    }
+                    if byte == b'[' || byte == b'{' {
+                        flow_depth += 1;
+                        plain_base_indent = None;
+                        out.push(byte as char);
+                        i += 1;
+                        continue;
+                    }
+                    if byte == b']' || byte == b'}' {
+                        flow_depth = flow_depth.saturating_sub(1);
+                        state = LineState::AfterQuoted;
+                        out.push(byte as char);
+                        i += 1;
+                        continue;
+                    }
+                    if flow_depth > 0 && byte == b',' {
+                        out.push(',');
+                        i += 1;
+                        continue;
+                    }
+                    // 仅在标量起点（ExpectToken）匹配并改写标签，避免误伤普通标量正文。
+                    if line[i..].starts_with(from) {
+                        let after = i + from.len();
+                        if after >= bytes.len()
+                            || matches!(bytes[after], b' ' | b'\t' | b'\r')
+                            || (flow_depth > 0 && matches!(bytes[after], b',' | b']' | b'}'))
+                        {
+                            out.push_str(to);
+                            i = after;
+                            continue;
+                        }
+                    }
+                    // 其他 YAML 标签（`!...`）或锚点（`&...`）：整体跳过并保持 ExpectToken，
+                    // 以便后续紧跟的引号/块标量/`!!js` 仍按标量起点处理。
+                    if byte == b'!' || byte == b'&' {
+                        let start = i;
+                        i += 1;
+                        while i < bytes.len()
+                            && !matches!(bytes[i], b' ' | b'\t' | b'\r')
+                            && !(flow_depth > 0 && matches!(bytes[i], b',' | b']' | b'}'))
+                        {
+                            let (_, next) = char_at(line, i);
+                            i = next;
+                        }
+                        out.push_str(&line[start..i]);
+                        continue;
+                    }
+                    // 冒号直接出现（例如空键 `: val`）也转回 ExpectToken。
+                    if byte == b':'
+                        && bytes
+                            .get(i + 1)
+                            .is_none_or(|next| matches!(next, b' ' | b'\t' | b'\r'))
+                    {
+                        if flow_depth == 0 && !saw_mapping_colon {
+                            saw_mapping_colon = true;
+                        }
+                        out.push(':');
+                        i += 1;
+                        continue;
+                    }
+
+                    // 进入普通标量（plain scalar）：之后本行内空格后的 `'`/`"` 均视为字面字符。
+                    token_start_col = i;
+                    state = LineState::PlainScalar;
+                    if flow_depth == 0 && (saw_mapping_colon || saw_seq_dash) {
+                        line_has_plain_value = true;
+                    }
+                    let (ch, next) = char_at(line, i);
                     out.push(ch);
                     i = next;
                 }
-                continue;
+                LineState::PlainScalar => {
+                    let is_colon_sep = byte == b':'
+                        && (bytes
+                            .get(i + 1)
+                            .is_none_or(|next| matches!(next, b' ' | b'\t' | b'\r'))
+                            || (flow_depth > 0
+                                && bytes
+                                    .get(i + 1)
+                                    .is_some_and(|next| matches!(next, b',' | b']' | b'}'))));
+                    if is_colon_sep {
+                        if flow_depth == 0 && !saw_mapping_colon {
+                            node_indent = token_start_col;
+                            saw_mapping_colon = true;
+                            line_has_plain_value = false;
+                        }
+                        state = LineState::ExpectToken;
+                        out.push(':');
+                        i += 1;
+                        continue;
+                    }
+                    if flow_depth > 0 {
+                        if byte == b',' {
+                            state = LineState::ExpectToken;
+                            out.push(',');
+                            i += 1;
+                            continue;
+                        }
+                        if byte == b'[' || byte == b'{' {
+                            flow_depth += 1;
+                            state = LineState::ExpectToken;
+                            out.push(byte as char);
+                            i += 1;
+                            continue;
+                        }
+                        if byte == b']' || byte == b'}' {
+                            flow_depth = flow_depth.saturating_sub(1);
+                            state = LineState::AfterQuoted;
+                            out.push(byte as char);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    let (ch, next) = char_at(line, i);
+                    out.push(ch);
+                    i = next;
+                }
+                LineState::AfterQuoted => {
+                    if matches!(byte, b' ' | b'\t' | b'\r') {
+                        out.push(byte as char);
+                        i += 1;
+                        continue;
+                    }
+                    if byte == b':'
+                        && (flow_depth > 0
+                            || bytes
+                                .get(i + 1)
+                                .is_none_or(|next| matches!(next, b' ' | b'\t' | b'\r')))
+                    {
+                        if flow_depth == 0 && !saw_mapping_colon {
+                            node_indent = token_start_col;
+                            saw_mapping_colon = true;
+                            line_has_plain_value = false;
+                        }
+                        state = LineState::ExpectToken;
+                        out.push(':');
+                        i += 1;
+                        continue;
+                    }
+                    if flow_depth > 0 && byte == b',' {
+                        state = LineState::ExpectToken;
+                        out.push(',');
+                        i += 1;
+                        continue;
+                    }
+                    if byte == b']' || byte == b'}' {
+                        flow_depth = flow_depth.saturating_sub(1);
+                        out.push(byte as char);
+                        i += 1;
+                        continue;
+                    }
+                    let (ch, next) = char_at(line, i);
+                    out.push(ch);
+                    i = next;
+                }
             }
-            let (ch, next) = char_at(input, i);
-            out.push(ch);
-            i = next;
-            continue;
         }
-        // 引号与注释之外：YAML 引号标量只能出现在标量起点（行首、空白或结构分隔符之后），
-        // 不能把无引号标量里的撇号（如 `note: don't break`）误判成跨行单引号字符串。
-        let scalar_start = i == 0
-            || matches!(
-                bytes[i - 1],
-                b' ' | b'\t' | b'\n' | b'\r' | b':' | b'-' | b'[' | b'{' | b','
-            );
-        if (byte == b'\'' || byte == b'"') && scalar_start {
-            quote = Some(byte);
-            out.push(byte as char);
-            i += 1;
-            continue;
-        }
-        // YAML 的注释必须与内容之间有空白，`v#notcomment` 不是注释。
-        if byte == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n')) {
-            comment = true;
-            out.push('#');
-            i += 1;
-            continue;
-        }
-        let before_ok = i == 0
-            || matches!(
-                bytes[i - 1],
-                b' ' | b'\t' | b'\n' | b'\r' | b':' | b'-' | b'[' | b'{' | b','
-            );
-        if before_ok && input[i..].starts_with(from) {
-            let after = i + from.len();
-            if after >= bytes.len() || matches!(bytes[after], b' ' | b'\t' | b'\r' | b'\n') {
-                out.push_str(to);
-                i = after;
-                continue;
+
+        if quote.is_none() && block_scalar.is_none() && flow_depth == 0 {
+            if line_has_plain_value {
+                plain_base_indent = Some(node_indent);
+            } else {
+                plain_base_indent = None;
             }
         }
-        let (ch, next) = char_at(input, i);
-        out.push(ch);
-        i = next;
+        out.push_str(newline);
     }
     out
 }
@@ -1644,5 +1889,136 @@ mod review_regression_tests {
         let mut owners = PatchOwners::default();
         let _ = apply_entry_patches_tracked(Vec::new(), &patches, 2, &mut owners, &mut |_| {});
         assert_eq!(owners.config_layer("child1"), Some(2));
+    }
+
+    #[test]
+    fn r4_p1_rewrite_tag_handles_space_preceded_quotes_in_plain_and_block_scalars() {
+        // 1. Plain scalars containing space-preceded apostrophe / double quote
+        let yaml_plain = concat!(
+            "- id: a\n",
+            "  name: llm\n",
+            "  config:\n",
+            "    note: The '90s era\n",
+            "    desc: Say \"hello world\n",
+            "- id: b\n",
+            "  name: gated\n",
+            "  disabled: !!js false\n",
+            "  config:\n",
+            "    token: !!js process.env.API_KEY\n",
+        );
+        let entries = parse_entries(yaml_plain).expect("parse plain scalar YAML");
+        assert_eq!(
+            entries[1].disabled_expr.as_ref().map(|e| e.source()),
+            Some("false".to_string()),
+            "普通标量空格后的撇号/引号不得吞掉后续 disabled: !!js 标签"
+        );
+        assert!(
+            JsExpr::from_value(&entries[1].config.as_ref().unwrap()["token"]).is_some(),
+            "普通标量空格后的撇号/引号不得吞掉后续 config 中的 !!js 标签: {:?}",
+            entries[1].config
+        );
+        let dumped = dump_entries(&entries).expect("dump_entries");
+        assert!(
+            !dumped.contains(JS_TAG),
+            "回写磁盘的 YAML 绝不得残留内部临时标签 !cordis-js:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("!!js"),
+            "回写 YAML 必须还原 !!js:\n{dumped}"
+        );
+        let reparsed = parse_entries(&dumped).expect("reparse dumped YAML");
+        assert_eq!(
+            reparsed[1].disabled_expr.as_ref().map(|e| e.source()),
+            Some("false".to_string())
+        );
+        assert!(JsExpr::from_value(&reparsed[1].config.as_ref().unwrap()["token"]).is_some());
+
+        // 2. Multiline `|` and `>` block scalars containing quotes & apostrophes
+        let yaml_block = concat!(
+            "- id: a\n",
+            "  name: llm\n",
+            "  config:\n",
+            "    prompt: |\n",
+            "      Use \"quotes freely\n",
+            "      and 'apostrophes in '90s prose\n",
+            "    folded: >-\n",
+            "      Another \"unclosed quote\n",
+            "- id: b\n",
+            "  name: gated\n",
+            "  config:\n",
+            "    key: !!js process.env.BLOCK_KEY\n",
+        );
+        let entries2 = parse_entries(yaml_block).expect("parse block scalar YAML");
+        assert!(
+            JsExpr::from_value(&entries2[1].config.as_ref().unwrap()["key"]).is_some(),
+            "块标量 `|`/`>` 内的未闭合引号不得吞掉后续 !!js 标签: {:?}",
+            entries2[1].config
+        );
+        let dumped2 = dump_entries(&entries2).expect("dump_entries block");
+        assert!(
+            !dumped2.contains(JS_TAG),
+            "含块标量回写后的 YAML 不得残留 !cordis-js:\n{dumped2}"
+        );
+        let reparsed2 = parse_entries(&dumped2).expect("reparse block YAML");
+        assert!(JsExpr::from_value(&reparsed2[1].config.as_ref().unwrap()["key"]).is_some());
+    }
+
+    #[test]
+    fn r4_p1_yaml_tag_scanner_roundtrip_matrix_never_leaks_internal_tag() {
+        let plain_samples = [
+            "The '90s era",
+            "Say \"hello world",
+            "it's a \"mixed 'quote case",
+            "hello !!js literal in plain",
+            "multi\n      '80s continuation",
+        ];
+        let block_headers = ["|", "|-", "|+", ">", ">-", "|2"];
+        let block_bodies = [
+            "      Use \"unclosed quote\n      and '90s apostrophe\n      !!js not-a-tag-in-block",
+            "      line1\n\n      'single and \"double",
+        ];
+        let mut checked = 0usize;
+        for plain in plain_samples {
+            for header in block_headers {
+                for body in block_bodies {
+                    let yaml = format!(
+                        "- id: a\n  name: llm\n  config:\n    plain: {plain}\n    blk: {header}\n{body}\n    flow: [!!js a, 'quoted !!js', plain '90s, !!js b]\n    fmap: {{\"k\":!!js c, m: Say \"hi, n: !!js d}}\n- id: b\n  name: gated\n  disabled: !!js false\n  config:\n    token: !!js process.env.KEY\n"
+                    );
+                    let entries = parse_entries(&yaml).unwrap_or_else(|e| {
+                        panic!("parse failed for header={header} plain={plain:?}: {e}\n{yaml}")
+                    });
+                    assert_eq!(
+                        entries[1].disabled_expr.as_ref().map(|e| e.source()),
+                        Some("false".to_string()),
+                        "disabled_expr lost:\n{yaml}"
+                    );
+                    assert!(
+                        JsExpr::from_value(&entries[1].config.as_ref().unwrap()["token"]).is_some(),
+                        "token expr lost:\n{yaml}"
+                    );
+                    let flow = entries[0].config.as_ref().unwrap()["flow"]
+                        .as_array()
+                        .unwrap();
+                    assert!(JsExpr::from_value(&flow[0]).is_some());
+                    assert_eq!(flow[1], Value::String("quoted !!js".to_string()));
+                    assert!(JsExpr::from_value(&flow[3]).is_some());
+                    let fmap = entries[0].config.as_ref().unwrap()["fmap"]
+                        .as_object()
+                        .unwrap();
+                    assert!(JsExpr::from_value(&fmap["k"]).is_some());
+                    assert!(JsExpr::from_value(&fmap["n"]).is_some());
+
+                    let dumped = dump_entries(&entries).expect("dump_entries");
+                    assert!(
+                        !dumped.contains(JS_TAG),
+                        "leaked internal tag !cordis-js in dumped YAML:\n{dumped}"
+                    );
+                    let reparsed = parse_entries(&dumped).expect("reparse dumped");
+                    assert_eq!(entries, reparsed, "round-trip mismatch:\n{dumped}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 60);
     }
 }

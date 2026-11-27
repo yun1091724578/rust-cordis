@@ -746,3 +746,553 @@ async fn r3_p3_capabilities_keeps_first_row_on_duplicate_id() {
     app.close().await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// ============================================================================
+// Round-4 P1 structural closure tests (P1-11, P1-12, P1-13, P1-14)
+// ============================================================================
+
+// R4 P1-11: Cancelling `mount_loaded` mid-`settle().await` must dispose the orphan fiber
+// and track `Draining` until its cleanup finishes (never leaving a live untracked orphan).
+#[tokio::test]
+async fn r4_p1_mount_loaded_cancel_disposes_orphan_and_tracks_draining() {
+    use cordis_core::{plugin_fn, Disposable, Dyn, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct SlowMountSource {
+        mounts: Arc<AtomicUsize>,
+        entered_apply: Arc<tokio::sync::Notify>,
+        release_apply: Arc<tokio::sync::Notify>,
+        entered_dispose: Arc<tokio::sync::Notify>,
+        release_dispose: Arc<tokio::sync::Notify>,
+        gate_first: Arc<AtomicBool>,
+    }
+    impl PluginSource for SlowMountSource {
+        fn load(
+            &self,
+            _entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            let mounts = self.mounts.clone();
+            let entered_apply = self.entered_apply.clone();
+            let release_apply = self.release_apply.clone();
+            let entered_dispose = self.entered_dispose.clone();
+            let release_dispose = self.release_dispose.clone();
+            let gated = self.gate_first.swap(false, Ordering::SeqCst);
+            Ok(LoadedFile {
+                plugin: plugin_fn("slow-mount", Inject::default(), move |ctx, _cfg| {
+                    let mounts = mounts.clone();
+                    let entered_apply = entered_apply.clone();
+                    let release_apply = release_apply.clone();
+                    let entered_dispose = entered_dispose.clone();
+                    let release_dispose = release_dispose.clone();
+                    Box::pin(async move {
+                        let id = mounts.fetch_add(1, Ordering::SeqCst) + 1;
+                        if gated {
+                            let _ = ctx.effect(move |_| {
+                                let entered_dispose = entered_dispose.clone();
+                                let release_dispose = release_dispose.clone();
+                                Disposable::new(move || {
+                                    Box::pin(async move {
+                                        entered_dispose.notify_one();
+                                        release_dispose.notified().await;
+                                    })
+                                })
+                            });
+                            entered_apply.notify_one();
+                            release_apply.notified().await;
+                        }
+                        ctx.provide("r4-slow-mount-svc", Dyn::new(id))?;
+                        Ok(())
+                    })
+                }),
+                source: std::path::PathBuf::new(),
+                staged: std::path::PathBuf::new(),
+                fingerprint: None,
+            })
+        }
+    }
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("cordis-r4-mount-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(&cfg_path, "[]\n").unwrap();
+
+    let mounts = Arc::new(AtomicUsize::new(0));
+    let entered_apply = Arc::new(tokio::sync::Notify::new());
+    let release_apply = Arc::new(tokio::sync::Notify::new());
+    let entered_dispose = Arc::new(tokio::sync::Notify::new());
+    let release_dispose = Arc::new(tokio::sync::Notify::new());
+    let gate_first = Arc::new(AtomicBool::new(true));
+
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(SlowMountSource {
+            mounts: mounts.clone(),
+            entered_apply: entered_apply.clone(),
+            release_apply: release_apply.clone(),
+            entered_dispose: entered_dispose.clone(),
+            release_dispose: release_dispose.clone(),
+            gate_first: gate_first.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let entries = cordis_host::patch::parse_entries("- id: slow\n  name: slow-mount\n").unwrap();
+    let reconcile_state = state.clone();
+    let reconcile_entries = entries.clone();
+    let handle = tokio::spawn(async move {
+        let _ = reconcile_state.reconcile_once(reconcile_entries).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_apply.notified())
+        .await
+        .expect("entered slow apply");
+
+    // Abort reconcile mid-`settle().await`!
+    handle.abort();
+    let _ = handle.await;
+
+    // Release apply so the fiber can finish or enter dispose.
+    release_apply.notify_waiters();
+
+    // The cancelled fiber MUST be disposed (entering its disposer).
+    tokio::time::timeout(Duration::from_secs(5), entered_dispose.notified())
+        .await
+        .expect("被取消的 mount_loaded 必须自动 dispose 孤儿 fiber，绝不得让其继续存活");
+
+    // While the cancelled fiber's disposer is still running, a concurrent `sync()` MUST see `Draining`
+    // and refuse to double-mount!
+    let blocked = state.sync().await;
+    assert!(
+        blocked
+            .failures
+            .iter()
+            .any(|msg| msg.contains("后台清理") || msg.contains("清理")),
+        "取消清理尚未完成前 sync 必须被 Draining 阻断，实际: {blocked:?}"
+    );
+    assert_eq!(
+        mounts.load(Ordering::SeqCst),
+        1,
+        "Draining 期间不得提前挂入第二份实例"
+    );
+
+    // Finish background dispose -> next `sync()` must converge cleanly to a single healthy instance!
+    release_dispose.notify_waiters();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let outcome = state.sync().await;
+        if outcome.failures.is_empty() && state.fiber_of("slow").is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "后台清理完成后 sync 必须恢复挂载，最后结果: {outcome:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(mounts.load(Ordering::SeqCst), 2);
+    assert!(app.root.get("r4-slow-mount-svc").is_some());
+
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// R4 P1-12 (replace path): If a mounted plugin self-disposes while `exec_replace_action` is
+// preloading the replacement plugin, `exec_replace_action` must NOT mount the replacement
+// concurrently with the self-disposing fiber or resurrect the self-disposed row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_p1_dispose_self_race_with_replace_never_resurrects() {
+    use cordis_core::{plugin_fn, Disposable, Dyn, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    struct RaceReplaceSource {
+        v2_mounts: Arc<AtomicUsize>,
+        v1_fiber: Arc<Mutex<Option<Arc<cordis_core::Fiber>>>>,
+        entered_self_dispose: Arc<std::sync::Condvar>,
+        self_dispose_flag: Arc<Mutex<bool>>,
+        release_self_dispose: Arc<tokio::sync::Notify>,
+    }
+    impl PluginSource for RaceReplaceSource {
+        fn load(
+            &self,
+            entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            if entry.name == "v1" {
+                let v1_fiber = self.v1_fiber.clone();
+                let entered_cv = self.entered_self_dispose.clone();
+                let flag = self.self_dispose_flag.clone();
+                let release = self.release_self_dispose.clone();
+                Ok(LoadedFile {
+                    plugin: plugin_fn("v1", Inject::default(), move |ctx, _cfg| {
+                        let v1_fiber = v1_fiber.clone();
+                        let entered_cv = entered_cv.clone();
+                        let flag = flag.clone();
+                        let release = release.clone();
+                        Box::pin(async move {
+                            *v1_fiber.lock().unwrap() = Some(ctx.fiber());
+                            ctx.provide("r4-exclusive-svc", Dyn::new(1u32))?;
+                            let _ = ctx.effect(move |_| {
+                                let entered_cv = entered_cv.clone();
+                                let flag = flag.clone();
+                                let release = release.clone();
+                                Disposable::new(move || {
+                                    Box::pin(async move {
+                                        *flag.lock().unwrap() = true;
+                                        entered_cv.notify_all();
+                                        release.notified().await;
+                                    })
+                                })
+                            });
+                            Ok(())
+                        })
+                    }),
+                    source: std::path::PathBuf::new(),
+                    staged: std::path::PathBuf::new(),
+                    fingerprint: None,
+                })
+            } else {
+                // While `exec_replace_action` is preloading `v2`, trigger `v1.dispose()` (self-dispose!)
+                // and wait until `v1` has entered its async disposer (so `on_plugin` has ALREADY claimed SelfDisposing!).
+                if let Some(fiber) = self.v1_fiber.lock().unwrap().clone() {
+                    tokio::runtime::Handle::current().spawn(async move {
+                        fiber.dispose().await;
+                    });
+                    let mut guard = self.self_dispose_flag.lock().unwrap();
+                    while !*guard {
+                        let (g, res) = self
+                            .entered_self_dispose
+                            .wait_timeout(guard, Duration::from_secs(5))
+                            .unwrap();
+                        guard = g;
+                        assert!(!res.timed_out(), "v1 self-dispose should enter disposer");
+                    }
+                }
+                let v2_mounts = self.v2_mounts.clone();
+                Ok(LoadedFile {
+                    plugin: plugin_fn("v2", Inject::default(), move |ctx, _cfg| {
+                        let v2_mounts = v2_mounts.clone();
+                        Box::pin(async move {
+                            v2_mounts.fetch_add(1, Ordering::SeqCst);
+                            ctx.provide("r4-exclusive-svc", Dyn::new(2u32))?;
+                            Ok(())
+                        })
+                    }),
+                    source: std::path::PathBuf::new(),
+                    staged: std::path::PathBuf::new(),
+                    fingerprint: None,
+                })
+            }
+        }
+    }
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("cordis-r4-replace-selfdisp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(&cfg_path, "- id: victim\n  name: v1\n").unwrap();
+
+    let v2_mounts = Arc::new(AtomicUsize::new(0));
+    let v1_fiber = Arc::new(Mutex::new(None));
+    let entered_self_dispose = Arc::new(std::sync::Condvar::new());
+    let self_dispose_flag = Arc::new(Mutex::new(false));
+    let release_self_dispose = Arc::new(tokio::sync::Notify::new());
+
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(RaceReplaceSource {
+            v2_mounts: v2_mounts.clone(),
+            v1_fiber: v1_fiber.clone(),
+            entered_self_dispose: entered_self_dispose.clone(),
+            self_dispose_flag: self_dispose_flag.clone(),
+            release_self_dispose: release_self_dispose.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(state.fiber_of("victim").is_some());
+
+    // Trigger Action::Replace ("v1" -> "v2"): `v1` self-disposes mid-preload!
+    let replace_entries = cordis_host::patch::parse_entries("- id: victim\n  name: v2\n").unwrap();
+    let _outcome = state.reconcile_once(replace_entries).await;
+
+    assert_eq!(
+        v2_mounts.load(Ordering::SeqCst),
+        0,
+        "v1 正在自我卸载期间，exec_replace_action 绝不得并发挂入 v2 或复活该行"
+    );
+    assert!(
+        state.fiber_of("victim").is_none(),
+        "自我卸载中的行不得被 replace 写回已挂载状态"
+    );
+
+    release_self_dispose.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let on_disk = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        on_disk.contains("disabled: true"),
+        "自我卸载完成后磁盘必须落盘 disabled: true:\n{on_disk}"
+    );
+
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// R4 P1-13: Cancelling `request_reconcile` mid-action-loop AFTER `adopt()` already committed
+// the new tree must trigger compensation convergence so remaining actions (e.g. mounting `row_b`)
+// still converge automatically instead of leaving tree/runtime permanently diverged.
+#[tokio::test]
+async fn r4_p1_cancel_drive_pending_after_adopt_converges_via_compensation_sync() {
+    use cordis_core::{plugin_fn, Disposable, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct TwoRowSource {
+        entered_a_dispose: Arc<tokio::sync::Notify>,
+        release_a_dispose: Arc<tokio::sync::Notify>,
+    }
+    impl PluginSource for TwoRowSource {
+        fn load(
+            &self,
+            entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            if entry.name == "row-a" {
+                let entered = self.entered_a_dispose.clone();
+                let release = self.release_a_dispose.clone();
+                Ok(LoadedFile {
+                    plugin: plugin_fn("row-a", Inject::default(), move |ctx, _cfg| {
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        Box::pin(async move {
+                            let _ = ctx.effect(move |_| {
+                                let entered = entered.clone();
+                                let release = release.clone();
+                                Disposable::new(move || {
+                                    Box::pin(async move {
+                                        entered.notify_one();
+                                        release.notified().await;
+                                    })
+                                })
+                            });
+                            Ok(())
+                        })
+                    }),
+                    source: std::path::PathBuf::new(),
+                    staged: std::path::PathBuf::new(),
+                    fingerprint: None,
+                })
+            } else {
+                Ok(LoadedFile {
+                    plugin: plugin_fn("row-b", Inject::default(), |_ctx, _cfg| {
+                        Box::pin(async { Ok(()) })
+                    }),
+                    source: std::path::PathBuf::new(),
+                    staged: std::path::PathBuf::new(),
+                    fingerprint: None,
+                })
+            }
+        }
+    }
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("cordis-r4-adopt-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(&cfg_path, "- id: a\n  name: row-a\n").unwrap();
+
+    let entered_a_dispose = Arc::new(tokio::sync::Notify::new());
+    let release_a_dispose = Arc::new(tokio::sync::Notify::new());
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(TwoRowSource {
+            entered_a_dispose: entered_a_dispose.clone(),
+            release_a_dispose: release_a_dispose.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.mounted_labels(), vec!["a"]);
+
+    // New tree disposes `a` and mounts `b`.
+    let next_entries = cordis_host::patch::parse_entries("- id: b\n  name: row-b\n").unwrap();
+    let req_state = state.clone();
+    let req_task = tokio::spawn(async move {
+        let _ = req_state.request_reconcile(next_entries).await;
+    });
+
+    // Wait until `a`'s dispose starts — at this point `adopt()` has ALREADY committed `next_entries`!
+    tokio::time::timeout(Duration::from_secs(5), entered_a_dispose.notified())
+        .await
+        .expect("a dispose started after adopt");
+
+    // Cancel `request_reconcile` right before `b` gets mounted!
+    req_task.abort();
+    let _ = req_task.await;
+    release_a_dispose.notify_waiters();
+
+    // Compensation sync MUST automatically converge `b` without another external request!
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if state.mounted_labels() == vec!["b".to_string()] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "adopt 后对账循环被取消必须自动触发补偿收敛，当前 mounted={:?}, tree={:?}",
+            state.mounted_labels(),
+            state.tree_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// R4 P1-14: Cancelling `dispose_row` mid-`dispose_with_report().await` must keep the row in
+// `Draining` until background disposal finishes, blocking concurrent remounts.
+#[tokio::test]
+async fn r4_p1_cancel_dispose_row_tracks_draining_until_cleanup_finishes() {
+    use cordis_core::{plugin_fn, Disposable, Dyn, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct SlowDisposeSource {
+        mounts: Arc<AtomicUsize>,
+        entered_dispose: Arc<tokio::sync::Notify>,
+        release_dispose: Arc<tokio::sync::Notify>,
+    }
+    impl PluginSource for SlowDisposeSource {
+        fn load(
+            &self,
+            _entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            let mounts = self.mounts.clone();
+            let entered = self.entered_dispose.clone();
+            let release = self.release_dispose.clone();
+            Ok(LoadedFile {
+                plugin: plugin_fn("slow-disp", Inject::default(), move |ctx, _cfg| {
+                    let mounts = mounts.clone();
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        let id = mounts.fetch_add(1, Ordering::SeqCst) + 1;
+                        ctx.provide("r4-slow-disp-svc", Dyn::new(id))?;
+                        if id == 1 {
+                            let _ = ctx.effect(move |_| {
+                                let entered = entered.clone();
+                                let release = release.clone();
+                                Disposable::new(move || {
+                                    Box::pin(async move {
+                                        entered.notify_one();
+                                        release.notified().await;
+                                    })
+                                })
+                            });
+                        }
+                        Ok(())
+                    })
+                }),
+                source: std::path::PathBuf::new(),
+                staged: std::path::PathBuf::new(),
+                fingerprint: None,
+            })
+        }
+    }
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("cordis-r4-dispose-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(&cfg_path, "- id: svc\n  name: slow-disp\n").unwrap();
+
+    let mounts = Arc::new(AtomicUsize::new(0));
+    let entered_dispose = Arc::new(tokio::sync::Notify::new());
+    let release_dispose = Arc::new(tokio::sync::Notify::new());
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(SlowDisposeSource {
+            mounts: mounts.clone(),
+            entered_dispose: entered_dispose.clone(),
+            release_dispose: release_dispose.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mounts.load(Ordering::SeqCst), 1);
+
+    // Start disabling `svc`, then cancel mid-`dispose_with_report().await`.
+    let disable_state = state.clone();
+    let disable_task = tokio::spawn(async move {
+        let _ = disable_state.set_disabled("svc", Some(true)).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_dispose.notified())
+        .await
+        .expect("entered slow disposer");
+    disable_task.abort();
+    let _ = disable_task.await;
+
+    // Immediately trying to re-enable / remount while disposer is STILL running MUST be blocked by `Draining`!
+    let remount_entries =
+        cordis_host::patch::parse_entries("- id: svc\n  name: slow-disp\n").unwrap();
+    let blocked = state.reconcile_once(remount_entries.clone()).await;
+    assert!(
+        blocked
+            .failures
+            .iter()
+            .any(|msg| msg.contains("后台清理") || msg.contains("清理")),
+        "dispose_row 中途被取消时必须落入 Draining 阻断并发重挂，实际: {blocked:?}"
+    );
+    assert_eq!(
+        mounts.load(Ordering::SeqCst),
+        1,
+        "旧实例清理未结束前绝不得挂入第二份实例"
+    );
+
+    // Release slow disposer -> background cleanup completes -> Draining clears -> next sync mounts cleanly!
+    release_dispose.notify_waiters();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let outcome = state.reconcile_once(remount_entries.clone()).await;
+        if outcome.failures.is_empty() && state.fiber_of("svc").is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "后台清理完成后应可正常重新挂载，最后结果: {outcome:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(mounts.load(Ordering::SeqCst), 2);
+
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

@@ -56,16 +56,18 @@ pub(crate) unsafe extern "C" fn host_ctx_require(handle: u64, name: Blob, out: *
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    with_resolved_as(
-        handle,
-        out,
-        "host_require",
-        "resolve",
-        |resolved| match resolved.ctx.require(&name) {
+    with_resolved_as(handle, out, "host_require", "resolve", |resolved| {
+        if resolved.is_child_fiber {
+            return Err(
+                "ctx_use 返回的子组件句柄不能用于 ctx_require（请使用自身实例或 isolate 句柄）"
+                    .to_string(),
+            );
+        }
+        match resolved.ctx.require(&name) {
             Err(err) => Err(err.to_string()),
             Ok(value) => encode_service(&name, value),
-        },
-    )
+        }
+    })
 }
 
 /// 把一个服务值编码成 ABI 可见的 JSON。
@@ -148,9 +150,12 @@ pub(crate) unsafe extern "C" fn host_ctx_isolate(
         Err(err) => return fail(out, &err),
     };
     with_resolved(handle, out, |resolved| {
+        let Some(_active) = admit_call(&resolved.instance) else {
+            return Err("实例已进入卸载/关闭流程，拒绝派生 isolate 句柄".to_string());
+        };
         let realm = (!label.is_empty()).then(|| resolved.ctx.store.named_realm(&key, &label));
         let derived = resolved.ctx.isolate(&key, realm);
-        let handle = register_derived(resolved.owner, derived, resolved.instance.clone(), None);
+        let handle = register_derived(resolved.owner, derived, resolved.instance.clone(), None)?;
         Ok(json!({ "handle": handle }).to_string())
     })
 }
@@ -175,18 +180,21 @@ pub(crate) unsafe extern "C" fn host_ctx_intercept(
         Err(err) => return fail(out, &err),
     };
     with_resolved(handle, out, |resolved| {
+        let Some(_active) = admit_call(&resolved.instance) else {
+            return Err("实例已进入卸载/关闭流程，拒绝派生 intercept 句柄".to_string());
+        };
         let derived = resolved.ctx.intercept(&key, metadata);
-        let handle = register_derived(resolved.owner, derived, resolved.instance.clone(), None);
+        let handle = register_derived(resolved.owner, derived, resolved.instance.clone(), None)?;
         Ok(json!({ "handle": handle }).to_string())
     })
 }
 
 /// #14 `ctx_use`：挂一个子组件。
 ///
-/// `url = "@native:<name>"` 走 [`NativeRegistry`]，其余交给进程级
-/// [`PluginSource`]（[`set_plugin_source`]）。新 fiber 是**调用方 fiber 的
-/// 一个 effect**（内核 `Fiber::new` 负责）：父 dispose ⇒ 子 dispose，
-/// 宿主不需要为父子关系记账。返回子 fiber 的派生句柄。
+/// `url = "@native:<name>"` 优先走 per-App [`NativeRegistry`]（[`set_native_registry_for`]），
+/// 缺失时回落进程级注册表；其余优先走 per-App [`PluginSource`]（[`set_plugin_source_for`]），
+/// 缺失时回落进程级来源。新 fiber 是**调用方 fiber 的一个 effect**（内核 `Fiber::new` 负责）：
+/// 父 dispose ⇒ 子 dispose。返回子 fiber 的派生生命周期句柄（绝不暴露子 fiber 的 `Ctx` 身份）。
 pub(crate) unsafe extern "C" fn host_ctx_use(
     handle: u64,
     url: Blob,
@@ -202,15 +210,40 @@ pub(crate) unsafe extern "C" fn host_ctx_use(
         Err(err) => return fail(out, &err),
     };
     with_resolved(handle, out, |resolved| {
-        let plugin = resolve_component(&url)?;
+        let Some(_active) = admit_call(&resolved.instance) else {
+            return Err("实例已进入卸载/关闭流程，拒绝挂载子组件".to_string());
+        };
+        if resolved
+            .ctx
+            .fiber_opt()
+            .is_some_and(|parent| parent.is_disposed())
+        {
+            return Err("父上下文已处置，无法挂载子组件".to_string());
+        }
+        let plugin = resolve_component(&resolved.ctx, &url)?;
         // 注意挂在**解析出的 ctx** 上：经派生句柄 use ⇒ 子组件落在隔离域内。
         let fiber = mount(&resolved.ctx, plugin, config, None);
-        let handle = register_derived(
+        if fiber.state() == cordis_core::FiberState::Failed {
+            return Err(fiber
+                .error()
+                .unwrap_or_else(|| format!("use \"{url}\" 挂载子组件失败")));
+        }
+        // 派生条目只保存调用方所在域上下文 `resolved.ctx`（绝不保存子 fiber 的 `Ctx`），
+        // 避免父插件借子句柄冒充子插件 CallerIdentity 或借用子插件 inject。
+        let handle = match register_derived(
             resolved.owner,
-            fiber.ctx(),
+            resolved.ctx.clone(),
             resolved.instance.clone(),
             Some(Arc::downgrade(&fiber)),
-        );
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    rt.spawn(async move { fiber.dispose().await });
+                }
+                return Err(err);
+            }
+        };
         Ok(json!({ "handle": handle }).to_string())
     })
 }
@@ -299,10 +332,10 @@ pub(crate) unsafe extern "C" fn host_ctx_dispose_self(handle: u64, out: *mut Out
     })
 }
 
-/// `ctx_use` 的 url 解析：`@native:<name>` 与 `PluginSource` 两条路。
-fn resolve_component(url: &str) -> std::result::Result<Arc<dyn Plugin>, String> {
+/// `ctx_use` 的 url 解析：`@native:<name>` 与 `PluginSource` 两条路（均优先读取 per-App 绑定）。
+fn resolve_component(ctx: &Ctx, url: &str) -> std::result::Result<Arc<dyn Plugin>, String> {
     if let Some(name) = url.strip_prefix("@native:") {
-        return native_registry()
+        return native_registry_for_ctx(ctx)
             .and_then(|registry| registry.native(name))
             .ok_or_else(|| format!("@native:{name}：宿主没有注册这个原生组件（NativeRegistry）"));
     }
@@ -310,7 +343,7 @@ fn resolve_component(url: &str) -> std::result::Result<Arc<dyn Plugin>, String> 
         name: url.to_string(),
         ..patch::Entry::default()
     };
-    let loaded = plugin_source()
+    let loaded = plugin_source_for_ctx(ctx)
         .load(&entry, &[], next_use_revision())
         .map_err(|err| format!("use \"{url}\" 失败: {err}"))?;
     Ok(loaded.plugin)
@@ -616,6 +649,28 @@ pub(crate) unsafe extern "C" fn host_ctx_call_iface(
                     .or_else(cordis_core::current_correlation_id)
             })
             .flatten();
+        // `ctx_use` 返回的句柄只代表子组件生命周期与域读取，不承载 RPC 调用方身份：
+        // 既不允许父插件借它冒充子插件身份，也不允许它继承父行授权。
+        if resolved.is_child_fiber {
+            if traced {
+                IfaceTrace {
+                    store: resolved.instance.ctx.store.clone(),
+                    name: format!("{service}.{method}"),
+                    callee_plugin: service.clone(),
+                    caller_uid: resolved.instance.ctx.caller_identity().fiber_uid,
+                    parent_call_id: trace_parent.unwrap_or(0),
+                    correlation_id: trace_correlation,
+                    started: std::time::Instant::now(),
+                }
+                .record("host_unauthorized");
+            }
+            return Err(ErrorPayload::new(
+                "ctx_use 返回的子组件句柄仅用于生命周期管理（ctx_dispose）与域读取（ctx_get），不能用于 ctx_call_iface",
+            )
+            .with_code("host_unauthorized")
+            .with_category("authorization")
+            .with_certainty("not_executed"));
+        }
         // 宿主方法白名单准入：在服务解析、派发槽位分配与提供者执行之前校验，
         // 身份直接来自宿主绑定的 `resolved.ctx`（不依赖 TraceSink / current_caller_uid）。
         if resolved.ctx.store.has_call_auth_hook() {

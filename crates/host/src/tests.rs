@@ -2699,3 +2699,300 @@ fn r3_p3_resolve_plugin_path_preserves_parent_for_lib_and_blocks_windows_root_es
         );
     }
 }
+
+#[tokio::test]
+async fn r4_p0_ctx_use_child_handle_cannot_impersonate_child_identity_or_inject() {
+    use cordis_core::{plugin_fn, BoxFuture, Config, Dyn, ExternService, ExternValue, Inject};
+
+    struct VaultSvc;
+    impl ExternService for VaultSvc {
+        fn service(&self) -> &str {
+            "vault"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["read_secret".to_string()]
+        }
+        fn call(
+            &self,
+            _caller_meta: Option<Config>,
+            _method: String,
+            _args: Config,
+        ) -> BoxFuture<cordis_core::Result<Config>> {
+            Box::pin(async { Ok(json!("TOP-SECRET-VALUE")) })
+        }
+    }
+
+    struct PrivChildRegistry;
+    impl NativeRegistry for PrivChildRegistry {
+        fn native(&self, name: &str) -> Option<Arc<dyn Plugin>> {
+            if name == "r4-priv-child" {
+                Some(plugin_fn(
+                    "r4-priv-child",
+                    Inject::of(&["vault@1"]),
+                    |ctx, _| {
+                        Box::pin(async move {
+                            let _ = ctx.provide("r4-child-pub", Dyn::new(ExternValue(json!("ok"))));
+                            Ok(())
+                        })
+                    },
+                ))
+            } else {
+                None
+            }
+        }
+    }
+
+    let app = cordis_core::App::new();
+    let _vault = app
+        .root
+        .provide_iface("vault@1", Arc::new(VaultSvc))
+        .unwrap();
+    let allow =
+        crate::policy::MethodAllowList::new().allow_plugin_service("r4-priv-child", "vault@1");
+    crate::policy::set_method_allow_list_for(&app.root, Some(allow));
+
+    set_native_registry_for(&app.root, Arc::new(PrivChildRegistry));
+
+    // Mount an unprivileged parent fiber with NO `vault@1` in `inject` and NOT in `allow`.
+    let parent_fiber = app.root.plugin(
+        plugin_fn("r4-unpriv-parent", Inject::default(), |_, _| {
+            Box::pin(async { Ok(()) })
+        }),
+        Config::Null,
+    );
+    parent_fiber.settle().await;
+    let parent_handle = register_instance_with_keepalive(
+        parent_fiber.ctx(),
+        stream_unused_call,
+        None,
+        cordis_abi::ERROR_FORMAT_V1,
+    )
+    .unwrap();
+
+    // Parent mounts `@native:r4-priv-child` via `host_ctx_use`.
+    let mut buf = vec![0u8; 4096];
+    let mut out = Out {
+        ptr: buf.as_mut_ptr(),
+        cap: buf.len(),
+        len: 0,
+    };
+    let st = unsafe {
+        host_ctx_use(
+            parent_handle,
+            Blob::new(b"@native:r4-priv-child"),
+            Blob::new(b"{}"),
+            &mut out,
+        )
+    };
+    assert_eq!(st, STATUS_OK, "ctx_use should succeed");
+    let parsed: Value = serde_json::from_slice(&buf[..out.len]).unwrap();
+    let child_handle = parsed["handle"].as_u64().unwrap();
+
+    // Wait briefly for child fiber to activate.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    // 1. Calling `vault@1.read_secret` through `child_handle` MUST be denied (no identity impersonation!).
+    out.len = 0;
+    let call_st = unsafe {
+        host_ctx_call_iface(
+            child_handle,
+            Blob::new(b"vault@1"),
+            1,
+            Blob::new(b"read_secret"),
+            Blob::new(b"[]"),
+            0,
+            &mut out,
+        )
+    };
+    let call_text = String::from_utf8_lossy(&buf[..out.len]).to_string();
+    assert_eq!(
+        call_st, STATUS_ERR,
+        "未授权父插件不得借用 ctx_use 子句柄冒充子插件身份调用受保护方法: {call_text}"
+    );
+    assert!(
+        !call_text.contains("TOP-SECRET-VALUE"),
+        "绝不得泄露受保护服务返回值: {call_text}"
+    );
+
+    // 2. Calling `ctx_require(child_handle, "vault@1")` MUST NOT borrow child's `inject`!
+    out.len = 0;
+    let req_st = unsafe { host_ctx_require(child_handle, Blob::new(b"vault@1"), &mut out) };
+    let req_text = String::from_utf8_lossy(&buf[..out.len]).to_string();
+    assert_eq!(
+        req_st, STATUS_ERR,
+        "父插件不得借用 ctx_use 子句柄绕过自身 inject 限制: {req_text}"
+    );
+
+    // 3. `ctx_get(child_handle, "r4-child-pub")` in the shared/isolated realm MUST still work.
+    out.len = 0;
+    let get_st = unsafe { host_ctx_get(child_handle, Blob::new(b"r4-child-pub"), &mut out) };
+    assert_eq!(get_st, STATUS_OK);
+    let get_val: Value = serde_json::from_slice(&buf[..out.len]).unwrap();
+    assert_eq!(get_val["value"], json!("ok"));
+
+    unregister_instance(parent_handle);
+    app.close().await;
+}
+
+#[tokio::test]
+async fn r4_p0_ctx_use_respects_per_app_strict_plugin_source_over_global() {
+    use crate::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use cordis_core::{plugin_fn, Inject};
+
+    struct StrictAppASource;
+    impl PluginSource for StrictAppASource {
+        fn load(
+            &self,
+            entry: &crate::patch::Entry,
+            _search: &[PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            if entry.name == "allowed-parent" {
+                Ok(LoadedFile {
+                    plugin: plugin_fn("allowed-parent", Inject::default(), |_, _| {
+                        Box::pin(async { Ok(()) })
+                    }),
+                    source: PathBuf::new(),
+                    staged: PathBuf::new(),
+                    fingerprint: None,
+                })
+            } else {
+                Err(format!("strict-app-a-reject: {}", entry.name))
+            }
+        }
+    }
+
+    struct LooseGlobalSource;
+    impl PluginSource for LooseGlobalSource {
+        fn load(
+            &self,
+            _entry: &crate::patch::Entry,
+            _search: &[PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            Ok(LoadedFile {
+                plugin: plugin_fn("rogue-global-plugin", Inject::default(), |_, _| {
+                    Box::pin(async { Ok(()) })
+                }),
+                source: PathBuf::new(),
+                staged: PathBuf::new(),
+                fingerprint: None,
+            })
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("cordis-r4-app-src-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(&cfg_path, "- id: parent\n  name: allowed-parent\n").unwrap();
+
+    // Process-global source is loose (accepts anything); restore after test to avoid cross-test pollution.
+    struct RestoreGlobalSource(Option<Arc<dyn PluginSource>>);
+    impl Drop for RestoreGlobalSource {
+        fn drop(&mut self) {
+            *PLUGIN_SOURCE.write().unwrap() = self.0.take();
+        }
+    }
+    let prev_global = PLUGIN_SOURCE.write().unwrap().take();
+    let _restore = RestoreGlobalSource(prev_global);
+    set_plugin_source(Arc::new(LooseGlobalSource));
+
+    // App A mounts its loader with StrictAppASource.
+    let app_a = cordis_core::App::new();
+    let state_a = load_with_source(
+        app_a.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(StrictAppASource),
+    )
+    .await
+    .unwrap();
+    let parent_fiber = state_a.fiber_of("parent").unwrap();
+    let handle_a = register_instance_with_keepalive(
+        parent_fiber.ctx(),
+        stream_unused_call,
+        None,
+        cordis_abi::ERROR_FORMAT_V1,
+    )
+    .unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let mut out = Out {
+        ptr: buf.as_mut_ptr(),
+        cap: buf.len(),
+        len: 0,
+    };
+    let st = unsafe {
+        host_ctx_use(
+            handle_a,
+            Blob::new(b"unverified-evil.dll"),
+            Blob::new(b"{}"),
+            &mut out,
+        )
+    };
+    let text = String::from_utf8_lossy(&buf[..out.len]).to_string();
+    assert_eq!(
+        st, STATUS_ERR,
+        "App A 内插件调用 ctx_use 不得绕过 per-App PluginSource 走全局宽松源: {text}"
+    );
+    assert!(
+        text.contains("strict-app-a-reject"),
+        "应命中 App A 专属来源拒绝原因，实际: {text}"
+    );
+
+    unregister_instance(handle_a);
+    app_a.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn r4_p1_register_derived_rejects_closed_instance_no_derived_table_leak() {
+    let app = cordis_core::App::new();
+    let handle = register_instance_with_keepalive(
+        app.root.clone(),
+        stream_unused_call,
+        None,
+        cordis_abi::ERROR_FORMAT_V1,
+    )
+    .unwrap();
+    let inst = instances().read().unwrap().get(handle).unwrap();
+    // Simulate teardown having marked the instance closed right before `unregister_instance`.
+    inst.closed.store(true, Ordering::SeqCst);
+
+    let mut buf = vec![0u8; 4096];
+    let mut out = Out {
+        ptr: buf.as_mut_ptr(),
+        cap: buf.len(),
+        len: 0,
+    };
+    let st_iso = unsafe { host_ctx_isolate(handle, Blob::new(b"svc"), Blob::new(b""), &mut out) };
+    assert_eq!(
+        st_iso, STATUS_ERR,
+        "closed 实例上调用 host_ctx_isolate 必须拒绝"
+    );
+
+    out.len = 0;
+    let st_int =
+        unsafe { host_ctx_intercept(handle, Blob::new(b"svc"), Blob::new(b"{}"), &mut out) };
+    assert_eq!(
+        st_int, STATUS_ERR,
+        "closed 实例上调用 host_ctx_intercept 必须拒绝"
+    );
+
+    let leaked = derived_table()
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|e| e.owner == handle)
+        .count();
+    assert_eq!(
+        leaked, 0,
+        "closed 实例的派生调用不得向全局 DERIVED 表泄漏任何条目"
+    );
+
+    unregister_instance(handle);
+    app.close().await;
+}

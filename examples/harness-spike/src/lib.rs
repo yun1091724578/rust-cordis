@@ -554,17 +554,28 @@ pub fn tool_plugin(agent: &str, tool: &str) -> Arc<dyn Plugin> {
                     .await?;
 
                 // 卸载时自动从目录撤销登记，避免残留幽灵条目并允许重新挂载同名工具。
-                let unregister_tools = tools.clone();
-                let unregister_name = tool.clone();
-                let _ = ctx.effect(move |_| {
-                    let unregister_tools = unregister_tools.clone();
-                    let unregister_name = unregister_name.clone();
-                    cordis::core::Disposable::new(move || {
-                        Box::pin(async move {
-                            let _ = unregister_tools.unregister(owner, unregister_name).await;
+                // 若登记返回后本 fiber 已并发进入卸载态，`try_effect` 失败时必须立即回滚目录条目。
+                let effect_res = ctx
+                    .fiber_opt()
+                    .ok_or_else(|| -> cordis::core::Error { "tool fiber is disposed".into() })
+                    .and_then(|fiber| {
+                        let unregister_tools = tools.clone();
+                        let unregister_name = tool.clone();
+                        fiber.try_effect(move |_| {
+                            let unregister_tools = unregister_tools.clone();
+                            let unregister_name = unregister_name.clone();
+                            cordis::core::Disposable::new(move || {
+                                Box::pin(async move {
+                                    let _ =
+                                        unregister_tools.unregister(owner, unregister_name).await;
+                                })
+                            })
                         })
-                    })
-                });
+                    });
+                if let Err(err) = effect_res {
+                    let _ = tools.unregister(owner, tool).await;
+                    return Err(err);
+                }
 
                 let mine = tool.clone();
                 let check_tools = tools.clone();

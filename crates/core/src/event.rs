@@ -217,20 +217,30 @@ pub async fn dispatch(
         // 失败照旧由 handler 自己记账（偏离清单 #3）：`allSettled` 的 rejected 分支
         // 在这里表现为"任务里的错误不会带出来"。
         Mode::Parallel => {
+            let inherited_fibers = crate::fiber::snapshot_execution_fibers();
+            let inherited_uid = crate::trace::current_caller_uid();
+            let inherited_cid = crate::trace::current_correlation_id();
             let mut tasks = tokio::task::JoinSet::new();
             for handler in handlers {
                 let ctx = ctx.clone();
                 let args = args.clone();
                 let cancel = cancel.clone();
-                tasks.spawn(async move {
-                    let call = Call {
-                        ctx,
-                        args,
-                        next: Next::none(),
-                        cancel,
-                    };
-                    let _ = handler(call).await;
-                });
+                let fibers = inherited_fibers.clone();
+                let cid = inherited_cid.clone();
+                tasks.spawn(crate::fiber::ExecutionFrameFuture::inherited(
+                    fibers,
+                    inherited_uid,
+                    cid,
+                    Box::pin(async move {
+                        let call = Call {
+                            ctx,
+                            args,
+                            next: Next::none(),
+                            cancel,
+                        };
+                        let _ = handler(call).await;
+                    }),
+                ));
             }
             // 等**全部**跑完，包括最慢的那一个（`allSettled` 的语义）。
             while tasks.join_next().await.is_some() {}

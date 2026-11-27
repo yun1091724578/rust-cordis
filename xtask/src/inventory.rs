@@ -550,7 +550,19 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         item: "set_plugin_source",
         kind: "fn",
         source: "crates/host/src/lib.rs",
-        marker: "pub fn set_plugin_source",
+        marker: "pub fn set_plugin_source(",
+    },
+    PublicItem {
+        item: "set_plugin_source_for",
+        kind: "fn",
+        source: "crates/host/src/lib.rs",
+        marker: "pub fn set_plugin_source_for(",
+    },
+    PublicItem {
+        item: "set_native_registry_for",
+        kind: "fn",
+        source: "crates/host/src/lib.rs",
+        marker: "pub fn set_native_registry_for(",
     },
     PublicItem {
         item: "set_dispatch_policy",
@@ -739,10 +751,16 @@ const PUBLIC_ITEMS: &[PublicItem] = &[
         marker: "pub fn read_manifest",
     },
     PublicItem {
+        item: "sha256_bytes",
+        kind: "fn",
+        source: "crates/host/src/source.rs",
+        marker: "pub fn sha256_bytes(",
+    },
+    PublicItem {
         item: "sha256_file",
         kind: "fn",
         source: "crates/host/src/source.rs",
-        marker: "pub fn sha256_file",
+        marker: "pub fn sha256_file(",
     },
     PublicItem {
         item: "mounted_sources",
@@ -1659,7 +1677,7 @@ pub struct Q {
             42,
             "ABI 字段总数漂移"
         );
-        assert_eq!(PUBLIC_ITEMS.len(), 166, "受控公开入口数量漂移");
+        assert_eq!(PUBLIC_ITEMS.len(), 169, "受控公开入口数量漂移");
         assert_eq!(PAYLOADS.len(), 33, "载荷清单数量漂移");
     }
 

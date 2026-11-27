@@ -137,8 +137,11 @@ impl Drop for SolverPool {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         self.tx.take();
+        let current = std::thread::current().id();
         for handle in self.workers.drain(..) {
-            let _ = handle.join();
+            if handle.thread().id() != current {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -376,5 +379,36 @@ mod tests {
             0,
             "drop 后排队任务必须被跳过而不是继续执行"
         );
+    }
+
+    #[test]
+    fn r4_p1_solver_pool_drop_from_worker_thread_does_not_deadlock() {
+        use std::time::Duration;
+
+        let pool = Arc::new(SolverPool::new(1, 4));
+        let entered = Arc::new(Barrier::new(2));
+        let main_dropped = Arc::new(Barrier::new(2));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let pool_in_worker = Arc::clone(&pool);
+        let e1 = Arc::clone(&entered);
+        let m1 = Arc::clone(&main_dropped);
+        pool.try_submit(move || {
+            e1.wait();
+            m1.wait();
+            // Worker now holds the LAST `Arc<SolverPool>`: dropping it here invokes
+            // `SolverPool::drop` ON the worker thread itself and MUST NOT self-join deadlock!
+            drop(pool_in_worker);
+            let _ = done_tx.send(());
+        })
+        .unwrap();
+
+        entered.wait();
+        drop(pool);
+        main_dropped.wait();
+
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("从 worker 线程内 drop 最后一个 Arc<SolverPool> 不得自 join 死锁");
     }
 }

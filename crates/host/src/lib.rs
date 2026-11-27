@@ -523,6 +523,11 @@ fn register_instance_with_keepalive(
 
 fn unregister_instance(handle: u64) {
     let removed = instances().write().unwrap().remove(handle);
+    if let Some((instance, _)) = &removed {
+        // 在排空派生表前强制置位 closed，与 `register_derived` 在同一 `derived_table` 锁内形成全序，
+        // 杜绝注销排水与并发 `ctx_isolate`/`ctx_intercept`/`ctx_use` 交错导致派生句柄永久泄漏。
+        instance.closed.store(true, Ordering::SeqCst);
+    }
     // 排水：`owner == root` 的派生句柄全部撤销。只撤句柄——不给派生句柄发
     // OP_DISPOSE（派生 ctx 没有自己的插件入口），子 fiber 的拆除由父 fiber 的
     // effect 链负责（`Fiber::new` 已把子 dispose 注册成父的 effect，且先于本
@@ -618,7 +623,8 @@ struct DerivedEntry {
     /// 创建者（根）实例句柄：`unregister_instance(root)` 时按它排水。
     /// 从派生句柄再派生时向上传播，保证排水总能追到根。
     owner: u64,
-    /// 派生 context（isolate/intercept 子 context；`ctx_use` 则是子 fiber 的 ctx）。
+    /// 调用方域上下文（isolate/intercept 子 context；`ctx_use` 保留调用方所在域上下文，
+    /// 绝不存储子 fiber 的 `Ctx`，杜绝父插件借子句柄冒充子插件身份或借用子插件 `inject`）。
     ctx: Ctx,
     /// 继承的调用方实例身份：回调 id 的派发仍走原实例（realm 隔离不隔离身份）。
     instance: Instance,
@@ -638,9 +644,18 @@ fn next_derived_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-fn register_derived(owner: u64, ctx: Ctx, instance: Instance, fiber: Option<Weak<Fiber>>) -> u64 {
+fn register_derived(
+    owner: u64,
+    ctx: Ctx,
+    instance: Instance,
+    fiber: Option<Weak<Fiber>>,
+) -> std::result::Result<u64, String> {
+    let mut table = derived_table().lock().unwrap();
+    if instance.closed.load(Ordering::SeqCst) {
+        return Err("实例已进入卸载/关闭流程，拒绝登记派生句柄".to_string());
+    }
     let handle = DERIVED_HANDLE_TAG | next_derived_seq();
-    derived_table().lock().unwrap().insert(
+    table.insert(
         handle,
         DerivedEntry {
             owner,
@@ -649,7 +664,7 @@ fn register_derived(owner: u64, ctx: Ctx, instance: Instance, fiber: Option<Weak
             fiber,
         },
     );
-    handle
+    Ok(handle)
 }
 
 /// 句柄解析的统一产物：派生句柄与实例句柄在这里汇成同一条路径。
@@ -658,6 +673,8 @@ struct Resolved {
     instance: Instance,
     /// 根实例句柄（派生条目向上传播；实例句柄就是它自己）。
     owner: u64,
+    /// 是否是 `ctx_use` 返回的子组件生命周期句柄。
+    is_child_fiber: bool,
 }
 
 /// 统一解析：**先实例表**（bit63=1 必然 miss），**后派生表**（位布局约定）。
@@ -669,6 +686,7 @@ fn resolve_handle(handle: u64) -> Option<Resolved> {
             ctx: entry.ctx.clone(),
             instance: entry.instance.clone(),
             owner: entry.owner,
+            is_child_fiber: entry.fiber.is_some(),
         })
     } else {
         let instance = instances().read().ok()?.get(handle)?;
@@ -676,6 +694,7 @@ fn resolve_handle(handle: u64) -> Option<Resolved> {
             ctx: instance.ctx.clone(),
             instance,
             owner: handle,
+            is_child_fiber: false,
         })
     }
 }
@@ -2358,6 +2377,12 @@ pub trait NativeRegistry: Send + Sync {
     fn native(&self, name: &str) -> Option<Arc<dyn Plugin>>;
 }
 
+#[derive(Clone)]
+struct StoreNativeRegistry(Arc<dyn NativeRegistry>);
+
+#[derive(Clone)]
+struct StorePluginSource(Arc<dyn loader::PluginSource>);
+
 static NATIVE_REGISTRY: RwLock<Option<Arc<dyn NativeRegistry>>> = RwLock::new(None);
 
 /// 登记进程级原生组件注册表（覆盖式；后设生效）。
@@ -2365,8 +2390,20 @@ pub fn set_native_registry(registry: Arc<dyn NativeRegistry>) {
     *NATIVE_REGISTRY.write().unwrap() = Some(registry);
 }
 
+/// 登记**单个 App** 的原生组件注册表（随 `App`/`Store` 自动释放，优先于进程级回落）。
+pub fn set_native_registry_for(ctx: &Ctx, registry: Arc<dyn NativeRegistry>) {
+    ctx.store.set_extension(StoreNativeRegistry(registry));
+}
+
 fn native_registry() -> Option<Arc<dyn NativeRegistry>> {
     NATIVE_REGISTRY.read().unwrap().clone()
+}
+
+pub(crate) fn native_registry_for_ctx(ctx: &Ctx) -> Option<Arc<dyn NativeRegistry>> {
+    ctx.store
+        .extension::<StoreNativeRegistry>()
+        .map(|entry| entry.0)
+        .or_else(native_registry)
 }
 
 static PLUGIN_SOURCE: RwLock<Option<Arc<dyn loader::PluginSource>>> = RwLock::new(None);
@@ -2377,12 +2414,27 @@ pub fn set_plugin_source(source: Arc<dyn loader::PluginSource>) {
     *PLUGIN_SOURCE.write().unwrap() = Some(source);
 }
 
+/// 登记**单个 App** 的 `ctx_use` 插件来源（随 `App`/`Store` 自动释放，优先于进程级回落）。
+///
+/// 装载器 `load_with_source` 在首次对账前会自动把自身来源绑定到所属 App，确保多 App
+/// 同进程隔离（严格 `PolicyPluginSource` 不会被其他 App 的全局宽松源绕过）。
+pub fn set_plugin_source_for(ctx: &Ctx, source: Arc<dyn loader::PluginSource>) {
+    ctx.store.set_extension(StorePluginSource(source));
+}
+
 fn plugin_source() -> Arc<dyn loader::PluginSource> {
     PLUGIN_SOURCE
         .read()
         .unwrap()
         .clone()
         .unwrap_or_else(|| Arc::new(loader::DiskPluginSource))
+}
+
+pub(crate) fn plugin_source_for_ctx(ctx: &Ctx) -> Arc<dyn loader::PluginSource> {
+    ctx.store
+        .extension::<StorePluginSource>()
+        .map(|entry| entry.0)
+        .unwrap_or_else(plugin_source)
 }
 
 // ------------------------------------------------------------ 动态库加载

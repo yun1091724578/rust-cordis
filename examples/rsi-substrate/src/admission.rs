@@ -5,7 +5,7 @@
 //! the eval record must describe the same artifact and variant revision, and
 //! the manifest's attestation must bind the eval record bytes.
 
-use cordis_host::source::{manifest_path, sha256_file};
+use cordis_host::source::{manifest_path, sha256_bytes, sha256_file};
 use serde_json::Value;
 use std::path::Path;
 
@@ -13,7 +13,13 @@ pub const REVIEWED_PIPELINES: &[&str] = &["rsi-pipeline@1"];
 
 pub fn verify(artifact: &Path, eval_record: &Path, spec: &Path) -> Result<(), String> {
     let manifest: Value = read_json(&manifest_path(artifact))?;
-    let record: Value = read_json(eval_record)?;
+    // Read eval_record once into memory and bind both JSON parsing and SHA-256
+    // hashing to the exact same byte slice (no TOCTOU double-read window).
+    let eval_bytes = std::fs::read(eval_record)
+        .map_err(|err| format!("read {}: {err}", eval_record.display()))?;
+    let eval_sha = sha256_bytes(&eval_bytes);
+    let record: Value = serde_json::from_slice(&eval_bytes)
+        .map_err(|err| format!("parse {}: {err}", eval_record.display()))?;
     let actual = sha256_file(artifact)?;
 
     if manifest["sha256"].as_str() != Some(actual.as_str()) {
@@ -34,25 +40,46 @@ pub fn verify(artifact: &Path, eval_record: &Path, spec: &Path) -> Result<(), St
     }
     let variant_rev = record["variant_revision"]
         .as_str()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "eval_record.variant_revision is missing or empty".to_string())?;
     let source_rev = manifest["source_revision"]
         .as_str()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "manifest.source_revision is missing or empty".to_string())?;
     if variant_rev != source_rev {
         return Err("eval_record.variant_revision does not match the manifest".to_string());
     }
-    let eval_sha = sha256_file(eval_record)?;
     let attestation = &manifest["attestation"];
     if attestation["eval_record_sha256"].as_str() != Some(eval_sha.as_str()) {
         return Err("attestation.eval_record_sha256 does not match the eval record".to_string());
     }
+    let att_pipeline_id = attestation["pipeline_id"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "attestation.pipeline_id is missing or empty".to_string())?;
+    let rec_pipeline_id = record["pipeline_id"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "eval_record.pipeline_id is missing or empty".to_string())?;
+    if rec_pipeline_id != att_pipeline_id {
+        return Err("eval_record.pipeline_id does not match attestation.pipeline_id".to_string());
+    }
     let pipeline = attestation["pipeline_revision"]
         .as_str()
-        .ok_or_else(|| "attestation.pipeline_revision is missing".to_string())?;
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "attestation.pipeline_revision is missing or empty".to_string())?;
     if !REVIEWED_PIPELINES.contains(&pipeline) {
         return Err(format!("pipeline revision {pipeline:?} is not reviewed"));
+    }
+    let rec_pipeline = record["pipeline_revision"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "eval_record.pipeline_revision is missing or empty".to_string())?;
+    if rec_pipeline != pipeline {
+        return Err(
+            "eval_record.pipeline_revision does not match attestation.pipeline_revision"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -202,6 +229,111 @@ mod tests {
             assert!(
                 verify(&artifact, &eval, &spec).is_err(),
                 "缺失或空的 variant_revision/source_revision ({rev_val:?}) 必须被准入拒绝"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r4_p1_admission_checks_record_pipeline_and_trimmed_revisions() {
+        let dir = std::env::temp_dir().join(format!(
+            "rsi-admission-r4-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let artifact = dir.join("solver.dll");
+        std::fs::write(&artifact, b"artifact-bytes").unwrap();
+        let artifact_sha = sha256_file(&artifact).unwrap();
+        let spec = dir.join("spec.json");
+        std::fs::write(&spec, br#"{"methods":["solve"]}"#).unwrap();
+        let spec_sha = sha256_file(&spec).unwrap();
+        let eval = dir.join("eval.json");
+
+        let cases = [
+            // 1. Whitespace-only revisions must be rejected.
+            (
+                "whitespace-rev",
+                json!({
+                    "pipeline_id": "rsi-evolve",
+                    "pipeline_revision": "rsi-pipeline@1",
+                    "variant_revision": "   ",
+                    "artifact_sha256": artifact_sha,
+                }),
+                "   ",
+                "rsi-evolve",
+                "rsi-pipeline@1",
+            ),
+            // 2. Unreviewed eval_record.pipeline_revision while attestation claims reviewed.
+            (
+                "mismatched-pipeline-rev",
+                json!({
+                    "pipeline_id": "rsi-evolve",
+                    "pipeline_revision": "unreviewed-pipeline@0",
+                    "variant_revision": "rsi:v1",
+                    "artifact_sha256": artifact_sha,
+                }),
+                "rsi:v1",
+                "rsi-evolve",
+                "rsi-pipeline@1",
+            ),
+            // 3. Mismatched pipeline_id between eval_record and attestation.
+            (
+                "mismatched-pipeline-id",
+                json!({
+                    "pipeline_id": "rogue-pipeline",
+                    "pipeline_revision": "rsi-pipeline@1",
+                    "variant_revision": "rsi:v1",
+                    "artifact_sha256": artifact_sha,
+                }),
+                "rsi:v1",
+                "rsi-evolve",
+                "rsi-pipeline@1",
+            ),
+            // 4. Whitespace-only pipeline_id.
+            (
+                "whitespace-pipeline-id",
+                json!({
+                    "pipeline_id": "  ",
+                    "pipeline_revision": "rsi-pipeline@1",
+                    "variant_revision": "rsi:v1",
+                    "artifact_sha256": artifact_sha,
+                }),
+                "rsi:v1",
+                "  ",
+                "rsi-pipeline@1",
+            ),
+        ];
+
+        for (label, eval_body, source_rev, att_pid, att_prev) in cases {
+            std::fs::write(&eval, serde_json::to_string_pretty(&eval_body).unwrap()).unwrap();
+            let eval_sha = sha256_file(&eval).unwrap();
+            let manifest = json!({
+                "id": "rsi-solver",
+                "version": "0.1.0",
+                "source_revision": source_rev,
+                "abi_version": 1,
+                "sha256": artifact_sha,
+                "provides": {},
+                "requires": {},
+                "iface_spec_sha256": spec_sha,
+                "attestation": {
+                    "pipeline_id": att_pid,
+                    "pipeline_revision": att_prev,
+                    "eval_record_sha256": eval_sha,
+                },
+            });
+            std::fs::write(
+                manifest_path(&artifact),
+                serde_json::to_string_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                verify(&artifact, &eval, &spec).is_err(),
+                "admission 绕过用例 `{label}` 必须被拒绝"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

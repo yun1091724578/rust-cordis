@@ -771,13 +771,113 @@ struct ScopeInput {
     intercept: Option<Config>,
 }
 
+/// 行级生命周期唯一真源状态机（单把 `LoaderState::rows` 锁原子跃迁）。
+///
+/// 取代原本分散在 `mounted` / `disposing` / `self_disposing` / `draining` 四个独立集合里的标记，
+/// 通过显式互斥态在结构上消灭跨锁竞态、取消漏记 draining、以及自我卸载与 reload/replace 互踩。
+enum RowSlot {
+    /// 正在 `mount_loaded` 挂入并等待 `settle().await`。
+    Mounting { ticket: u64 },
+    /// 正常已挂载行（仅此状态对外表现为已挂载）。
+    Mounted(Box<Mounted>),
+    /// 装载器有意卸载/热替换中（`dispose_row` / `exec_replace_action` / `finish_reload_swap`）。
+    Disposing { ticket: u64 },
+    /// 插件自我卸载已由 `on_plugin` 原子认领，正在异步回写 `tree`/`disabled: true` 落盘。
+    SelfDisposing { ticket: u64 },
+    /// 旧实例（或被取消挂载/卸载的实例）仍在后台清理中；清理未完成前阻断旁路重挂。
+    Draining {
+        fiber: Arc<Fiber>,
+        ticket: u64,
+        /// `true` 表示后台任务正在主动跑 `fiber.dispose().await`，必须等该任务完成并摘表；
+        /// `false` 表示由 `dispose_with_report` 超时转入，只要 `pending_background_cleanups() == 0` 即可摘除。
+        wait_task: bool,
+    },
+}
+
+enum DisposeClaim {
+    /// 成功从 `Mounted` 原子跃迁至 `Disposing`，持有取消安全事务守卫。
+    Claimed(RowTransactionGuard),
+    /// 该行正处于自我卸载（或期望的旧实例在并发窗口内已因自我卸载消失）。
+    SelfDisposing,
+    /// 该行仍有旧实例在后台清理中。
+    Draining,
+    /// 该行当前未挂载（且不存在冲突态）。
+    NotMounted,
+}
+
+impl DisposeClaim {
+    fn into_claimed(self) -> Option<RowTransactionGuard> {
+        match self {
+            Self::Claimed(guard) => Some(guard),
+            _ => None,
+        }
+    }
+}
+
+/// 单行事务守卫（挂载 / 卸载 / 热替换共用）：
+/// 任何正常完成路径必须调用 `commit_mounted` / `finish_empty` / `finish_draining` 解除武装；
+/// 一旦 future 在 `.await` 期间被取消或 panic，`Drop` 会原子把槽位推进到 `RowSlot::Draining`
+/// 并派发后台 `fiber.dispose().await`，且因为声明在外层 `mutation` 锁守卫之后，
+/// 析构必然发生在释放 `mutation` 锁之前。
+struct RowTransactionGuard {
+    state: Arc<LoaderState>,
+    label: String,
+    ticket: u64,
+    active_fiber: Option<Arc<Fiber>>,
+    armed: bool,
+}
+
+impl RowTransactionGuard {
+    fn set_active_fiber(&mut self, fiber: Option<Arc<Fiber>>) {
+        self.active_fiber = fiber;
+    }
+
+    fn active_fiber(&self) -> Option<Arc<Fiber>> {
+        self.active_fiber.clone()
+    }
+
+    fn commit_mounted(mut self, record: Mounted) {
+        self.armed = false;
+        self.active_fiber = None;
+        let mut rows = self.state.rows.lock().unwrap();
+        rows.insert(self.label.clone(), RowSlot::Mounted(Box::new(record)));
+    }
+
+    fn finish_empty(mut self) {
+        self.armed = false;
+        self.active_fiber = None;
+        self.state.clear_slot_if_ticket(&self.label, self.ticket);
+    }
+
+    fn finish_draining(mut self, fiber: Arc<Fiber>) {
+        self.armed = false;
+        self.active_fiber = None;
+        self.state
+            .enter_draining_for_ticket(&self.label, Some(self.ticket), fiber, false);
+    }
+}
+
+impl Drop for RowTransactionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(fiber) = self.active_fiber.take() {
+            self.state
+                .enter_draining_for_ticket(&self.label, Some(self.ticket), fiber, true);
+        } else {
+            self.state.clear_slot_if_ticket(&self.label, self.ticket);
+        }
+    }
+}
+
 /// 装载器的运行时状态。
 ///
 /// # 为什么它必须是显式类型
 /// "运行期启停"要求**装载之后**还能改一行的 `disabled` 并立刻装卸——这需要条目树、
 /// 装载表、派生域缓存与修订号落在同一处（M4-2 之前它们是 `load()` 的局部量，
 /// 于是"装完就定死"）。热重载与对账状态机（M4-3）共用同一份状态。
-type PendingSelfDispose = (Arc<Fiber>, String, Option<Mounted>);
+type PendingSelfDispose = (Arc<Fiber>, String, Option<Mounted>, u64);
 
 pub struct LoaderState {
     /// 装载器自己的上下文：派生行 ctx、写日志、发事件都以它为根。
@@ -799,8 +899,12 @@ pub struct LoaderState {
     /// 主配置初始基线是否有效（仅当主配置损坏且 `StartupPolicy.persisted_state == Degrade` 时为 `false`，
     /// 防止运行时回写覆盖磁盘上尚未修复的原始配置文件）。
     main_baseline_valid: AtomicBool,
-    /// 装载表：label → 记录。
-    mounted: Mutex<HashMap<String, Mounted>>,
+    /// 行级状态机唯一真源：label → [`RowSlot`]（`Mounting` / `Mounted` / `Disposing` / `SelfDisposing` / `Draining`）。
+    rows: Mutex<HashMap<String, RowSlot>>,
+    /// 单调递增的行槽位票号，用于精准匹配 `Mounting` / `Disposing` / `SelfDisposing` / `Draining` 释放点。
+    row_ticket: AtomicU64,
+    /// 后台 `Draining` 槽位清空通知，供取消补偿收敛等待旧实例清理完成后再执行 `sync()`。
+    draining_changed: tokio::sync::Notify,
     /// 变更序列的**互斥闸门**（对账、同步、启停、单行重载共用）。
     ///
     /// 这些操作都会经过"读现状 → 算动作 → 改实例 → 改记录"的窗口；没有互斥，
@@ -837,18 +941,9 @@ pub struct LoaderState {
     /// 在飞/排队的候选记下构造时的版本；版本变了就说明候选基于一棵已经过时的树，
     /// 采纳它会悄悄退回运行时回写的结果（watcher 的指纹已对齐磁盘，不会补偿）。
     writeback: AtomicU64,
-    /// 装载器**有意**卸载中的行：`internal/plugin` 观察者据此把它与"插件自我卸载"区分开。
-    disposing: Mutex<HashSet<String>>,
-    /// 插件自我卸载在同步 `on_plugin` 阶段暂存的 `(fiber, label, record)`，
+    /// 插件自我卸载在同步 `on_plugin` 阶段暂存的 `(fiber, label, record, ticket)`，
     /// 供 `on_plugin_dispose_async` 在 `spawn_blocking` 中持 `config_gate` 完成落盘而不阻塞 Tokio worker。
     pending_self_disposes: Mutex<Vec<PendingSelfDispose>>,
-    /// 正在异步收尾并等待落盘 `disabled: true` 的自我卸载行标集合：
-    /// 阻止并发 `sync` / `reconcile` 在 `persist_self_disposed` 完成前把该行复活成第二份实例。
-    self_disposing: Mutex<HashSet<String>>,
-    /// 卸载超时后仍在后台清理中的旧实例（`label -> Arc<Fiber>`）：
-    /// 在 `pending_background_cleanups()` 归零之前拒绝 `Action::Mount` 旁路重挂，
-    /// 后台清理完成时由弱引用监听任务自动摘除并释放 `Arc<Fiber>`。
-    draining: Mutex<HashMap<String, Arc<Fiber>>>,
     /// 最近一次真正执行过的对账产物（`report.reconcile` 与测试用）。
     last: Mutex<Option<ReconcileOutcome>>,
     /// 最近一次热重载的结构化报告（`report.lastReload` 与 [`LoaderState::last_reload`]）。
@@ -1107,6 +1202,9 @@ struct ReconcileDriver {
     active: bool,
     /// 已 take 但**尚未落定**的候选：取消/超时时回填合并槽（不丢、也不静默丢弃）。
     taken: Option<Candidate>,
+    /// 本轮候选是否已通过 `adopt()` 写入 `tree` 且动作循环尚未跑完：
+    /// 若在此时被取消，必须安排一次补偿收敛 `sync()`，防止 `tree` 与运行时实例永久漂移。
+    adopted_in_progress: Arc<AtomicBool>,
 }
 
 impl ReconcileDriver {
@@ -1115,6 +1213,7 @@ impl ReconcileDriver {
             state,
             active: true,
             taken: None,
+            adopted_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1122,6 +1221,7 @@ impl ReconcileDriver {
     fn finish(&mut self) {
         self.active = false;
         self.taken = None;
+        self.adopted_in_progress.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1134,30 +1234,31 @@ impl Drop for ReconcileDriver {
         //
         // 顺序不能反：先放开 `reconciling` 的话，别人可能进来 take 到空槽并收工，
         // 紧接着我们才回填——那份候选就再也没人驱动了（幽灵滞后）。
-        //
+        let needs_convergence = self.adopted_in_progress.load(Ordering::SeqCst);
         // 代次先记下来：清位之后要靠它辨认"槽里那份还是不是我们这份"。
         let held_gen = self.taken.as_ref().map(|candidate| candidate.gen);
-        let restored = self
-            .taken
-            .take()
-            .map(|candidate| self.state.restore_candidate(candidate));
+        let restored = if needs_convergence {
+            // 候选已通过 `adopt()` 提交进 `tree` 且 `adopted_gen` 已推进，不再回填旧候选；
+            // 清位后通过补偿收敛驱动把未跑完的动作推到位。
+            self.taken.take();
+            None
+        } else {
+            self.taken
+                .take()
+                .map(|candidate| self.state.restore_candidate(candidate))
+        };
         // 测试停点：钉住"已回填、还没清位"的两条指令之间（R1 的窗口）。
         #[cfg(test)]
         self.state.hooks.pass_before_release_flight();
         self.state.reconciling.store(false, Ordering::SeqCst);
-        // 两条都会永久滞留的路径，都必须安排**一次**补偿驱动把它带走
-        // （本函数不能 await，只能 spawn；抢不到单飞位就安静退出）：
-        //
+        // 三条都会永久滞留的路径，都必须安排**一次**补偿驱动把它带走：
         // ① 回填**被拒**（`false`）：槽里已经有一份我们没持有的更新候选；
-        // ② 回填**成功**、但清位之后槽里已经**不是**我们这份了：在回填与清位之间，
-        //    另一线程登记了更新的候选——它的 `drive_pending` 读到单飞位仍是 `true`，
-        //    于是返回 `None`，我们这份又被它顶掉。清位后槽里就是一份没人驱动的更新候选。
-        //
-        // 两种情况下 watcher 的指纹都早已对齐磁盘、不会再来一次：用户看到的是
-        // "最后一次编辑永不生效"。反之，若清位后槽里仍是**我们回填的这份**，就保持
-        // 既有语义：不自动驱动，等下一次请求（`request_reconcile` / `reload`）接管。
+        // ② 回填**成功**、但清位之后槽里已经**不是**我们这份了；
+        // ③ `adopt()` 已提交 `tree` 但动作循环中途被取消：槽里没有更新候选，必须补一次收敛 `sync()`。
         if restored == Some(false) || self.state.has_foreign_pending(held_gen) {
             self.state.schedule_compensation();
+        } else if needs_convergence {
+            self.state.schedule_adopted_convergence();
         }
     }
 }
@@ -1230,7 +1331,9 @@ impl LoaderState {
             main_startup: Mutex::new(main_startup),
             row_startup: Mutex::new(row_startup),
             main_baseline_valid: AtomicBool::new(main_baseline_valid),
-            mounted: Mutex::new(HashMap::new()),
+            rows: Mutex::new(HashMap::new()),
+            row_ticket: AtomicU64::new(0),
+            draining_changed: tokio::sync::Notify::new(),
             mutation: tokio::sync::Mutex::new(()),
             scopes: Mutex::new(RowScopes::default()),
             revision: AtomicU64::new(0),
@@ -1244,10 +1347,7 @@ impl LoaderState {
             next_gen: AtomicU64::new(0),
             adopted_gen: AtomicU64::new(0),
             writeback: AtomicU64::new(0),
-            disposing: Mutex::new(HashSet::new()),
             pending_self_disposes: Mutex::new(Vec::new()),
-            self_disposing: Mutex::new(HashSet::new()),
-            draining: Mutex::new(HashMap::new()),
             last: Mutex::new(None),
             last_reload: Mutex::new(None),
             failed_rows: Mutex::new(HashMap::new()),
@@ -1427,9 +1527,35 @@ impl LoaderState {
         *self.preflight_provides.lock().unwrap() = provides;
     }
 
+    fn next_row_ticket(&self) -> u64 {
+        self.row_ticket.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn mounted_record_clone(&self, label: &str) -> Option<Mounted> {
+        match self.rows.lock().unwrap().get(label) {
+            Some(RowSlot::Mounted(record)) => Some(record.as_ref().clone()),
+            _ => None,
+        }
+    }
+
+    fn with_mounted_mut<T>(&self, label: &str, f: impl FnOnce(&mut Mounted) -> T) -> Option<T> {
+        let mut rows = self.rows.lock().unwrap();
+        match rows.get_mut(label) {
+            Some(RowSlot::Mounted(record)) => Some(f(record)),
+            _ => None,
+        }
+    }
+
     /// 当前装载表里的行标（排序）。诊断与断言都在用它——加载器不该只有日志这一种观测面。
     pub fn mounted_labels(&self) -> Vec<String> {
-        let mut labels: Vec<String> = self.mounted.lock().unwrap().keys().cloned().collect();
+        let mut labels: Vec<String> = self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, slot)| matches!(slot, RowSlot::Mounted(_)))
+            .map(|(label, _)| label.clone())
+            .collect();
         labels.sort();
         labels
     }
@@ -1440,11 +1566,14 @@ impl LoaderState {
     /// SHA256；暂存副本的 `.rN` 名字旁边没有发布方写的 manifest。
     pub fn mounted_sources(&self) -> Vec<(String, PathBuf)> {
         let mut rows: Vec<(String, PathBuf)> = self
-            .mounted
+            .rows
             .lock()
             .unwrap()
             .values()
-            .map(|record| (record.label.clone(), record.source.clone()))
+            .filter_map(|slot| match slot {
+                RowSlot::Mounted(record) => Some((record.label.clone(), record.source.clone())),
+                _ => None,
+            })
             .collect();
         rows.sort_by(|left, right| left.0.cmp(&right.0));
         rows
@@ -1456,17 +1585,20 @@ impl LoaderState {
     /// 表里的记录都不会指向一个已经拆掉的实例（表不撒谎）。
     pub fn mounted_liveness(&self) -> Vec<(String, bool)> {
         let mut rows: Vec<(String, bool)> = self
-            .mounted
+            .rows
             .lock()
             .unwrap()
             .iter()
-            .map(|(label, record)| {
-                let alive = record
-                    .fiber
-                    .upgrade()
-                    .map(|fiber| !fiber.is_disposed())
-                    .unwrap_or(false);
-                (label.clone(), alive)
+            .filter_map(|(label, slot)| match slot {
+                RowSlot::Mounted(record) => {
+                    let alive = record
+                        .fiber
+                        .upgrade()
+                        .map(|fiber| !fiber.is_disposed())
+                        .unwrap_or(false);
+                    Some((label.clone(), alive))
+                }
+                _ => None,
             })
             .collect();
         rows.sort();
@@ -1475,11 +1607,10 @@ impl LoaderState {
 
     /// 一行的根 fiber（诊断/测试用；没有实例时为 `None`）。
     pub fn fiber_of(&self, label: &str) -> Option<Arc<Fiber>> {
-        self.mounted
-            .lock()
-            .unwrap()
-            .get(label)
-            .and_then(|record| record.fiber.upgrade())
+        match self.rows.lock().unwrap().get(label) {
+            Some(RowSlot::Mounted(record)) => record.fiber.upgrade(),
+            _ => None,
+        }
     }
 
     /// 当前**插件文件已变**的行标（HMR 的重载队列，诊断/测试用）。
@@ -1488,16 +1619,16 @@ impl LoaderState {
     /// 把"未知"当成"永远变了"会让每个轮询周期都重挂一次。
     pub fn stale_labels(&self) -> Vec<String> {
         let candidates: Vec<_> = {
-            let table = self.mounted.lock().unwrap();
+            let table = self.rows.lock().unwrap();
             table
                 .values()
-                .filter(|record| record.fingerprint.is_some())
-                .map(|record| {
-                    (
+                .filter_map(|slot| match slot {
+                    RowSlot::Mounted(record) if record.fingerprint.is_some() => Some((
                         record.label.clone(),
                         record.source.clone(),
                         record.fingerprint,
-                    )
+                    )),
+                    _ => None,
                 })
                 .collect()
         };
@@ -1544,10 +1675,14 @@ impl LoaderState {
     pub fn cycle_paths(&self) -> Vec<Vec<String>> {
         // 节点：已挂载的行（label、inject 名字集合、provision key 集合）。
         let mut nodes: Vec<(String, Vec<String>, Vec<String>)> = self
-            .mounted
+            .rows
             .lock()
             .unwrap()
             .values()
+            .filter_map(|slot| match slot {
+                RowSlot::Mounted(record) => Some(record),
+                _ => None,
+            })
             .map(|record| {
                 let mut inject: Vec<String> = record
                     .plugin
@@ -1684,10 +1819,14 @@ impl LoaderState {
             out
         };
         let mut rows: Vec<serde_json::Value> = self
-            .mounted
+            .rows
             .lock()
             .unwrap()
             .values()
+            .filter_map(|slot| match slot {
+                RowSlot::Mounted(record) => Some(record),
+                _ => None,
+            })
             .map(|record| {
                 let mut inject: Vec<String> = record
                     .plugin
@@ -1817,46 +1956,227 @@ impl LoaderState {
         self.failed_rows.lock().unwrap().remove(label);
     }
 
-    /// 登记一条卸载超时后仍在后台清理的旧实例，防止后续 `reconcile` 在清理完成前旁路重挂。
-    ///
-    /// 同时派发一个仅持 `Weak<LoaderState>` 的收尾任务：后台清理归零后立即摘表并释放 `Arc<Fiber>`。
-    fn mark_row_draining(self: &Arc<Self>, label: &str, fiber: Arc<Fiber>) {
-        if fiber.pending_background_cleanups() == 0 {
+    fn clear_slot_if_ticket(&self, label: &str, ticket: u64) {
+        let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        let matches = matches!(
+            rows.get(label),
+            Some(
+                RowSlot::Mounting { ticket: t }
+                    | RowSlot::Disposing { ticket: t }
+                    | RowSlot::SelfDisposing { ticket: t }
+                    | RowSlot::Draining { ticket: t, .. }
+            ) if *t == ticket
+        );
+        if matches {
+            let was_draining = matches!(rows.remove(label), Some(RowSlot::Draining { .. }));
+            drop(rows);
+            if was_draining {
+                self.draining_changed.notify_waiters();
+            }
+        }
+    }
+
+    /// 原子把某行推进到 `RowSlot::Draining`（可选校验旧票号），并派发仅持 `Weak<LoaderState>`
+    /// 的后台清理监听任务：清理完成后按票号摘除槽位并唤醒等待者。
+    fn enter_draining_for_ticket(
+        self: &Arc<Self>,
+        label: &str,
+        expected_ticket: Option<u64>,
+        fiber: Arc<Fiber>,
+        run_dispose: bool,
+    ) {
+        if !run_dispose && fiber.pending_background_cleanups() == 0 {
+            if let Some(ticket) = expected_ticket {
+                self.clear_slot_if_ticket(label, ticket);
+            }
             return;
         }
-        let label_owned = label.to_string();
-        self.draining
-            .lock()
-            .unwrap()
-            .insert(label_owned.clone(), fiber.clone());
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        let ticket = self.next_row_ticket();
+        let rt = tokio::runtime::Handle::try_current().ok();
+        let wait_task = run_dispose && rt.is_some();
+        let installed = {
+            let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+            let allowed = match expected_ticket {
+                None => true,
+                Some(exp) => match rows.get(label) {
+                    None => true,
+                    Some(RowSlot::Mounting { ticket: t } | RowSlot::Disposing { ticket: t }) => {
+                        *t == exp
+                    }
+                    _ => false,
+                },
+            };
+            if allowed {
+                rows.insert(
+                    label.to_string(),
+                    RowSlot::Draining {
+                        fiber: fiber.clone(),
+                        ticket,
+                        wait_task,
+                    },
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if !installed {
+            return;
+        }
+        if let Some(rt) = rt {
             let weak_state = Arc::downgrade(self);
+            let label_owned = label.to_string();
             rt.spawn(async move {
+                if run_dispose {
+                    fiber.dispose().await;
+                }
                 fiber.wait_background_cleanups().await;
                 if let Some(state) = weak_state.upgrade() {
-                    let mut table = state.draining.lock().unwrap();
-                    if table
-                        .get(&label_owned)
-                        .is_some_and(|stored| Arc::ptr_eq(stored, &fiber))
-                    {
-                        table.remove(&label_owned);
-                    }
+                    state.clear_slot_if_ticket(&label_owned, ticket);
                 }
             });
         }
     }
 
+    /// 清理已经不再有后台任务的非 `wait_task` `Draining` 槽位。
+    fn prune_finished_draining(&self) -> bool {
+        let mut rows = self.rows.lock().unwrap();
+        let mut still_draining = false;
+        let mut removed_any = false;
+        rows.retain(|_, slot| match slot {
+            RowSlot::Draining {
+                fiber, wait_task, ..
+            } => {
+                if *wait_task || fiber.pending_background_cleanups() > 0 {
+                    still_draining = true;
+                    true
+                } else {
+                    removed_any = true;
+                    false
+                }
+            }
+            _ => true,
+        });
+        drop(rows);
+        if removed_any {
+            self.draining_changed.notify_waiters();
+        }
+        still_draining
+    }
+
+    /// 等待当前所有处于 `Draining` 的行完成后台清理（取消补偿收敛前调用）。
+    async fn wait_active_draining(&self) {
+        loop {
+            let notified = self.draining_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.prune_finished_draining() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// 检查指定行是否仍有旧实例在后台清理未完成（若已完成则当场摘除）。
     fn is_row_draining(&self, label: &str) -> bool {
-        let mut table = self.draining.lock().unwrap();
-        let Some(fiber) = table.get(label) else {
-            return false;
-        };
-        if fiber.pending_background_cleanups() > 0 {
-            true
-        } else {
-            table.remove(label);
-            false
+        let mut rows = self.rows.lock().unwrap();
+        match rows.get(label) {
+            Some(RowSlot::Draining {
+                fiber, wait_task, ..
+            }) => {
+                if *wait_task || fiber.pending_background_cleanups() > 0 {
+                    true
+                } else {
+                    rows.remove(label);
+                    drop(rows);
+                    self.draining_changed.notify_waiters();
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn is_row_self_disposing(&self, label: &str) -> bool {
+        matches!(
+            self.rows.lock().unwrap().get(label),
+            Some(RowSlot::SelfDisposing { .. })
+        )
+    }
+
+    /// 在单把 `rows` 锁内原子认领一个 `Mounted` 行进入 `Disposing` 态。
+    ///
+    /// 若提供了 `expected_fiber`，同时校验当前挂载实例正是同一 `Arc<Fiber>`，防止在预检/暂存
+    /// 窗口内发生自我卸载或替换后误拆/复活新旧实例。
+    fn claim_mounted_for_dispose(
+        self: &Arc<Self>,
+        label: &str,
+        expected_fiber: Option<&Arc<Fiber>>,
+    ) -> DisposeClaim {
+        let mut rows = self.rows.lock().unwrap();
+        match rows.get(label) {
+            Some(RowSlot::Mounted(record)) => {
+                let current_fiber = record.fiber.upgrade();
+                if let Some(expected) = expected_fiber {
+                    let matches = current_fiber
+                        .as_ref()
+                        .is_some_and(|cur| Arc::ptr_eq(cur, expected));
+                    if !matches {
+                        return DisposeClaim::SelfDisposing;
+                    }
+                }
+                let ticket = self.next_row_ticket();
+                rows.insert(label.to_string(), RowSlot::Disposing { ticket });
+                DisposeClaim::Claimed(RowTransactionGuard {
+                    state: self.clone(),
+                    label: label.to_string(),
+                    ticket,
+                    active_fiber: current_fiber,
+                    armed: true,
+                })
+            }
+            Some(RowSlot::SelfDisposing { .. }) => DisposeClaim::SelfDisposing,
+            Some(RowSlot::Draining {
+                fiber, wait_task, ..
+            }) => {
+                if *wait_task || fiber.pending_background_cleanups() > 0 {
+                    DisposeClaim::Draining
+                } else {
+                    rows.remove(label);
+                    drop(rows);
+                    self.draining_changed.notify_waiters();
+                    if expected_fiber.is_some() {
+                        DisposeClaim::SelfDisposing
+                    } else {
+                        DisposeClaim::NotMounted
+                    }
+                }
+            }
+            Some(RowSlot::Mounting { .. } | RowSlot::Disposing { .. }) => DisposeClaim::Draining,
+            None => {
+                if expected_fiber.is_some() {
+                    // 预检前看到 `expected_fiber` 在位，预检后已从 `rows` 消失 ⇒ 并发自我卸载已落盘完成。
+                    DisposeClaim::SelfDisposing
+                } else {
+                    DisposeClaim::NotMounted
+                }
+            }
+        }
+    }
+
+    /// 原子登记一条行进入 `Mounting` 态，并返回取消安全事务守卫。
+    fn begin_mount_slot(self: &Arc<Self>, label: &str, fiber: Arc<Fiber>) -> RowTransactionGuard {
+        let ticket = self.next_row_ticket();
+        self.rows
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), RowSlot::Mounting { ticket });
+        RowTransactionGuard {
+            state: self.clone(),
+            label: label.to_string(),
+            ticket,
+            active_fiber: Some(fiber),
+            armed: true,
         }
     }
 
@@ -1906,16 +2226,17 @@ impl LoaderState {
     /// 不证明在当前行的 isolate 域里可见。
     pub fn pending_report(&self) -> Vec<PendingRow> {
         let rows: Vec<(String, String, Weak<Fiber>)> = self
-            .mounted
+            .rows
             .lock()
             .unwrap()
             .values()
-            .map(|record| {
-                (
+            .filter_map(|slot| match slot {
+                RowSlot::Mounted(record) => Some((
                     record.label.clone(),
                     record.plugin.name().to_string(),
                     record.fiber.clone(),
-                )
+                )),
+                _ => None,
             })
             .collect();
         let mut pending = Vec::new();
@@ -1943,17 +2264,18 @@ impl LoaderState {
     /// 不将其误报为下游 `Pending` 的阻塞上游；跨不同 `isolate` 域的失败行亦不会误关联。
     pub fn correlated_pending_report(&self) -> Vec<CorrelatedPendingRow> {
         let mounted_rows: Vec<(String, String, Weak<Fiber>, IsolateScope)> = self
-            .mounted
+            .rows
             .lock()
             .unwrap()
             .values()
-            .map(|record| {
-                (
+            .filter_map(|slot| match slot {
+                RowSlot::Mounted(record) => Some((
                     record.label.clone(),
                     record.plugin.name().to_string(),
                     record.fiber.clone(),
                     record.scope.isolate.clone(),
-                )
+                )),
+                _ => None,
             })
             .collect();
         let mut active_labels: HashSet<String> = HashSet::new();
@@ -2166,14 +2488,20 @@ impl LoaderState {
     ///
     /// 两者会分开，正是要看的信号：有声明却没有活实例 ⇒ 下次对账会重挂它。
     fn volatile_summary(&self) -> (usize, usize) {
-        let table = self.mounted.lock().unwrap();
+        let table = self.rows.lock().unwrap();
         let declared = table
             .values()
-            .filter(|record| record.volatile.is_some())
+            .filter(|slot| matches!(slot, RowSlot::Mounted(record) if record.volatile.is_some()))
             .count();
         let supported = table
             .values()
-            .filter(|record| record.volatile.is_some() && record.fiber.upgrade().is_some())
+            .filter(|slot| {
+                matches!(
+                    slot,
+                    RowSlot::Mounted(record)
+                        if record.volatile.is_some() && record.fiber.upgrade().is_some()
+                )
+            })
             .count();
         (declared, supported)
     }
@@ -2219,18 +2547,60 @@ impl LoaderState {
     }
 
     fn label_of_fiber(&self, fiber: &Arc<Fiber>) -> Option<String> {
-        self.mounted
+        self.rows
             .lock()
             .unwrap()
-            .values()
-            .find(|record| {
-                record
-                    .fiber
-                    .upgrade()
-                    .map(|own| Arc::ptr_eq(&own, fiber))
-                    .unwrap_or(false)
+            .iter()
+            .find_map(|(label, slot)| match slot {
+                RowSlot::Mounted(record)
+                    if record
+                        .fiber
+                        .upgrade()
+                        .is_some_and(|own| Arc::ptr_eq(&own, fiber)) =>
+                {
+                    Some(label.clone())
+                }
+                _ => None,
             })
-            .map(|record| record.label.clone())
+    }
+
+    /// 在单把 `rows` 锁内原子识别并认领插件自我卸载（`Mounted` → `SelfDisposing`）。
+    ///
+    /// 若该行当前已处于 `Disposing`（装载器有意卸载/换实例/HMR）或其他非 `Mounted` 态，
+    /// 直接返回 `false`，绝不把有意卸载误判为自我卸载，也消除 `disposing` 与 `mounted` 之间的跨锁竞态。
+    fn try_claim_self_dispose(&self, fiber: &Arc<Fiber>) -> bool {
+        let claimed = {
+            let mut rows = self.rows.lock().unwrap();
+            let label = rows.iter().find_map(|(label, slot)| match slot {
+                RowSlot::Mounted(record)
+                    if record
+                        .fiber
+                        .upgrade()
+                        .is_some_and(|own| Arc::ptr_eq(&own, fiber)) =>
+                {
+                    Some(label.clone())
+                }
+                _ => None,
+            });
+            let Some(label) = label else {
+                return false;
+            };
+            let ticket = self.next_row_ticket();
+            let Some(RowSlot::Mounted(record)) =
+                rows.insert(label.clone(), RowSlot::SelfDisposing { ticket })
+            else {
+                unreachable!("validated RowSlot::Mounted under the same rows lock");
+            };
+            (label, record, ticket)
+        };
+        let (label, record, ticket) = claimed;
+        self.pending_self_disposes.lock().unwrap().push((
+            fiber.clone(),
+            label,
+            Some(*record),
+            ticket,
+        ));
+        true
     }
 
     /// 运行期启停一行：`Some(true)` 禁用、`Some(false)` 显式启用、`None` 清掉选项。
@@ -2413,6 +2783,14 @@ impl LoaderState {
     }
 
     async fn reconcile_attempt(self: &Arc<Self>, candidate: &Candidate) -> ReconcileAttempt {
+        self.reconcile_attempt_with_flag(candidate, None).await
+    }
+
+    async fn reconcile_attempt_with_flag(
+        self: &Arc<Self>,
+        candidate: &Candidate,
+        adopted_flag: Option<&AtomicBool>,
+    ) -> ReconcileAttempt {
         // P1-1：HMR/patch/启停触发的对账也要在挂载前重跑依赖预检。
         // 初装已经在创建状态前预检过，第一次 reconcile 用标记跳过，避免重复访问 source。
         //
@@ -2470,6 +2848,9 @@ impl LoaderState {
                 rejection: Some(rejection),
             };
         }
+        if let Some(flag) = adopted_flag {
+            flag.store(true, Ordering::SeqCst);
+        }
         // 采纳成功：这一刻候选才成为当前树，这一轮的预检结论才配进报告（O7）。
         if let Some((report, provides)) = accepted_preflight {
             self.record_preflight(report, provides);
@@ -2496,8 +2877,14 @@ impl LoaderState {
                     | Action::Volatile { label, .. } => label.as_str(),
                 })
                 .collect();
-            let mounted_labels: HashSet<String> =
-                self.mounted.lock().unwrap().keys().cloned().collect();
+            let mounted_labels: HashSet<String> = self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, slot)| matches!(slot, RowSlot::Mounted(_)))
+                .map(|(label, _)| label.clone())
+                .collect();
             self.failed_rows.lock().unwrap().retain(|label, _| {
                 if active_issue_keys.contains(label.as_str()) {
                     return true;
@@ -2633,7 +3020,7 @@ impl LoaderState {
     async fn exec_mount_action(self: &Arc<Self>, row: FlatRow, outcome: &mut ReconcileOutcome) {
         let label = row.label.clone();
         // 该行正处于插件自我卸载异步收尾期，绝不允许旁路重挂复活。
-        if self.self_disposing.lock().unwrap().contains(&label) {
+        if self.is_row_self_disposing(&label) {
             outcome.skipped.push(label);
             return;
         }
@@ -2678,12 +3065,10 @@ impl LoaderState {
 
     async fn exec_replace_action(self: &Arc<Self>, row: FlatRow, outcome: &mut ReconcileOutcome) {
         let label = row.label.clone();
-        let previous_plugin = self
-            .mounted
-            .lock()
-            .unwrap()
-            .get(&label)
-            .map(|record| record.plugin.clone());
+        let (expected_fiber, previous_plugin) = self
+            .mounted_record_clone(&label)
+            .map(|record| (record.fiber.upgrade(), Some(record.plugin)))
+            .unwrap_or((None, None));
         // O5b-2：**先决策、再前移**——artifact 的预检（resolve → stage → open → ping）
         // 必须在拆卸之前跑完。写错 `name` / artifact 缺失时旧实例仍在服务：
         // 这一行本轮到此为止（不拆卸、不回滚、更不重建旧实例）。
@@ -2711,9 +3096,41 @@ impl LoaderState {
                 return;
             }
         };
+        // 在单把 `rows` 锁内原子核验并认领旧实例进入 `Disposing` 态：
+        // 若预检期间插件发生自我卸载（`SelfDisposing` 或旧实例已消失）或处于 `Draining`，
+        // 立即丢弃预加载的 `loaded` 并终止替换，杜绝并发双实例或复活已自卸载的行。
+        let tx_guard = match self.claim_mounted_for_dispose(&label, expected_fiber.as_ref()) {
+            DisposeClaim::Claimed(guard) => Some(guard),
+            DisposeClaim::SelfDisposing => {
+                drop(loaded);
+                outcome.skipped.push(label);
+                return;
+            }
+            DisposeClaim::Draining => {
+                drop(loaded);
+                let provides =
+                    self.declared_provides_for(&label, &row.entry, None, previous_plugin.as_ref());
+                self.handle_row_failure(
+                    &label,
+                    &row.entry,
+                    Some(row.scope.isolate.clone()),
+                    FailureCategory::RuntimeUnavailable,
+                    "旧实例后台清理尚未完成，拒绝换实例".to_string(),
+                    provides,
+                    outcome,
+                    "",
+                    None,
+                );
+                return;
+            }
+            DisposeClaim::NotMounted => None,
+        };
         // 先卸后装：同一隔离域里一个服务名只能有一个实现（内核不变量）。
         self.emit_partial_dispose(Some(&row), &label, true).await;
-        let close_report = self.dispose_row(&label).await;
+        let close_report = match tx_guard {
+            Some(guard) => self.finish_claimed_dispose(guard).await,
+            None => None,
+        };
         if let Some(report) = &close_report {
             if report.still_running {
                 // 丢弃预加载的 artifact（立即回收暂存副本），绝不在旧实例尚未清完时挂入新实例。
@@ -3010,6 +3427,34 @@ impl LoaderState {
         });
     }
 
+    /// 安排一次**已采纳树的补偿收敛**：当 `drive_pending` 在 `adopt()` 已经提交新树之后、
+    /// 动作循环跑完之前被取消时，等待本次取消产生的 `Draining` 清理归零后自动跑一次 `sync()`
+    /// （若期间又来了更新候选，则改由 `drive_pending` 一并驱动）。
+    fn schedule_adopted_convergence(self: &Arc<Self>) {
+        if self.ctx.fiber_opt().is_none_or(|fiber| fiber.is_disposed()) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let state = self.clone();
+        handle.spawn(async move {
+            state.wait_active_draining().await;
+            if state
+                .ctx
+                .fiber_opt()
+                .is_none_or(|fiber| fiber.is_disposed())
+            {
+                return;
+            }
+            if state.pending.lock().unwrap().is_some() {
+                state.drive_pending().await;
+            } else {
+                state.sync().await;
+            }
+        });
+    }
+
     /// 驱动 `pending` 里的候选（单飞）：直到槽空为止，每次只应用"当下最新"的那份。
     async fn drive_pending(self: &Arc<Self>) -> Option<ReconcileOutcome> {
         if self.reconciling.swap(true, Ordering::SeqCst) {
@@ -3035,14 +3480,20 @@ impl LoaderState {
                     let gen = candidate.gen;
                     // 候选先进**驱动器**（不是循环变量）：future 被取消/超时丢弃时，
                     // `ReconcileDriver::drop` 才能把它回填，而不是跟着栈一起蒸发。
+                    driver.adopted_in_progress.store(false, Ordering::SeqCst);
                     driver.taken = Some(candidate);
                     // 合并逻辑归 `request_candidate`，但**落地**必须与其它变更序列互斥：
                     // 否则运行期启停会与这一轮对账交错，把刚卸下的行挂回去。
                     let attempt = {
                         let _guard = self.mutation.lock().await;
                         let candidate = driver.taken.as_ref().expect("刚填进去的候选");
-                        self.reconcile_attempt(candidate).await
+                        self.reconcile_attempt_with_flag(
+                            candidate,
+                            Some(&driver.adopted_in_progress),
+                        )
+                        .await
                     };
+                    driver.adopted_in_progress.store(false, Ordering::SeqCst);
                     let ReconcileAttempt {
                         mut outcome,
                         rejection,
@@ -3315,21 +3766,25 @@ impl LoaderState {
 
     /// 现状 vs 期望态 ⇒ 动作表。
     fn diff(&self, desired: &[FlatRow]) -> Vec<Action> {
-        let mounted = self.mounted.lock().unwrap();
+        let rows = self.rows.lock().unwrap();
         let wanted: HashSet<&str> = desired.iter().map(|row| row.label.as_str()).collect();
-        let mut removed: Vec<String> = mounted
-            .keys()
-            .filter(|label| !wanted.contains(label.as_str()))
-            .cloned()
+        let mut removed: Vec<String> = rows
+            .iter()
+            .filter(|(label, slot)| {
+                matches!(slot, RowSlot::Mounted(_)) && !wanted.contains(label.as_str())
+            })
+            .map(|(label, _)| label.clone())
             .collect();
         removed.sort();
         let mut actions: Vec<Action> = removed.into_iter().map(Action::Dispose).collect();
         for row in desired {
-            let Some(record) = mounted.get(&row.label) else {
-                if !self.self_disposing.lock().unwrap().contains(&row.label) {
+            let record = match rows.get(&row.label) {
+                Some(RowSlot::Mounted(record)) => record,
+                Some(RowSlot::SelfDisposing { .. }) => continue,
+                _ => {
                     actions.push(Action::Mount(row.label.clone()));
+                    continue;
                 }
-                continue;
             };
             let config = row.entry.config.clone().unwrap_or(Config::Null);
             if record.scope_inputs != row.scope_inputs
@@ -3424,25 +3879,15 @@ impl LoaderState {
                         None => state.mount_row(&owned).await,
                     };
                     match mounted {
-                        Ok(record) => {
-                            state
-                                .mounted
-                                .lock()
-                                .unwrap()
-                                .insert(owned.label.clone(), record);
-                            ActionOutcome::Done
-                        }
+                        Ok(_record) => ActionOutcome::Done,
                         Err((failure, provides)) => ActionOutcome::Failed { failure, provides },
                     }
                 }
                 PatchWork::Update(config) => match state.fiber_of(&owned.label) {
                     Some(fiber) if fiber.pending_background_cleanups() > 0 => {
                         let prev = state
-                            .mounted
-                            .lock()
-                            .unwrap()
-                            .get(&owned.label)
-                            .map(|record| record.plugin.clone());
+                            .mounted_record_clone(&owned.label)
+                            .map(|record| record.plugin);
                         let provides = state.declared_provides_for(
                             &owned.label,
                             &owned.entry,
@@ -3460,11 +3905,9 @@ impl LoaderState {
                         Ok(UpdateOutcome::Restarted) => {
                             // 记录跟着走：`no_save=true` 的提交已经由观察者推进过内存记录，
                             // 这里再对齐一次，免得 diff 下一轮又看到"配置变了"。
-                            if let Some(record) =
-                                state.mounted.lock().unwrap().get_mut(&owned.label)
-                            {
+                            state.with_mounted_mut(&owned.label, |record| {
                                 record.config = owned.entry.config.clone().unwrap_or(Config::Null);
-                            }
+                            });
                             ActionOutcome::Done
                         }
                         Ok(UpdateOutcome::Vetoed | UpdateOutcome::Superseded) => {
@@ -3472,11 +3915,8 @@ impl LoaderState {
                         }
                         Err(err) => {
                             let prev = state
-                                .mounted
-                                .lock()
-                                .unwrap()
-                                .get(&owned.label)
-                                .map(|record| record.plugin.clone());
+                                .mounted_record_clone(&owned.label)
+                                .map(|record| record.plugin);
                             let provides = state.declared_provides_for(
                                 &owned.label,
                                 &owned.entry,
@@ -3543,12 +3983,10 @@ impl LoaderState {
             return Ok(None);
         };
         // 声明与插件对象一起取（一次锁）：两者都是这次提交要用的。
-        let Some((paths, plugin)) = self.mounted.lock().unwrap().get(label).and_then(|record| {
-            record
-                .volatile
-                .clone()
-                .map(|paths| (paths, record.plugin.clone()))
-        }) else {
+        let Some((paths, plugin)) = self
+            .mounted_record_clone(label)
+            .and_then(|record| record.volatile.map(|paths| (paths, record.plugin)))
+        else {
             return Ok(None);
         };
         if fiber.state() != cordis_core::FiberState::Active {
@@ -3556,9 +3994,9 @@ impl LoaderState {
         }
         // ① raw 推进 + 记录推进：文件是真相，下一次激活拿新的。
         fiber.set_raw_config(config.clone());
-        if let Some(record) = self.mounted.lock().unwrap().get_mut(label) {
+        self.with_mounted_mut(label, |record| {
             record.config = config.clone();
-        }
+        });
 
         // ② 候选（会走 `internal/config` 链 + 插件的校验器）。
         let epoch_before = fiber.running_epoch();
@@ -3612,43 +4050,29 @@ impl LoaderState {
             .await;
     }
 
-    /// 有意卸载一行：**先摘记录**（表不撒谎），再按 App 生命周期预算执行 `dispose_with_report`。
-    ///
-    /// 若卸载超时（`report.still_running == true`），将旧实例登记到 `draining`，
-    /// 在后台清理归零前阻止后续 `Action::Mount` / `Action::Replace` 旁路重挂。
+    /// 有意卸载一行：**单把 `rows` 锁原子跃迁至 `Disposing`**，再按 App 生命周期预算执行
+    /// `dispose_with_report`。若卸载超时或 future 在 `.await` 期间被取消，均自动落入 `Draining`
+    /// 直到后台清理归零，阻止后续 `Action::Mount` / `Action::Replace` 旁路重挂。
     async fn dispose_row(self: &Arc<Self>, label: &str) -> Option<CloseReport> {
-        let _disposing = DisposingGuard::new(self.clone(), label);
-        let record = self.mounted.lock().unwrap().remove(label);
-        if let Some(record) = record {
-            if let Some(fiber) = record.fiber.upgrade() {
-                let report = fiber.dispose_with_report(None).await;
-                if report.still_running {
-                    self.mark_row_draining(label, fiber);
-                }
-                Some(report)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        let guard = self.claim_mounted_for_dispose(label, None).into_claimed()?;
+        self.finish_claimed_dispose(guard).await
     }
 
-    /// 插件**自己**把这一行卸载了（上游 `loader/src/index.ts:137-145` 的 case 7）：
-    /// 同步阶段只先登记 `self_disposing`、再从装载表摘除并暂存记录，绝不在这里持 `config_gate` 或做磁盘 I/O。
-    fn enqueue_self_dispose(&self, fiber: &Arc<Fiber>, label: &str) {
-        // 必须先插 `self_disposing`、释放该锁后再摘 `mounted`：
-        // 1) 杜绝 `mounted` 已摘但 `self_disposing` 尚未可见的复活窗口；
-        // 2) 不嵌套持有 `self_disposing` 与 `mounted`，与 `diff()` 绝无锁序冲突。
-        self.self_disposing
-            .lock()
-            .unwrap()
-            .insert(label.to_string());
-        let record = self.mounted.lock().unwrap().remove(label);
-        self.pending_self_disposes
-            .lock()
-            .unwrap()
-            .push((fiber.clone(), label.to_string(), record));
+    async fn finish_claimed_dispose(
+        self: &Arc<Self>,
+        tx_guard: RowTransactionGuard,
+    ) -> Option<CloseReport> {
+        let Some(fiber) = tx_guard.active_fiber() else {
+            tx_guard.finish_empty();
+            return None;
+        };
+        let report = fiber.dispose_with_report(None).await;
+        if report.still_running {
+            tx_guard.finish_draining(fiber);
+        } else {
+            tx_guard.finish_empty();
+        }
+        Some(report)
     }
 
     /// 在阻塞线程池（或无运行时时的同步路径）里完成自我卸载的树更新与磁盘落盘。
@@ -3658,7 +4082,7 @@ impl LoaderState {
     /// 固化进主配置（下次读取时 patch 再插一遍 ⇒ 重复），还会把 patch 的改动
     /// 写进错误的文件。所以：主配置里的行走 [`persist`]；patch 插入的行走
     /// [`persist_overlay`]（追加一条 overlay 到最后一个 patch 文件）。
-    fn persist_self_disposed(&self, label: &str, record: Option<Mounted>) {
+    fn persist_self_disposed(&self, label: &str, record: Option<Mounted>, ticket: u64) {
         // 闸门**先**取：从"改树"到"落盘"整段必须在同一个临界区里。与 [`adopt`] 的
         // "校验 + 整份写树"互斥——否则采纳可以在两者之间插进来，把这次回写盖回去
         // （树退回旧内容，而记录与磁盘是新值；watcher 指纹已对齐，不会补偿）。
@@ -3666,17 +4090,14 @@ impl LoaderState {
         // 闸门里**不跑任何用户代码**：`ctx.log` 是宿主/应用注入的 sink（可能 panic），
         // 在这里调它会让 std `Mutex` 中毒、把整个装载器闸门一起带走。所以结果先攒着，
         // 出了这个块再打日志。
-        struct SelfDisposingGuard<'a> {
+        struct SelfDisposingSlotGuard<'a> {
             state: &'a LoaderState,
             label: &'a str,
+            ticket: u64,
         }
-        impl Drop for SelfDisposingGuard<'_> {
+        impl Drop for SelfDisposingSlotGuard<'_> {
             fn drop(&mut self) {
-                self.state
-                    .self_disposing
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(self.label);
+                self.state.clear_slot_if_ticket(self.label, self.ticket);
             }
         }
         let plugin_name = record
@@ -3685,9 +4106,13 @@ impl LoaderState {
             .unwrap_or_default();
         let result = {
             let _gate = self.config_gate.lock().unwrap();
-            // 声明在 `_gate` 之后：按逆序 drop，确保摘除 `self_disposing` 必然发生在
+            // 声明在 `_gate` 之后：按逆序 drop，确保释放 `RowSlot::SelfDisposing` 必然发生在
             // `tree` 已标 `disabled = true` 且 `bump_writeback()` 生效之后、且仍在 `config_gate` 内。
-            let _self_disposing = SelfDisposingGuard { state: self, label };
+            let _self_disposing = SelfDisposingSlotGuard {
+                state: self,
+                label,
+                ticket,
+            };
             // 合并树（内存）先标上：下一轮对账不会把它再挂回来。
             let marked = {
                 let mut tree = self.tree.lock().unwrap();
@@ -3945,22 +4370,26 @@ impl LoaderState {
             row.entry.inject.clone(),
             &row.label,
         );
+        // 挂入后立刻受 `RowTransactionGuard` 保护：若 `settle().await` 或失败自清理期间
+        // future 被取消/drop，`Drop` 自动把槽位推进到 `Draining` 并后台 `dispose()` 孤儿 fiber。
+        let tx_guard = self.begin_mount_slot(&row.label, fiber.clone());
         fiber.settle().await;
         if let Some(error) = fiber.error() {
             // `apply` 失败留下的 fiber 仍然占着 runtime 表（`fibers_by_plugin_name` 看得见），
             // 必须按 App 的生命周期等待预算做结构化清理；若后台清理仍在运行（例如 T2 `OP_APPLY`
-            // 超时或半途 disposer 超时），登记到 `draining` 阻止后续对账旁路重挂。
+            // 超时或半途 disposer 超时），推进到 `Draining` 阻止后续对账旁路重挂。
             let provides =
                 self.declared_provides_for(&row.label, &row.entry, Some(&loaded.plugin), None);
             let close_report = fiber.dispose_with_report(None).await;
             if close_report.still_running {
-                self.mark_row_draining(&row.label, fiber);
+                tx_guard.finish_draining(fiber);
                 let detail = format!(
                     "{error}（失败清理未在预算内完成，状态={}，后台清理仍在进行，清理完成前禁止重挂）",
                     close_report.status.as_str()
                 );
                 return Err((LoadFailure::runtime(detail), provides));
             }
+            tx_guard.finish_empty();
             return Err((LoadFailure::runtime(error), provides));
         }
         // volatile 声明在**装载成功之后**取（对应 §8 M4-5 的"paths 在挂载成功后查询"）：
@@ -3971,7 +4400,7 @@ impl LoaderState {
         // 非文件来源（内建/假源）没有稳定内容，报告里填 "builtin"。
         let file_source = loaded.fingerprint.is_some();
         let sha256 = staged_sha256(&loaded.staged, file_source);
-        Ok(Mounted {
+        let record = Mounted {
             label: row.label.clone(),
             origin,
             source: loaded.source,
@@ -3987,7 +4416,9 @@ impl LoaderState {
             volatile,
             sha256,
             file_source,
-        })
+        };
+        tx_guard.commit_mounted(record.clone());
+        Ok(record)
     }
 }
 
@@ -5180,8 +5611,10 @@ pub async fn load_with_source(
     // O7：首轮预检的分类结论在 state 建好之后、出版报告之前落位。
     state.record_preflight(preflight, preflight_provides);
 
-    // 4) `!!js` 的插值挂上 `internal/config` 链（M4-4b）——**必须在第一次对账之前**：
-    //    首挂那一行的配置解析就要走它，否则原始标记会流进插件。
+    // 4) 绑定 per-App PluginSource（确保本 App 内插件调用 ctx_use 始终走同一来源与策略，
+    //    不被同进程其他 App 的全局源绕过），并把 `!!js` 插值挂上 `internal/config` 链（M4-4b）——
+    //    两者都**必须在第一次对账之前**完成。
+    crate::set_plugin_source_for(&ctx, state.source.clone());
     attach_interpolation(&ctx, state.clone());
 
     // 5) 挂载 = **对账一次**：初次装载与热重载/运行期启停走同一条码路，不存在两套语义。
@@ -5498,22 +5931,22 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
             let state = state.clone();
             Box::pin(async move {
                 let found = {
-                    let table = state.mounted.lock().unwrap();
-                    table
-                        .values()
-                        .find(|record| {
-                            record
+                    let table = state.rows.lock().unwrap();
+                    table.values().find_map(|slot| match slot {
+                        RowSlot::Mounted(record)
+                            if record
                                 .fiber
                                 .upgrade()
-                                .is_some_and(|f| Arc::ptr_eq(&f, &fiber))
-                        })
-                        .map(|record| {
-                            (
+                                .is_some_and(|f| Arc::ptr_eq(&f, &fiber)) =>
+                        {
+                            Some((
                                 record.label.clone(),
                                 record.origin,
                                 record.declared.name.clone(),
-                            )
-                        })
+                            ))
+                        }
+                        _ => None,
+                    })
                 };
                 let Some((label, origin, plugin_name)) = found else {
                     return;
@@ -5535,8 +5968,10 @@ fn attach_commit_writer(ctx: &Ctx, state: Arc<LoaderState>) {
                     move || -> Option<std::result::Result<(), String>> {
                         let _gate = state.config_gate.lock().unwrap();
                         {
-                            let mut mounted = state.mounted.lock().unwrap();
-                            let record = mounted.get_mut(&label)?;
+                            let mut rows = state.rows.lock().unwrap();
+                            let Some(RowSlot::Mounted(record)) = rows.get_mut(&label) else {
+                                return None;
+                            };
                             if !record
                                 .fiber
                                 .upgrade()
@@ -5660,10 +6095,10 @@ fn attach_self_dispose_observer(ctx: &Ctx, state: Arc<LoaderState>) {
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
             cleanup_state
-                .self_disposing
+                .rows
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clear();
+                .retain(|_, slot| !matches!(slot, RowSlot::SelfDisposing { .. }));
         })
     });
     let loader_ctx = ctx.clone();
@@ -5678,13 +6113,9 @@ fn attach_self_dispose_observer(ctx: &Ctx, state: Arc<LoaderState>) {
         {
             return;
         }
-        let Some(label) = sync_state.label_of_fiber(fiber) else {
-            return;
-        };
-        if sync_state.disposing.lock().unwrap().contains(&label) {
-            return;
-        }
-        sync_state.enqueue_self_dispose(fiber, &label);
+        // 在单把 `rows` 锁内原子判定并从 `Mounted` 跃迁到 `SelfDisposing`：
+        // 若该行已处于 `Disposing`（有意卸载/换实例/HMR）则直接忽略。
+        let _ = sync_state.try_claim_self_dispose(fiber);
     });
     ctx.store
         .clone()
@@ -5694,27 +6125,23 @@ fn attach_self_dispose_observer(ctx: &Ctx, state: Arc<LoaderState>) {
                 let pending = {
                     let mut list = state.pending_self_disposes.lock().unwrap();
                     list.iter()
-                        .position(|(f, _, _)| Arc::ptr_eq(f, &fiber))
+                        .position(|(f, _, _, _)| Arc::ptr_eq(f, &fiber))
                         .map(|idx| {
-                            let (_, label, record) = list.swap_remove(idx);
-                            (label, record)
+                            let (_, label, record, ticket) = list.swap_remove(idx);
+                            (label, record, ticket)
                         })
                 };
-                let Some((label, record)) = pending else {
+                let Some((label, record, ticket)) = pending else {
                     return;
                 };
                 let write_state = state.clone();
                 let write_label = label.clone();
                 let write_job = move || {
-                    write_state.persist_self_disposed(&write_label, record);
+                    write_state.persist_self_disposed(&write_label, record, ticket);
                 };
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     if let Err(err) = handle.spawn_blocking(write_job).await {
-                        state
-                            .self_disposing
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&label);
+                        state.clear_slot_if_ticket(&label, ticket);
                         state.record_persisted_error(
                             &label,
                             "",
@@ -6073,77 +6500,28 @@ fn volatile_of(paths: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
-/// RAII 守卫：确保 `dispose_row` / `finish_reload_swap` 在任意退出或异步取消路径上清理 `disposing` 标记。
-struct DisposingGuard {
-    state: Arc<LoaderState>,
-    label: String,
-}
-
-impl DisposingGuard {
-    fn new(state: Arc<LoaderState>, label: &str) -> Self {
-        state.disposing.lock().unwrap().insert(label.to_string());
-        Self {
-            state,
-            label: label.to_string(),
-        }
-    }
-}
-
-impl Drop for DisposingGuard {
-    fn drop(&mut self) {
-        self.state
-            .disposing
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.label);
-    }
-}
-
-/// RAII 守卫：`swap_entry` 在 `.settle().await` 期间若被取消，确保已挂入的未移交 fiber 不泄漏为孤儿活实例。
-struct CancelDisposeGuard(Option<Arc<Fiber>>);
-
-impl CancelDisposeGuard {
-    fn new(fiber: Arc<Fiber>) -> Self {
-        Self(Some(fiber))
-    }
-
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for CancelDisposeGuard {
-    fn drop(&mut self) {
-        if let Some(fiber) = self.0.take() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    fiber.dispose().await;
-                });
-            }
-        }
-    }
-}
-
 /// 就地把 `record` 指向的实例换成 `new_plugin`；**换失败则回滚到 `record.plugin`**。
 ///
-/// # 为什么这里必须有事务语义
-/// 预检（`ping`）只挡得住"新库加载不起来"。`apply` 阶段的失败——配置校验不过、
-/// 依赖服务不存在、插件自己返回 `Err`——只有走到这里才发现，而那时旧实例**已经拆掉了**。
-/// 不回滚就等于"一次失败的自我修改让能力凭空消失"。
-///
-/// 这正是论文 §5.2.2 Algorithm 10 在装载器层的对应物：
-/// *"The transaction guarantees that the system never enters a half-reloaded state."*
-/// 论文那版要 `backup ← invalidate_caches(...)` / `restore_caches(backup)`，
-/// 是因为 JS 的模块系统有缓存要搬运；Rust 这边动态库没有那一层，
-/// 手上留着的 `record.plugin` 就是"备份"本身，回滚只是把它重新 `mount` 一次。
-///
-/// 返回 [`SwapOutcome`]：回滚成功时，`restored` 才是"当前在服务的实例"——
-/// 调用方必须把它写回记录（M1-2）。
+/// 全程受调用方传入的 `tx_guard`（`RowTransactionGuard`）保护：无论在旧实例卸载、
+/// 新实例 `settle`/`dispose`、还是回滚实例 `settle`/`dispose` 哪一个 `.await` 点被取消，
+/// 守卫析构时都会自动把当前活跃 fiber 推进到 `RowSlot::Draining` 并后台完成清理。
+#[cfg(test)]
 async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcome {
+    swap_entry_guarded(record, new_plugin, None).await
+}
+
+async fn swap_entry_guarded(
+    record: &Mounted,
+    new_plugin: Arc<dyn Plugin>,
+    mut tx_guard: Option<&mut RowTransactionGuard>,
+) -> SwapOutcome {
     // 卸载旧实例（带结构化报告，并遵守 App 的 LifecyclePolicy 等待预算）。
     // 这一步无法与安装合并：同一隔离域里一个服务名只能有一个实现，
     // 旧实例还在时新实例的 `provide` 必然冲突。
-    let old_fiber = record.fiber.upgrade();
+    let old_fiber = tx_guard
+        .as_deref()
+        .and_then(RowTransactionGuard::active_fiber)
+        .or_else(|| record.fiber.upgrade());
     let dispose_report = if let Some(fiber) = &old_fiber {
         Some(fiber.dispose_with_report(None).await)
     } else {
@@ -6174,9 +6552,10 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
         record.inject.clone(),
         &record.label,
     );
-    let mut new_guard = CancelDisposeGuard::new(fiber.clone());
+    if let Some(guard) = tx_guard.as_deref_mut() {
+        guard.set_active_fiber(Some(fiber.clone()));
+    }
     fiber.settle().await;
-    new_guard.disarm();
     let Some(error) = fiber.error() else {
         let (status, pending) = if fiber.state() == FiberState::Active {
             (ReloadStatus::Active, Vec::new())
@@ -6220,9 +6599,10 @@ async fn swap_entry(record: &Mounted, new_plugin: Arc<dyn Plugin>) -> SwapOutcom
         record.inject.clone(),
         &record.label,
     );
-    let mut restored_guard = CancelDisposeGuard::new(restored.clone());
+    if let Some(guard) = tx_guard {
+        guard.set_active_fiber(Some(restored.clone()));
+    }
     restored.settle().await;
-    restored_guard.disarm();
     match restored.error() {
         // 回滚成功：报新版本的失败，并说明已经回到旧实例。
         None => {
@@ -6298,15 +6678,25 @@ async fn finish_reload_swap(
     pre_stage_fp: Option<(u64, u64)>,
     guard: tokio::sync::MutexGuard<'_, ()>,
 ) -> ReloadReport {
-    // 先把记录**摘出装载表**再动手（M4-3）：`swap_entry` 会 dispose 旧实例，而
-    // "表里的记录指向已 dispose 的实例"正是要消灭的状态。摘掉之后：
-    // - 观测者看到的是"这一行暂时不在服务"（真实情况）；
-    // - `DisposingGuard` 让 `internal/plugin` 观察者不把这次有意卸载误判成插件自我卸载，
-    //   且即便在 `swap_entry().await` 期间被取消也会自动清理 `disposing`。
-    let disposing_guard = DisposingGuard::new(state.clone(), label);
-    state.mounted.lock().unwrap().remove(label);
-    let outcome = swap_entry(&record, new_plugin).await;
-    drop(disposing_guard);
+    // 在单把 `rows` 锁内原子校验当前槽位仍是 `Mounted` 且指向同一 `fiber` 并跃迁至 `Disposing`：
+    // 若在预检/暂存/打开新库窗口内插件已经发生自我卸载（`SelfDisposing` 或已摘除），
+    // 立刻丢弃新插件并返回 `NotMounted`，绝不复活已自卸载的行或与正在清理的旧实例并发冲突。
+    let expected_fiber = record.fiber.upgrade();
+    let Some(mut tx_guard) = state
+        .claim_mounted_for_dispose(label, expected_fiber.as_ref())
+        .into_claimed()
+    else {
+        drop(new_plugin);
+        drop(guard);
+        return ReloadReport {
+            label: label.to_string(),
+            status: ReloadStatus::NotMounted,
+            pending: Vec::new(),
+            dispose_report: None,
+            error: None,
+        };
+    };
+    let outcome = swap_entry_guarded(&record, new_plugin, Some(&mut tx_guard)).await;
 
     let report = outcome.to_report(label);
     let (lost_reason, draining_fiber) = match &outcome {
@@ -6323,7 +6713,9 @@ async fn finish_reload_swap(
     let remove_entry = record.commit_outcome_with_fp(outcome, staged, pre_stage_fp);
     if remove_entry {
         if let Some(draining) = draining_fiber {
-            state.mark_row_draining(label, draining);
+            tx_guard.finish_draining(draining);
+        } else {
+            tx_guard.finish_empty();
         }
         let provides = state.declared_provides_for(label, &old_declared, None, Some(&old_plugin));
         let startup = state.effective_row_startup(label, old_declared.id.as_deref());
@@ -6355,11 +6747,7 @@ async fn finish_reload_swap(
         if matches!(report.status, ReloadStatus::Active | ReloadStatus::Pending) {
             clear_reload_failures(state, label);
         }
-        state
-            .mounted
-            .lock()
-            .unwrap()
-            .insert(label.to_string(), record.clone());
+        tx_guard.commit_mounted(record.clone());
     }
 
     state.record_reload(report.clone());
@@ -6450,7 +6838,7 @@ pub async fn reload_one_report(ctx: &Ctx, state: &Arc<LoaderState>, label: &str)
     let guard = state.mutation.lock().await;
     // 在预检 / 来源校验 / 暂存之前先快照磁盘指纹，避免热重载期间并发写入的新版本被
     // 重载结束时的事后指纹采样吞掉（HMR 丢失更新）。
-    let pre_stage_fp = state.mounted.lock().unwrap().get(label).and_then(|record| {
+    let pre_stage_fp = state.mounted_record_clone(label).and_then(|record| {
         record
             .file_source
             .then(|| fingerprint(&record.source))
@@ -6472,7 +6860,7 @@ pub async fn reload_one_report(ctx: &Ctx, state: &Arc<LoaderState>, label: &str)
             return report;
         }
     }
-    let Some(record) = state.mounted.lock().unwrap().get(label).cloned() else {
+    let Some(record) = state.mounted_record_clone(label) else {
         return ReloadReport {
             label: label.to_string(),
             status: ReloadStatus::NotMounted,
@@ -6600,7 +6988,7 @@ pub async fn reload_one_with_plugin(
     new_plugin: Arc<dyn Plugin>,
 ) -> ReloadReport {
     let guard = state.mutation.lock().await;
-    let Some(record) = state.mounted.lock().unwrap().get(label).cloned() else {
+    let Some(record) = state.mounted_record_clone(label) else {
         return ReloadReport {
             label: label.to_string(),
             status: ReloadStatus::NotMounted,
@@ -6619,10 +7007,7 @@ pub async fn reload_one_with_plugin(
 #[cfg(test)]
 fn advance_fingerprint(state: &Arc<LoaderState>, label: &str) {
     let fp = state
-        .mounted
-        .lock()
-        .unwrap()
-        .get(label)
+        .mounted_record_clone(label)
         .and_then(|record| fingerprint(&record.source));
     advance_fingerprint_with(state, label, fp);
 }
@@ -6633,11 +7018,11 @@ fn advance_fingerprint_with(
     pre_stage_fp: Option<(u64, u64)>,
 ) {
     if let Some(fp) = pre_stage_fp {
-        if let Some(record) = state.mounted.lock().unwrap().get_mut(label) {
+        state.with_mounted_mut(label, |record| {
             if record.fingerprint.is_some() {
                 record.fingerprint = Some(fp);
             }
-        }
+        });
     }
 }
 

@@ -65,6 +65,10 @@ fn apply(ctx: &sdk::Ctx, config: Value) -> PluginResult {
         .ok_or("harness-tool 需要配置 `log`（会话日志的路径）")?
         .to_string();
     let log = Arc::new(SessionLog::open(PathBuf::from(&log_path))?);
+    let flush_log = log.clone();
+    ctx.effect(move || {
+        let _ = flush_log.flush();
+    })?;
     let boot = log.append(json!({
         "kind": "boot",
         "plugin": "harness-tool",
@@ -211,6 +215,8 @@ fn apply(ctx: &sdk::Ctx, config: Value) -> PluginResult {
         )],
     )?;
     let registered_slot = registered.clone();
+    let register_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let register_err_cb = register_err.clone();
     ctx.call_iface(
         "tools@1",
         1,
@@ -224,13 +230,47 @@ fn apply(ctx: &sdk::Ctx, config: Value) -> PluginResult {
         move |result| {
             let outcome = match result {
                 Ok(_) => "ok".to_string(),
-                Err(message) => format!("err: {message}"),
+                Err(message) => {
+                    *register_err_cb
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message.clone());
+                    format!("err: {message}")
+                }
             };
             *registered_slot
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = outcome;
         },
     )?;
+    if let Some(err) = register_err
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Err(format!("向 tools@1 登记 harness-echo 失败: {err}"));
+    }
+
+    // 紧随目录登记之后立刻挂好撤销 effect：避免后续 isolate / use_child / intercept_ctx
+    // 任一步失败时残留幽灵目录条目阻塞下次重载。
+    let ctx_cleanup = ctx;
+    if let Err(err) = ctx.effect(move || {
+        let _ = ctx_cleanup.call_iface(
+            "tools@1",
+            1,
+            "unregister",
+            json!([0, "harness-echo"]),
+            |_| {},
+        );
+    }) {
+        let _ = ctx.call_iface(
+            "tools@1",
+            1,
+            "unregister",
+            json!([0, "harness-echo"]),
+            |_| {},
+        );
+        return Err(err);
+    }
 
     // ------------------------------------------------ ⑤ A4：派生隔离域 + @native 子组件
     //
@@ -274,25 +314,6 @@ fn apply(ctx: &sdk::Ctx, config: Value) -> PluginResult {
     ctx.on("harness/unload", move |_args: Vec<Value>| {
         ctx_unload.dispose_self()?;
         Ok(json!({ "unloading": true }))
-    })?;
-
-    // ------------------------------------------------ ⑦ 收尾：一个 effect 干两件事
-    //
-    // ① **撤销目录登记**：目录是 T1 插件的状态，内核只回收"你自己 provide 的东西"。
-    //    不撤销的话，重载后的新实例会撞上"自己留下的"那条重名登记。
-    // ② flush：不是 spawn 一个后台刷盘任务——卸载时**同步**刷干净，语义才说得清。
-    //    （cleanup 跑在句柄注销**之前**，所以这一刻还能调宿主，见 `apply_via` 的契约。）
-    let cleanup_log = log.clone();
-    let ctx_cleanup = ctx;
-    ctx.effect(move || {
-        let _ = ctx_cleanup.call_iface(
-            "tools@1",
-            1,
-            "unregister",
-            json!([0, "harness-echo"]),
-            |_| {},
-        );
-        let _ = cleanup_log.flush();
     })?;
 
     // ------------------------------------------------ ⑧ 把这一切报给宿主（诊断面）
@@ -593,26 +614,43 @@ impl SessionLog {
     fn open(path: PathBuf) -> Result<Self, String> {
         let mut next = 1u64;
         let mut boots = 0u64;
+        let mut needs_trailing_newline = false;
         if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .map_err(|err| format!("读会话日志 {} 失败: {err}", path.display()))?;
+            if !text.is_empty() && !text.ends_with('\n') {
+                needs_trailing_newline = true;
+            }
             for line in text.lines().filter(|line| !line.trim().is_empty()) {
                 let value: Value = serde_json::from_str(line).map_err(|err| {
                     format!("会话日志 {} 里有一行不是 JSON: {err}", path.display())
                 })?;
                 if let Some(seq) = value.get("seq").and_then(Value::as_u64) {
-                    next = next.max(seq + 1);
+                    let candidate = seq.checked_add(1).ok_or_else(|| {
+                        format!(
+                            "会话日志 {} 中的 seq={seq} 已达到 u64::MAX 上限",
+                            path.display()
+                        )
+                    })?;
+                    next = next.max(candidate);
                 }
                 if value.get("kind").and_then(Value::as_str) == Some("boot") {
-                    boots += 1;
+                    boots = boots.saturating_add(1);
                 }
             }
         }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .map_err(|err| format!("打开会话日志 {} 失败: {err}", path.display()))?;
+        if needs_trailing_newline {
+            file.write_all(b"\n")
+                .and_then(|_| file.flush())
+                .and_then(|_| file.sync_all())
+                .map_err(|err| format!("补齐会话日志 {} 尾部换行失败: {err}", path.display()))?;
+        }
         Ok(Self {
             path,
             state: Mutex::new(LogState { file, next, boots }),
@@ -626,6 +664,9 @@ impl SessionLog {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let seq = state.next;
+        let next_seq = seq
+            .checked_add(1)
+            .ok_or_else(|| "会话日志 seq 已达到 u64::MAX 上限".to_string())?;
         let mut record = record;
         let Some(map) = record.as_object_mut() else {
             return Err("会话记录必须是 JSON 对象（否则重载恢复时无法提取 seq）".to_string());
@@ -637,22 +678,36 @@ impl SessionLog {
         line.push('\n');
         let describe =
             |err: std::io::Error, what: &str| format!("{what} {} 失败: {err}", self.path.display());
-        state
+        let prev_len = state
+            .file
+            .metadata()
+            .map_err(|err| describe(err, "读取会话日志长度"))?
+            .len();
+        let write_res = state
             .file
             .write_all(line.as_bytes())
-            .map_err(|err| describe(err, "写会话日志"))?;
-        // 屏障：write + flush + sync_all，一个都不能少（后者才是"到了盘上"）。
-        state
-            .file
-            .flush()
-            .map_err(|err| describe(err, "flush 会话日志"))?;
-        state
-            .file
-            .sync_all()
-            .map_err(|err| describe(err, "sync 会话日志"))?;
-        state.next = seq + 1;
+            .map_err(|err| describe(err, "写会话日志"))
+            .and_then(|_| {
+                // 屏障：write + flush + sync_all，一个都不能少（后者才是"到了盘上"）。
+                state
+                    .file
+                    .flush()
+                    .map_err(|err| describe(err, "flush 会话日志"))
+            })
+            .and_then(|_| {
+                state
+                    .file
+                    .sync_all()
+                    .map_err(|err| describe(err, "sync 会话日志"))
+            });
+        if let Err(err) = write_res {
+            let _ = state.file.set_len(prev_len);
+            let _ = state.file.sync_all();
+            return Err(err);
+        }
+        state.next = next_seq;
         if is_boot {
-            state.boots += 1;
+            state.boots = state.boots.saturating_add(1);
         }
         Ok(seq)
     }
@@ -874,6 +929,59 @@ mod tests {
         let reopened = SessionLog::open(path).unwrap();
         assert_eq!(reopened.next_seq(), 32);
         assert_eq!(reopened.boots(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r4_p1_session_log_repairs_missing_trailing_newline_and_guards_seq_overflow() {
+        let dir =
+            std::env::temp_dir().join(format!("cordis-r4-session-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Existing file missing trailing `\n` must NOT concatenate the next JSONL line.
+        let no_nl = dir.join("no-nl.jsonl");
+        std::fs::write(&no_nl, r#"{"kind":"boot","seq":1}"#).unwrap();
+        let log = SessionLog::open(no_nl.clone()).unwrap();
+        assert_eq!(log.next_seq(), 2);
+        assert_eq!(log.append(json!({ "kind": "step" })).unwrap(), 2);
+        let rows = log
+            .tail(10)
+            .expect("tail after missing-newline recovery must parse cleanly");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["seq"], json!(1));
+        assert_eq!(rows[1]["seq"], json!(2));
+        let reopened = SessionLog::open(no_nl).unwrap();
+        assert_eq!(reopened.next_seq(), 3);
+
+        // 2. Existing log containing seq == u64::MAX must fail closed without overflow panic.
+        let overflow_file = dir.join("overflow.jsonl");
+        std::fs::write(
+            &overflow_file,
+            format!("{{\"kind\":\"boot\",\"seq\":{}}}\n", u64::MAX),
+        )
+        .unwrap();
+        assert!(
+            SessionLog::open(overflow_file).is_err(),
+            "seq == u64::MAX 的历史日志必须返回可读错误而非溢出 panic"
+        );
+
+        // 3. Direct append when next == u64::MAX must return Err without panicking or writing.
+        let near_max = dir.join("near-max.jsonl");
+        std::fs::write(
+            &near_max,
+            format!("{{\"kind\":\"boot\",\"seq\":{}}}\n", u64::MAX - 1),
+        )
+        .unwrap();
+        let log_max = SessionLog::open(near_max.clone()).unwrap();
+        assert_eq!(log_max.next_seq(), u64::MAX);
+        assert!(
+            log_max.append(json!({ "kind": "overflow" })).is_err(),
+            "next == u64::MAX 时 append 必须返回错误而非溢出"
+        );
+        let rows_after = log_max.tail(10).unwrap();
+        assert_eq!(rows_after.len(), 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

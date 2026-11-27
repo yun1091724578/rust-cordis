@@ -167,6 +167,8 @@
 | `apply_via_with_error_format` | fn | `crates/host/src/lib.rs` |
 | `apply_via_with_keepalive_and_error_format` | fn | `crates/host/src/lib.rs` |
 | `set_plugin_source` | fn | `crates/host/src/lib.rs` |
+| `set_plugin_source_for` | fn | `crates/host/src/lib.rs` |
+| `set_native_registry_for` | fn | `crates/host/src/lib.rs` |
 | `set_dispatch_policy` | fn | `crates/host/src/policy.rs` |
 | `set_dispatch_policy_for` | fn | `crates/host/src/policy.rs` |
 | `set_host_limits_for` | fn | `crates/host/src/policy.rs` |
@@ -198,6 +200,7 @@
 | `admission` | fn | `crates/host/src/source.rs` |
 | `admission_mode` | fn | `crates/host/src/source.rs` |
 | `read_manifest` | fn | `crates/host/src/source.rs` |
+| `sha256_bytes` | fn | `crates/host/src/source.rs` |
 | `sha256_file` | fn | `crates/host/src/source.rs` |
 | `mounted_sources` | fn | `crates/host/src/loader.rs` |
 | `DispatchPolicy` | struct | `crates/host/src/policy.rs` |

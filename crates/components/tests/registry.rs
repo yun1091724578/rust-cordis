@@ -329,3 +329,68 @@ async fn r3_p2_registry_handle_retired_after_restart_no_split_brain() {
     );
     app.close().await;
 }
+
+#[tokio::test]
+async fn r4_p1_concurrent_registry_put_replace_and_restart_no_cross_generation_split_brain() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let app = App::new();
+    let reg_fiber = app.root.plugin(registry::plugin(), Config::Null);
+    reg_fiber.settle().await;
+
+    for round in 0..20u32 {
+        let h1 = registry::handle(&app.root).expect("gen-1 handle");
+        let _seed = h1.put("shared", Dyn::new(100u32 + round)).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_put = stop.clone();
+        let h1_put = h1.clone();
+        let t_put = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !stop_put.load(Ordering::Relaxed) {
+                let _ = h1_put.put("raced_slot", Dyn::new(i));
+                i = i.wrapping_add(1);
+            }
+        });
+
+        let stop_rep = stop.clone();
+        let h1_rep = h1.clone();
+        let t_rep = std::thread::spawn(move || {
+            while !stop_rep.load(Ordering::Relaxed) {
+                let _ = h1_rep.replace("shared", Dyn::new(9999u32));
+            }
+        });
+
+        // Restart registry while Gen-1 handle is actively hammering `put` and `replace`.
+        reg_fiber.restart().await.unwrap();
+        let h2 = registry::handle(&app.root).expect("gen-2 handle");
+        // Register Gen-2 values right after restart while old threads may still be mid-call.
+        let d_shared = h2
+            .put("shared", Dyn::new(200u32 + round))
+            .expect("Gen-2 must be able to put `shared` without collision");
+        let d_raced = h2
+            .put("raced_slot", Dyn::new(300u32 + round))
+            .expect("Gen-2 must NEVER be bricked by a retired Gen-1 handle's raced put()");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        stop.store(true, Ordering::Relaxed);
+        t_put.join().unwrap();
+        t_rep.join().unwrap();
+
+        assert_eq!(
+            h2.get("shared")
+                .and_then(|v| v.downcast::<u32>().map(|n| *n)),
+            Some(200u32 + round),
+            "退役 Gen-1 句柄的 replace() 不得静默覆写 Gen-2 的槽位值 (round={round})"
+        );
+        assert_eq!(
+            h2.get("raced_slot")
+                .and_then(|v| v.downcast::<u32>().map(|n| *n)),
+            Some(300u32 + round)
+        );
+        d_shared.run().await;
+        d_raced.run().await;
+    }
+    app.close().await;
+}

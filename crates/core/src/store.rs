@@ -2232,31 +2232,40 @@ impl Store {
     /// 注意：只要仍有活跃 fiber，不提前把 `Runtime` 移出 `self.runtimes`，确保期间上游提供者
     /// 卸载等待与环检测仍能观察到这些实例；每个实例在 `dispose()` 完成后由 `DisposeDone` 统一摘除。
     pub fn delete_plugin(&self, key: &str) -> Vec<Arc<Fiber>> {
-        let mut runtimes = self.runtimes.lock().unwrap();
+        let mut removed_runtimes = Vec::new();
         let mut fibers = Vec::new();
-        let mut i = 0;
-        while i < runtimes.len() {
-            if !runtimes[i].retired.load(Ordering::Acquire) && &*runtimes[i].key == key {
-                runtimes[i].retired.store(true, Ordering::Release);
-                let live = runtimes[i].fibers.lock().unwrap().clone();
-                if live.is_empty() {
-                    runtimes.remove(i);
-                    continue;
+        {
+            let mut runtimes = self.runtimes.lock().unwrap();
+            let mut i = 0;
+            while i < runtimes.len() {
+                if !runtimes[i].retired.load(Ordering::Acquire) && &*runtimes[i].key == key {
+                    runtimes[i].retired.store(true, Ordering::Release);
+                    let live = runtimes[i].fibers.lock().unwrap().clone();
+                    if live.is_empty() {
+                        removed_runtimes.push(runtimes.remove(i));
+                        continue;
+                    }
+                    fibers.extend(live);
                 }
-                fibers.extend(live);
+                i += 1;
             }
-            i += 1;
         }
+        // 锁外释放 `Arc<Runtime>`，防止用户 `Plugin::drop` 重入 `Store` 时在 `self.runtimes` 上死锁。
+        drop(removed_runtimes);
         fibers
     }
 
-    pub(crate) fn register_fiber(&self, runtime: &Arc<Runtime>, fiber: &Arc<Fiber>) {
-        // 统一锁序：`self.runtimes` → `runtime.fibers`，避免与 `unregister_fiber` 竞态孤立新 fiber。
+    pub(crate) fn register_fiber(&self, runtime: &Arc<Runtime>, fiber: &Arc<Fiber>) -> bool {
+        // 统一锁序：`self.runtimes` → `runtime.fibers`，且拒绝向已退役 runtime 复活新 fiber。
         let mut runtimes = self.runtimes.lock().unwrap();
+        if runtime.retired.load(Ordering::Acquire) {
+            return false;
+        }
         if !runtimes.iter().any(|r| Arc::ptr_eq(r, runtime)) {
             runtimes.push(runtime.clone());
         }
         runtime.fibers.lock().unwrap().push(fiber.clone());
+        true
     }
 
     pub(crate) fn unregister_fiber(&self, runtime: &Arc<Runtime>, fiber: &Arc<Fiber>) {
