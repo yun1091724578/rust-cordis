@@ -25,7 +25,7 @@ use cordis_abi::cordis_plugin;
 use cordis_abi::sdk::{self, PluginResult};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -639,14 +639,21 @@ impl SessionLog {
                 }
             }
         }
+        // Windows 上 Rust std 的 `OpenOptions::append(true)` 只向 CreateFileW 请求
+        // `FILE_APPEND_DATA`（会忽略 `.write(true)`），导致写失败后的 `File::set_len(prev_len)`
+        // 回滚返回 `ERROR_ACCESS_DENIED`。`SessionLog` 所有写入都受同一把 `Mutex` 串行保护，
+        // 使用 `.read(true).write(true)` 并在写入前显式 `seek(SeekFrom::End(0))` 可在三平台
+        // 同时保证追加语义与 `set_len` 原子回滚能力。
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
-            .append(true)
+            .write(true)
+            .truncate(false)
             .open(&path)
             .map_err(|err| format!("打开会话日志 {} 失败: {err}", path.display()))?;
         if needs_trailing_newline {
-            file.write_all(b"\n")
+            file.seek(SeekFrom::End(0))
+                .and_then(|_| file.write_all(b"\n"))
                 .and_then(|_| file.flush())
                 .and_then(|_| file.sync_all())
                 .map_err(|err| format!("补齐会话日志 {} 尾部换行失败: {err}", path.display()))?;
@@ -680,9 +687,8 @@ impl SessionLog {
             |err: std::io::Error, what: &str| format!("{what} {} 失败: {err}", self.path.display());
         let prev_len = state
             .file
-            .metadata()
-            .map_err(|err| describe(err, "读取会话日志长度"))?
-            .len();
+            .seek(SeekFrom::End(0))
+            .map_err(|err| describe(err, "定位会话日志末尾"))?;
         let write_res = state
             .file
             .write_all(line.as_bytes())
@@ -702,6 +708,7 @@ impl SessionLog {
             });
         if let Err(err) = write_res {
             let _ = state.file.set_len(prev_len);
+            let _ = state.file.seek(SeekFrom::End(0));
             let _ = state.file.sync_all();
             return Err(err);
         }
@@ -981,6 +988,40 @@ mod tests {
         );
         let rows_after = log_max.tail(10).unwrap();
         assert_eq!(rows_after.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r5_p2_session_log_file_handle_supports_set_len_rollback_on_windows() {
+        let dir = std::env::temp_dir().join(format!(
+            "cordis-r5-session-log-set-len-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollback.jsonl");
+
+        let log = SessionLog::open(path.clone()).unwrap();
+        assert_eq!(log.append(json!({ "kind": "boot" })).unwrap(), 1);
+        let prev_len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(log.append(json!({ "kind": "step", "x": 1 })).unwrap(), 2);
+        assert!(std::fs::metadata(&path).unwrap().len() > prev_len);
+
+        // Directly verify that the open handle held by `SessionLog` has sufficient access rights
+        // (`FILE_WRITE_DATA` on Windows) for `File::set_len(prev_len)` rollback on write error!
+        {
+            let state = log.state.lock().unwrap();
+            state
+                .file
+                .set_len(prev_len)
+                .expect("SessionLog handle must permit set_len rollback on all platforms");
+            state.file.sync_all().unwrap();
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), prev_len);
+        let rows = log.tail(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["seq"], json!(1));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

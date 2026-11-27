@@ -10,4 +10,7 @@
 //! 另两条只到"单键原地换值"与"稳定句柄"，都已被 [`registry`] 覆盖）；
 //! 日志面板 / 配置监视器 / 健康检查属于领域词汇，不进骨架。
 
+// clippy 1.98 会把已经是 `const { … }` 的初始化器继续报成“可改为 const”。
+#![allow(clippy::missing_const_for_thread_local)]
+
 pub mod registry;

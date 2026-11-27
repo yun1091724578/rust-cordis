@@ -28,12 +28,91 @@
 //! - [`RegistryHandle`] 只持 `Weak<Context>`（M4 的 Weak 纪律：句柄通常被别的插件
 //!   拿在手里活得更久，不能把上下文树吊住）；注册表卸载后所有入口**优雅降级**。
 
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::cell::RefCell;
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use cordis_core::{
     plugin_fn, with_provision, Config, Context, Ctx, Disposable, Dyn, Error, ExternValue, Inject,
     Plugin,
 };
+
+thread_local! {
+    static ACTIVE_REGISTRY_GATES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 可重入、无死锁的代际存活闸门：
+/// - 跨线程并发：`retire()` 置 `alive = false` 并等待全部在飞 `put`/`replace`/`get`/`names` 完成，
+///   彻底杜绝 `Fiber::restart()` 复用 `Context` 引起的跨代脑裂与跨代读取；
+/// - 同线程重入：`replace()`/`put()` 触发 `set_hooks` 或旧值 `Drop` 在同线程重入 `handle.*`
+///   （甚至同线程触发 `retire()`）时绝不阻塞在写者队列后，杜绝 Windows `SRWLOCK`/写优先 `RwLock` 死锁。
+struct GenGate {
+    state: Mutex<(bool, usize)>,
+    cv: Condvar,
+}
+
+struct GenGateGuard<'a> {
+    gate: &'a GenGate,
+    reentrant: bool,
+}
+
+impl Drop for GenGateGuard<'_> {
+    fn drop(&mut self) {
+        let addr = self.gate as *const GenGate as usize;
+        ACTIVE_REGISTRY_GATES.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if let Some(pos) = stack.iter().rposition(|&x| x == addr) {
+                stack.remove(pos);
+            }
+        });
+        if !self.reentrant {
+            let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.1 = st.1.saturating_sub(1);
+            if st.1 == 0 {
+                self.gate.cv.notify_all();
+            }
+        }
+    }
+}
+
+impl GenGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new((true, 0)),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn try_enter(&self) -> Option<GenGateGuard<'_>> {
+        let addr = self as *const GenGate as usize;
+        let reentrant = ACTIVE_REGISTRY_GATES.with(|stack| stack.borrow().contains(&addr));
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.0 {
+            return None;
+        }
+        if !reentrant {
+            st.1 += 1;
+        }
+        drop(st);
+        ACTIVE_REGISTRY_GATES.with(|stack| stack.borrow_mut().push(addr));
+        Some(GenGateGuard {
+            gate: self,
+            reentrant,
+        })
+    }
+
+    fn retire(&self) {
+        let addr = self as *const GenGate as usize;
+        let same_thread = ACTIVE_REGISTRY_GATES.with(|stack| stack.borrow().contains(&addr));
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.0 = false;
+        if same_thread {
+            return;
+        }
+        while st.1 > 0 {
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
 
 /// 原生句柄所在的键（用 [`handle`] 取，不用手写这个字符串）。
 pub const HANDLE_KEY: &str = "registry.local";
@@ -67,12 +146,12 @@ enum SlotState {
 /// 注册表的**原生句柄**（T1）：槽位值可以是任意 [`Dyn`]。
 ///
 /// 它只持注册表 ctx 的**弱引用**，因此可以被别的插件长期持有：
-/// 注册表卸载或重启之后，本代句柄的 `alive` 标志永久置 `false`，所有入口都会给出可读的降级结果。
+/// 注册表卸载或重启之后，本代句柄的代际闸门永久关闭，所有入口都会给出可读的降级结果。
 pub struct RegistryHandle {
     ctx: Weak<Context>,
-    /// 本代注册表实例的存活读写锁：`put`/`replace` 持读锁跨越 `provide`/`set`，
-    /// 卸载/重启清理器持写锁置 `false`，彻底消除跨 `Fiber::restart()` 复用 `Context` 的跨代脑裂。
-    alive: Arc<RwLock<bool>>,
+    /// 本代注册表实例的可重入代际闸门：`put`/`replace`/`get`/`names` 全程持闸门，
+    /// 卸载/重启清理器关闭闸门并排干在飞调用，彻底消除跨代脑裂与回调重入死锁。
+    gate: Arc<GenGate>,
     /// 槽位名与状态（按注册顺序）。**值本身只有一份真相**——在服务表里。
     names: Mutex<Vec<(String, SlotState)>>,
 }
@@ -86,8 +165,10 @@ impl RegistryHandle {
         if name == HANDLE_KEY || name == RegistryService::KEY {
             return Err(format!("槽位 \"{name}\" 为注册表保留键，不能覆写").into());
         }
-        let alive = self.alive.read().unwrap();
-        let ctx = self.live_ctx_locked(*alive)?;
+        let _gate = self.gate.try_enter().ok_or_else(|| -> Error {
+            "注册表已卸载或重启：请重新获取 cordis_components::registry::handle()".into()
+        })?;
+        let ctx = self.live_ctx()?;
         {
             let mut names = self.names.lock().unwrap();
             if let Some((_, state)) = names.iter().find(|(existing, _)| existing == name) {
@@ -120,7 +201,7 @@ impl RegistryHandle {
                 *state = SlotState::Active;
             }
         }
-        drop(alive);
+        drop(_gate);
         let table = Arc::downgrade(self);
         let name_owned = name.to_string();
         Ok(Disposable::new(move || {
@@ -161,8 +242,10 @@ impl RegistryHandle {
     /// **原地换值**：一次同步写（[`Store::set`](cordis_core::Store::set)），
     /// 槽位在服务表里的身份不变 ⇒ 依赖者 epoch 不变，但它们读到的是新值。
     pub fn replace(&self, name: &str, value: Dyn) -> Result<(), Error> {
-        let alive = self.alive.read().unwrap();
-        let ctx = self.live_ctx_locked(*alive)?;
+        let _gate = self.gate.try_enter().ok_or_else(|| -> Error {
+            "注册表已卸载或重启：请重新获取 cordis_components::registry::handle()".into()
+        })?;
+        let ctx = self.live_ctx()?;
         if !self
             .names
             .lock()
@@ -177,9 +260,7 @@ impl RegistryHandle {
 
     /// 读**当下**的值（走注册表自己的提交视图，不是注册时的快照）。没有 ⇒ `None`。
     pub fn get(&self, name: &str) -> Option<Dyn> {
-        if !*self.alive.read().unwrap() {
-            return None;
-        }
+        let _gate = self.gate.try_enter()?;
         let ctx = self.ctx.upgrade()?;
         if !ctx.is_active() {
             return None;
@@ -198,9 +279,9 @@ impl RegistryHandle {
 
     /// 当前槽位名（按注册顺序）。注册表已卸载 ⇒ 空表（优雅降级）。
     pub fn names(&self) -> Vec<String> {
-        if !*self.alive.read().unwrap() {
+        let Some(_gate) = self.gate.try_enter() else {
             return Vec::new();
-        }
+        };
         let Some(ctx) = self.ctx.upgrade() else {
             return Vec::new();
         };
@@ -218,12 +299,7 @@ impl RegistryHandle {
 
     /// 注册表自己的 ctx，且必须**在运行**：`provide` 在未激活/正在卸载的状态上会
     /// `assert`（那是内核护栏），组件不该去撞它——这里先给出可读错误。
-    fn live_ctx_locked(&self, alive: bool) -> Result<Ctx, Error> {
-        if !alive {
-            return Err(
-                "注册表已卸载或重启：请重新获取 cordis_components::registry::handle()".into(),
-            );
-        }
+    fn live_ctx(&self) -> Result<Ctx, Error> {
         let ctx = self.ctx.upgrade().ok_or_else(|| -> Error {
             "注册表已卸载：请重新挂载 cordis_components::registry::plugin()".into()
         })?;
@@ -256,20 +332,20 @@ pub fn plugin() -> Arc<dyn Plugin> {
             Inject::default(),
             |ctx: Ctx, _config: Config| {
                 Box::pin(async move {
-                    let alive = Arc::new(RwLock::new(true));
-                    let alive_drop = alive.clone();
-                    let _retire = ctx.effect(move |_| {
-                        Disposable::sync(move || {
-                            *alive_drop.write().unwrap() = false;
-                        })
-                    });
+                    let gate = Arc::new(GenGate::new());
                     let handle = Arc::new(RegistryHandle {
                         ctx: ctx.downgrade(),
-                        alive,
+                        gate: gate.clone(),
                         names: Mutex::new(Vec::new()),
                     });
                     ctx.provide(HANDLE_KEY, Dyn::shared(handle.clone()))?;
                     RegistryService::provide(&ctx, Arc::new(TypedFace { handle }))?;
+                    // 最后注册退役 effect，保证 LIFO 卸载时第一时间关闭本代闸门并排干在飞调用。
+                    let _retire = ctx.effect(move |_| {
+                        Disposable::sync(move || {
+                            gate.retire();
+                        })
+                    });
                     Ok(())
                 })
             },

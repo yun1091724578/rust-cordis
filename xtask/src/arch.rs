@@ -12,7 +12,7 @@
 
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -539,6 +539,7 @@ enum YamlScalarLookup<'a> {
     Missing,
     Str(&'a str),
     NonString(&'a YamlValue),
+    DuplicateCaseKeys,
 }
 
 fn yaml_str<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a str> {
@@ -554,6 +555,8 @@ fn yaml_lookup_str<'a>(map: &'a serde_yaml::Mapping, key: &str) -> YamlScalarLoo
     }
 }
 
+/// 大小写不敏感查找 YAML `env` 映射中的变量（防止 Windows runner 上 `rustup_toolchain` 静默覆盖）。
+/// 若同一 `env` 映射中存在多个仅大小写不同的同名键，fail-closed 返回 `DuplicateCaseKeys`。
 fn yaml_lookup_env_var<'a>(map: &'a serde_yaml::Mapping, var: &str) -> YamlScalarLookup<'a> {
     let Some(env_val) = map.get(YamlValue::String("env".to_string())) else {
         return YamlScalarLookup::Missing;
@@ -561,271 +564,21 @@ fn yaml_lookup_env_var<'a>(map: &'a serde_yaml::Mapping, var: &str) -> YamlScala
     let Some(env_map) = env_val.as_mapping() else {
         return YamlScalarLookup::NonString(env_val);
     };
-    yaml_lookup_str(env_map, var)
-}
-
-fn contains_version_token(haystack: &str, expected_version: &str) -> bool {
-    let escaped = expected_version.replace('.', "\\.");
-    let needles = [
-        format!("rustc {expected_version}"),
-        format!("rustc {escaped}"),
-    ];
-    for needle in &needles {
-        let mut rest = haystack;
-        while let Some(idx) = rest.find(needle.as_str()) {
-            let after = &rest[idx + needle.len()..];
-            // 禁止前缀误匹配（例如 1.98.1 误匹配 1.98.10）。
-            if !after.as_bytes().first().is_some_and(u8::is_ascii_digit) {
-                return true;
-            }
-            rest = after;
+    let mut matched: Option<&'a YamlValue> = None;
+    for (k, v) in env_map {
+        if k.as_str().is_some_and(|s| s.eq_ignore_ascii_case(var)) && matched.replace(v).is_some() {
+            return YamlScalarLookup::DuplicateCaseKeys;
         }
     }
-    false
-}
-
-/// 检查 `|| <rhs>` 后的兜底子句是否**显式以非零状态失败**。
-///
-/// 采用严格白名单并检查每一条分号子句：
-/// - 任何子句若为 `return ...` 或 `exit <256 的整数倍>`（如 `exit 0`、`exit 256`、`exit -256`）
-///   都会令 shell 以退出码 0 提前返回，直接判为不安全；
-/// - 末尾有效子句必须是 `false` 或 `exit <n>` 且 `n.rem_euclid(256) != 0`。
-fn fallback_explicitly_fails(rhs: &str) -> bool {
-    let rhs = rhs.trim();
-    if rhs.ends_with('&') && !rhs.ends_with("&&") {
-        return false;
+    match matched {
+        None => YamlScalarLookup::Missing,
+        Some(YamlValue::String(s)) => YamlScalarLookup::Str(s.as_str()),
+        Some(other) => YamlScalarLookup::NonString(other),
     }
-    let body = rhs
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .or_else(|| rhs.strip_prefix('(').and_then(|s| s.strip_suffix(')')))
-        .unwrap_or(rhs)
-        .trim();
-    // 兜底块内禁止出现未加引号的 `&&` / `||`（例如 `{ true && exit 0; exit 1; }`），避免提前以 0 退出。
-    if contains_unquoted_seq(body, b"&&") || contains_unquoted_seq(body, b"||") {
-        return false;
-    }
-    let clauses: Vec<&str> = body
-        .split(';')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
-    if clauses.is_empty() {
-        return false;
-    }
-    let parse_nonzero_exit = |stmt: &str| -> Option<bool> {
-        let code = stmt.strip_prefix("exit")?;
-        if !code.is_empty() && !code.starts_with(char::is_whitespace) {
-            return None;
-        }
-        let trimmed = code.trim();
-        if trimmed.is_empty() {
-            // 裸 `exit` 沿用 `$?`：在 `||` 兜底块里，若前面已有 `echo ...` 会把 `$?` 改成 0。
-            return Some(false);
-        }
-        let n = trimmed.parse::<i32>().ok()?;
-        Some(n.rem_euclid(256) != 0)
-    };
-    let is_return_stmt = |stmt: &str| -> bool {
-        stmt.strip_prefix("return")
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-    };
-    for &clause in &clauses[..clauses.len() - 1] {
-        if is_return_stmt(clause) {
-            return false;
-        }
-        if let Some(nonzero) = parse_nonzero_exit(clause) {
-            if !nonzero {
-                return false;
-            }
-        }
-    }
-    let last = *clauses.last().unwrap();
-    if last == "false" {
-        return true;
-    }
-    parse_nonzero_exit(last).unwrap_or(false)
-}
-
-fn find_unquoted_seq(s: &str, needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if escaped {
-            escaped = false;
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\\' if !in_single => {
-                escaped = true;
-                i += 1;
-            }
-            b'\'' if !in_double => {
-                in_single = !in_single;
-                i += 1;
-            }
-            b'"' if !in_single => {
-                in_double = !in_double;
-                i += 1;
-            }
-            _ if !in_single
-                && !in_double
-                && i + needle.len() <= bytes.len()
-                && &bytes[i..i + needle.len()] == needle =>
-            {
-                return Some(i);
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    None
-}
-
-fn contains_unquoted_seq(s: &str, needle: &[u8]) -> bool {
-    find_unquoted_seq(s, needle).is_some()
-}
-
-fn suppresses_failure(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.ends_with('&') && !trimmed.ends_with("&&") {
-        return true;
-    }
-    if let Some(idx) = find_unquoted_seq(trimmed, b"||") {
-        let lhs = &trimmed[..idx];
-        let rhs = &trimmed[idx + 2..];
-        if contains_unquoted_seq(lhs, b";") || contains_unquoted_seq(lhs, b"&&") {
-            return true;
-        }
-        return !fallback_explicitly_fails(rhs);
-    }
-    if contains_unquoted_seq(trimmed, b";") || contains_unquoted_seq(trimmed, b"&&") {
-        return true;
-    }
-    false
-}
-
-/// 简易 shell 分词：保留单/双引号内容并标记 token 是否曾被引号包裹。
-fn shell_tokens(s: &str) -> Vec<(String, bool)> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_tok = false;
-    let mut was_quoted = false;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    for ch in s.chars() {
-        if escaped {
-            cur.push(ch);
-            in_tok = true;
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if !in_single => {
-                escaped = true;
-                in_tok = true;
-            }
-            '\'' if !in_double => {
-                in_single = !in_single;
-                in_tok = true;
-                was_quoted = true;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                in_tok = true;
-                was_quoted = true;
-            }
-            c if c.is_ascii_whitespace() && !in_single && !in_double => {
-                if in_tok {
-                    out.push((std::mem::take(&mut cur), was_quoted));
-                    in_tok = false;
-                    was_quoted = false;
-                }
-            }
-            c => {
-                cur.push(c);
-                in_tok = true;
-            }
-        }
-    }
-    if in_tok {
-        out.push((cur, was_quoted));
-    }
-    out
-}
-
-/// 解析行中的 heredoc 起始标记（`<<EOF` / `<<'EOF'` / `<<-EOF` 等；排除 here-string `<<<`）。
-fn parse_heredoc_start(line: &str) -> Option<(String, bool)> {
-    let bytes = line.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let b = bytes[i];
-        if escaped {
-            escaped = false;
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\\' if !in_single => {
-                escaped = true;
-                i += 1;
-            }
-            b'\'' if !in_double => {
-                in_single = !in_single;
-                i += 1;
-            }
-            b'"' if !in_single => {
-                in_double = !in_double;
-                i += 1;
-            }
-            b'<' if !in_single && !in_double && bytes[i + 1] == b'<' => {
-                if i + 2 < bytes.len() && bytes[i + 2] == b'<' {
-                    i += 3;
-                    continue;
-                }
-                let mut j = i + 2;
-                let strip_tabs = if j < bytes.len() && bytes[j] == b'-' {
-                    j += 1;
-                    true
-                } else {
-                    false
-                };
-                let rest = line[j..].trim_start();
-                let mut delim = String::new();
-                for ch in rest.chars() {
-                    if ch.is_ascii_whitespace() || ch == ';' || ch == '&' || ch == '|' {
-                        break;
-                    }
-                    if ch != '\'' && ch != '"' && ch != '\\' {
-                        delim.push(ch);
-                    }
-                }
-                if !delim.is_empty() {
-                    return Some((delim, strip_tabs));
-                }
-                i = j;
-            }
-            _ => i += 1,
-        }
-    }
-    None
 }
 
 /// 判断 workflow 是否由主 CI / 合并队列 / 可复用 CI 门禁触发（不因改名、merge_group 或
-/// reusable workflow 而绕过 `rustc --version` 守卫）。
+/// reusable workflow 而绕过工具链校验守卫）。
 fn workflow_triggers_on_push_or_pr(root_map: &serde_yaml::Mapping) -> bool {
     let on_val = root_map
         .get(YamlValue::String("on".to_string()))
@@ -850,250 +603,57 @@ fn workflow_triggers_on_push_or_pr(root_map: &serde_yaml::Mapping) -> bool {
     }
 }
 
-fn strip_inline_comment(line: &str) -> &str {
-    let mut in_single = false;
-    let mut in_double = false;
-    let bytes = line.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'#' if !in_single && !in_double && (i == 0 || bytes[i - 1].is_ascii_whitespace()) => {
-                return &line[..i];
-            }
-            _ => {}
-        }
-    }
-    line
+fn is_standard_ci_shell(shell: &str) -> bool {
+    matches!(shell.trim(), "bash" | "sh" | "pwsh" | "cmd")
 }
 
-fn is_grep_assertion(rhs: &str, expected_version: &str) -> bool {
-    let rhs = rhs.trim();
-    let Some(rest) = rhs
-        .strip_prefix("grep")
-        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
-    else {
+/// 防止 workflow/job 通过 `defaults.run.shell: "true {0}"` 静默吞掉规范步骤。
+fn defaults_shell_is_safe(map: &serde_yaml::Mapping) -> bool {
+    let Some(defaults) = map.get(YamlValue::String("defaults".to_string())) else {
+        return true;
+    };
+    let Some(defaults_map) = defaults.as_mapping() else {
         return false;
     };
-    let tokens = shell_tokens(rest);
-    let mut expect_pattern = false;
-    let mut after_double_dash = false;
-    // 扫描全部 token（GNU grep 允许把 `-v` 等选项写在模式之后，如 `grep -q 'pat' -v`）。
-    for (token, was_quoted) in &tokens {
-        if expect_pattern {
-            if token.is_empty() {
-                return false;
-            }
-            expect_pattern = false;
-            continue;
-        }
-        if !after_double_dash && !*was_quoted {
-            if token == "--" {
-                after_double_dash = true;
-                continue;
-            }
-            if token == "--invert-match"
-                || token == "-f"
-                || token == "--file"
-                || token.starts_with("--file=")
-            {
-                return false;
-            }
-            if token == "-e" || token == "--regexp" {
-                expect_pattern = true;
-                continue;
-            }
-            if let Some(pat) = token.strip_prefix("--regexp=") {
-                if pat.is_empty() {
-                    return false;
-                }
-                continue;
-            }
-            if token.starts_with('-') && !token.starts_with("--") {
-                let flags = &token[1..];
-                if flags.contains('v') || flags.contains('f') {
-                    return false;
-                }
-                if let Some(idx) = flags.find('e') {
-                    if flags[idx + 1..].is_empty() {
-                        expect_pattern = true;
-                    }
-                }
-            }
-        }
-    }
-    if expect_pattern {
-        return false;
-    }
-    contains_version_token(rest, expected_version)
-}
-
-fn line_disables_errexit(line: &str) -> bool {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.first().copied() != Some("set") {
-        return false;
-    }
-    tokens
-        .iter()
-        .skip(1)
-        .any(|&tok| tok.starts_with('+') && !tok.starts_with("++") && tok[1..].contains('e'))
-        || tokens.windows(2).any(|w| w[0] == "+o" && w[1] == "errexit")
-}
-
-fn line_enables_errexit(line: &str) -> bool {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.first().copied() != Some("set") {
-        return false;
-    }
-    tokens
-        .iter()
-        .skip(1)
-        .any(|&tok| tok.starts_with('-') && !tok.starts_with("--") && tok[1..].contains('e'))
-        || tokens.windows(2).any(|w| w[0] == "-o" && w[1] == "errexit")
-}
-
-fn update_block_depth(line: &str, block_depth: &mut usize) -> bool {
-    let first = line
-        .split(|c: char| c.is_ascii_whitespace() || c == ';')
-        .next()
-        .unwrap_or("");
-    let closes_block = matches!(first, "fi" | "done" | "esac" | "}");
-    let opens_block = matches!(first, "if" | "for" | "while" | "until" | "case")
-        || line == "{"
-        || line.ends_with(" {");
-    if closes_block {
-        *block_depth = block_depth.saturating_sub(1);
+    let Some(run_val) = defaults_map.get(YamlValue::String("run".to_string())) else {
         return true;
+    };
+    let Some(run_map) = run_val.as_mapping() else {
+        return false;
+    };
+    match run_map.get(YamlValue::String("shell".to_string())) {
+        None => true,
+        Some(YamlValue::String(s)) => is_standard_ci_shell(s),
+        Some(_) => false,
     }
-    if opens_block {
-        // 单行 `if ...; then ...; fi` 不改变净深度，但本身也不是顶层断言。
-        let closed_same_line = line.ends_with("; fi")
-            || line.ends_with(" fi")
-            || line.ends_with("; done")
-            || line.ends_with(" done")
-            || line.ends_with("; esac")
-            || line.ends_with(" esac")
-            || line.ends_with('}');
-        if !closed_same_line {
-            *block_depth += 1;
-        }
-        return true;
-    }
-    false
 }
 
-fn step_verifies_rustc_version(run_script: &str, expected_version: &str) -> bool {
-    let mut captured_vars: Vec<String> = Vec::new();
-    let mut errexit_disabled = false;
-    let mut heredoc_end: Option<(String, bool)> = None;
-    let mut block_depth: usize = 0;
-    for raw_line in run_script.lines() {
-        if let Some((ref delim, strip_tabs)) = heredoc_end {
-            let candidate = if strip_tabs {
-                raw_line.trim_start_matches('\t')
-            } else {
-                raw_line
-            };
-            if candidate == delim {
-                heredoc_end = None;
-            }
-            continue;
-        }
-        let line = strip_inline_comment(raw_line).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(hd) = parse_heredoc_start(line) {
-            heredoc_end = Some(hd);
-            continue;
-        }
-        if update_block_depth(line, &mut block_depth) {
-            continue;
-        }
-        if block_depth > 0 {
-            continue;
-        }
-        if line_disables_errexit(line) {
-            errexit_disabled = true;
-            continue;
-        }
-        if line_enables_errexit(line) {
-            errexit_disabled = false;
-            continue;
-        }
-        if suppresses_failure(line) {
-            continue;
-        }
-        // `set +e` / `set +o errexit` 生效期间，裸断言失败不会终止步骤，必须带显式失败的 `||` 兜底。
-        if errexit_disabled && !contains_unquoted_seq(line, b"||") {
-            continue;
-        }
-        // 记录 `VAR=$(rustc --version)` 或 `VAR="$(rustc --version)"` 赋值。
-        if let Some((lhs, rhs)) = line.split_once('=') {
-            let var = lhs.trim();
-            let rhs_trimmed = rhs.trim().trim_matches('"').trim_matches('\'');
-            if !var.is_empty()
-                && var.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                && (rhs_trimmed == "$(rustc --version)" || rhs_trimmed == "`rustc --version`")
-            {
-                captured_vars.push(var.to_string());
-                continue;
-            }
-        }
-        // 形态 1：`rustc --version | grep ... '<expected>'`（禁止多级管道掩盖退出码，拒绝 echo/注释伪造）。
-        if let Some((lhs, rhs)) = line.split_once('|') {
-            if !rhs.starts_with('|') {
-                let lhs = lhs.trim();
-                let grep_stage = match find_unquoted_seq(rhs, b"||") {
-                    Some(idx) => rhs[..idx].trim(),
-                    None => rhs.trim(),
-                };
-                if lhs == "rustc --version"
-                    && !contains_unquoted_seq(grep_stage, b"|")
-                    && is_grep_assertion(grep_stage, expected_version)
-                {
-                    return true;
-                }
-            }
-        }
-        // 形态 2：shell 条件断言 `[[ "$(rustc --version)" == "rustc <ver>"* ]]` /
-        //        `[[ "$ver" == "rustc <ver>"* ]]`（拒绝 `!` 取反、`!=` 或 `-o`/`||` 逻辑或放行）。
-        let expr = match find_unquoted_seq(line, b"||") {
-            Some(idx) => line[..idx].trim(),
-            None => line.trim(),
-        };
-        let inner = expr
-            .strip_prefix("[[ ")
-            .and_then(|s| s.strip_suffix(" ]]"))
-            .or_else(|| expr.strip_prefix("[ ").and_then(|s| s.strip_suffix(" ]")))
-            .or_else(|| expr.strip_prefix("test "));
-        if let Some(inner) = inner {
-            let tokens = shell_tokens(inner);
-            let has_unsafe_op = tokens.iter().any(|(tok, quoted)| {
-                !*quoted
-                    && (tok == "!"
-                        || tok == "!="
-                        || tok == "-o"
-                        || tok == "||"
-                        || tok.starts_with('!'))
-            });
-            if has_unsafe_op {
-                continue;
-            }
-            let references_rustc = expr.contains("$(rustc --version)")
-                || expr.contains("`rustc --version`")
-                || captured_vars.iter().any(|v| {
-                    expr.contains(&format!("${v}")) || expr.contains(&format!("${{{v}}}"))
-                });
-            let is_positive_cmp =
-                expr.contains("==") || expr.contains(" = ") || expr.contains("=~");
-            if references_rustc && is_positive_cmp && contains_version_token(expr, expected_version)
-            {
-                return true;
-            }
-        }
+fn step_shell_is_safe(step_map: &serde_yaml::Mapping) -> bool {
+    match step_map.get(YamlValue::String("shell".to_string())) {
+        None => true,
+        Some(YamlValue::String(s)) => is_standard_ci_shell(s),
+        Some(_) => false,
     }
-    false
+}
+
+/// 规范单行工具链校验契约：CI job 必须通过 `cargo xtask verify-toolchain <expected_version>`
+/// 在运行期执行真实版本断言，彻底消除对任意 bash 脚本做静态启发式分析的猫鼠游戏。
+fn step_is_canonical_toolchain_verify(
+    step_map: &serde_yaml::Mapping,
+    expected_version: &str,
+) -> bool {
+    if !step_is_unconditional_and_blocking(step_map) || !step_shell_is_safe(step_map) {
+        return false;
+    }
+    let Some(run_script) = yaml_str(step_map, "run") else {
+        return false;
+    };
+    let trimmed = run_script.trim();
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return false;
+    }
+    trimmed == format!("cargo xtask verify-toolchain {expected_version}")
+        || trimmed == format!("cargo xtask verify-toolchain --expected {expected_version}")
 }
 
 fn yaml_is_explicit_false(val: &YamlValue) -> bool {
@@ -1203,10 +763,15 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
             }
         };
         let scanned = scanned_uses(&text);
+        let mut scanned_comments: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
         for (line_no, action_ref, comment) in &scanned {
             if !action_ref.starts_with("dtolnay/rust-toolchain@") {
                 continue;
             }
+            scanned_comments
+                .entry(action_ref.clone())
+                .or_default()
+                .push_back(comment.clone());
             if !allowed_ci_toolchains.contains(comment) {
                 problems.push(format!(
                     "{name}:{line_no}: dtolnay/rust-toolchain 尾注 `{comment}` 必须与 rust-toolchain.toml (`{pinned_channel}`) 或 workspace rust-version ({msrv_version:?}) 一致"
@@ -1217,8 +782,9 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
         let Some(root_map) = doc.as_mapping() else {
             continue;
         };
+        let root_shell_safe = defaults_shell_is_safe(root_map);
         // Rustup 优先级：env.RUSTUP_TOOLCHAIN 高于 rust-toolchain.toml 与 rustup default。
-        // 顶层 env 若声明 RUSTUP_TOOLCHAIN，不得偏离 pinned_channel，且禁止非字符串 YAML 标量绕过。
+        // 顶层 env 若声明 RUSTUP_TOOLCHAIN，不得偏离 pinned_channel，且禁止非字符串/大小写重复键绕过。
         match yaml_lookup_env_var(root_map, "RUSTUP_TOOLCHAIN") {
             YamlScalarLookup::Missing => {}
             YamlScalarLookup::Str(top_tc) => {
@@ -1231,6 +797,11 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
             YamlScalarLookup::NonString(val) => {
                 problems.push(format!(
                     "{name}: workflow 顶层 `env.RUSTUP_TOOLCHAIN` 必须是字符串，实际为非字符串 YAML 值 `{val:?}`（fail closed）"
+                ));
+            }
+            YamlScalarLookup::DuplicateCaseKeys => {
+                problems.push(format!(
+                    "{name}: workflow 顶层 `env` 中存在多个大小写不同的 `RUSTUP_TOOLCHAIN` 键（fail closed）"
                 ));
             }
         }
@@ -1260,10 +831,9 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                     };
                     if let Some(uses_val) = yaml_str(step_map, "uses") {
                         if uses_val.starts_with("dtolnay/rust-toolchain@") {
-                            let comment = scanned
-                                .iter()
-                                .find(|(_, r, _)| r == uses_val)
-                                .map(|(_, _, c)| c.clone())
+                            let comment = scanned_comments
+                                .get_mut(uses_val)
+                                .and_then(VecDeque::pop_front)
                                 .unwrap_or_default();
                             if !comment.is_empty() {
                                 job_toolchain_from_action = Some(comment.clone());
@@ -1296,6 +866,7 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                                             "{name}:{job_name}: dtolnay/rust-toolchain 的 `with.toolchain` 必须是字符串，实际为非字符串 YAML 值 `{val:?}`（fail closed）"
                                         ));
                                     }
+                                    YamlScalarLookup::DuplicateCaseKeys => {}
                                 }
                             }
                         }
@@ -1319,6 +890,11 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                             "{name}:{job_name}: job 级 `env.RUSTUP_TOOLCHAIN` 必须是字符串，实际为非字符串 YAML 值 `{val:?}`（fail closed）"
                         ));
                     }
+                    YamlScalarLookup::DuplicateCaseKeys => {
+                        problems.push(format!(
+                            "{name}:{job_name}: job 级 `env` 中存在多个大小写不同的 `RUSTUP_TOOLCHAIN` 键（fail closed）"
+                        ));
+                    }
                     YamlScalarLookup::Missing => {
                         if expected_job_tc != pinned_channel {
                             problems.push(format!(
@@ -1327,6 +903,8 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                         }
                     }
                 }
+
+                let job_shell_safe = root_shell_safe && defaults_shell_is_safe(job_map);
 
                 for step in steps {
                     let Some(step_map) = step.as_mapping() else {
@@ -1346,14 +924,17 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                                 "{name}:{job_name}: step 级 `env.RUSTUP_TOOLCHAIN` 必须是字符串，实际为非字符串 YAML 值 `{val:?}`（fail closed）"
                             ));
                         }
-                    }
-                    if let Some(run_script) = yaml_str(step_map, "run") {
-                        if job_is_blocking_ci(job_map)
-                            && step_is_unconditional_and_blocking(step_map)
-                            && step_verifies_rustc_version(run_script, expected_job_tc)
-                        {
-                            has_rustc_version_check = true;
+                        YamlScalarLookup::DuplicateCaseKeys => {
+                            problems.push(format!(
+                                "{name}:{job_name}: step 级 `env` 中存在多个大小写不同的 `RUSTUP_TOOLCHAIN` 键（fail closed）"
+                            ));
                         }
+                    }
+                    if job_shell_safe
+                        && job_is_blocking_ci(job_map)
+                        && step_is_canonical_toolchain_verify(step_map, expected_job_tc)
+                    {
+                        has_rustc_version_check = true;
                     }
                 }
 
@@ -1364,7 +945,7 @@ pub(crate) fn check_toolchain_pin_and_ci_sync(
                     && !has_rustc_version_check
                 {
                     problems.push(format!(
-                        "{name}:{job_name}: CI workflow 中安装 Rust 工具链的 job 必须显式校验实际生效的 `rustc --version` 为 `{expected_job_tc}`"
+                        "{name}:{job_name}: CI workflow 中安装 Rust 工具链的 job 必须包含无条件阻断的规范校验步骤 `cargo xtask verify-toolchain {expected_job_tc}`"
                     ));
                 }
             }
@@ -1992,7 +1573,9 @@ mod tests {
             "{problems3:?}"
         );
         assert!(
-            problems3.iter().any(|p| p.contains("rustc --version")),
+            problems3
+                .iter()
+                .any(|p| p.contains("verify-toolchain 1.98.1")),
             "{problems3:?}"
         );
     }
@@ -2166,86 +1749,83 @@ version = "0.1.3"
     }
 
     #[test]
-    fn rustc_version_guard_rejects_echo_comments_and_non_failing_steps() {
-        // 真实会失败的断言必须放行。
-        assert!(step_verifies_rustc_version(
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 '",
+    fn r5_canonical_toolchain_verify_contract_replaces_shell_heuristics() {
+        let make_step = |yaml: &str| -> serde_yaml::Mapping {
+            serde_yaml::from_str::<YamlValue>(yaml)
+                .unwrap()
+                .as_mapping()
+                .unwrap()
+                .clone()
+        };
+
+        // 1. Only exact single-line canonical `cargo xtask verify-toolchain <ver>` passes.
+        assert!(step_is_canonical_toolchain_verify(
+            &make_step("run: cargo xtask verify-toolchain 1.98.1\n"),
             "1.98.1"
         ));
-        assert!(step_verifies_rustc_version(
-            "[[ \"$(rustc --version)\" == \"rustc 1.98.1 \"* ]]",
+        assert!(step_is_canonical_toolchain_verify(
+            &make_step("run: cargo xtask verify-toolchain --expected 1.98.1\n"),
             "1.98.1"
         ));
-        assert!(step_verifies_rustc_version(
-            "ver=\"$(rustc --version)\"\n[[ \"$ver\" == \"rustc 1.98.1 \"* ]] || exit 1",
-            "1.98.1"
-        ));
-        assert!(step_verifies_rustc_version(
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || { echo bad >&2; exit 1; }",
+        assert!(step_is_canonical_toolchain_verify(
+            &make_step(
+                "continue-on-error: false\nshell: bash\nrun: cargo xtask verify-toolchain 1.98.1\n"
+            ),
             "1.98.1"
         ));
 
-        // 任何不会失败的提示、注释、吞错、取反或前缀误匹配都必须拒绝。
-        for bad in [
-            "echo \"hint: rustc --version should be rustc 1.98.1\"",
-            "printf 'rustc --version | grep -q \"^rustc 1.98.1 \"\\n'",
-            "# rustc --version | grep -q '^rustc 1\\.98\\.1 '",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || true",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || exit 0",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || sleep 0",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || { exit 0; }",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || return 0",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' | cat",
-            "rustc --version | grep -qv '^rustc 1\\.98\\.1 '",
-            "rustc --version | grep -q '^rustc 1\\.98\\.10 '",
-            "rustc --version; echo \"expected rustc 1.98.1\"",
+        // 2. Arbitrary bash scripts, pipelines, shell bypasses, custom shells, wrong versions,
+        //    and conditional/non-blocking steps are ALL structurally rejected.
+        for bad_step_yaml in [
+            "run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+            "run: cargo xtask verify-toolchain 1.98.1 || true\n",
+            "run: cargo xtask verify-toolchain 1.98.1; exit 0\n",
+            "run: cargo xtask verify-toolchain 1.98.1 &\n",
+            "run: cargo xtask verify-toolchain 1.98.10\n",
+            "run: |\n  set +e\n  cargo xtask verify-toolchain 1.98.1\n",
+            "run: |\n  if false; then\n    cargo xtask verify-toolchain 1.98.1\n  fi\n",
+            "shell: true {0}\nrun: cargo xtask verify-toolchain 1.98.1\n",
+            "if: false\nrun: cargo xtask verify-toolchain 1.98.1\n",
+            "continue-on-error: true\nrun: cargo xtask verify-toolchain 1.98.1\n",
         ] {
             assert!(
-                !step_verifies_rustc_version(bad, "1.98.1"),
-                "非失败断言 `{bad}` 必须被工具链守卫拒绝"
+                !step_is_canonical_toolchain_verify(&make_step(bad_step_yaml), "1.98.1"),
+                "非规范步骤必须被拒绝:\n{bad_step_yaml}"
             );
         }
 
-        // 端到端 workflow 级反例：ci.yml 仅含 echo 提示必须判红。
-        let tmp = TempDir::new("echo-rustc-guard");
-        let wf_dir = tmp.path.join(".github").join("workflows");
-        std::fs::create_dir_all(&wf_dir).unwrap();
-        std::fs::write(
-            tmp.path.join("rust-toolchain.toml"),
-            "[toolchain]\nchannel = \"1.98.1\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            wf_dir.join("ci.yml"),
-            "permissions:\n  contents: read\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: 'echo \"hint: rustc --version should be rustc 1.98.1\"'\n",
-        )
-        .unwrap();
-        let problems = check_toolchain_pin_and_ci_sync(&tmp.path, &wf_dir);
-        assert!(
-            problems.iter().any(|p| p.contains("rustc --version")),
-            "仅含 echo 提示的 workflow 必须触发版本校验缺失告警：{problems:?}"
-        );
-
-        // 带 `if: false`、`if: ${{ false }}`、条件 `if:`、`continue-on-error: true`、
-        // `continue-on-error: ${{ true }}` 或 job 级 `continue-on-error: true` 的版本断言
-        // 不能阻断 CI，必须全部拒绝。
-        for (label, job_extra, step_extra) in [
-            ("step-if-false", "", "        if: false\n"),
-            ("step-if-expr-false", "", "        if: ${{ false }}\n"),
+        // 3. End-to-end workflow checks: non-blocking job/step, custom defaults.run.shell,
+        //    case-insensitive `rustup_toolchain`, and renamed/merge_group/workflow_call triggers.
+        for (label, job_extra, step_extra, wf_extra) in [
+            ("step-if-false", "", "        if: false\n", ""),
+            ("step-if-expr-false", "", "        if: ${{ false }}\n", ""),
             (
                 "step-if-cond",
                 "",
                 "        if: github.event_name == 'release'\n",
+                "",
             ),
-            ("step-coe-true", "", "        continue-on-error: true\n"),
+            ("step-coe-true", "", "        continue-on-error: true\n", ""),
             (
                 "step-coe-expr",
                 "",
                 "        continue-on-error: ${{ true }}\n",
+                "",
             ),
-            ("job-coe-true", "    continue-on-error: true\n", ""),
-            ("job-if-false", "    if: false\n", ""),
-            ("job-if-expr-false", "    if: ${{ false }}\n", ""),
+            ("job-coe-true", "    continue-on-error: true\n", "", ""),
+            ("job-if-false", "    if: false\n", "", ""),
+            (
+                "custom-defaults-shell",
+                "    defaults:\n      run:\n        shell: true {0}\n",
+                "",
+                "",
+            ),
+            (
+                "root-defaults-shell",
+                "",
+                "",
+                "defaults:\n  run:\n    shell: true {0}\n",
+            ),
         ] {
             let tmp_nb = TempDir::new(label);
             let wf_nb = tmp_nb.path.join(".github").join("workflows");
@@ -2256,17 +1836,19 @@ version = "0.1.3"
             )
             .unwrap();
             let yaml = format!(
-                "permissions:\n  contents: read\njobs:\n  lint:\n    runs-on: ubuntu-latest\n{job_extra}    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n{step_extra}"
+                "permissions:\n  contents: read\n{wf_extra}jobs:\n  lint:\n    runs-on: ubuntu-latest\n{job_extra}    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo xtask verify-toolchain 1.98.1\n{step_extra}"
             );
             std::fs::write(wf_nb.join("ci.yml"), yaml).unwrap();
             let nb_problems = check_toolchain_pin_and_ci_sync(&tmp_nb.path, &wf_nb);
             assert!(
-                nb_problems.iter().any(|p| p.contains("rustc --version")),
-                "非阻断版本断言夹具 `{label}` 必须被拒绝：{nb_problems:?}"
+                nb_problems
+                    .iter()
+                    .any(|p| p.contains("verify-toolchain 1.98.1")),
+                "非阻断/自定义 shell 夹具 `{label}` 必须被拒绝：{nb_problems:?}"
             );
         }
 
-        // 显式 `continue-on-error: false` 且无 `if:` 的版本断言可阻断 CI，应放行。
+        // 4. Explicit `continue-on-error: false` with canonical verify-toolchain passes.
         let tmp_ok = TempDir::new("step-coe-false");
         let wf_ok = tmp_ok.path.join(".github").join("workflows");
         std::fs::create_dir_all(&wf_ok).unwrap();
@@ -2277,72 +1859,23 @@ version = "0.1.3"
         .unwrap();
         std::fs::write(
             wf_ok.join("ci.yml"),
-            "permissions:\n  contents: read\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - continue-on-error: false\n        run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+            "permissions:\n  contents: read\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - continue-on-error: false\n        run: cargo xtask verify-toolchain 1.98.1\n",
         )
         .unwrap();
         let ok_problems = check_toolchain_pin_and_ci_sync(&tmp_ok.path, &wf_ok);
         assert!(
             ok_problems.is_empty(),
-            "显式 continue-on-error: false 的阻断断言应放行：{ok_problems:?}"
+            "显式 continue-on-error: false 的规范步骤应放行：{ok_problems:?}"
         );
 
-        // 改名后的 push / pull_request CI workflow 也必须强制校验 rustc --version；
-        // 仅 workflow_dispatch 的手工任务不受该条约束。
-        let tmp_renamed = TempDir::new("renamed-pr-workflow");
-        let wf_renamed = tmp_renamed.path.join(".github").join("workflows");
-        std::fs::create_dir_all(&wf_renamed).unwrap();
-        std::fs::write(
-            tmp_renamed.path.join("rust-toolchain.toml"),
-            "[toolchain]\nchannel = \"1.98.1\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            wf_renamed.join("rust-ci.yml"),
-            "on: [push, pull_request]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo test\n",
-        )
-        .unwrap();
-        std::fs::write(
-            wf_renamed.join("manual.yml"),
-            "on: workflow_dispatch\npermissions:\n  contents: read\njobs:\n  manual:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo test\n",
-        )
-        .unwrap();
-        let renamed_problems = check_toolchain_pin_and_ci_sync(&tmp_renamed.path, &wf_renamed);
-        assert!(
-            renamed_problems
-                .iter()
-                .any(|p| p.contains("rust-ci.yml") && p.contains("rustc --version")),
-            "改名的 push/pull_request workflow 必须受 rustc --version 守卫约束：{renamed_problems:?}"
-        );
-        assert!(
-            !renamed_problems.iter().any(|p| p.contains("manual.yml")),
-            "仅 workflow_dispatch 的 workflow 不应被误报：{renamed_problems:?}"
-        );
-    }
-
-    #[test]
-    fn r2_p2_rustc_guard_rejects_early_exit0_mod256_semicolon_bg_and_set_plus_e() {
-        for bypass in [
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || { exit 0; exit 1; }",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || exit 256",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || exit -256",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 '; true",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 '; exit 0",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' &",
-            "set +e\nrustc --version | grep -q '^rustc 1\\.98\\.1 '",
-            "set +o errexit\nrustc --version | grep -q '^rustc 1\\.98\\.1 '",
-        ] {
-            assert!(
-                !step_verifies_rustc_version(bypass, "1.98.1"),
-                "绕过写法 `{bypass}` 必须被 rustc --version 守卫拒绝"
-            );
-        }
-
-        // merge_group 与 workflow_call 触发的 CI workflow 也必须强制校验 rustc --version。
-        for (name, trigger) in [
+        // 5. Renamed CI workflows (push/pull_request/merge_group/workflow_call) enforce the contract;
+        //    manual workflow_dispatch does not.
+        for (wf_name, trigger) in [
+            ("rust-ci.yml", "on: [push, pull_request]"),
             ("merge-group.yml", "on: merge_group"),
             ("reusable.yml", "on: workflow_call"),
         ] {
-            let tmp = TempDir::new(name);
+            let tmp = TempDir::new(wf_name);
             let wf_dir = tmp.path.join(".github").join("workflows");
             std::fs::create_dir_all(&wf_dir).unwrap();
             std::fs::write(
@@ -2351,7 +1884,7 @@ version = "0.1.3"
             )
             .unwrap();
             std::fs::write(
-                wf_dir.join(name),
+                wf_dir.join(wf_name),
                 format!("{trigger}\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo test\n"),
             )
             .unwrap();
@@ -2359,35 +1892,43 @@ version = "0.1.3"
             assert!(
                 problems
                     .iter()
-                    .any(|p| p.contains(name) && p.contains("rustc --version")),
-                "{trigger} workflow 必须受 rustc --version 守卫约束：{problems:?}"
+                    .any(|p| p.contains(wf_name) && p.contains("verify-toolchain 1.98.1")),
+                "{trigger} workflow 必须要求规范 verify-toolchain 步骤：{problems:?}"
             );
         }
-    }
 
-    #[test]
-    fn r3_p2_rustc_guard_rejects_set_plus_eu_and_and_inverted_grep_heredoc() {
-        for bypass in [
-            "set +eu\nrustc --version | grep -q '^rustc 1\\.98\\.1 '",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' && echo ok",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' || { true && exit 0; exit 1; }",
-            "[[ ! \"$(rustc --version)\" == \"rustc 1.98.1 \"* ]]",
-            "[ \"$(rustc --version)\" = \"rustc 1.98.1 \" -o 1 = 1 ]",
-            "rustc --version | grep -q '^rustc 1\\.98\\.1 ' -v",
-            "rustc --version | grep -q -e '' -e '^rustc 1\\.98\\.1 '",
-            "if false; then\n  rustc --version | grep -q '^rustc 1\\.98\\.1 '\nfi",
-            "cat <<'EOF'\nrustc --version | grep -q '^rustc 1\\.98\\.1 '\nEOF",
-        ] {
-            assert!(
-                !step_verifies_rustc_version(bypass, "1.98.1"),
-                "绕过写法 `{bypass}` 必须被 rustc --version 守卫拒绝"
-            );
-        }
-        // Sanity: genuine guard scripts still pass.
-        assert!(step_verifies_rustc_version(
-            "set -euo pipefail\nrustc --version | grep -q '^rustc 1\\.98\\.1 '",
-            "1.98.1"
-        ));
+        // 6. Case-insensitive `rustup_toolchain` and duplicate-SHA different-comment jobs are caught.
+        let tmp_ci = TempDir::new("case-and-dup-sha");
+        let wf_ci = tmp_ci.path.join(".github").join("workflows");
+        std::fs::create_dir_all(&wf_ci).unwrap();
+        std::fs::write(
+            tmp_ci.path.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.98.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp_ci.path.join("Cargo.toml"),
+            "[workspace.package]\nrust-version = \"1.85\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf_ci.join("ci.yml"),
+            "permissions:\n  contents: read\nenv:\n  rustup_toolchain: stable\njobs:\n  first:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo xtask verify-toolchain 1.98.1\n  second:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.85.0\n      - run: cargo xtask verify-toolchain 1.98.1\n",
+        )
+        .unwrap();
+        let ci_problems = check_toolchain_pin_and_ci_sync(&tmp_ci.path, &wf_ci);
+        assert!(
+            ci_problems
+                .iter()
+                .any(|p| p.contains("顶层 `env.RUSTUP_TOOLCHAIN`") && p.contains("stable")),
+            "小写 rustup_toolchain 覆写必须被拦截：{ci_problems:?}"
+        );
+        assert!(
+            ci_problems
+                .iter()
+                .any(|p| p.contains("ci.yml:second") && p.contains("1.85.0")),
+            "重复 SHA 的第二个 job 必须匹配其自身尾注 `1.85.0` 而非复用首个 job 尾注：{ci_problems:?}"
+        );
     }
 
     #[test]
@@ -2397,27 +1938,27 @@ version = "0.1.3"
         let cases = [
             (
                 "top-env-float",
-                "env:\n  RUSTUP_TOOLCHAIN: 1.90\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+                "env:\n  RUSTUP_TOOLCHAIN: 1.90\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo xtask verify-toolchain 1.98.1\n",
             ),
             (
                 "top-env-bool",
-                "env:\n  RUSTUP_TOOLCHAIN: true\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+                "env:\n  RUSTUP_TOOLCHAIN: true\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo xtask verify-toolchain 1.98.1\n",
             ),
             (
                 "job-env-float",
-                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    env:\n      RUSTUP_TOOLCHAIN: 1.90\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    env:\n      RUSTUP_TOOLCHAIN: 1.90\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - run: cargo xtask verify-toolchain 1.98.1\n",
             ),
             (
                 "step-env-null",
-                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - env:\n          RUSTUP_TOOLCHAIN: null\n        run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n      - env:\n          RUSTUP_TOOLCHAIN: null\n        run: cargo xtask verify-toolchain 1.98.1\n",
             ),
             (
                 "with-toolchain-float",
-                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n        with:\n          toolchain: 1.90\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n        with:\n          toolchain: 1.90\n      - run: cargo xtask verify-toolchain 1.98.1\n",
             ),
             (
                 "with-toolchain-bool",
-                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n        with:\n          toolchain: true\n      - run: \"rustc --version | grep -q '^rustc 1\\\\.98\\\\.1 '\"\n",
+                "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@01e2821fc38dbca62c2557c927b33938a2e005fd # 1.98.1\n        with:\n          toolchain: true\n      - run: cargo xtask verify-toolchain 1.98.1\n",
             ),
         ];
 

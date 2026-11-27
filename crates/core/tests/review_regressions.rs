@@ -3368,3 +3368,97 @@ async fn r4_p1_concurrent_load_and_update_with_never_splits_volatile_or_bypasses
     );
     app.close().await;
 }
+
+#[tokio::test]
+async fn r5_p1_fail_closed_fiber_cannot_be_resurrected_by_update_and_sync_filter_panic_is_caught() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 1. Fail-closed fiber on disposed parent MUST be terminal (UID_DISPOSED) so `update()`
+    //    cannot resurrect it into an untracked Active zombie escaping `App::close()`.
+    let app = App::new();
+    let parent = app.root.plugin(
+        plugin_fn("r5-parent", Inject::default(), |_ctx, _| {
+            Box::pin(async { Ok(()) })
+        }),
+        Config::Null,
+    );
+    parent.settle().await;
+    let parent_ctx = parent.ctx();
+    parent.dispose().await;
+    assert_eq!(parent.state(), FiberState::Disposed);
+
+    let applies = Arc::new(AtomicUsize::new(0));
+    let applies_c = applies.clone();
+    let rejected = app.store.plugin(
+        &parent_ctx,
+        plugin_fn("r5-zombie-candidate", Inject::default(), move |_ctx, _| {
+            let applies_c = applies_c.clone();
+            Box::pin(async move {
+                applies_c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }),
+        Config::Null,
+        Inject::default(),
+    );
+    assert_eq!(rejected.state(), FiberState::Failed);
+    assert!(
+        rejected.is_disposed(),
+        "fail-closed 拒绝态 fiber 必须已置 UID_DISPOSED 终态"
+    );
+    let update_res = rejected.update(json!({"try": "resurrect"})).await;
+    assert!(
+        update_res.is_err(),
+        "fail-closed 拒绝态 fiber 不得被 update() 复活: {update_res:?}"
+    );
+    assert_eq!(rejected.state(), FiberState::Failed);
+    assert_eq!(
+        applies.load(Ordering::SeqCst),
+        0,
+        "fail-closed 拒绝态 fiber 的 apply() 绝对不能执行"
+    );
+    app.close().await;
+
+    // 2. Synchronous panic inside a `ScopePredicate` (`ctx.filter(...)`) is caught inside
+    //    `hook_scope` (never crashing `resolve_config` or stranding the fiber in `Loading`),
+    //    and a panic inside an `internal/config` handler itself transitions cleanly to `Failed`.
+    let app2 = App::new();
+    let filtered = app2
+        .root
+        .filter(Arc::new(|_| panic!("boom in sync scope predicate")));
+    let _hook = filtered.on("internal/config", |call| {
+        Box::pin(async move { call.next.call(call.args).await })
+    });
+    let f = app2.root.plugin(
+        plugin_fn("r5-sync-filter-panic", Inject::default(), |_ctx, _| {
+            Box::pin(async { Ok(()) })
+        }),
+        json!({"ok": true}),
+    );
+    f.settle().await;
+    assert_eq!(
+        f.state(),
+        FiberState::Active,
+        "单个坏 ScopePredicate panic 不得导致无关 fiber 崩溃或滞留 Loading"
+    );
+
+    let _bad_cfg = app2.root.on("internal/config", |_call| {
+        Box::pin(async move {
+            panic!("boom inside internal/config handler");
+        })
+    });
+    let f2 = app2.root.plugin(
+        plugin_fn("r5-cfg-handler-panic", Inject::default(), |_ctx, _| {
+            Box::pin(async { Ok(()) })
+        }),
+        json!({"ok": true}),
+    );
+    f2.settle().await;
+    assert_eq!(
+        f2.state(),
+        FiberState::Failed,
+        "internal/config handler panic 必须收敛到 Failed 而非滞留 Loading"
+    );
+    assert!(f2.error().is_some());
+    app2.close().await;
+}

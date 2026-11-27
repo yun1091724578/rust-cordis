@@ -1114,367 +1114,125 @@ impl JsExpr {
     }
 }
 
-/// 检查从 `rest` 开始的行尾是否是合法 YAML 块标量头（`|` / `>` + 可选 chomp/indent + 可选注释）。
-fn is_block_scalar_header(rest: &str) -> bool {
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    let mut seen_chomp = false;
-    let mut seen_indent = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' | b'-' if !seen_chomp => {
-                seen_chomp = true;
-                i += 1;
-            }
-            b'1'..=b'9' if !seen_indent => {
-                seen_indent = true;
-                i += 1;
-            }
-            _ => break,
-        }
-    }
-    let mut saw_ws = false;
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
-        saw_ws = true;
-        i += 1;
-    }
-    if i == bytes.len() || bytes[i] == b'\r' {
-        return true;
-    }
-    bytes[i] == b'#' && (saw_ws || i == 0)
-}
-
-/// 把标签 token `from` 改写为 `to`，按 YAML 行上下文状态机区分：
-/// - 单/双引号标量（可跨行，`''` 与 `\` 转义）；
-/// - 块标量正文（`|` / `>`，按所属键或 `-` 基准缩进整体原样透传）；
-/// - 普通标量（单行与多行续行中的 `'` / `"` 均为字面字符，绝不开启引号态）；
-/// - 注释（空白或行首后的 `#` 到行尾）。
+/// 使用 `unsafe-libyaml` 真实 YAML 词法扫描器（`yaml_parser_scan`）定位所有匹配
+/// `(from_handle, from_suffix)` 的真实 `YAML_TAG_TOKEN`（如 `("!!", "js")` 或
+/// `("!", "cordis-js")`），并按 libyaml 返回的精确 UTF-8 字节偏移原地替换为 `replacement`。
 ///
-/// 同时服务于解析（`!!js` → `!cordis-js`）与回写（反向），双向对称且无损。
-fn rewrite_tag_outside_quotes(input: &str, from: &str, to: &str) -> String {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum LineState {
-        ExpectToken,
-        PlainScalar,
-        AfterQuoted,
+/// 相比任何手写文本/行状态机，块标量（含换行 `key:\n  |`）、单/双引号标量、多行普通标量、
+/// flow 集合多行标量、多行引号键、锚点与注释均由 libyaml 完整 YAML 语法机裁决，
+/// 彻底消除“字面量误改写”与“合法 YAML 漏识标签”的打地鼠循环。
+fn rewrite_yaml_tag_tokens(
+    input: &str,
+    from_handle: &str,
+    from_suffix: &str,
+    replacement: &str,
+) -> String {
+    use std::ffi::CStr;
+    use std::mem::MaybeUninit;
+    use std::os::raw::c_char;
+
+    struct ParserGuard(unsafe_libyaml::yaml_parser_t);
+    impl Drop for ParserGuard {
+        fn drop(&mut self) {
+            unsafe {
+                unsafe_libyaml::yaml_parser_delete(&mut self.0);
+            }
+        }
     }
 
-    let mut out = String::with_capacity(input.len());
-    let mut quote: Option<u8> = None;
-    let mut block_scalar: Option<usize> = None;
-    let mut plain_base_indent: Option<usize> = None;
-    let mut flow_depth: usize = 0;
-
-    for raw_line in input.split_inclusive('\n') {
-        let (line, newline) = match raw_line.strip_suffix('\n') {
-            Some(stripped) => (stripped, "\n"),
-            None => (raw_line, ""),
-        };
-        let bytes = line.as_bytes();
-
-        // 若正处于跨行引号标量内，直接在本行继续扫描直到闭合引号或行尾。
-        let mut i = 0;
-        let mut node_indent = 0usize;
-        let mut token_start_col = 0usize;
-        let mut saw_mapping_colon = false;
-        let mut saw_seq_dash = false;
-        let mut allow_block_indicator = true;
-        let mut line_has_plain_value = false;
-        let mut state = LineState::ExpectToken;
-
-        if quote.is_none() {
-            while i < bytes.len() && bytes[i] == b' ' {
-                i += 1;
+    struct TokenGuard(unsafe_libyaml::yaml_token_t);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            unsafe {
+                unsafe_libyaml::yaml_token_delete(&mut self.0);
             }
-            let line_indent = i;
-            let rest_trimmed = line[i..].trim_end_matches([' ', '\t', '\r']);
-            let is_blank = rest_trimmed.is_empty();
-
-            if let Some(base_indent) = block_scalar {
-                if is_blank || line_indent > base_indent {
-                    out.push_str(raw_line);
-                    continue;
-                }
-                block_scalar = None;
-            }
-
-            if flow_depth == 0 {
-                if let Some(base_indent) = plain_base_indent {
-                    if is_blank || line_indent > base_indent {
-                        // 多行普通标量续行：内部 `'`/`"` 和 `!!js` 均是字面正文。
-                        out.push_str(raw_line);
-                        continue;
-                    }
-                    plain_base_indent = None;
-                }
-            }
-
-            out.push_str(&line[..i]);
-            node_indent = line_indent;
         }
+    }
 
-        while i < bytes.len() {
-            let byte = bytes[i];
+    let bytes = input.as_bytes();
+    let mut parser_raw = MaybeUninit::<unsafe_libyaml::yaml_parser_t>::zeroed();
+    if !unsafe { unsafe_libyaml::yaml_parser_initialize(parser_raw.as_mut_ptr()) }.ok {
+        return input.to_string();
+    }
+    let mut parser = ParserGuard(unsafe { parser_raw.assume_init() });
+    unsafe {
+        unsafe_libyaml::yaml_parser_set_encoding(&mut parser.0, unsafe_libyaml::YAML_UTF8_ENCODING);
+        unsafe_libyaml::yaml_parser_set_input_string(
+            &mut parser.0,
+            bytes.as_ptr(),
+            bytes.len() as u64,
+        );
+    }
 
-            if let Some(active) = quote {
-                if byte == active {
-                    if active == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
-                        out.push_str("''");
-                        i += 2;
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    loop {
+        let mut tok_raw = MaybeUninit::<unsafe_libyaml::yaml_token_t>::zeroed();
+        if !unsafe { unsafe_libyaml::yaml_parser_scan(&mut parser.0, tok_raw.as_mut_ptr()) }.ok {
+            // 非法 YAML 原样交回上层 `serde_yaml::from_str` 报告原始语法错误。
+            return input.to_string();
+        }
+        let tok = TokenGuard(unsafe { tok_raw.assume_init() });
+        match tok.0.type_ {
+            unsafe_libyaml::YAML_STREAM_END_TOKEN => break,
+            unsafe_libyaml::YAML_TAG_TOKEN => {
+                let (handle, suffix) = unsafe {
+                    let tag = &tok.0.data.tag;
+                    let h = if tag.handle.is_null() {
+                        ""
                     } else {
-                        quote = None;
-                        state = LineState::AfterQuoted;
-                        out.push(active as char);
-                        i += 1;
-                    }
-                    continue;
-                }
-                if byte == b'\\' && active == b'"' {
-                    let (ch, next) = char_at(line, i);
-                    out.push(ch);
-                    i = next;
-                    if i < bytes.len() {
-                        let (ch, next) = char_at(line, i);
-                        out.push(ch);
-                        i = next;
-                    }
-                    continue;
-                }
-                let (ch, next) = char_at(line, i);
-                out.push(ch);
-                i = next;
-                continue;
-            }
-
-            // YAML 注释必须在行首或紧跟空白之后。
-            if byte == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
-                out.push_str(&line[i..]);
-                break;
-            }
-
-            match state {
-                LineState::ExpectToken => {
-                    if matches!(byte, b' ' | b'\t' | b'\r') {
-                        out.push(byte as char);
-                        i += 1;
-                        continue;
-                    }
-                    if flow_depth == 0
-                        && allow_block_indicator
-                        && matches!(byte, b'-' | b'?')
-                        && bytes
-                            .get(i + 1)
-                            .is_none_or(|next| matches!(next, b' ' | b'\t' | b'\r'))
+                        CStr::from_ptr(tag.handle as *const c_char)
+                            .to_str()
+                            .unwrap_or("")
+                    };
+                    let s = if tag.suffix.is_null() {
+                        ""
+                    } else {
+                        CStr::from_ptr(tag.suffix as *const c_char)
+                            .to_str()
+                            .unwrap_or("")
+                    };
+                    (h, s)
+                };
+                if handle == from_handle && suffix == from_suffix {
+                    let start = tok.0.start_mark.index as usize;
+                    let end = tok.0.end_mark.index as usize;
+                    if start < end
+                        && end <= bytes.len()
+                        && input.is_char_boundary(start)
+                        && input.is_char_boundary(end)
                     {
-                        node_indent = i;
-                        saw_seq_dash = true;
-                        out.push(byte as char);
-                        i += 1;
-                        continue;
+                        spans.push((start, end));
                     }
-                    allow_block_indicator = false;
-
-                    if byte == b'\'' || byte == b'"' {
-                        token_start_col = i;
-                        quote = Some(byte);
-                        out.push(byte as char);
-                        i += 1;
-                        continue;
-                    }
-                    if flow_depth == 0
-                        && (byte == b'|' || byte == b'>')
-                        && is_block_scalar_header(&line[i + 1..])
-                    {
-                        block_scalar = Some(node_indent);
-                        plain_base_indent = None;
-                        out.push_str(&line[i..]);
-                        break;
-                    }
-                    if byte == b'[' || byte == b'{' {
-                        flow_depth += 1;
-                        plain_base_indent = None;
-                        out.push(byte as char);
-                        i += 1;
-                        continue;
-                    }
-                    if byte == b']' || byte == b'}' {
-                        flow_depth = flow_depth.saturating_sub(1);
-                        state = LineState::AfterQuoted;
-                        out.push(byte as char);
-                        i += 1;
-                        continue;
-                    }
-                    if flow_depth > 0 && byte == b',' {
-                        out.push(',');
-                        i += 1;
-                        continue;
-                    }
-                    // 仅在标量起点（ExpectToken）匹配并改写标签，避免误伤普通标量正文。
-                    if line[i..].starts_with(from) {
-                        let after = i + from.len();
-                        if after >= bytes.len()
-                            || matches!(bytes[after], b' ' | b'\t' | b'\r')
-                            || (flow_depth > 0 && matches!(bytes[after], b',' | b']' | b'}'))
-                        {
-                            out.push_str(to);
-                            i = after;
-                            continue;
-                        }
-                    }
-                    // 其他 YAML 标签（`!...`）或锚点（`&...`）：整体跳过并保持 ExpectToken，
-                    // 以便后续紧跟的引号/块标量/`!!js` 仍按标量起点处理。
-                    if byte == b'!' || byte == b'&' {
-                        let start = i;
-                        i += 1;
-                        while i < bytes.len()
-                            && !matches!(bytes[i], b' ' | b'\t' | b'\r')
-                            && !(flow_depth > 0 && matches!(bytes[i], b',' | b']' | b'}'))
-                        {
-                            let (_, next) = char_at(line, i);
-                            i = next;
-                        }
-                        out.push_str(&line[start..i]);
-                        continue;
-                    }
-                    // 冒号直接出现（例如空键 `: val`）也转回 ExpectToken。
-                    if byte == b':'
-                        && bytes
-                            .get(i + 1)
-                            .is_none_or(|next| matches!(next, b' ' | b'\t' | b'\r'))
-                    {
-                        if flow_depth == 0 && !saw_mapping_colon {
-                            saw_mapping_colon = true;
-                        }
-                        out.push(':');
-                        i += 1;
-                        continue;
-                    }
-
-                    // 进入普通标量（plain scalar）：之后本行内空格后的 `'`/`"` 均视为字面字符。
-                    token_start_col = i;
-                    state = LineState::PlainScalar;
-                    if flow_depth == 0 && (saw_mapping_colon || saw_seq_dash) {
-                        line_has_plain_value = true;
-                    }
-                    let (ch, next) = char_at(line, i);
-                    out.push(ch);
-                    i = next;
-                }
-                LineState::PlainScalar => {
-                    let is_colon_sep = byte == b':'
-                        && (bytes
-                            .get(i + 1)
-                            .is_none_or(|next| matches!(next, b' ' | b'\t' | b'\r'))
-                            || (flow_depth > 0
-                                && bytes
-                                    .get(i + 1)
-                                    .is_some_and(|next| matches!(next, b',' | b']' | b'}'))));
-                    if is_colon_sep {
-                        if flow_depth == 0 && !saw_mapping_colon {
-                            node_indent = token_start_col;
-                            saw_mapping_colon = true;
-                            line_has_plain_value = false;
-                        }
-                        state = LineState::ExpectToken;
-                        out.push(':');
-                        i += 1;
-                        continue;
-                    }
-                    if flow_depth > 0 {
-                        if byte == b',' {
-                            state = LineState::ExpectToken;
-                            out.push(',');
-                            i += 1;
-                            continue;
-                        }
-                        if byte == b'[' || byte == b'{' {
-                            flow_depth += 1;
-                            state = LineState::ExpectToken;
-                            out.push(byte as char);
-                            i += 1;
-                            continue;
-                        }
-                        if byte == b']' || byte == b'}' {
-                            flow_depth = flow_depth.saturating_sub(1);
-                            state = LineState::AfterQuoted;
-                            out.push(byte as char);
-                            i += 1;
-                            continue;
-                        }
-                    }
-                    let (ch, next) = char_at(line, i);
-                    out.push(ch);
-                    i = next;
-                }
-                LineState::AfterQuoted => {
-                    if matches!(byte, b' ' | b'\t' | b'\r') {
-                        out.push(byte as char);
-                        i += 1;
-                        continue;
-                    }
-                    if byte == b':'
-                        && (flow_depth > 0
-                            || bytes
-                                .get(i + 1)
-                                .is_none_or(|next| matches!(next, b' ' | b'\t' | b'\r')))
-                    {
-                        if flow_depth == 0 && !saw_mapping_colon {
-                            node_indent = token_start_col;
-                            saw_mapping_colon = true;
-                            line_has_plain_value = false;
-                        }
-                        state = LineState::ExpectToken;
-                        out.push(':');
-                        i += 1;
-                        continue;
-                    }
-                    if flow_depth > 0 && byte == b',' {
-                        state = LineState::ExpectToken;
-                        out.push(',');
-                        i += 1;
-                        continue;
-                    }
-                    if byte == b']' || byte == b'}' {
-                        flow_depth = flow_depth.saturating_sub(1);
-                        out.push(byte as char);
-                        i += 1;
-                        continue;
-                    }
-                    let (ch, next) = char_at(line, i);
-                    out.push(ch);
-                    i = next;
                 }
             }
+            _ => {}
         }
-
-        if quote.is_none() && block_scalar.is_none() && flow_depth == 0 {
-            if line_has_plain_value {
-                plain_base_indent = Some(node_indent);
-            } else {
-                plain_base_indent = None;
-            }
-        }
-        out.push_str(newline);
     }
-    out
-}
 
-fn char_at(input: &str, index: usize) -> (char, usize) {
-    let ch = input[index..]
-        .chars()
-        .next()
-        .expect("index 必须落在字符边界上");
-    (ch, index + ch.len_utf8())
+    if spans.is_empty() {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len() + spans.len() * replacement.len());
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        if start >= cursor {
+            out.push_str(&input[cursor..start]);
+            out.push_str(replacement);
+            cursor = end;
+        }
+    }
+    out.push_str(&input[cursor..]);
+    out
 }
 
 /// 解析前：`!!js`（标准标签，serde_yaml 会丢弃）→ `!cordis-js`（本地标签，能识别）。
 fn mark_js_tags(text: &str) -> String {
-    rewrite_tag_outside_quotes(text, "!!js", JS_TAG)
+    rewrite_yaml_tag_tokens(text, "!!", "js", JS_TAG)
 }
 
 /// 回写后：`!cordis-js` → `!!js`，让磁盘上仍是 cordis 配置的标准写法。
 fn restore_js_tags(text: &str) -> String {
-    rewrite_tag_outside_quotes(text, JS_TAG, "!!js")
+    rewrite_yaml_tag_tokens(text, "!", JS_TAG.trim_start_matches('!'), "!!js")
 }
 
 /// `serde_json::Value` → `serde_yaml::Value`，并把表达式标记还原成**真标签**。
@@ -2020,5 +1778,108 @@ mod review_regression_tests {
             }
         }
         assert!(checked >= 60);
+    }
+
+    #[test]
+    fn r5_p1_libyaml_tag_engine_handles_all_four_yaml_1_2_edge_cases() {
+        // 1. Next-line block scalar header with unclosed quote & literal `!!js` inside block body.
+        let yaml_next_line_block = concat!(
+            "- id: a\n",
+            "  name: llm\n",
+            "  config:\n",
+            "    prompt:\n",
+            "      |\n",
+            "      \"unclosed\n",
+            "      !!js literal-in-block\n",
+            "    token: !!js x\n",
+        );
+        let e1 = parse_entries(yaml_next_line_block).expect("parse next-line block scalar");
+        let cfg1 = e1[0].config.as_ref().unwrap();
+        assert_eq!(
+            cfg1["prompt"].as_str().unwrap(),
+            "\"unclosed\n!!js literal-in-block\n"
+        );
+        assert_eq!(
+            JsExpr::from_value(&cfg1["token"]).map(|e| e.source()),
+            Some("x".to_string())
+        );
+
+        // 2. Next-line multiline plain scalar with apostrophe & literal `!!js` on continuation line.
+        let yaml_next_line_plain = concat!(
+            "- id: a\n",
+            "  name: llm\n",
+            "  config:\n",
+            "    prompt:\n",
+            "      First line\n",
+            "      '90s continuation\n",
+            "      !!js literal-in-plain\n",
+            "    token: !!js x\n",
+        );
+        let e2 = parse_entries(yaml_next_line_plain).expect("parse next-line multiline plain");
+        let cfg2 = e2[0].config.as_ref().unwrap();
+        assert_eq!(
+            cfg2["prompt"].as_str().unwrap(),
+            "First line '90s continuation !!js literal-in-plain"
+        );
+        assert_eq!(
+            JsExpr::from_value(&cfg2["token"]).map(|e| e.source()),
+            Some("x".to_string())
+        );
+
+        // 3. Multiline plain scalar inside flow collection.
+        let yaml_flow_multiline = concat!(
+            "- id: a\n",
+            "  name: llm\n",
+            "  config:\n",
+            "    flow: [\n",
+            "      The\n",
+            "      '90s era,\n",
+            "      !!js x\n",
+            "    ]\n",
+        );
+        let e3 = parse_entries(yaml_flow_multiline).expect("parse flow multiline plain");
+        let flow3 = e3[0].config.as_ref().unwrap()["flow"].as_array().unwrap();
+        assert_eq!(flow3[0], Value::String("The '90s era".to_string()));
+        assert_eq!(
+            JsExpr::from_value(&flow3[1]).map(|e| e.source()),
+            Some("x".to_string())
+        );
+
+        // 4. Explicit multiline quoted mapping key, multiline quoted value containing `!!js`,
+        //    and anchored mapping key with block scalar.
+        let yaml_quoted_and_anchored = concat!(
+            "- id: a\n",
+            "  name: llm\n",
+            "  config:\n",
+            "    ? \"multi\n",
+            "      key\"\n",
+            "    : \"line1\n",
+            "      !!js inside-double-quotes\"\n",
+            "    &k anchored: |\n",
+            "      \"unclosed\n",
+            "    token: !!js y\n",
+        );
+        let e4 = parse_entries(yaml_quoted_and_anchored).expect("parse multiline quoted + anchor");
+        let cfg4 = e4[0].config.as_ref().unwrap();
+        assert_eq!(
+            cfg4["multi key"],
+            Value::String("line1 !!js inside-double-quotes".to_string())
+        );
+        assert_eq!(cfg4["anchored"], Value::String("\"unclosed\n".to_string()));
+        assert_eq!(
+            JsExpr::from_value(&cfg4["token"]).map(|e| e.source()),
+            Some("y".to_string())
+        );
+
+        // Round-trip all 4 cases cleanly without ever leaking `!cordis-js`.
+        for entries in [&e1, &e2, &e3, &e4] {
+            let dumped = dump_entries(entries).expect("dump_entries");
+            assert!(
+                !dumped.contains(JS_TAG),
+                "leaked internal tag !cordis-js:\n{dumped}"
+            );
+            let reparsed = parse_entries(&dumped).expect("reparse dumped");
+            assert_eq!(*entries, reparsed);
+        }
     }
 }

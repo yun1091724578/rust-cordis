@@ -1132,10 +1132,7 @@ impl Fiber {
             // 2) 若父 fiber 已被释放（`parent.fiber_opt().is_none()`）或正在卸载，同样 fail-closed，
             //    绝不产生逃逸 `App::close()` 的孤儿活 fiber。
             if !store.register_fiber(runtime, &fiber) {
-                fiber.mark_effects_closed();
-                *fiber.error.lock().unwrap() =
-                    Some("plugin runtime was retired before mount".into());
-                fiber.set_state(FiberState::Failed);
+                fiber.fail_closed("plugin runtime was retired before mount".into());
                 return fiber;
             }
             // 关键：**插件的生命周期本身就是父 fiber 的一个 effect**。
@@ -1149,7 +1146,7 @@ impl Fiber {
                 let parent_weak = Arc::downgrade(&parent_fiber);
                 // 竞态保护：`try_plugin` 检查之后父 fiber 仍可能进入 UNLOADING。
                 // 此时不要 panic（那会跨 ABI 边界 abort 进程），而是让返回的
-                // fiber 以 FAILED 收敛，调用方 settle() 时拿到可读错误。
+                // fiber 以 FAILED + UID_DISPOSED 终态收敛，绝不可被 `update()` 复活。
                 match parent_fiber.try_effect_registered(move |_| {
                     Disposable::new(move || {
                         let this = this.upgrade();
@@ -1171,18 +1168,13 @@ impl Fiber {
                     }
                     Err(err) => {
                         store.unregister_fiber(runtime, &fiber);
-                        fiber.mark_effects_closed();
-                        *fiber.error.lock().unwrap() = Some(err);
-                        fiber.set_state(FiberState::Failed);
+                        fiber.fail_closed(err);
                         return fiber;
                     }
                 }
             } else {
                 store.unregister_fiber(runtime, &fiber);
-                fiber.mark_effects_closed();
-                *fiber.error.lock().unwrap() =
-                    Some("cannot mount plugin on disposed parent context".into());
-                fiber.set_state(FiberState::Failed);
+                fiber.fail_closed("cannot mount plugin on disposed parent context".into());
                 return fiber;
             }
             if fiber.is_disposed() {
@@ -1199,6 +1191,19 @@ impl Fiber {
     }
 
     // ------------------------------------------------------------- 基本访问
+
+    /// 挂载拒绝时的终态 fail-closed 收口：置 `UID_DISPOSED`、关闭 `effect_gate`、清掉 `ctx`
+    /// 并保留 `FiberState::Failed` + `error`，确保永远不会被 `update()`/`restart()` 复活为僵尸 fiber。
+    fn fail_closed(self: &Arc<Self>, err: Error) {
+        self.mark_effects_closed();
+        *self.error.lock().unwrap() = Some(err);
+        // 先写 `Failed` 再置 `UID_DISPOSED`：保留失败诊断态供调用方读取，
+        // 同时使 `is_disposed() == true`，彻底封死 `update()`/`restart()` 复活路径。
+        self.set_state(FiberState::Failed);
+        self.uid.store(UID_DISPOSED, Ordering::SeqCst);
+        let old_ctx = self.ctx.lock().unwrap().take();
+        drop(old_ctx);
+    }
 
     pub fn uid(&self) -> u64 {
         self.uid.load(Ordering::SeqCst)
@@ -2559,6 +2564,10 @@ impl Fiber {
                 // 已注册子 fiber/effect"的 fiber 同样必须走 `unload`，
                 // 否则 `dispose` 只改状态、不释放任何资源。
                 if this.is_disposed() {
+                    if this.state() == FiberState::Failed && this.ctx_opt().is_none() {
+                        // `Fiber::new` 阶段即被 fail-closed 拒绝（从未挂载/登记），保持 `Failed` 终态。
+                        break;
+                    }
                     if let Err(payload) = CatchPanic::new(this.unload()).await {
                         let reason = format!(
                             "生命周期清理任务 panic: {}",
@@ -2677,10 +2686,20 @@ impl Fiber {
                 (self.config.lock().unwrap().clone(), rb.live_rev)
             }
         };
-        let resolve_fut = ExecutionFrameFuture::with_fiber(
-            Arc::downgrade(self),
-            self.store.resolve_config(&ctx, &runtime, raw),
-        );
+        let resolve_fut = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _frame = enter_execution_fiber(Arc::downgrade(self));
+            self.store.resolve_config(&ctx, &runtime, raw)
+        })) {
+            Ok(fut) => ExecutionFrameFuture::with_fiber(Arc::downgrade(self), fut),
+            Err(payload) => {
+                let reason = format!(
+                    "插件配置解析或校验 panic: {}",
+                    crate::panic_message(&*payload)
+                );
+                self.fail(&ctx, reason.into(), gen).await;
+                return;
+            }
+        };
         let resolved = match CatchPanic::new(resolve_fut).await {
             Ok(Ok(config)) => config,
             Ok(Err(err)) => {

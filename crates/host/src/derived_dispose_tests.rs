@@ -251,12 +251,10 @@ fn o2_live_fiber_without_runtime_preserves_entry() {
         let target = serde_json::from_str::<Value>(&text).unwrap()["handle"]
             .as_u64()
             .unwrap();
-        let fiber = derived_table().lock().unwrap()[&target]
-            .fiber
-            .as_ref()
-            .unwrap()
-            .upgrade()
-            .unwrap();
+        let fiber = match &derived_table().lock().unwrap()[&target].kind {
+            DerivedKind::ChildFiber { fiber, .. } => fiber.upgrade().unwrap(),
+            DerivedKind::Scope(_) => panic!("expected ChildFiber entry"),
+        };
         fiber.settle().await;
         assert_eq!(fiber.state(), cordis_core::FiberState::Active);
         (target, fiber)
@@ -303,7 +301,10 @@ fn probed(ctx: &Ctx, label: &'static str, log: &DropLog) -> Ctx {
 fn probe_entry(target: u64, label: &'static str, log: &DropLog) {
     let mut table = derived_table().lock().unwrap();
     let entry = table.get_mut(&target).unwrap();
-    entry.ctx = probed(&entry.ctx, label, log);
+    match &mut entry.kind {
+        DerivedKind::Scope(ctx) => *ctx = probed(ctx, label, log),
+        DerivedKind::ChildFiber { read_ctx, .. } => *read_ctx = probed(read_ctx, label, log),
+    }
 }
 
 #[test]
@@ -326,7 +327,10 @@ fn o2_fiberless_dispose_without_runtime_drops_synchronously() {
     probe_entry(intercepted, "intercept", &log);
     assert!(tokio::runtime::Handle::try_current().is_err());
     for target in [isolated, intercepted] {
-        assert!(derived_table().lock().unwrap()[&target].fiber.is_none());
+        assert!(matches!(
+            derived_table().lock().unwrap()[&target].kind,
+            DerivedKind::Scope(_)
+        ));
         assert_eq!(dispose(owner, target).0, STATUS_OK);
         assert!(!derived_table().lock().unwrap().contains_key(&target));
     }

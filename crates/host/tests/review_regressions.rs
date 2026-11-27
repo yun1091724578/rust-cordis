@@ -1296,3 +1296,407 @@ async fn r4_p1_cancel_dispose_row_tracks_draining_until_cleanup_finishes() {
     app.close().await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// R5 P1: Cancelling `drive_pending` after `adopt()` while a row is still `Draining` AND a foreign
+// pending candidate is queued MUST wait for `Draining` to finish before driving the foreign
+// candidate (and still converge the adopted tree if the foreign candidate fails preflight).
+#[tokio::test]
+async fn r5_p1_cancel_drive_pending_with_foreign_pending_waits_for_draining_and_converges() {
+    use cordis_core::{plugin_fn, Disposable, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct SlowMountAndDisposeSource {
+        mounts_a: Arc<AtomicUsize>,
+        entered_a_apply: Arc<tokio::sync::Notify>,
+        release_a_apply: Arc<tokio::sync::Notify>,
+        entered_a_dispose: Arc<tokio::sync::Notify>,
+        release_a_dispose: Arc<tokio::sync::Notify>,
+    }
+
+    impl PluginSource for SlowMountAndDisposeSource {
+        fn load(
+            &self,
+            entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            if entry.name == "plugin-a" {
+                let mounts = self.mounts_a.clone();
+                let entered_apply = self.entered_a_apply.clone();
+                let release_apply = self.release_a_apply.clone();
+                let entered_disp = self.entered_a_dispose.clone();
+                let release_disp = self.release_a_dispose.clone();
+                Ok(LoadedFile {
+                    plugin: plugin_fn("plugin-a", Inject::default(), move |ctx, _cfg| {
+                        let mounts = mounts.clone();
+                        let entered_apply = entered_apply.clone();
+                        let release_apply = release_apply.clone();
+                        let entered_disp = entered_disp.clone();
+                        let release_disp = release_disp.clone();
+                        Box::pin(async move {
+                            let n = mounts.fetch_add(1, Ordering::SeqCst) + 1;
+                            if n == 1 {
+                                let _ = ctx.effect(move |_| {
+                                    let entered_disp = entered_disp.clone();
+                                    let release_disp = release_disp.clone();
+                                    Disposable::new(move || {
+                                        Box::pin(async move {
+                                            entered_disp.notify_one();
+                                            release_disp.notified().await;
+                                        })
+                                    })
+                                });
+                                entered_apply.notify_one();
+                                release_apply.notified().await;
+                            }
+                            Ok(())
+                        })
+                    }),
+                    source: std::path::PathBuf::new(),
+                    staged: std::path::PathBuf::new(),
+                    fingerprint: None,
+                })
+            } else {
+                Ok(LoadedFile {
+                    plugin: plugin_fn("plugin-b", Inject::default(), |_ctx, _cfg| {
+                        Box::pin(async { Ok(()) })
+                    }),
+                    source: std::path::PathBuf::new(),
+                    staged: std::path::PathBuf::new(),
+                    fingerprint: None,
+                })
+            }
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "cordis-r5-p1-draining-foreign-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(&cfg_path, "[]\n").unwrap();
+
+    let mounts_a = Arc::new(AtomicUsize::new(0));
+    let entered_a_apply = Arc::new(tokio::sync::Notify::new());
+    let release_a_apply = Arc::new(tokio::sync::Notify::new());
+    let entered_a_dispose = Arc::new(tokio::sync::Notify::new());
+    let release_a_dispose = Arc::new(tokio::sync::Notify::new());
+
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(SlowMountAndDisposeSource {
+            mounts_a: mounts_a.clone(),
+            entered_a_apply: entered_a_apply.clone(),
+            release_a_apply: release_a_apply.clone(),
+            entered_a_dispose: entered_a_dispose.clone(),
+            release_a_dispose: release_a_dispose.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Request G1: mount `a` (blocks inside apply after registering slow disposer).
+    let g1 = cordis_host::patch::parse_entries("- id: a\n  name: plugin-a\n").unwrap();
+    let s1 = state.clone();
+    let t1 = tokio::spawn(async move {
+        let _ = s1.request_reconcile(g1).await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), entered_a_apply.notified())
+        .await
+        .expect("a entered apply");
+
+    // Queue foreign candidate G2 (wants `a` and `b`) while G1 is mid-flight!
+    let g2 =
+        cordis_host::patch::parse_entries("- id: a\n  name: plugin-a\n- id: b\n  name: plugin-b\n")
+            .unwrap();
+    assert!(
+        state.request_reconcile(g2).await.is_none(),
+        "G2 must coalesce into pending slot while G1 holds single-flight"
+    );
+
+    // Abort G1: RowTransactionGuard puts `a` in `Draining` and spawns dispose; ReconcileDriver
+    // sees foreign pending G2. Compensation MUST wait for `a`'s `Draining` before driving G2!
+    t1.abort();
+    let _ = t1.await;
+
+    // Wait until `a`'s background dispose starts, then hold it for 120ms so any eager
+    // non-draining-aware compensation would collide with `Draining` and fail `a`!
+    tokio::time::timeout(Duration::from_secs(5), entered_a_dispose.notified())
+        .await
+        .expect("a entered background dispose");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    release_a_dispose.notify_waiters();
+
+    // Wait for G2 to finish converging both `a` and `b` cleanly with ZERO failures.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if state.mounted_labels() == vec!["a".to_string(), "b".to_string()] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "带 foreign pending 的取消补偿必须先等 Draining 再驱动 G2，当前 mounted={:?}, failed={:?}",
+            state.mounted_labels(),
+            state.failed_rows()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        state.failed_rows().is_empty(),
+        "等待 Draining 后驱动 G2 不得留下失败台账: {:?}",
+        state.failed_rows()
+    );
+
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// R5 P1: `exec_replace_action` must NOT resurrect a plugin that completed `dispose_self()`
+// between `diff()` and `exec_replace_action` (e.g. while an earlier `Action::Dispose` awaited).
+#[tokio::test]
+async fn r5_p1_exec_replace_action_never_resurrects_self_disposed_plugin_after_diff() {
+    use cordis_core::{plugin_fn, Disposable, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct ReplaceRaceSource {
+        mounts_a: Arc<AtomicUsize>,
+        entered_b_dispose: Arc<tokio::sync::Notify>,
+        release_b_dispose: Arc<tokio::sync::Notify>,
+    }
+
+    impl PluginSource for ReplaceRaceSource {
+        fn load(
+            &self,
+            entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            if entry.name == "plugin-a" || entry.name == "plugin-a-v2" {
+                let mounts = self.mounts_a.clone();
+                let name: &'static str = if entry.name == "plugin-a" {
+                    "plugin-a"
+                } else {
+                    "plugin-a-v2"
+                };
+                Ok(LoadedFile {
+                    plugin: plugin_fn(name, Inject::default(), move |_ctx, _cfg| {
+                        let mounts = mounts.clone();
+                        Box::pin(async move {
+                            mounts.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                    }),
+                    source: std::path::PathBuf::new(),
+                    staged: std::path::PathBuf::new(),
+                    fingerprint: None,
+                })
+            } else {
+                let entered = self.entered_b_dispose.clone();
+                let release = self.release_b_dispose.clone();
+                Ok(LoadedFile {
+                    plugin: plugin_fn("plugin-b", Inject::default(), move |ctx, _cfg| {
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        Box::pin(async move {
+                            let _ = ctx.effect(move |_| {
+                                let entered = entered.clone();
+                                let release = release.clone();
+                                Disposable::new(move || {
+                                    Box::pin(async move {
+                                        entered.notify_one();
+                                        release.notified().await;
+                                    })
+                                })
+                            });
+                            Ok(())
+                        })
+                    }),
+                    source: std::path::PathBuf::new(),
+                    staged: std::path::PathBuf::new(),
+                    fingerprint: None,
+                })
+            }
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "cordis-r5-p1-replace-self-dispose-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(
+        &cfg_path,
+        "- id: a\n  name: plugin-a\n- id: b\n  name: plugin-b\n",
+    )
+    .unwrap();
+
+    let mounts_a = Arc::new(AtomicUsize::new(0));
+    let entered_b_dispose = Arc::new(tokio::sync::Notify::new());
+    let release_b_dispose = Arc::new(tokio::sync::Notify::new());
+
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(ReplaceRaceSource {
+            mounts_a: mounts_a.clone(),
+            entered_b_dispose: entered_b_dispose.clone(),
+            release_b_dispose: release_b_dispose.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.mounted_labels(), vec!["a", "b"]);
+    assert_eq!(mounts_a.load(Ordering::SeqCst), 1);
+
+    let fiber_a = state.fiber_of("a").expect("row a mounted");
+
+    // Reconcile drops `b` (Action::Dispose("b")) and replaces `a` (`plugin-a` -> `plugin-a-v2`).
+    let next = cordis_host::patch::parse_entries("- id: a\n  name: plugin-a-v2\n").unwrap();
+    let rec_state = state.clone();
+    let rec_task = tokio::spawn(async move { rec_state.reconcile_once(next).await });
+
+    // Wait until `Action::Dispose("b")` is paused in its slow disposer.
+    tokio::time::timeout(Duration::from_secs(5), entered_b_dispose.notified())
+        .await
+        .expect("b entered slow disposer");
+
+    // While `Action::Dispose("b")` is awaiting, `a` self-disposes completely!
+    fiber_a.dispose().await;
+
+    // Release `b`'s disposer so `exec_replace_action("a")` runs next.
+    release_b_dispose.notify_waiters();
+    let outcome = rec_task.await.expect("reconcile finished");
+
+    assert!(
+        state.fiber_of("a").is_none(),
+        "self-disposed row `a` must NEVER be resurrected by exec_replace_action; outcome={outcome:?}"
+    );
+    assert_eq!(
+        mounts_a.load(Ordering::SeqCst),
+        1,
+        "plugin-a-v2 must not have been mounted after `a` self-disposed"
+    );
+
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// R5 P2: Dropping a cancelled `mount_loaded` future on a non-Tokio thread must still dispose the
+// orphan fiber via LoaderState's captured Tokio Handle and hold `Draining` until cleanup completes.
+#[tokio::test]
+async fn r5_p2_non_tokio_drop_of_cancelled_mount_still_disposes_via_captured_handle() {
+    use cordis_core::{plugin_fn, Disposable, Inject};
+    use cordis_host::loader::{load_with_source, LoadedFile, LoaderConfig, PluginSource};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct BlockingMountSource {
+        entered_apply: Arc<tokio::sync::Notify>,
+        disposed: Arc<AtomicBool>,
+        disposed_notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl PluginSource for BlockingMountSource {
+        fn load(
+            &self,
+            _entry: &cordis_host::patch::Entry,
+            _search: &[std::path::PathBuf],
+            _revision: u64,
+        ) -> std::result::Result<LoadedFile, String> {
+            let entered = self.entered_apply.clone();
+            let disposed = self.disposed.clone();
+            let disposed_notify = self.disposed_notify.clone();
+            Ok(LoadedFile {
+                plugin: plugin_fn("blocking-mount", Inject::default(), move |ctx, _cfg| {
+                    let entered = entered.clone();
+                    let disposed = disposed.clone();
+                    let disposed_notify = disposed_notify.clone();
+                    Box::pin(async move {
+                        let _ = ctx.effect(move |_| {
+                            let disposed = disposed.clone();
+                            let disposed_notify = disposed_notify.clone();
+                            Disposable::sync(move || {
+                                disposed.store(true, Ordering::SeqCst);
+                                disposed_notify.notify_waiters();
+                            })
+                        });
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    })
+                }),
+                source: std::path::PathBuf::new(),
+                staged: std::path::PathBuf::new(),
+                fingerprint: None,
+            })
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "cordis-r5-p2-non-tokio-drop-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cfg_path = tmp_dir.join("cordis.yml");
+    std::fs::write(&cfg_path, "[]\n").unwrap();
+
+    let entered_apply = Arc::new(tokio::sync::Notify::new());
+    let disposed = Arc::new(AtomicBool::new(false));
+    let disposed_notify = Arc::new(tokio::sync::Notify::new());
+
+    let app = App::new();
+    let state = load_with_source(
+        app.root.clone(),
+        LoaderConfig::new(cfg_path.to_string_lossy().into_owned()),
+        Arc::new(BlockingMountSource {
+            entered_apply: entered_apply.clone(),
+            disposed: disposed.clone(),
+            disposed_notify: disposed_notify.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Poll `reconcile_once` manually until `plugin` enters `apply`, then move the live future to a
+    // plain OS thread (NO Tokio runtime context!) and drop it there!
+    let entries = cordis_host::patch::parse_entries("- id: a\n  name: blocking-mount\n").unwrap();
+    let mut fut = Box::pin(async move {
+        let _ = state.reconcile_once(entries).await;
+    });
+    tokio::select! {
+        _ = &mut fut => panic!("reconcile_once must stay pending inside apply"),
+        _ = entered_apply.notified() => {}
+    }
+
+    // Drop the future on a non-Tokio OS thread!
+    std::thread::spawn(move || {
+        drop(fut);
+    })
+    .join()
+    .unwrap();
+
+    // Captured Tokio Handle MUST still drive orphan fiber disposal on the Tokio runtime!
+    tokio::time::timeout(Duration::from_secs(5), disposed_notify.notified())
+        .await
+        .expect("orphan fiber must be disposed even when future is dropped off-Tokio");
+    assert!(disposed.load(Ordering::SeqCst));
+
+    app.close().await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

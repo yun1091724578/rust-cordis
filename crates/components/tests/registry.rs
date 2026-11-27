@@ -394,3 +394,59 @@ async fn r4_p1_concurrent_registry_put_replace_and_restart_no_cross_generation_s
     }
     app.close().await;
 }
+
+#[tokio::test]
+async fn r5_p1_registry_replace_drop_reentrancy_during_teardown_never_deadlocks() {
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    struct ReentrantDrop {
+        handle: Arc<registry::RegistryHandle>,
+        entered_drop: Arc<Barrier>,
+    }
+
+    impl Drop for ReentrantDrop {
+        fn drop(&mut self) {
+            self.entered_drop.wait();
+            // Give teardown thread time to enter `retire()` and block waiting for in-flight readers.
+            std::thread::sleep(Duration::from_millis(40));
+            // Re-entering `handle.get()` / `handle.names()` on the same thread MUST NOT deadlock!
+            let _ = self.handle.get("reentrant");
+            let _ = self.handle.names();
+        }
+    }
+
+    let app = App::new();
+    let reg_fiber = app.root.plugin(registry::plugin(), Config::Null);
+    reg_fiber.settle().await;
+    let handle = registry::handle(&app.root).expect("registry handle");
+
+    let entered_drop = Arc::new(Barrier::new(2));
+    let _disposer = handle.put("reentrant", Dyn::new(0u32)).unwrap();
+    // Put `ReentrantDrop` via `replace` so its only strong reference lives in `impl_.value`
+    // and is dropped synchronously inside the next `replace()` -> `Store::set`.
+    handle
+        .replace(
+            "reentrant",
+            Dyn::new(ReentrantDrop {
+                handle: handle.clone(),
+                entered_drop: entered_drop.clone(),
+            }),
+        )
+        .unwrap();
+
+    let h_rep = handle.clone();
+    let rep_thread = std::thread::spawn(move || h_rep.replace("reentrant", Dyn::new(42u32)));
+
+    // Wait until `Store::set` has begun dropping the old `ReentrantDrop` inside `replace()`.
+    entered_drop.wait();
+
+    // Concurrently dispose the registry fiber (calling `retire()`).
+    tokio::time::timeout(Duration::from_secs(2), reg_fiber.dispose())
+        .await
+        .expect("replace() 旧值 Drop 重入 handle.* 与 teardown 并发时发生死锁");
+
+    let rep_res = rep_thread.join().expect("replace thread panicked");
+    assert!(rep_res.is_ok(), "replace 应正常完成: {rep_res:?}");
+    app.close().await;
+}

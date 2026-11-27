@@ -905,6 +905,11 @@ pub struct LoaderState {
     row_ticket: AtomicU64,
     /// 后台 `Draining` 槽位清空通知，供取消补偿收敛等待旧实例清理完成后再执行 `sync()`。
     draining_changed: tokio::sync::Notify,
+    /// 装载器自身 fiber 关停时的即时唤醒通知：确保等待 `Draining` 的补偿任务在 `App::close()` 时立刻退出。
+    closed_notify: tokio::sync::Notify,
+    /// 构造 `LoaderState` 时捕获的 Tokio runtime 句柄：即使 `RowTransactionGuard` / `ReconcileDriver`
+    /// 在非 Tokio 线程被 drop，也能正确派发孤儿 fiber 后台清理与收敛任务。
+    runtime_handle: Option<tokio::runtime::Handle>,
     /// 变更序列的**互斥闸门**（对账、同步、启停、单行重载共用）。
     ///
     /// 这些操作都会经过"读现状 → 算动作 → 改实例 → 改记录"的窗口；没有互斥，
@@ -1202,9 +1207,9 @@ struct ReconcileDriver {
     active: bool,
     /// 已 take 但**尚未落定**的候选：取消/超时时回填合并槽（不丢、也不静默丢弃）。
     taken: Option<Candidate>,
-    /// 本轮候选是否已通过 `adopt()` 写入 `tree` 且动作循环尚未跑完：
-    /// 若在此时被取消，必须安排一次补偿收敛 `sync()`，防止 `tree` 与运行时实例永久漂移。
-    adopted_in_progress: Arc<AtomicBool>,
+    /// 本轮候选是否已通过 `adopt()` 写入 `tree` 且动作循环尚未跑完（0 = 未采纳，>0 = 已采纳代次）：
+    /// 若在此时被取消，必须安排一次补偿收敛（先等 `Draining`，驱动新候选，必要时补跑 `sync()`）。
+    adopted_gen_in_progress: Arc<AtomicU64>,
 }
 
 impl ReconcileDriver {
@@ -1213,7 +1218,7 @@ impl ReconcileDriver {
             state,
             active: true,
             taken: None,
-            adopted_in_progress: Arc::new(AtomicBool::new(false)),
+            adopted_gen_in_progress: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1221,7 +1226,7 @@ impl ReconcileDriver {
     fn finish(&mut self) {
         self.active = false;
         self.taken = None;
-        self.adopted_in_progress.store(false, Ordering::SeqCst);
+        self.adopted_gen_in_progress.store(0, Ordering::SeqCst);
     }
 }
 
@@ -1234,12 +1239,13 @@ impl Drop for ReconcileDriver {
         //
         // 顺序不能反：先放开 `reconciling` 的话，别人可能进来 take 到空槽并收工，
         // 紧接着我们才回填——那份候选就再也没人驱动了（幽灵滞后）。
-        let needs_convergence = self.adopted_in_progress.load(Ordering::SeqCst);
+        let adopted_gen = self.adopted_gen_in_progress.load(Ordering::SeqCst);
+        let needs_convergence = adopted_gen != 0;
         // 代次先记下来：清位之后要靠它辨认"槽里那份还是不是我们这份"。
         let held_gen = self.taken.as_ref().map(|candidate| candidate.gen);
         let restored = if needs_convergence {
             // 候选已通过 `adopt()` 提交进 `tree` 且 `adopted_gen` 已推进，不再回填旧候选；
-            // 清位后通过补偿收敛驱动把未跑完的动作推到位。
+            // 清位后通过统一收敛驱动等待 `Draining`、消费外部候选并在需要时补跑 `sync()`。
             self.taken.take();
             None
         } else {
@@ -1251,14 +1257,15 @@ impl Drop for ReconcileDriver {
         #[cfg(test)]
         self.state.hooks.pass_before_release_flight();
         self.state.reconciling.store(false, Ordering::SeqCst);
-        // 三条都会永久滞留的路径，都必须安排**一次**补偿驱动把它带走：
+        // 三条都会永久滞留或漂移的路径，统一收口到 `schedule_convergence`：
         // ① 回填**被拒**（`false`）：槽里已经有一份我们没持有的更新候选；
         // ② 回填**成功**、但清位之后槽里已经**不是**我们这份了；
-        // ③ `adopt()` 已提交 `tree` 但动作循环中途被取消：槽里没有更新候选，必须补一次收敛 `sync()`。
-        if restored == Some(false) || self.state.has_foreign_pending(held_gen) {
-            self.state.schedule_compensation();
-        } else if needs_convergence {
-            self.state.schedule_adopted_convergence();
+        // ③ `adopt()` 已提交 `tree` 但动作循环中途被取消：先等本轮取消产生的 `Draining` 清空，
+        //    再驱动外部候选，若外部候选未取代已采纳代次（如预检失败）则补跑 `sync()` 收敛。
+        if restored == Some(false) || self.state.has_foreign_pending(held_gen) || needs_convergence
+        {
+            self.state
+                .schedule_convergence(needs_convergence.then_some(adopted_gen));
         }
     }
 }
@@ -1334,6 +1341,8 @@ impl LoaderState {
             rows: Mutex::new(HashMap::new()),
             row_ticket: AtomicU64::new(0),
             draining_changed: tokio::sync::Notify::new(),
+            closed_notify: tokio::sync::Notify::new(),
+            runtime_handle: tokio::runtime::Handle::try_current().ok(),
             mutation: tokio::sync::Mutex::new(()),
             scopes: Mutex::new(RowScopes::default()),
             revision: AtomicU64::new(0),
@@ -1992,8 +2001,12 @@ impl LoaderState {
             return;
         }
         let ticket = self.next_row_ticket();
-        let rt = tokio::runtime::Handle::try_current().ok();
-        let wait_task = run_dispose && rt.is_some();
+        let rt = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.runtime_handle.clone());
+        // Fail-closed：当需要执行 `fiber.dispose()` 时始终标记 `wait_task = true`，
+        // 即使无可用 runtime 也不允许被 `prune_finished_draining()` 悄悄摘表放行旁路重挂。
+        let wait_task = run_dispose;
         let installed = {
             let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
             let allowed = match expected_ticket {
@@ -2064,16 +2077,29 @@ impl LoaderState {
         still_draining
     }
 
-    /// 等待当前所有处于 `Draining` 的行完成后台清理（取消补偿收敛前调用）。
-    async fn wait_active_draining(&self) {
+    /// 等待当前所有处于 `Draining` 的行完成后台清理，若期间装载器关停则立即返回 `false`。
+    async fn wait_active_draining_or_closed(&self) -> bool {
         loop {
-            let notified = self.draining_changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if !self.prune_finished_draining() {
-                return;
+            let draining = self.draining_changed.notified();
+            tokio::pin!(draining);
+            draining.as_mut().enable();
+            let closed = self.closed_notify.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            if self.ctx.fiber_opt().is_none_or(|fiber| fiber.is_disposed()) {
+                return false;
             }
-            notified.await;
+            if !self.prune_finished_draining() {
+                return true;
+            }
+            tokio::select! {
+                _ = draining => {}
+                _ = closed => {
+                    if self.ctx.fiber_opt().is_none_or(|fiber| fiber.is_disposed()) {
+                        return false;
+                    }
+                }
+            }
         }
     }
 
@@ -2789,7 +2815,7 @@ impl LoaderState {
     async fn reconcile_attempt_with_flag(
         self: &Arc<Self>,
         candidate: &Candidate,
-        adopted_flag: Option<&AtomicBool>,
+        adopted_gen_slot: Option<&AtomicU64>,
     ) -> ReconcileAttempt {
         // P1-1：HMR/patch/启停触发的对账也要在挂载前重跑依赖预检。
         // 初装已经在创建状态前预检过，第一次 reconcile 用标记跳过，避免重复访问 source。
@@ -2848,8 +2874,12 @@ impl LoaderState {
                 rejection: Some(rejection),
             };
         }
-        if let Some(flag) = adopted_flag {
-            flag.store(true, Ordering::SeqCst);
+        if let Some(slot) = adopted_gen_slot {
+            let adopted = candidate
+                .gen
+                .max(self.adopted_gen.load(Ordering::SeqCst))
+                .max(1);
+            slot.store(adopted, Ordering::SeqCst);
         }
         // 采纳成功：这一刻候选才成为当前树，这一轮的预检结论才配进报告（O7）。
         if let Some((report, provides)) = accepted_preflight {
@@ -3065,10 +3095,22 @@ impl LoaderState {
 
     async fn exec_replace_action(self: &Arc<Self>, row: FlatRow, outcome: &mut ReconcileOutcome) {
         let label = row.label.clone();
-        let (expected_fiber, previous_plugin) = self
-            .mounted_record_clone(&label)
-            .map(|record| (record.fiber.upgrade(), Some(record.plugin)))
-            .unwrap_or((None, None));
+        let (expected_fiber, previous_plugin, already_gone_or_self_disposing) = {
+            let rows = self.rows.lock().unwrap();
+            match rows.get(&label) {
+                Some(RowSlot::Mounted(record)) => {
+                    (record.fiber.upgrade(), Some(record.plugin.clone()), false)
+                }
+                None | Some(RowSlot::SelfDisposing { .. }) => (None, None, true),
+                _ => (None, None, false),
+            }
+        };
+        if already_gone_or_self_disposing {
+            // Action::Replace 仅在 diff() 看到 Mounted 时产出；在 mutation 锁保护下此刻已消失
+            // 或处于 SelfDisposing，说明前置动作等待期间该行已自我卸载，跳过且不做无效暂存。
+            outcome.skipped.push(label);
+            return;
+        }
         // O5b-2：**先决策、再前移**——artifact 的预检（resolve → stage → open → ping）
         // 必须在拆卸之前跑完。写错 `name` / artifact 缺失时旧实例仍在服务：
         // 这一行本轮到此为止（不拆卸、不回滚、更不重建旧实例）。
@@ -3097,11 +3139,11 @@ impl LoaderState {
             }
         };
         // 在单把 `rows` 锁内原子核验并认领旧实例进入 `Disposing` 态：
-        // 若预检期间插件发生自我卸载（`SelfDisposing` 或旧实例已消失）或处于 `Draining`，
+        // 若预检期间插件发生自我卸载（`SelfDisposing` 或已落盘消失成 `NotMounted`）或处于 `Draining`，
         // 立即丢弃预加载的 `loaded` 并终止替换，杜绝并发双实例或复活已自卸载的行。
         let tx_guard = match self.claim_mounted_for_dispose(&label, expected_fiber.as_ref()) {
-            DisposeClaim::Claimed(guard) => Some(guard),
-            DisposeClaim::SelfDisposing => {
+            DisposeClaim::Claimed(guard) => guard,
+            DisposeClaim::SelfDisposing | DisposeClaim::NotMounted => {
                 drop(loaded);
                 outcome.skipped.push(label);
                 return;
@@ -3123,14 +3165,10 @@ impl LoaderState {
                 );
                 return;
             }
-            DisposeClaim::NotMounted => None,
         };
         // 先卸后装：同一隔离域里一个服务名只能有一个实现（内核不变量）。
         self.emit_partial_dispose(Some(&row), &label, true).await;
-        let close_report = match tx_guard {
-            Some(guard) => self.finish_claimed_dispose(guard).await,
-            None => None,
-        };
+        let close_report = self.finish_claimed_dispose(tx_guard).await;
         if let Some(report) = &close_report {
             if report.still_running {
                 // 丢弃预加载的 artifact（立即回收暂存副本），绝不在旧实例尚未清完时挂入新实例。
@@ -3402,55 +3440,51 @@ impl LoaderState {
             .is_some_and(|queued| Some(queued.gen) != held_gen)
     }
 
-    /// 安排一次**补偿驱动**：`Drop` 里发现槽里有一份没人处理的候选时用。
+    /// 统一取消补偿收敛入口（替代原先分离的 `schedule_compensation` 与 `schedule_adopted_convergence`）：
     ///
-    /// 不能 await（`Drop` 是同步的），所以 spawn 一个**只做 [`Self::drive_pending`]** 的
-    /// 任务：它照常 `reconciling.swap(true)` 抢单飞位，抢不到就安静退出——于是不会与
-    /// 别的驱动竞争出两份采纳，也不绕过任何既有协议（回填/代次/回写版本照旧生效）。
-    ///
-    /// 边界：拿不到 runtime 句柄（非 runtime 上下文，例如 runtime 正在关闭时丢弃驱动）
-    /// 就**不安排**——补偿不保证执行；调用方下一次 `request_reconcile` / `reload` 仍会驱动。
-    fn schedule_compensation(self: &Arc<Self>) {
-        if self.pending.lock().unwrap().is_none() {
+    /// 1. 仅捕获 `Weak<LoaderState>`，绝不把 `LoaderState` 钉死在孤儿任务里；
+    /// 2. 先 `wait_active_draining_or_closed().await`，确保上一轮取消遗留的 `Draining` 清理归零
+    ///    （或 `App::close()` 触发 `closed_notify` 立即退出），彻底消除"带 foreign pending 取消撞上
+    ///    `Draining` 直接失败"的窗口；
+    /// 3. 若合并槽里有待处理候选，先走标准 `drive_pending().await`；
+    /// 4. 若本轮曾发生 `adopt()` 且 `adopted_gen` 仍停留在 `target_gen`（例如没有外部候选、
+    ///    或外部候选预检失败/过期未取代本轮树）且当前树仍有未收敛动作，则补跑 `sync().await`。
+    fn schedule_convergence(self: &Arc<Self>, adopted_gen_to_converge: Option<u64>) {
+        if adopted_gen_to_converge.is_none() && self.pending.lock().unwrap().is_none() {
             return;
         }
         // 整棵树正在关：没有"用户的下一次编辑"要救，别在关停途中挂新东西。
         if self.ctx.fiber_opt().is_none_or(|fiber| fiber.is_disposed()) {
             return;
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        let Some(handle) = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.runtime_handle.clone())
+        else {
             return;
         };
-        let state = self.clone();
+        let weak_state = Arc::downgrade(self);
         handle.spawn(async move {
-            state.drive_pending().await;
-        });
-    }
-
-    /// 安排一次**已采纳树的补偿收敛**：当 `drive_pending` 在 `adopt()` 已经提交新树之后、
-    /// 动作循环跑完之前被取消时，等待本次取消产生的 `Draining` 清理归零后自动跑一次 `sync()`
-    /// （若期间又来了更新候选，则改由 `drive_pending` 一并驱动）。
-    fn schedule_adopted_convergence(self: &Arc<Self>) {
-        if self.ctx.fiber_opt().is_none_or(|fiber| fiber.is_disposed()) {
-            return;
-        }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let state = self.clone();
-        handle.spawn(async move {
-            state.wait_active_draining().await;
-            if state
-                .ctx
-                .fiber_opt()
-                .is_none_or(|fiber| fiber.is_disposed())
-            {
+            let Some(state) = weak_state.upgrade() else {
+                return;
+            };
+            if !state.wait_active_draining_or_closed().await {
                 return;
             }
             if state.pending.lock().unwrap().is_some() {
-                state.drive_pending().await;
-            } else {
-                state.sync().await;
+                let _ = state.drive_pending().await;
+            }
+            if let Some(target_gen) = adopted_gen_to_converge {
+                if state.adopted_gen.load(Ordering::SeqCst) == target_gen
+                    && !state
+                        .ctx
+                        .fiber_opt()
+                        .is_none_or(|fiber| fiber.is_disposed())
+                    && !state.plan(&state.tree_snapshot()).is_empty()
+                    && state.wait_active_draining_or_closed().await
+                {
+                    let _ = state.sync().await;
+                }
             }
         });
     }
@@ -3480,7 +3514,7 @@ impl LoaderState {
                     let gen = candidate.gen;
                     // 候选先进**驱动器**（不是循环变量）：future 被取消/超时丢弃时，
                     // `ReconcileDriver::drop` 才能把它回填，而不是跟着栈一起蒸发。
-                    driver.adopted_in_progress.store(false, Ordering::SeqCst);
+                    driver.adopted_gen_in_progress.store(0, Ordering::SeqCst);
                     driver.taken = Some(candidate);
                     // 合并逻辑归 `request_candidate`，但**落地**必须与其它变更序列互斥：
                     // 否则运行期启停会与这一轮对账交错，把刚卸下的行挂回去。
@@ -3489,11 +3523,11 @@ impl LoaderState {
                         let candidate = driver.taken.as_ref().expect("刚填进去的候选");
                         self.reconcile_attempt_with_flag(
                             candidate,
-                            Some(&driver.adopted_in_progress),
+                            Some(&driver.adopted_gen_in_progress),
                         )
                         .await
                     };
-                    driver.adopted_in_progress.store(false, Ordering::SeqCst);
+                    driver.adopted_gen_in_progress.store(0, Ordering::SeqCst);
                     let ReconcileAttempt {
                         mut outcome,
                         rejection,
@@ -6099,6 +6133,7 @@ fn attach_self_dispose_observer(ctx: &Ctx, state: Arc<LoaderState>) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|_, slot| !matches!(slot, RowSlot::SelfDisposing { .. }));
+            cleanup_state.closed_notify.notify_waiters();
         })
     });
     let loader_ctx = ctx.clone();

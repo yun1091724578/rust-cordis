@@ -96,6 +96,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "unsafe-libyaml",
 ]
 
 [[package]]

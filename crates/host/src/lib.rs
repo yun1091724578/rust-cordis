@@ -618,18 +618,22 @@ pub fn loaded_instances() -> usize {
 
 // ------------------------------------------------------------ 派生句柄表（M1）
 
-/// 派生表的一条记录：isolate/intercept 派生的子 context，或 `ctx_use` 挂的子 fiber。
+/// 派生表条目的强类型能力变体：在类型系统层区分“可调用/可派生的域上下文”与
+/// “仅允许读域和卸载的子组件生命周期句柄”，杜绝漏写黑名单 `if` 导致子句柄洗白或权限越界。
+enum DerivedKind {
+    /// `ctx_isolate` / `ctx_intercept`：承载可继续派生与发起调用的域上下文。
+    Scope(Ctx),
+    /// `ctx_use`：子组件生命周期句柄（不承载可调用/可派生的身份 `Ctx`，仅支持域读取与卸载）。
+    ChildFiber { read_ctx: Ctx, fiber: Weak<Fiber> },
+}
+
 struct DerivedEntry {
-    /// 创建者（根）实例句柄：`unregister_instance(root)` 时按它排水。
-    /// 从派生句柄再派生时向上传播，保证排水总能追到根。
+    /// 根实例句柄：注销根实例时按它把所有后代派生句柄一并排水。
     owner: u64,
-    /// 调用方域上下文（isolate/intercept 子 context；`ctx_use` 保留调用方所在域上下文，
-    /// 绝不存储子 fiber 的 `Ctx`，杜绝父插件借子句柄冒充子插件身份或借用子插件 `inject`）。
-    ctx: Ctx,
     /// 继承的调用方实例身份：回调 id 的派发仍走原实例（realm 隔离不隔离身份）。
     instance: Instance,
-    /// `ctx_use` 挂的子 fiber（isolate/intercept 派生条目为 `None`）。
-    fiber: Option<Weak<Fiber>>,
+    /// 强类型派生能力变体。
+    kind: DerivedKind,
 }
 
 fn derived_table() -> &'static Mutex<HashMap<u64, DerivedEntry>> {
@@ -646,9 +650,8 @@ fn next_derived_seq() -> u64 {
 
 fn register_derived(
     owner: u64,
-    ctx: Ctx,
     instance: Instance,
-    fiber: Option<Weak<Fiber>>,
+    kind: DerivedKind,
 ) -> std::result::Result<u64, String> {
     let mut table = derived_table().lock().unwrap();
     if instance.closed.load(Ordering::SeqCst) {
@@ -659,22 +662,43 @@ fn register_derived(
         handle,
         DerivedEntry {
             owner,
-            ctx,
             instance,
-            fiber,
+            kind,
         },
     );
     Ok(handle)
 }
 
-/// 句柄解析的统一产物：派生句柄与实例句柄在这里汇成同一条路径。
+/// 句柄解析的强类型能力视图。
+enum ResolvedKind {
+    /// 实例句柄或 `isolate`/`intercept` 域句柄：允许 `require`/`isolate`/`intercept`/`use`/`call_iface`。
+    Scope(Ctx),
+    /// `ctx_use` 子组件生命周期句柄：仅允许 `ctx_get`（读域）与 `ctx_dispose`（卸载）。
+    ChildFiber { read_ctx: Ctx },
+}
+
+/// 句柄解析的统一产物：用于同时接受域句柄与子生命周期句柄的入口（`ctx_get` / `ctx_dispose` / `ctx_dispose_self`）。
 struct Resolved {
-    ctx: Ctx,
+    kind: ResolvedKind,
     instance: Instance,
     /// 根实例句柄（派生条目向上传播；实例句柄就是它自己）。
     owner: u64,
-    /// 是否是 `ctx_use` 返回的子组件生命周期句柄。
-    is_child_fiber: bool,
+}
+
+impl Resolved {
+    fn read_ctx(&self) -> &Ctx {
+        match &self.kind {
+            ResolvedKind::Scope(ctx) => ctx,
+            ResolvedKind::ChildFiber { read_ctx } => read_ctx,
+        }
+    }
+}
+
+/// 仅面向完整域句柄的解析产物（编译期保证绝不来自 `ctx_use` 子生命周期句柄）。
+struct ScopeResolved {
+    ctx: Ctx,
+    instance: Instance,
+    owner: u64,
 }
 
 /// 统一解析：**先实例表**（bit63=1 必然 miss），**后派生表**（位布局约定）。
@@ -682,29 +706,29 @@ fn resolve_handle(handle: u64) -> Option<Resolved> {
     if handle & DERIVED_HANDLE_TAG != 0 {
         let table = derived_table().lock().ok()?;
         let entry = table.get(&handle)?;
+        let kind = match &entry.kind {
+            DerivedKind::Scope(ctx) => ResolvedKind::Scope(ctx.clone()),
+            DerivedKind::ChildFiber { read_ctx, .. } => ResolvedKind::ChildFiber {
+                read_ctx: read_ctx.clone(),
+            },
+        };
         Some(Resolved {
-            ctx: entry.ctx.clone(),
+            kind,
             instance: entry.instance.clone(),
             owner: entry.owner,
-            is_child_fiber: entry.fiber.is_some(),
         })
     } else {
         let instance = instances().read().ok()?.get(handle)?;
         Some(Resolved {
-            ctx: instance.ctx.clone(),
+            kind: ResolvedKind::Scope(instance.ctx.clone()),
             instance,
             owner: handle,
-            is_child_fiber: false,
         })
     }
 }
 
-/// [`with_instance`] 的统一解析版：`ctx_get` / `ctx_require` 与 M1 的五个
-/// 新能力经它接受派生句柄；只在实例上成立的 op 仍走 [`with_instance`]
-/// （派生句柄在那里自然落进"已失效"分支——这正是位布局要的性质）。
-///
-/// 与 `with_instance` 同一套纪律：克隆后才执行（执行期间不持锁）、
-/// panic 兜底截在 ABI 边界之内。
+/// 接受实例句柄、域派生句柄与子生命周期句柄的统一入口（仅限 `ctx_get` / `ctx_dispose` / `ctx_dispose_self`）。
+#[allow(clippy::result_large_err)]
 unsafe fn with_resolved<T>(
     handle: u64,
     out: *mut Out,
@@ -713,27 +737,83 @@ unsafe fn with_resolved<T>(
 where
     T: AsRef<[u8]>,
 {
-    with_resolved_as(handle, out, "host_call", "protocol", f)
+    with_resolved_payload(handle, out, |resolved| {
+        f(resolved).map_err(|message| {
+            ErrorPayload::new(message)
+                .with_code("host_call")
+                .with_category("protocol")
+        })
+    })
 }
 
-/// 与 [`with_resolved`] 相同，但允许调用点给出更具体的错误 `code` / `category`。
-#[allow(clippy::result_large_err)]
-unsafe fn with_resolved_as<T>(
+/// 仅接受可调用/可派生的完整域句柄（实例句柄或 `isolate`/`intercept` 句柄）；
+/// `ctx_use` 子组件生命周期句柄在统一入口被结构性拒绝，绝不进入回调。
+unsafe fn with_scope_resolved<T>(
     handle: u64,
     out: *mut Out,
-    code: &str,
-    category: &str,
-    f: impl FnOnce(&Resolved) -> std::result::Result<T, String>,
+    op_name: &str,
+    f: impl FnOnce(&ScopeResolved) -> std::result::Result<T, String>,
 ) -> i32
 where
     T: AsRef<[u8]>,
 {
-    with_resolved_payload(handle, out, |resolved| {
-        f(resolved).map_err(|message| {
-            ErrorPayload::new(message)
-                .with_code(code)
-                .with_category(category)
-        })
+    with_scope_resolved_as(handle, out, "host_call", "protocol", op_name, f)
+}
+
+#[allow(clippy::result_large_err)]
+unsafe fn with_scope_resolved_as<T>(
+    handle: u64,
+    out: *mut Out,
+    code: &str,
+    category: &str,
+    op_name: &str,
+    f: impl FnOnce(&ScopeResolved) -> std::result::Result<T, String>,
+) -> i32
+where
+    T: AsRef<[u8]>,
+{
+    with_resolved_payload(handle, out, |resolved| match &resolved.kind {
+        ResolvedKind::Scope(ctx) => {
+            let scoped = ScopeResolved {
+                ctx: ctx.clone(),
+                instance: resolved.instance.clone(),
+                owner: resolved.owner,
+            };
+            f(&scoped).map_err(|message| {
+                ErrorPayload::new(message)
+                    .with_code(code)
+                    .with_category(category)
+            })
+        }
+        ResolvedKind::ChildFiber { .. } => Err(ErrorPayload::new(format!(
+            "ctx_use 返回的子组件生命周期句柄仅用于 ctx_dispose / ctx_get，不能用于 {op_name}"
+        ))
+        .with_code(code)
+        .with_category(category)),
+    })
+}
+
+/// [`with_scope_resolved`] 的载荷版：在拒绝 `ChildFiber` 时允许调用方记录自定义审计事件与错误载荷。
+#[allow(clippy::result_large_err)]
+unsafe fn with_scope_resolved_payload<T>(
+    handle: u64,
+    out: *mut Out,
+    on_child_rejected: impl FnOnce(&Resolved) -> ErrorPayload,
+    f: impl FnOnce(&ScopeResolved) -> std::result::Result<T, ErrorPayload>,
+) -> i32
+where
+    T: AsRef<[u8]>,
+{
+    with_resolved_payload(handle, out, |resolved| match &resolved.kind {
+        ResolvedKind::Scope(ctx) => {
+            let scoped = ScopeResolved {
+                ctx: ctx.clone(),
+                instance: resolved.instance.clone(),
+                owner: resolved.owner,
+            };
+            f(&scoped)
+        }
+        ResolvedKind::ChildFiber { .. } => Err(on_child_rejected(resolved)),
     })
 }
 

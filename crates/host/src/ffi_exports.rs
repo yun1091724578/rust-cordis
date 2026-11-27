@@ -36,11 +36,12 @@ pub(crate) unsafe extern "C" fn host_ctx_get(handle: u64, name: Blob, out: *mut 
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    // 统一解析（M1）：实例句柄与派生句柄同路——派生 ctx 读的是隔离域
-    //（fiberless 的宽容读走内核的 unchecked root 语义，见 Store::resolve）。
-    with_resolved(handle, out, |resolved| match resolved.ctx.get(&name) {
-        None => Ok(json!({ "missing": true }).to_string()),
-        Some(value) => encode_service(&name, value),
+    // 统一解析（M1）：实例句柄、域句柄与子生命周期句柄同路读域。
+    with_resolved(handle, out, |resolved| {
+        match resolved.read_ctx().get(&name) {
+            None => Ok(json!({ "missing": true }).to_string()),
+            Some(value) => encode_service(&name, value),
+        }
     })
 }
 
@@ -56,18 +57,17 @@ pub(crate) unsafe extern "C" fn host_ctx_require(handle: u64, name: Blob, out: *
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    with_resolved_as(handle, out, "host_require", "resolve", |resolved| {
-        if resolved.is_child_fiber {
-            return Err(
-                "ctx_use 返回的子组件句柄不能用于 ctx_require（请使用自身实例或 isolate 句柄）"
-                    .to_string(),
-            );
-        }
-        match resolved.ctx.require(&name) {
+    with_scope_resolved_as(
+        handle,
+        out,
+        "host_require",
+        "resolve",
+        "ctx_require",
+        |resolved| match resolved.ctx.require(&name) {
             Err(err) => Err(err.to_string()),
             Ok(value) => encode_service(&name, value),
-        }
-    })
+        },
+    )
 }
 
 /// 把一个服务值编码成 ABI 可见的 JSON。
@@ -149,13 +149,17 @@ pub(crate) unsafe extern "C" fn host_ctx_isolate(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    with_resolved(handle, out, |resolved| {
+    with_scope_resolved(handle, out, "ctx_isolate", |resolved| {
         let Some(_active) = admit_call(&resolved.instance) else {
             return Err("实例已进入卸载/关闭流程，拒绝派生 isolate 句柄".to_string());
         };
         let realm = (!label.is_empty()).then(|| resolved.ctx.store.named_realm(&key, &label));
         let derived = resolved.ctx.isolate(&key, realm);
-        let handle = register_derived(resolved.owner, derived, resolved.instance.clone(), None)?;
+        let handle = register_derived(
+            resolved.owner,
+            resolved.instance.clone(),
+            DerivedKind::Scope(derived),
+        )?;
         Ok(json!({ "handle": handle }).to_string())
     })
 }
@@ -179,12 +183,16 @@ pub(crate) unsafe extern "C" fn host_ctx_intercept(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    with_resolved(handle, out, |resolved| {
+    with_scope_resolved(handle, out, "ctx_intercept", |resolved| {
         let Some(_active) = admit_call(&resolved.instance) else {
             return Err("实例已进入卸载/关闭流程，拒绝派生 intercept 句柄".to_string());
         };
         let derived = resolved.ctx.intercept(&key, metadata);
-        let handle = register_derived(resolved.owner, derived, resolved.instance.clone(), None)?;
+        let handle = register_derived(
+            resolved.owner,
+            resolved.instance.clone(),
+            DerivedKind::Scope(derived),
+        )?;
         Ok(json!({ "handle": handle }).to_string())
     })
 }
@@ -194,7 +202,7 @@ pub(crate) unsafe extern "C" fn host_ctx_intercept(
 /// `url = "@native:<name>"` 优先走 per-App [`NativeRegistry`]（[`set_native_registry_for`]），
 /// 缺失时回落进程级注册表；其余优先走 per-App [`PluginSource`]（[`set_plugin_source_for`]），
 /// 缺失时回落进程级来源。新 fiber 是**调用方 fiber 的一个 effect**（内核 `Fiber::new` 负责）：
-/// 父 dispose ⇒ 子 dispose。返回子 fiber 的派生生命周期句柄（绝不暴露子 fiber 的 `Ctx` 身份）。
+/// 父 dispose ⇒ 子 dispose。返回子 fiber 的强类型生命周期句柄（绝不暴露子 fiber 的 `Ctx` 身份）。
 pub(crate) unsafe extern "C" fn host_ctx_use(
     handle: u64,
     url: Blob,
@@ -209,7 +217,7 @@ pub(crate) unsafe extern "C" fn host_ctx_use(
         Ok(value) => value,
         Err(err) => return fail(out, &err),
     };
-    with_resolved(handle, out, |resolved| {
+    with_scope_resolved(handle, out, "ctx_use", |resolved| {
         let Some(_active) = admit_call(&resolved.instance) else {
             return Err("实例已进入卸载/关闭流程，拒绝挂载子组件".to_string());
         };
@@ -223,18 +231,22 @@ pub(crate) unsafe extern "C" fn host_ctx_use(
         let plugin = resolve_component(&resolved.ctx, &url)?;
         // 注意挂在**解析出的 ctx** 上：经派生句柄 use ⇒ 子组件落在隔离域内。
         let fiber = mount(&resolved.ctx, plugin, config, None);
-        if fiber.state() == cordis_core::FiberState::Failed {
+        // 仅拦截 `Fiber::new` 同步 fail-closed 拒绝态（已置 `UID_DISPOSED` 且从未登记到父/Store）；
+        // 异步 `settle()` 快失败仍已登记到父 fiber，正常返回生命周期句柄供调用方 `ctx_dispose` 回收。
+        if fiber.is_disposed() {
             return Err(fiber
                 .error()
                 .unwrap_or_else(|| format!("use \"{url}\" 挂载子组件失败")));
         }
-        // 派生条目只保存调用方所在域上下文 `resolved.ctx`（绝不保存子 fiber 的 `Ctx`），
-        // 避免父插件借子句柄冒充子插件 CallerIdentity 或借用子插件 inject。
+        // 强类型 `ChildFiber` 仅保存调用方所在域的只读视图 `read_ctx` 与子 fiber 弱引用，
+        // 在类型系统层彻底隔离 `ctx_call_iface` / `ctx_require` / `ctx_isolate` / `ctx_intercept` / `ctx_use`。
         let handle = match register_derived(
             resolved.owner,
-            resolved.ctx.clone(),
             resolved.instance.clone(),
-            Some(Arc::downgrade(&fiber)),
+            DerivedKind::ChildFiber {
+                read_ctx: resolved.ctx.clone(),
+                fiber: Arc::downgrade(&fiber),
+            },
         ) {
             Ok(handle) => handle,
             Err(err) => {
@@ -281,7 +293,10 @@ pub(crate) unsafe extern "C" fn host_ctx_dispose(handle: u64, target: Blob, out:
                 "派生句柄 {raw} 不属于调用方根实例 {handle}，拒绝回收"
             ));
         }
-        let live_fiber = entry.fiber.as_ref().and_then(Weak::upgrade);
+        let live_fiber = match &entry.kind {
+            DerivedKind::ChildFiber { fiber, .. } => fiber.upgrade(),
+            DerivedKind::Scope(_) => None,
+        };
         // 先在摘表前确认运行时：否则 remove 之后才发现无法 dispose，句柄就丢了。
         let runtime = if live_fiber.is_some() {
             match tokio::runtime::Handle::try_current() {
@@ -637,209 +652,220 @@ pub(crate) unsafe extern "C" fn host_ctx_call_iface(
     // 元数据"就无从谈起）。实例句柄照旧可用（派生表在实例表之后解析）；续延仍
     // 发回**根实例句柄**（派生句柄不是回调目标，与 `ctx_isolate` 的派生条目同一约定）。
     //
-    // 用载荷版是为了让容量拒绝保留 `host_capacity` / `capacity` / `not_executed`。
-    with_resolved_payload(handle, out, move |resolved| {
-        let traced = resolved.instance.ctx.store.has_trace_sink();
-        let trace_parent = traced.then(call_scope_top).flatten();
-        let trace_correlation = traced
-            .then(|| {
-                resolved
-                    .ctx
-                    .correlation_id_arc()
-                    .or_else(cordis_core::current_correlation_id)
-            })
-            .flatten();
-        // `ctx_use` 返回的句柄只代表子组件生命周期与域读取，不承载 RPC 调用方身份：
-        // 既不允许父插件借它冒充子插件身份，也不允许它继承父行授权。
-        if resolved.is_child_fiber {
+    // 走强类型 [`with_scope_resolved_payload`]：`ChildFiber` 句柄在类型入口即被拒绝，
+    // 容量拒绝保留 `host_capacity` / `capacity` / `not_executed`。
+    let reject_service = service.clone();
+    let reject_method = method.clone();
+    with_scope_resolved_payload(
+        handle,
+        out,
+        move |rejected| {
+            let traced = rejected.instance.ctx.store.has_trace_sink();
             if traced {
+                let trace_parent = call_scope_top();
+                let trace_correlation = rejected
+                    .read_ctx()
+                    .correlation_id_arc()
+                    .or_else(cordis_core::current_correlation_id);
                 IfaceTrace {
-                    store: resolved.instance.ctx.store.clone(),
-                    name: format!("{service}.{method}"),
-                    callee_plugin: service.clone(),
-                    caller_uid: resolved.instance.ctx.caller_identity().fiber_uid,
+                    store: rejected.instance.ctx.store.clone(),
+                    name: format!("{reject_service}.{reject_method}"),
+                    callee_plugin: reject_service,
+                    caller_uid: rejected.instance.ctx.caller_identity().fiber_uid,
                     parent_call_id: trace_parent.unwrap_or(0),
                     correlation_id: trace_correlation,
                     started: std::time::Instant::now(),
                 }
                 .record("host_unauthorized");
             }
-            return Err(ErrorPayload::new(
+            ErrorPayload::new(
                 "ctx_use 返回的子组件句柄仅用于生命周期管理（ctx_dispose）与域读取（ctx_get），不能用于 ctx_call_iface",
             )
             .with_code("host_unauthorized")
             .with_category("authorization")
-            .with_certainty("not_executed"));
-        }
-        // 宿主方法白名单准入：在服务解析、派发槽位分配与提供者执行之前校验，
-        // 身份直接来自宿主绑定的 `resolved.ctx`（不依赖 TraceSink / current_caller_uid）。
-        if resolved.ctx.store.has_call_auth_hook() {
-            let started = std::time::Instant::now();
-            let caller = resolved.ctx.caller_identity();
-            if let Err(err) = resolved
-                .ctx
-                .store
-                .authorize_call(&caller, &service, &method)
-            {
-                if traced {
-                    IfaceTrace {
-                        store: resolved.instance.ctx.store.clone(),
-                        name: format!("{service}.{method}"),
-                        callee_plugin: service.clone(),
-                        caller_uid: caller.fiber_uid,
-                        parent_call_id: trace_parent.unwrap_or(0),
-                        correlation_id: trace_correlation,
-                        started,
-                    }
-                    .record("host_unauthorized");
-                }
-                return Err(ErrorPayload::new(err.to_string())
-                    .with_code("host_unauthorized")
-                    .with_category("authorization")
-                    .with_certainty("not_executed"));
-            }
-        }
-        let timeout_service = service.clone();
-        let timeout_method = method.clone();
-        let error_format = resolved.instance.error_format;
-        let future = resolved.ctx.call_iface(&service, version, &method, parsed);
-        let trace = traced.then(|| {
-            Arc::new(IfaceTrace {
-                store: resolved.instance.ctx.store.clone(),
-                name: format!("{service}.{method}"),
-                callee_plugin: service.clone(),
-                caller_uid: resolved
+            .with_certainty("not_executed")
+        },
+        move |resolved| {
+            let traced = resolved.instance.ctx.store.has_trace_sink();
+            let trace_parent = traced.then(call_scope_top).flatten();
+            let trace_correlation = traced
+                .then(|| {
+                    resolved
+                        .ctx
+                        .correlation_id_arc()
+                        .or_else(cordis_core::current_correlation_id)
+                })
+                .flatten();
+            // 宿主方法白名单准入：在服务解析、派发槽位分配与提供者执行之前校验，
+            // 身份直接来自宿主绑定的 `resolved.ctx`（不依赖 TraceSink / current_caller_uid）。
+            if resolved.ctx.store.has_call_auth_hook() {
+                let started = std::time::Instant::now();
+                let caller = resolved.ctx.caller_identity();
+                if let Err(err) = resolved
                     .ctx
-                    .fiber_opt()
-                    .map(|fiber| fiber.uid())
-                    .unwrap_or(cordis_core::UID_ROOT),
-                parent_call_id: trace_parent.unwrap_or(0),
-                correlation_id: trace_correlation.clone(),
-                started: std::time::Instant::now(),
-            })
-        });
-        let future = with_iface_timeout(
-            future,
-            timeout_service,
-            timeout_method,
-            resolved.instance.dispatch_policy,
-            trace.clone(),
-        );
-        let consumer = resolved.owner;
-        // 把这次 iface 调用登记成消费者实例的一条在飞记录：
-        // 消费者卸载时 `apply_via` 的排水会把它撤掉，避免延迟 on_done 打进已释放的库。
-        // 容量拒绝时直接返回：future 还没有被 poll，提供者代码不会执行。
-        let iface_id = next_dispatch_id();
-        let parent = scope_top().map(|(_, id)| id);
-        let (cancel, done) = insert_dispatch_task(
-            &resolved.instance,
-            iface_id,
-            DispatchRecord {
-                sink: None,
-                frame: None,
-                parent,
-                outbound: Some(Outbound {
-                    owner: consumer,
-                    continuation,
-                    kind: ContinuationKind::Iface,
-                    trace_parent,
-                    trace_correlation,
-                }),
-                stream: None,
-            },
-        )
-        .map_err(|(payload, _)| payload)?;
-        let deliver: Arc<dyn Fn(Result<Config>) + Send + Sync> = Arc::new(move |result| {
-            let payload = json!({
-                "kind": KIND_IFACE,
-                "id": continuation,
-                "args": [match &result {
-                    Ok(value) => json!({ "result": value }),
-                    Err(err) => error_arg(error_format, &payload_of(err.as_ref())),
-                }],
-            })
-            .to_string();
-            deliver_outbound(consumer, iface_id, &payload);
-        });
-        let deferred = {
-            let on_done = deliver.clone();
-            let on_panic = deliver.clone();
-            let panic_trace = trace.clone();
-            complete_or_defer(
-                future,
-                move |result| on_done(result),
-                move |payload| {
-                    if let Some(trace) = panic_trace.as_ref() {
-                        trace.record(&payload.code);
+                    .store
+                    .authorize_call(&caller, &service, &method)
+                {
+                    if traced {
+                        IfaceTrace {
+                            store: resolved.instance.ctx.store.clone(),
+                            name: format!("{service}.{method}"),
+                            callee_plugin: service.clone(),
+                            caller_uid: caller.fiber_uid,
+                            parent_call_id: trace_parent.unwrap_or(0),
+                            correlation_id: trace_correlation,
+                            started,
+                        }
+                        .record("host_unauthorized");
                     }
-                    on_panic(Err(Box::new(CallFailure::from_payload(payload))))
-                },
-                (cancel, done),
-                PanicScope {
-                    scene: "iface",
-                    handle: consumer,
-                    dispatch_id: iface_id,
+                    return Err(ErrorPayload::new(err.to_string())
+                        .with_code("host_unauthorized")
+                        .with_category("authorization")
+                        .with_certainty("not_executed"));
+                }
+            }
+            let timeout_service = service.clone();
+            let timeout_method = method.clone();
+            let error_format = resolved.instance.error_format;
+            let future = resolved.ctx.call_iface(&service, version, &method, parsed);
+            let trace = traced.then(|| {
+                Arc::new(IfaceTrace {
+                    store: resolved.instance.ctx.store.clone(),
+                    name: format!("{service}.{method}"),
+                    callee_plugin: service.clone(),
+                    caller_uid: resolved
+                        .ctx
+                        .fiber_opt()
+                        .map(|fiber| fiber.uid())
+                        .unwrap_or(cordis_core::UID_ROOT),
+                    parent_call_id: trace_parent.unwrap_or(0),
+                    correlation_id: trace_correlation.clone(),
+                    started: std::time::Instant::now(),
+                })
+            });
+            let future = with_iface_timeout(
+                future,
+                timeout_service,
+                timeout_method,
+                resolved.instance.dispatch_policy,
+                trace.clone(),
+            );
+            let consumer = resolved.owner;
+            // 把这次 iface 调用登记成消费者实例的一条在飞记录：
+            // 消费者卸载时 `apply_via` 的排水会把它撤掉，避免延迟 on_done 打进已释放的库。
+            // 容量拒绝时直接返回：future 还没有被 poll，提供者代码不会执行。
+            let iface_id = next_dispatch_id();
+            let parent = scope_top().map(|(_, id)| id);
+            let (cancel, done) = insert_dispatch_task(
+                &resolved.instance,
+                iface_id,
+                DispatchRecord {
+                    sink: None,
+                    frame: None,
+                    parent,
+                    outbound: Some(Outbound {
+                        owner: consumer,
+                        continuation,
+                        kind: ContinuationKind::Iface,
+                        trace_parent,
+                        trace_correlation,
+                    }),
+                    stream: None,
                 },
             )
-        };
-        match deferred {
-            // 内联完成：把结果直接带回，插件侧自己消费掉它的续延（零额外跨边界往返）。
-            // 若 `unregister_dispatch_node` 返回 `false`，说明重入 `ctx_abort` 或并发卸载已
-            // 摘走节点并通过 `OP_CALLBACK` 结算续延，此时返回 `pending: true` 避免双重结算。
-            Ok(Some(result)) => {
-                if !unregister_dispatch_node(consumer, iface_id) {
-                    return Ok(json!({ "pending": true }).to_string());
-                }
-                match result {
-                    Ok(value) => Ok(json!({ "pending": false, "result": value }).to_string()),
-                    // 并发收紧白名单时，内核 `call_iface` 复检仍可能返回 `MethodUnauthorized`：
-                    // 统一收口为 `STATUS_ERR` + 结构化 `ErrorPayload`，避免协议形态漂移为 `STATUS_OK` 内联错。
-                    Err(err)
-                        if err
-                            .downcast_ref::<cordis_core::MethodUnauthorized>()
-                            .is_some() =>
-                    {
-                        Err(payload_of(err.as_ref()))
-                    }
-                    Err(err) => {
-                        let mut response = json!({ "pending": false });
-                        if let Value::Object(map) = &mut response {
-                            if let Value::Object(error) =
-                                error_arg(error_format, &payload_of(err.as_ref()))
-                            {
-                                map.extend(error);
-                            }
+            .map_err(|(payload, _)| payload)?;
+            let deliver: Arc<dyn Fn(Result<Config>) + Send + Sync> = Arc::new(move |result| {
+                let payload = json!({
+                    "kind": KIND_IFACE,
+                    "id": continuation,
+                    "args": [match &result {
+                        Ok(value) => json!({ "result": value }),
+                        Err(err) => error_arg(error_format, &payload_of(err.as_ref())),
+                    }],
+                })
+                .to_string();
+                deliver_outbound(consumer, iface_id, &payload);
+            });
+            let deferred = {
+                let on_done = deliver.clone();
+                let on_panic = deliver.clone();
+                let panic_trace = trace.clone();
+                complete_or_defer(
+                    future,
+                    move |result| on_done(result),
+                    move |payload| {
+                        if let Some(trace) = panic_trace.as_ref() {
+                            trace.record(&payload.code);
                         }
-                        Ok(response.to_string())
+                        on_panic(Err(Box::new(CallFailure::from_payload(payload))))
+                    },
+                    (cancel, done),
+                    PanicScope {
+                        scene: "iface",
+                        handle: consumer,
+                        dispatch_id: iface_id,
+                    },
+                )
+            };
+            match deferred {
+                // 内联完成：把结果直接带回，插件侧自己消费掉它的续延（零额外跨边界往返）。
+                // 若 `unregister_dispatch_node` 返回 `false`，说明重入 `ctx_abort` 或并发卸载已
+                // 摘走节点并通过 `OP_CALLBACK` 结算续延，此时返回 `pending: true` 避免双重结算。
+                Ok(Some(result)) => {
+                    if !unregister_dispatch_node(consumer, iface_id) {
+                        return Ok(json!({ "pending": true }).to_string());
+                    }
+                    match result {
+                        Ok(value) => Ok(json!({ "pending": false, "result": value }).to_string()),
+                        // 并发收紧白名单时，内核 `call_iface` 复检仍可能返回 `MethodUnauthorized`：
+                        // 统一收口为 `STATUS_ERR` + 结构化 `ErrorPayload`，避免协议形态漂移为 `STATUS_OK` 内联错。
+                        Err(err)
+                            if err
+                                .downcast_ref::<cordis_core::MethodUnauthorized>()
+                                .is_some() =>
+                        {
+                            Err(payload_of(err.as_ref()))
+                        }
+                        Err(err) => {
+                            let mut response = json!({ "pending": false });
+                            if let Value::Object(map) = &mut response {
+                                if let Value::Object(error) =
+                                    error_arg(error_format, &payload_of(err.as_ref()))
+                                {
+                                    map.extend(error);
+                                }
+                            }
+                            Ok(response.to_string())
+                        }
                     }
                 }
+                // 未就绪：结果会通过 `OP_CALLBACK` 送到同一个续延 id 上。
+                Ok(None) => Ok(json!({ "pending": true }).to_string()),
+                Err(DeferFailure::NoRuntime(message)) => {
+                    if let Some(trace) = trace.as_ref() {
+                        trace.record("host_call");
+                    }
+                    if !unregister_dispatch_node(consumer, iface_id) {
+                        return Ok(json!({ "pending": true }).to_string());
+                    }
+                    Err(ErrorPayload::new(message)
+                        .with_code("host_call")
+                        .with_category("protocol"))
+                }
+                // 首 poll panic：调用方同步拿到错误 ⇒ **先摘表再返回**，
+                // 否则关闭路径会为同一次调用补发一条 abort（双交付）。
+                Err(DeferFailure::Panic(payload)) => {
+                    if let Some(trace) = trace.as_ref() {
+                        trace.record(&payload.code);
+                    }
+                    if !unregister_dispatch_node(consumer, iface_id) {
+                        return Ok(json!({ "pending": true }).to_string());
+                    }
+                    Err(payload)
+                }
             }
-            // 未就绪：结果会通过 `OP_CALLBACK` 送到同一个续延 id 上。
-            Ok(None) => Ok(json!({ "pending": true }).to_string()),
-            Err(DeferFailure::NoRuntime(message)) => {
-                if let Some(trace) = trace.as_ref() {
-                    trace.record("host_call");
-                }
-                if !unregister_dispatch_node(consumer, iface_id) {
-                    return Ok(json!({ "pending": true }).to_string());
-                }
-                Err(ErrorPayload::new(message)
-                    .with_code("host_call")
-                    .with_category("protocol"))
-            }
-            // 首 poll panic：调用方同步拿到错误 ⇒ **先摘表再返回**，
-            // 否则关闭路径会为同一次调用补发一条 abort（双交付）。
-            Err(DeferFailure::Panic(payload)) => {
-                if let Some(trace) = trace.as_ref() {
-                    trace.record(&payload.code);
-                }
-                if !unregister_dispatch_node(consumer, iface_id) {
-                    return Ok(json!({ "pending": true }).to_string());
-                }
-                Err(payload)
-            }
-        }
-    })
+        },
+    )
 }
 
 /// #17 `ctx_fulfill`（M2）：结算一个返回过 `STATUS_PENDING` 的入站续延。

@@ -2949,6 +2949,102 @@ async fn r4_p0_ctx_use_respects_per_app_strict_plugin_source_over_global() {
 }
 
 #[tokio::test]
+async fn r5_p1_child_fiber_handle_rejects_isolate_intercept_and_nested_use() {
+    use cordis_core::{plugin_fn, Inject};
+
+    struct ChildReg;
+    impl NativeRegistry for ChildReg {
+        fn native(&self, name: &str) -> Option<Arc<dyn cordis_core::Plugin>> {
+            let static_name = match name {
+                "r5-child" => "r5-child",
+                _ => "r5-grandchild",
+            };
+            Some(plugin_fn(static_name, Inject::default(), |_, _| {
+                Box::pin(async { Ok(()) })
+            }))
+        }
+    }
+
+    let app = cordis_core::App::new();
+    set_native_registry_for(&app.root, Arc::new(ChildReg));
+
+    let parent_fiber = app.root.plugin(
+        plugin_fn("r5-parent", Inject::default(), |_, _| {
+            Box::pin(async { Ok(()) })
+        }),
+        cordis_core::Config::Null,
+    );
+    parent_fiber.settle().await;
+    let parent_handle = register_instance_with_keepalive(
+        parent_fiber.ctx(),
+        stream_unused_call,
+        None,
+        cordis_abi::ERROR_FORMAT_V1,
+    )
+    .unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let mut out = Out {
+        ptr: buf.as_mut_ptr(),
+        cap: buf.len(),
+        len: 0,
+    };
+    let st = unsafe {
+        host_ctx_use(
+            parent_handle,
+            Blob::new(b"@native:r5-child"),
+            Blob::new(b"{}"),
+            &mut out,
+        )
+    };
+    assert_eq!(st, STATUS_OK);
+    let child_json: Value = serde_json::from_slice(&buf[..out.len]).unwrap();
+    let child_handle = child_json["handle"].as_u64().unwrap();
+
+    // 1. `ctx_isolate(child_handle, ...)` MUST be rejected so child handle cannot be laundered into a scope handle.
+    out.len = 0;
+    let iso_st =
+        unsafe { host_ctx_isolate(child_handle, Blob::new(b"k"), Blob::new(b""), &mut out) };
+    assert_eq!(
+        iso_st,
+        STATUS_ERR,
+        "ctx_use 子句柄不得经 ctx_isolate 洗白为可调用域句柄: {}",
+        String::from_utf8_lossy(&buf[..out.len])
+    );
+
+    // 2. `ctx_intercept(child_handle, ...)` MUST be rejected for the same reason.
+    out.len = 0;
+    let int_st =
+        unsafe { host_ctx_intercept(child_handle, Blob::new(b"k"), Blob::new(b"{}"), &mut out) };
+    assert_eq!(
+        int_st,
+        STATUS_ERR,
+        "ctx_use 子句柄不得经 ctx_intercept 洗白为可调用域句柄: {}",
+        String::from_utf8_lossy(&buf[..out.len])
+    );
+
+    // 3. `ctx_use(child_handle, ...)` MUST be rejected instead of silently mounting grandchild onto parent.
+    out.len = 0;
+    let use_st = unsafe {
+        host_ctx_use(
+            child_handle,
+            Blob::new(b"@native:r5-grandchild"),
+            Blob::new(b"{}"),
+            &mut out,
+        )
+    };
+    assert_eq!(
+        use_st,
+        STATUS_ERR,
+        "ctx_use 子句柄不得接受嵌套 ctx_use 避免孙组件泄漏挂载到父 fiber: {}",
+        String::from_utf8_lossy(&buf[..out.len])
+    );
+
+    unregister_instance(parent_handle);
+    app.close().await;
+}
+
+#[tokio::test]
 async fn r4_p1_register_derived_rejects_closed_instance_no_derived_table_leak() {
     let app = cordis_core::App::new();
     let handle = register_instance_with_keepalive(

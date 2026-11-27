@@ -28,6 +28,8 @@ cargo xtask <命令>
   ci               fmt + inventory + docs + matrix + arch + clippy(--all-features)
                    + check(--all-features) + test + doctest + consumer + demo + e2e
   arch             检查架构分层 DAG、工具链锁版与 GitHub Actions SHA/权限门禁
+  verify-toolchain <ver>
+                   运行期校验当前生效的 `rustc --version` 前缀是否精确匹配 `<ver>`
   docs [path]      检查支持契约的保证索引（默认 docs/support-contract.md）
   inventory [--write|--check] [path]
                    检查/写入公开 API 清单（默认 docs/api-inventory.md）
@@ -89,6 +91,7 @@ fn main() -> ExitCode {
         "e2e" => build_then(&["run", "--locked", "-p", "harness-spike"]),
         "ci" => ci(),
         "arch" => arch_check(),
+        "verify-toolchain" => verify_toolchain_command(std::env::args().skip(2).collect()),
         "docs" => docs_check(std::env::args().nth(2)),
         "inventory" => inventory_command(std::env::args().skip(2).collect()),
         "matrix" => matrix_command(std::env::args().skip(2).collect()),
@@ -215,6 +218,43 @@ fn arch_check() -> i32 {
         for violation in &violations {
             eprintln!("  - {violation}");
         }
+        1
+    }
+}
+
+fn verify_toolchain_command(args: Vec<String>) -> i32 {
+    let expected = match args.as_slice() {
+        [ver] => ver.as_str(),
+        [flag, ver] if flag == "--expected" => ver.as_str(),
+        _ => {
+            eprintln!("用法: cargo xtask verify-toolchain <version>（例如 1.98.1）");
+            return 2;
+        }
+    };
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let output = match Command::new(&rustc).arg("--version").output() {
+        Ok(o) => o,
+        Err(err) => {
+            eprintln!("执行 `{rustc} --version` 失败: {err}");
+            return 1;
+        }
+    };
+    if !output.status.success() {
+        eprintln!(
+            "`{rustc} --version` 退出失败 ({:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return 1;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let actual = stdout.trim();
+    let required_prefix = format!("rustc {expected} ");
+    if actual.starts_with(&required_prefix) {
+        println!("工具链校验通过：{actual}");
+        0
+    } else {
+        eprintln!("工具链版本不匹配：期望前缀 `{required_prefix}`，实际 `{actual}`");
         1
     }
 }
